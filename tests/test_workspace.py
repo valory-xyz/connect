@@ -98,12 +98,16 @@ def test_user_files_survive(store_path: Path) -> None:
 
 
 def test_deep_links(store_path: Path) -> None:
-    """Deep links and the launch order."""
+    """Deep links and the harness-dependent launch order."""
     assert workspace.desktop_deep_link(store_path).startswith(
         "claude://code/new?folder="
     )
     assert workspace.cli_deep_link(store_path).startswith("claude-cli://open?cwd=")
-    # desktop first, CLI as fallback
+    # desktop harness (the default): desktop first, CLI as fallback
     first, second = workspace.launch_order(store_path)
     assert first.startswith("claude://")
     assert second.startswith("claude-cli://")
+    # CLI harness reverses the order
+    first, second = workspace.launch_order(store_path, "claude_code_cli")
+    assert first.startswith("claude-cli://")
+    assert second.startswith("claude://")

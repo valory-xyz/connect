@@ -36,8 +36,18 @@ from fastapi.testclient import TestClient
 
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig, ChainConfig
+from pearl_connect.guard import Guard
 from pearl_connect.server.app import create_app
+from pearl_connect.settings import (
+    MODE_UNRESTRICTED,
+    SETTINGS_FILE,
+    Settings,
+    SettingsStore,
+    derive_mac_key,
+)
 from pearl_connect.signer import Signer
+
+from tests.conftest import TEST_PASSWORD
 
 RPC_ENV = "GNOSIS_TESTNET_RPC"
 MIDDLEWARE_ENV_FILE = (
@@ -100,30 +110,49 @@ def fork_config_fixture(rpc_url: str, store_path: Path) -> AppConfig:
     )
 
 
+@pytest.fixture(name="fork_store")
+def fork_store_fixture(account: LocalAccount, store_path: Path) -> SettingsStore:
+    """Return the settings store for the fork; fresh -> restricted defaults."""
+    return SettingsStore(
+        store_path / SETTINGS_FILE, derive_mac_key(account), ActivityLog(store_path)
+    )
+
+
 @pytest.fixture(name="funded_signer")
 def funded_signer_fixture(
     rpc_url: str,
     fork_config: AppConfig,
+    fork_store: SettingsStore,
     store_path: Path,
     account: LocalAccount,
 ) -> Signer:
-    """Return a signer whose EOA holds 1 xDAI on the fork."""
+    """Return a guarded signer whose EOA holds 1 xDAI on the fork."""
     _set_balance(rpc_url, account.address, 10**18)
     return Signer(
         account=account,
         config=fork_config,
         activity=ActivityLog(store_path),
+        guard=Guard(fork_store, fork_config),
     )
 
 
 def _fork_app(
     signer: Signer,
     config: AppConfig,
+    store: SettingsStore,
     store_path: Path,
     token: str,
 ) -> object:
     activity = ActivityLog(store_path)
-    return create_app(signer=signer, config=config, activity=activity, token=token)
+    guard = Guard(store, config)
+    return create_app(
+        signer=signer,
+        config=config,
+        activity=activity,
+        token=token,
+        guard=guard,
+        settings_store=store,
+    )
 
 
 def _wait_mined(signer: Signer, tx_hash: str, timeout: float = 120) -> dict:
@@ -143,12 +172,14 @@ def _wait_mined(signer: Signer, tx_hash: str, timeout: float = 120) -> dict:
 def test_sign_and_send_mines_on_fork(
     funded_signer: Signer,
     fork_config: AppConfig,
+    fork_store: SettingsStore,
     store_path: Path,
     account: LocalAccount,
 ) -> None:
     """A transfer sent through /sign-and-send is broadcast and mined."""
+    fork_store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
     token = secrets.token_urlsafe(16)
-    app = _fork_app(funded_signer, fork_config, store_path, token)
+    app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         request_id = f"it-{secrets.token_hex(8)}"
         payload = {
@@ -173,16 +204,94 @@ def test_sign_and_send_mines_on_fork(
 def test_funds_status_reports_live_balance(
     funded_signer: Signer,
     fork_config: AppConfig,
+    fork_store: SettingsStore,
     store_path: Path,
 ) -> None:
     """/funds-status reflects the on-chain balance against the threshold."""
     fork_config.fund_requirements = {
         "gnosis": {"agent": {"0x" + "00" * 20: 2 * 10**18}}
     }
-    app = _fork_app(funded_signer, fork_config, store_path, "t")
+    app = _fork_app(funded_signer, fork_config, fork_store, store_path, "t")
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         body = client.get("/funds-status").json()
     entry = body["gnosis"][funded_signer.address]["0x" + "00" * 20]
     assert int(entry["balance"]) > 0
     assert int(entry["deficit"]) == max(0, 2 * 10**18 - int(entry["balance"]))
     assert json.dumps(body)  # shape is JSON-serializable end-to-end
+
+
+def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-arguments
+    funded_signer: Signer,
+    fork_config: AppConfig,
+    fork_store: SettingsStore,
+    store_path: Path,
+    keystore_dir: Path,
+    account: LocalAccount,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh settings boot restricted; the password-authed endpoint flips them.
+
+    Covers: blocked arbitrary transfer, allowed EOA->safe sweep, blocked raw
+    digest signing, wrong password 401, and live effect of the mode change.
+    """
+    monkeypatch.chdir(keystore_dir)  # POST /settings re-decrypts the keystore
+    fork_config.chains["gnosis"].safe_address = "0x" + "33" * 20
+    token = secrets.token_urlsafe(16)
+    app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
+    headers = {"Authorization": f"Bearer {token}"}
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        assert client.get("/settings").json()["mode"] == "restricted"
+        assert client.get("/wallet", headers=headers).json()["mode"] == "restricted"
+
+        # arbitrary transfer: blocked with the violated rule in the message
+        blocked = client.post(
+            "/sign-and-send",
+            json={"chain": "gnosis", "to": account.address, "value": 1},
+            headers=headers,
+        )
+        assert blocked.status_code == 400
+        assert "restricted mode" in blocked.json()["detail"]
+
+        # EOA -> safe native sweep: allowed and mined
+        sweep = client.post(
+            "/sign-and-send",
+            json={
+                "chain": "gnosis",
+                "to": fork_config.chains["gnosis"].safe_address,
+                "value": 10**12,
+            },
+            headers=headers,
+        )
+        assert sweep.status_code == 200, sweep.text
+        _wait_mined(funded_signer, sweep.json()["tx_hash"])
+
+        # raw digest signing: off in restricted mode
+        digest_denied = client.post(
+            "/sign-message", json={"digest": "0x" + "ab" * 32}, headers=headers
+        )
+        assert digest_denied.status_code == 400
+        assert "restricted" in digest_denied.json()["detail"]
+
+        # settings write: wrong password rejected, right one applies live
+        denied = client.post(
+            "/settings",
+            json={
+                "password": "wrong",
+                "mode": "unrestricted",
+                "whitelist": {},
+            },  # nosec B105
+        )
+        assert denied.status_code == 401
+        flipped = client.post(
+            "/settings",
+            json={"password": TEST_PASSWORD, "mode": "unrestricted", "whitelist": {}},
+        )
+        assert flipped.status_code == 200, flipped.text
+        assert flipped.json()["mode"] == "unrestricted"
+
+        allowed = client.post(
+            "/sign-and-send",
+            json={"chain": "gnosis", "to": account.address, "value": 1},
+            headers=headers,
+        )
+        assert allowed.status_code == 200, allowed.text

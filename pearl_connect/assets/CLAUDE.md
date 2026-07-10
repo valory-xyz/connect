@@ -19,6 +19,8 @@ pearl-connect server owns — don't hand-edit them:
 - `.mcp.json` — connection config for your signing service (fresh auth token
   each run)
 - `.claude/skills/pearl-connect/` — your skill, kept up to date by the server
+- `pearl-connect.settings.json` — agent wallet's settings; integrity-checked, any
+  hand-edit is detected and reset to safe defaults
 - this `CLAUDE.md` itself
 
 The pearl-connect server that launched this session runs on
@@ -39,6 +41,14 @@ spend passes through one authenticated, logged choke point. The bearer token
 in `.mcp.json` is what authorizes *this* session to use the signer; never
 paste it into anything outside this workspace.
 
+## The guardrail
+
+The signer enforces a user-controlled guardrail (`restricted` by default): it
+may refuse to sign, and every refusal names the exact rule it violated. You
+cannot lift the restrictions yourself — when a task needs more than the
+guardrail allows, tell the user what was blocked and why. The pearl-connect
+skill documents the modes and how to respond to a block.
+
 ## How to act on-chain: the pearl-connect skill
 
 For **any** on-chain action — checking balances, sending transactions,
@@ -46,10 +56,10 @@ spending from the service safe, signing digests — use the **pearl-connect
 skill** (`.claude/skills/pearl-connect/SKILL.md`). It documents:
 
 - the MCP tools (`wallet_info`, `send_transaction`, `transaction_status`,
-  `sign_message`);
+  `sign_message`, `settings`);
 - `scripts/signer_client.py` for web3.py code run by spawned scripts;
 - the threshold-1 safe pattern for spending from the service safe.
 
 Don't hand-roll signing, key loading, or raw RPC sends — the skill's paths
 are the supported, audited ones. Start any on-chain task with `wallet_info`
-to learn your addresses, chains, and balances.
+to learn your addresses, chains, balances, and guardrail mode.

@@ -32,6 +32,14 @@ from web3 import Web3
 
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig, ChainConfig
+from pearl_connect.guard import Guard
+from pearl_connect.settings import (
+    MODE_UNRESTRICTED,
+    SETTINGS_FILE,
+    Settings,
+    SettingsStore,
+    derive_mac_key,
+)
 from pearl_connect.signer import Signer, _ChainState
 
 TEST_PASSWORD = "test-password"  # nosec B105
@@ -184,8 +192,28 @@ def test_signer(
 
 
 @pytest.fixture
-def make_app() -> t.Callable:
-    """Return an app factory."""
+def settings_store(
+    account: LocalAccount, store_path: Path, activity: ActivityLog
+) -> SettingsStore:
+    """Build a settings store pre-set to unrestricted so legacy tests keep signing.
+
+    The restricted default and its rules are exercised explicitly by the
+    guard/settings tests.
+    """
+    store = SettingsStore(store_path / SETTINGS_FILE, derive_mac_key(account), activity)
+    store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+    return store
+
+
+@pytest.fixture
+def guard(settings_store: SettingsStore, app_config: AppConfig) -> Guard:
+    """Guard over the unrestricted test settings store."""
+    return Guard(settings_store, app_config)
+
+
+@pytest.fixture
+def make_app(guard: Guard, settings_store: SettingsStore) -> t.Callable:
+    """Return an app factory threading the guard/settings wiring."""
     from pearl_connect.server.app import create_app
 
     def _make(
@@ -194,6 +222,15 @@ def make_app() -> t.Callable:
         activity: ActivityLog,
         token: str = "tok",  # nosec B107
     ) -> t.Any:
-        return create_app(signer=signer, config=config, activity=activity, token=token)
+        # the app's signing endpoints must honor the same guard the app serves
+        signer.set_guard(guard)
+        return create_app(
+            signer=signer,
+            config=config,
+            activity=activity,
+            token=token,
+            guard=guard,
+            settings_store=settings_store,
+        )
 
     return _make

@@ -35,6 +35,7 @@ from web3.types import TxParams
 
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
+from pearl_connect.guard import Guard, GuardError
 
 GAS_ESTIMATE_BUFFER = 1.2
 
@@ -144,12 +145,18 @@ class Signer:
         account: LocalAccount,
         config: AppConfig,
         activity: ActivityLog,
+        guard: Guard | None = None,
     ) -> None:
         """Initialize."""
         self._account = account
         self._activity = activity
         self._chains = _ChainPool(config)
         self._requests = _IdempotencyCache()
+        self._guard = guard
+
+    def set_guard(self, guard: Guard) -> None:
+        """Attach the guardrail; the boot path passes it to the constructor."""
+        self._guard = guard
 
     @property
     def address(self) -> str:
@@ -176,9 +183,13 @@ class Signer:
         returns the original tx hash without rebroadcasting.
         """
         if request_id is not None:
+            # a completed send stays answerable even if the guardrail has
+            # tightened since — the transaction already happened; nothing
+            # new is signed by returning its hash again
             cached = self._requests.cached(request_id)
             if cached is not None:
                 return cached
+        self._check_transaction(chain=chain, to=to, value=value, data=data)
 
         def broadcast() -> str:
             return self._send(
@@ -269,12 +280,35 @@ class Signer:
             tx["gasPrice"] = w3.eth.gas_price
         return tx
 
+    def _check_transaction(self, *, chain: str, to: str, value: int, data: str) -> None:
+        """Consult the guardrail; a denial is audited and surfaced as SignerError."""
+        if self._guard is None:
+            return
+        try:
+            self._guard.check_transaction(chain, to, value, data)
+        except GuardError as e:
+            self._activity.record(
+                "blocked",
+                action="send",
+                chain=chain,
+                to=to,
+                value=str(value),
+                reason=str(e),
+            )
+            raise SignerError(str(e)) from e
+
     def sign_digest(self, digest: bytes) -> str:
         """Sign a raw 32-byte digest (no EIP-191 prefix); returns 0x-hex 65-byte signature.
 
         mech-client's off-chain flow verifies with plain ecrecover, so the
         digest must be signed unprefixed.
         """
+        if self._guard is not None:
+            try:
+                self._guard.check_sign_digest()
+            except GuardError as e:
+                self._activity.record("blocked", action="sign_digest", reason=str(e))
+                raise SignerError(str(e)) from e
         if len(digest) != 32:
             raise SignerError(f"digest must be exactly 32 bytes, got {len(digest)}")
         signature = self._account.unsafe_sign_hash(

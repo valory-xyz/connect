@@ -88,4 +88,8 @@ def sign_message(body: SignMessageRequest, request: Request) -> dict:
 @router.get("/wallet")
 def wallet_info(request: Request) -> dict:
     """Wallet info."""
-    return wallet.wallet_overview(request.app.state.config, request.app.state.signer)
+    overview = wallet.wallet_overview(
+        request.app.state.config, request.app.state.signer
+    )
+    overview["mode"] = request.app.state.guard.mode()
+    return overview

@@ -38,8 +38,10 @@ import uvicorn
 from pearl_connect import workspace
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
+from pearl_connect.guard import Guard
 from pearl_connect.keystore import KeystoreError, load_account
 from pearl_connect.server.app import create_app
+from pearl_connect.settings import SETTINGS_FILE, SettingsStore, derive_mac_key
 from pearl_connect.signer import Signer
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [agent] %(message)s"
@@ -64,16 +66,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def wait_and_launch(server: uvicorn.Server, store_path: Path) -> None:
+def wait_and_launch(
+    server: uvicorn.Server, store_path: Path, settings_store: SettingsStore
+) -> None:
     """Launch Claude Code once the server reports startup complete.
 
     Runs in a background thread so the MCP endpoint is connectable the moment
-    the session opens.
+    the session opens. The configured harness decides which Claude Code the
+    workspace opens in (the other stays the fallback).
     """
     while not server.started and not server.should_exit:
         time.sleep(0.2)
     if server.started:
-        workspace.launch_claude(store_path)
+        workspace.launch_claude(store_path, harness=settings_store.load().harness)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -98,7 +103,12 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("configured chains: %s", sorted(config.chains) or "none")
 
     activity = ActivityLog(config.store_path)
-    signer = Signer(account=account, config=config, activity=activity)
+    settings_store = SettingsStore(
+        config.store_path / SETTINGS_FILE, derive_mac_key(account), activity
+    )
+    guard = Guard(settings_store, config)
+    signer = Signer(account=account, config=config, activity=activity, guard=guard)
+    logger.info("guardrail mode: %s", guard.mode())
     token = secrets.token_urlsafe(32)
 
     try:
@@ -114,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
         config=config,
         activity=activity,
         token=token,
+        guard=guard,
+        settings_store=settings_store,
     )
 
     server = uvicorn.Server(
@@ -131,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
     threading.Thread(
         target=wait_and_launch,
-        args=(server, config.store_path),
+        args=(server, config.store_path, settings_store),
         daemon=True,
     ).start()
 

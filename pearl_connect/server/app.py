@@ -27,21 +27,27 @@ from fastapi import Depends, FastAPI
 
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
-from pearl_connect.server import pearl_routes, signer_routes
+from pearl_connect.guard import Guard
+from pearl_connect.server import pearl_routes, settings_routes, signer_routes
 from pearl_connect.server.auth import AuthMiddleware, RequireAuth
 from pearl_connect.server.mcp_tools import build_mcp
+from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer
 
 
-def create_app(
+def create_app(  # pylint: disable=too-many-arguments
     signer: Signer,
     config: AppConfig,
     activity: ActivityLog,
     *,
     token: str,
+    guard: Guard,
+    settings_store: SettingsStore,
 ) -> FastAPI:
     """Create app."""
-    mcp = build_mcp(signer, config, activity)
+    mcp = build_mcp(
+        signer, config, activity, guard=guard, settings_store=settings_store
+    )
     mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
@@ -53,9 +59,12 @@ def create_app(
     app.state.signer = signer
     app.state.config = config
     app.state.activity = activity
+    app.state.guard = guard
+    app.state.settings_store = settings_store
     app.state.funds_cache = {"at": 0.0, "value": {}, "lock": threading.Lock()}
 
     app.include_router(pearl_routes.router)
+    app.include_router(settings_routes.router)
     app.include_router(
         signer_routes.router,
         dependencies=[Depends(RequireAuth(token, activity))],
