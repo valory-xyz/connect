@@ -40,6 +40,7 @@ from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
 from pearl_connect.guard import Guard
 from pearl_connect.keystore import KeystoreError, load_account
+from pearl_connect.mech import MechService
 from pearl_connect.server.app import create_app
 from pearl_connect.settings import SETTINGS_FILE, SettingsStore, derive_mac_key
 from pearl_connect.signer import Signer
@@ -108,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     guard = Guard(settings_store, config)
     signer = Signer(account=account, config=config, activity=activity, guard=guard)
+    mech = MechService(signer, config, activity, guard)
     logger.info("guardrail mode: %s", guard.mode())
     token = secrets.token_urlsafe(32)
 
@@ -126,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         token=token,
         guard=guard,
         settings_store=settings_store,
+        mech=mech,
     )
 
     server = uvicorn.Server(

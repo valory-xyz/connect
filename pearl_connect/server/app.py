@@ -28,6 +28,7 @@ from fastapi import Depends, FastAPI
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
 from pearl_connect.guard import Guard
+from pearl_connect.mech import MechService
 from pearl_connect.server import pearl_routes, settings_routes, signer_routes
 from pearl_connect.server.auth import AuthMiddleware, RequireAuth
 from pearl_connect.server.mcp_tools import build_mcp
@@ -43,10 +44,16 @@ def create_app(  # pylint: disable=too-many-arguments
     token: str,
     guard: Guard,
     settings_store: SettingsStore,
+    mech: MechService,
 ) -> FastAPI:
     """Create app."""
     mcp = build_mcp(
-        signer, config, activity, guard=guard, settings_store=settings_store
+        signer,
+        config,
+        activity,
+        guard=guard,
+        mech=mech,
+        settings_store=settings_store,
     )
     mcp_app = mcp.streamable_http_app()
 
@@ -61,6 +68,7 @@ def create_app(  # pylint: disable=too-many-arguments
     app.state.activity = activity
     app.state.guard = guard
     app.state.settings_store = settings_store
+    app.state.mech = mech
     app.state.funds_cache = {"at": 0.0, "value": {}, "lock": threading.Lock()}
 
     app.include_router(pearl_routes.router)
