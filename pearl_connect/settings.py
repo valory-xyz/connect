@@ -58,6 +58,7 @@ DEFAULT_HARNESS = HARNESS_CLAUDE_CODE_DESKTOP
 _MAC_KEY_INFO = b"pearl-connect settings hmac v1"
 
 # Operator-provided additions to the default whitelist (chain -> addresses).
+# The MechMarketplace contracts are merged in by default_whitelist().
 EXTRA_DEFAULT_WHITELIST: dict[str, tuple[str, ...]] = {}
 
 
@@ -104,16 +105,56 @@ class Settings:
         return cls(mode=str(mode), whitelist=normalized, harness=str(harness))
 
 
+def _mech_system_addresses() -> dict[str, list[str]]:
+    """Collect the MechMarketplace contract per chain from the pinned mech-client.
+
+    The marketplace is the only contract the service safe CALLs in the
+    restricted-mode mech flow (`request`/`requestBatch`; native payment rides
+    as the inner value). Balance trackers are deliberately NOT whitelisted —
+    the safe only calls them for prepaid deposits, which our surface reaches
+    only via the off-chain flow (unrestricted mode). Payment token contracts
+    are NOT whitelisted either: the whitelist is address-level, so allowing a
+    token contract would allow arbitrary `transfer`s of the safe's balance,
+    not just the `approve` a token-paid mech needs. Operators can whitelist
+    those explicitly when they want token-paid mechs in restricted mode.
+
+    Importing the address (rather than hardcoding a copy) keeps a single
+    source of truth: a mech-client upgrade that moves the marketplace updates
+    the default whitelist with it.
+    """
+    # pylint: disable=import-outside-toplevel
+    try:
+        from mech_client.infrastructure.config.constants import MECH_CONFIGS
+        from mech_client.utils.constants import CHAIN_NAME_TO_ID
+
+        zero_address = "0x" + "00" * 20
+        mechs = json.loads(Path(MECH_CONFIGS).read_text(encoding="utf-8"))
+        result: dict[str, list[str]] = {}
+        for chain in CHAIN_NAME_TO_ID:
+            marketplace = mechs.get(chain, {}).get("mech_marketplace_contract", "")
+            if marketplace and marketplace.lower() != zero_address:
+                result[chain] = [marketplace.lower()]
+        return result
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # A broken mech-client install must not take the guard down with it:
+        # every guarded decision loads settings, and a tampered/missing file
+        # loads defaults. Fail closed to an empty whitelist instead.
+        logger.warning("could not load mech marketplace addresses: %s", e)
+        return {}
+
+
 def default_whitelist() -> dict[str, tuple[str, ...]]:
-    """Return the operator-provided default whitelist, normalized."""
-    merged: dict[str, set[str]] = {}
+    """Marketplace contracts merged with the operator's extra defaults."""
+    merged: dict[str, set[str]] = {
+        chain: set(addresses) for chain, addresses in _mech_system_addresses().items()
+    }
     for chain, addresses in EXTRA_DEFAULT_WHITELIST.items():
         merged.setdefault(chain, set()).update(a.lower() for a in addresses)
     return {chain: tuple(sorted(addresses)) for chain, addresses in merged.items()}
 
 
 def defaults() -> Settings:
-    """Return the fail-closed state: restricted with the default whitelist."""
+    """Return the fail-closed state: restricted, marketplaces whitelisted."""
     return Settings(mode=MODE_RESTRICTED, whitelist=default_whitelist())
 
 

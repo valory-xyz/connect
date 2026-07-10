@@ -37,6 +37,7 @@ from fastapi.testclient import TestClient
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig, ChainConfig
 from pearl_connect.guard import Guard
+from pearl_connect.mech import MechError, MechService
 from pearl_connect.server.app import create_app
 from pearl_connect.settings import (
     MODE_UNRESTRICTED,
@@ -152,6 +153,7 @@ def _fork_app(
         token=token,
         guard=guard,
         settings_store=store,
+        mech=MechService(signer, config, activity, guard),
     )
 
 
@@ -295,3 +297,96 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
             headers=headers,
         )
         assert allowed.status_code == 200, allowed.text
+
+
+def _deploy_safe(rpc_url: str, signer: Signer, account: LocalAccount) -> str:
+    """Deploy a 1/1 Safe (v1.4.1 canonical) owned by the agent EOA on the fork."""
+    from eth_typing import URI
+    from safe_eth.eth import EthereumClient
+    from safe_eth.safe import Safe
+    from safe_eth.safe.safe_deployments import safe_deployments
+
+    deployments = safe_deployments["1.4.1"]
+    chain = "100"  # gnosis
+    tx_sent = Safe.create(
+        EthereumClient(URI(rpc_url)),
+        deployer_account=account,
+        master_copy_address=deployments["SafeL2"][chain][0],
+        owners=[account.address],
+        threshold=1,
+        fallback_handler=deployments["CompatibilityFallbackHandler"][chain][0],
+        proxy_factory_address=deployments["SafeProxyFactory"][chain][0],
+    )
+    _wait_mined(signer, tx_sent.tx_hash.hex())
+    return str(tx_sent.contract_address)
+
+
+def _pick_live_mech(mech_service: MechService) -> tuple[str, str] | None:
+    """Find a native-payment mech (and a tool name) via the mech_tools surface.
+
+    Exercises MechService.tools() against the live subgraph + fork. A missing
+    tool list degrades to a default tool name: mech-client's tool validation
+    is best-effort and no delivery can happen on a fork anyway.
+    """
+    listing = mech_service.tools(chain="gnosis")
+    assert listing["mechs"], "subgraph returned no live mechs"
+    for entry in listing["mechs"]:
+        try:
+            # some mechs may post-date the fork snapshot -> calls revert
+            info = mech_service.tools(chain="gnosis", priority_mech=entry["address"])
+        except Exception:  # pylint: disable=broad-except # nosec B112
+            continue
+        if info["payment_type"] == "NATIVE":
+            tools = info.get("tools") or ["prediction-online"]
+            return str(entry["address"]), str(tools[0])
+    return None
+
+
+def test_mech_request_on_fork_restricted_mode(
+    rpc_url: str,
+    funded_signer: Signer,
+    fork_config: AppConfig,
+    fork_store: SettingsStore,
+    store_path: Path,
+    account: LocalAccount,
+) -> None:
+    """An on-chain mech request passes the restricted-mode gate end to end.
+
+    The default whitelist (mech marketplace + trackers) is the only thing
+    letting these safe transactions through — there is no bypass. No live
+    mech serves a fork, so delivery cannot arrive; the assertions are the
+    request-side effects: the safe's execTransaction to the marketplace
+    mines and a request id is issued.
+    """
+    _set_balance(rpc_url, account.address, 10 * 10**18)
+    safe_address = _deploy_safe(rpc_url, funded_signer, account)
+    _set_balance(rpc_url, safe_address, 10 * 10**18)
+    fork_config.chains["gnosis"].safe_address = safe_address
+
+    activity = ActivityLog(store_path)
+    guard = Guard(fork_store, fork_config)
+    assert guard.mode() == "restricted"  # fresh store -> restricted defaults
+    mech_service = MechService(funded_signer, fork_config, activity, guard)
+
+    # off-chain requests are cleanly refused in restricted mode
+    with pytest.raises(MechError, match="legacy_on_chain"):
+        mech_service.request("test", "test", chain="gnosis")
+
+    picked = _pick_live_mech(mech_service)
+    if picked is None:
+        pytest.skip("no live native-payment mech found on gnosis")
+    assert picked is not None  # mypy: pytest.skip's NoReturn isn't visible
+    mech_address, tool = picked
+
+    result = mech_service.request(
+        f"integration test {secrets.token_hex(4)}",
+        tool,
+        chain="gnosis",
+        legacy_on_chain=True,
+        priority_mech=mech_address,
+        timeout=30,  # no delivery will come on a fork; don't wait the default 5m
+    )
+    assert result["tx_hash"], result
+    assert result["request_ids"], result
+    receipt = _wait_mined(funded_signer, result["tx_hash"])
+    assert receipt["status"] == 1

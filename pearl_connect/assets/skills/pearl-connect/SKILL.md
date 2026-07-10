@@ -30,6 +30,13 @@ private key — and never need to.
 - `sign_message(digest)` — sign a raw 32-byte digest (0x-hex), **unprefixed**
   (plain ecrecover semantics; used by off-chain mech requests). Unavailable
   in restricted mode.
+- `mech_tools(chain, priority_mech, limit, offset)` — discover live mechs
+  (most deliveries first; paginate with limit/offset, `total` tells you
+  when to stop) and, given a `priority_mech`, its payment type and tool
+  names.
+- `mech_request(prompt, tool, chain, legacy_on_chain, priority_mech, auto_deposit, timeout)` —
+  send a request to an Olas mech (an on-chain-paid AI service) and wait for its delivery.
+  See "Mech requests" below.
 - `settings()` — the enforced guardrail mode, per-chain whitelist and the
   harness the workspace session opens in (read-only; see "Guardrail
   modes" below).
@@ -45,11 +52,30 @@ it):
   plain CALL to a whitelisted address (any value, any calldata, no
   delegatecall) with the refund fields zeroed (`gasPrice=0`, `gasToken=0x0`,
   `refundReceiver=0x0` — exactly the shape documented below). Raw digest
-  signing (`sign_message`) is disabled entirely.
+  signing (`sign_message`) is disabled entirely, which also disables
+  off-chain mech requests — use `mech_request(..., legacy_on_chain=true)`.
 
 Every blocked request fails with the violated rule. You cannot lift the
 restrictions; the user changes them in the agent UI with their keystore password.
 Never ask for the password in chat — point them at the UI.
+
+## Mech requests
+
+[Mechs](https://olas.network/services/ai-mechs) are on-chain-paid AI services.
+`mech_request` drives the whole flow through the signer: metadata to IPFS,
+payment via the service safe, request, and delivery watching. Start with
+`mech_tools()` to pick a mech and a tool it serves.
+
+- `legacy_on_chain=false` (default): off-chain request — no transaction; it
+  raw-signs a request digest and spends prepaid balance held by the mech
+  BalanceTracker. Requires unrestricted mode. With `auto_deposit=true` (the
+  default) an insufficient prepaid balance is topped up from the safe once
+  and the request retried.
+- `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
+  via the service safe. Works in restricted mode out of the box (the
+  marketplace contract ships in the default whitelist).
+- `timeout` (seconds, default 300) bounds the wait for the mech's answer; on
+  timeout you still get the `tx_hash`/`request_ids` and can check later.
 
 ## Spending from the service safe
 

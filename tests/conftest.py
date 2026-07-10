@@ -33,6 +33,7 @@ from web3 import Web3
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig, ChainConfig
 from pearl_connect.guard import Guard
+from pearl_connect.mech import MechService
 from pearl_connect.settings import (
     MODE_UNRESTRICTED,
     SETTINGS_FILE,
@@ -212,8 +213,18 @@ def guard(settings_store: SettingsStore, app_config: AppConfig) -> Guard:
 
 
 @pytest.fixture
-def make_app(guard: Guard, settings_store: SettingsStore) -> t.Callable:
-    """Return an app factory threading the guard/settings wiring."""
+def mech_service(
+    test_signer: Signer, app_config: AppConfig, activity: ActivityLog, guard: Guard
+) -> MechService:
+    """Mech service over the fake-backed signer (never contacts a chain)."""
+    return MechService(test_signer, app_config, activity, guard)
+
+
+@pytest.fixture
+def make_app(
+    guard: Guard, settings_store: SettingsStore, mech_service: MechService
+) -> t.Callable:
+    """Return an app factory threading the guard/settings/mech wiring."""
     from pearl_connect.server.app import create_app
 
     def _make(
@@ -231,6 +242,7 @@ def make_app(guard: Guard, settings_store: SettingsStore) -> t.Callable:
             token=token,
             guard=guard,
             settings_store=settings_store,
+            mech=mech_service,
         )
 
     return _make

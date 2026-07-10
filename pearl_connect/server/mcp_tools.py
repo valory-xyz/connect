@@ -36,6 +36,7 @@ from pearl_connect import wallet
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
 from pearl_connect.guard import Guard
+from pearl_connect.mech import DEFAULT_MECH_CHAIN, MechService
 from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer
 
@@ -43,12 +44,13 @@ RECEIPT_POLL_SECONDS = 2
 MAX_RECEIPT_TIMEOUT = 300
 
 
-def build_mcp(  # pylint: disable=unused-argument
+def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     signer: Signer,
     config: AppConfig,
     activity: ActivityLog,
     *,
     guard: Guard,
+    mech: MechService,
     settings_store: SettingsStore,
 ) -> FastMCP:
     """Build mcp."""
@@ -155,6 +157,64 @@ def build_mcp(  # pylint: disable=unused-argument
         except ValueError as e:
             raise ValueError(f"digest must be a 0x-hex string: {e}") from e
         return {"signature": await asyncio.to_thread(signer.sign_digest, raw)}
+
+    @mcp.tool()
+    async def mech_request(  # pylint: disable=too-many-arguments
+        prompt: str,
+        tool: str,
+        chain: str = DEFAULT_MECH_CHAIN,
+        *,
+        legacy_on_chain: bool = False,
+        priority_mech: str | None = None,
+        auto_deposit: bool = True,
+        timeout: float = 300,
+    ) -> dict:
+        """Send a request to an Olas mech (AI service) and wait for its delivery.
+
+        By default the request goes off-chain (prepaid balance, no transaction;
+        needs unrestricted mode). With legacy_on_chain=true it is sent on-chain
+        through the mech marketplace via the service safe — this works in
+        restricted mode because the mech contracts are whitelisted by default.
+        auto_deposit tops up the prepaid balance from the safe when the mech
+        answers 402 (insufficient balance) and retries once.
+        """
+        # mech-client manages its own event loops (asyncio.run + sync gql):
+        # it must run in a worker thread, never on the server loop
+        return await asyncio.to_thread(
+            mech.request,
+            prompt,
+            tool,
+            chain=chain,
+            legacy_on_chain=legacy_on_chain,
+            priority_mech=priority_mech,
+            auto_deposit=auto_deposit,
+            timeout=timeout,
+        )
+
+    @mcp.tool()
+    async def mech_tools(
+        chain: str = DEFAULT_MECH_CHAIN,
+        priority_mech: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict:
+        """Discover Olas mechs and the tools they serve, for use with mech_request.
+
+        Without priority_mech: a page of live marketplace mechs (most
+        deliveries first; `total` reports how many exist — page with
+        limit/offset). With priority_mech: that mech's payment type, service
+        id and available tool names — pass one as mech_request's `tool`
+        argument (limit/offset are ignored then).
+        """
+        # same as mech_request: the sync gql subgraph client refuses to run
+        # on an already-running loop
+        return await asyncio.to_thread(
+            mech.tools,
+            chain=chain,
+            priority_mech=priority_mech,
+            limit=limit,
+            offset=offset,
+        )
 
     @mcp.tool()
     async def settings() -> dict:

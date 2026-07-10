@@ -16,7 +16,8 @@ other non-aea agent. It:
    - a bearer-authed signing surface: `POST /sign-and-send`,
      `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
-     `send_transaction`, `transaction_status`, `sign_message`, `settings`;
+     `send_transaction`, `transaction_status`, `sign_message`,
+     `mech_tools`, `mech_request`, `settings`;
 4. opens a Claude Code session at the workspace via deep link — the
    `harness` setting picks which one to try first (`claude_code_desktop`
    → `claude://code/new?folder=…`, `claude_code_cli` →
@@ -35,10 +36,17 @@ The signer enforces one of two persistent modes:
 - **restricted** (default) — raw digest signing is off, and the only allowed
   transactions are EOA→safe native sweeps and safe `execTransaction` CALLs to
   whitelisted addresses with the gas-refund fields zeroed (a non-zero SafeTx
-  `gasPrice` would pay a refund out of the safe past the whitelist).
+  `gasPrice` would pay a refund out of the safe past the whitelist). The
+  MechMarketplace contract per chain (imported from
+  the pinned mech-client) is whitelisted by default — the only contract the
+  safe calls in the on-chain mech flow — so mech requests work out of the box.
+  Balance trackers and payment tokens are deliberately not whitelisted: the
+  whitelist is address-level (any calldata), so a token entry would permit
+  arbitrary transfers, and the safe only calls trackers for prepaid deposits,
+  an off-chain-flow (unrestricted-mode) concern.
 
-There is a single gate with no bypass: the MCP tools and the HTTP signing
-endpoints all pass the same check. State persists in
+There is a single gate with no bypass: the MCP tools, the HTTP signing
+endpoints and the mech request flow all pass the same check. State persists in
 `pearl-connect.settings.json` at STORE_PATH, HMAC'd with a key derived from
 the agent private key and verified on every read — an edit by the agent (or
 anything else without the key) fails verification and resets the file to the
@@ -48,6 +56,15 @@ while the mode was unrestricted) fails the same way; only a replay staged
 while the server is stopped escapes the pin. Operators change mode/whitelist in the agent UI at
 `http://127.0.0.1:8716/`; the change is authenticated by re-decrypting the
 keystore with the submitted password, not by the session's bearer token.
+
+## Mech requests
+
+The `mech_request` MCP tool drives [mech](https://olas.network/services/ai-mechs)
+requests through mech-client's `Signer` protocol, so every transaction and
+digest passes the guarded choke point. `legacy_on_chain=false` (default) uses
+the off-chain prepaid flow (needs unrestricted mode; `auto_deposit` tops up
+the prepaid balance from the safe on HTTP 402); `legacy_on_chain=true` sends
+the request on-chain through the MechMarketplace via the service safe.
 
 ## Development
 
@@ -95,3 +112,12 @@ After changing a package: `autonomy packages sync && autonomy packages lock && a
 (requires `open-autonomy` + `open-aea-cli-ipfs`). Publishing to IPFS and
 minting the agent blueprint/service on the Olas Registry follow the
 [Pearl integration checklist](https://stack.olas.network/pearl/agent-integration-checklist/).
+
+## Release
+
+Publishing a GitHub release triggers `.github/workflows/release.yml`, which:
+
+- verifies the package hashes (`autonomy packages lock --check`) and pushes
+  `packages/` to the Olas IPFS registry (`autonomy push-all`), and
+- builds PyInstaller binaries named `agent_runner_{linux,macos,windows}_{x64,arm64}`
+  — the asset names Pearl's middleware downloads and sha256-verifies.

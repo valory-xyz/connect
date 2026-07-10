@@ -52,11 +52,12 @@ skill documents the modes and how to respond to a block.
 ## How to act on-chain: the pearl-connect skill
 
 For **any** on-chain action — checking balances, sending transactions,
-spending from the service safe, signing digests — use the **pearl-connect
-skill** (`.claude/skills/pearl-connect/SKILL.md`). It documents:
+spending from the service safe, making mech requests, signing mech-request
+digests — use the **pearl-connect skill**
+(`.claude/skills/pearl-connect/SKILL.md`). It documents:
 
 - the MCP tools (`wallet_info`, `send_transaction`, `transaction_status`,
-  `sign_message`, `settings`);
+  `sign_message`, `mech_tools`, `mech_request`, `settings`);
 - `scripts/signer_client.py` for web3.py code run by spawned scripts;
 - the threshold-1 safe pattern for spending from the service safe.
 

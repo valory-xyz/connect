@@ -41,6 +41,7 @@ from pearl_connect.config import (
 )
 from pearl_connect.guard import Guard
 from pearl_connect.keystore import KeystoreError, load_account
+from pearl_connect.mech import MechService
 from pearl_connect.server.auth import AuthMiddleware
 from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.settings import SettingsStore
@@ -328,6 +329,7 @@ class TestMcpTools:
         app_config: AppConfig,
         activity: ActivityLog,
         guard: Guard,
+        mech_service: MechService,
         settings_store: SettingsStore,
     ) -> dict[str, t.Callable]:
         """Return the registered tool functions keyed by name."""
@@ -336,6 +338,7 @@ class TestMcpTools:
             app_config,
             activity,
             guard=guard,
+            mech=mech_service,
             settings_store=settings_store,
         )
         manager = mcp._tool_manager  # pylint: disable=protected-access

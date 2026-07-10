@@ -1,0 +1,80 @@
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-packages:
+    name: Push packages to IPFS
+    runs-on: ubuntu-latest
+    container:
+      image: valory/open-autonomy-user:0.21.26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify hashes and push packages
+        run: |
+          export AUTHOR=$(grep 'service/' packages/packages.json | awk -F/ '{print $2}' | head -1)
+          autonomy init --reset --author $AUTHOR --ipfs --remote
+          autonomy packages sync
+          autonomy packages lock --check
+          autonomy push-all
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: agent_runner_linux_x64
+          - runner: ubuntu-24.04-arm
+            asset: agent_runner_linux_arm64
+          - runner: macos-13
+            asset: agent_runner_macos_x64
+          - runner: macos-latest
+            asset: agent_runner_macos_arm64
+          - runner: windows-latest
+            asset: agent_runner_windows_x64.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build binary
+        run: |
+          uv sync
+          uv run pyinstaller packaging/pyinstaller.spec
+
+      - name: Rename to release asset (unix)
+        if: runner.os != 'Windows'
+        run: mv dist/pearl-connect "dist/${{ matrix.asset }}"
+
+      - name: Rename to release asset (windows)
+        if: runner.os == 'Windows'
+        run: Move-Item dist/pearl-connect.exe "dist/${{ matrix.asset }}"
+
+      - name: Smoke test
+        if: runner.os != 'Windows'
+        run: |
+          ./dist/${{ matrix.asset }} --help
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG_NAME" "dist/${{ matrix.asset }}" --clobber
+
+      - name: Upload workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}

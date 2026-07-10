@@ -17,12 +17,14 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Tests for the tamper-evident settings store and the guardrail."""
+"""Tests for the tamper-evident settings store, the guardrail, and mech wiring."""
 
+import asyncio
 import json
 import logging
 import typing as t
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from eth_abi import encode as abi_encode
@@ -34,6 +36,12 @@ from pearl_connect import settings as settings_module
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig, ChainConfig
 from pearl_connect.guard import EXEC_TRANSACTION_SELECTOR, Guard, GuardError
+from pearl_connect.mech import (
+    MAX_DELIVERY_TIMEOUT,
+    MechError,
+    MechService,
+    MechSigner,
+)
 from pearl_connect.settings import (
     MODE_RESTRICTED,
     MODE_UNRESTRICTED,
@@ -50,6 +58,8 @@ from tests.conftest import FakeW3, TEST_PASSWORD
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
 OTHER = "0x" + "bb" * 20
+
+GNOSIS_MARKETPLACE = "0x735faab1c4ec41128c367afb5c3bac73509f70bb"
 
 
 def exec_transaction_calldata(  # pylint: disable=too-many-arguments
@@ -99,7 +109,7 @@ class TestSettingsStore:
         """A fresh store fails closed to restricted defaults and persists them."""
         loaded = store.load()
         assert loaded.mode == MODE_RESTRICTED
-        assert loaded.whitelist == default_whitelist()
+        assert GNOSIS_MARKETPLACE in loaded.whitelist["gnosis"]
         assert store._path.exists()  # pylint: disable=protected-access
 
     def test_roundtrip(self, store: SettingsStore) -> None:
@@ -206,10 +216,26 @@ class TestSettingsStore:
 class TestDefaults:
     """Default whitelist composition."""
 
+    def test_only_the_marketplace_ships_whitelisted(self) -> None:
+        """The default whitelist is exactly the marketplace contract per chain.
+
+        Trackers (deposits: an off-chain/unrestricted concern) and payment
+        tokens (address-level whitelisting would permit arbitrary transfers)
+        must NOT be whitelisted by default.
+        """
+        whitelist = default_whitelist()
+        assert whitelist["gnosis"] == (GNOSIS_MARKETPLACE,)
+        # native balance tracker on gnosis stays out
+        assert "0x21ce6799a22a3da84b7c44a814a9c79ab1d2a50d" not in whitelist["gnosis"]
+        # OLAS token on gnosis stays out
+        assert "0xce11e14225575945b8e6dc0d4f2dd4c570f79d9f" not in whitelist["gnosis"]
+        assert set(whitelist) >= {"gnosis", "base", "polygon", "optimism"}
+        assert all(len(addresses) == 1 for addresses in whitelist.values())
+
     def test_extra_default_whitelist_merged(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Operator-provided extras form the default whitelist, normalized."""
+        """Operator-provided extras land next to the mech addresses."""
         monkeypatch.setattr(
             settings_module,
             "EXTRA_DEFAULT_WHITELIST",
@@ -218,6 +244,17 @@ class TestDefaults:
         whitelist = default_whitelist()
         assert "0x" + "cc" * 20 in whitelist["gnosis"]
         assert whitelist["testchain"] == ("0x" + "dd" * 20,)
+        assert defaults().mode == MODE_RESTRICTED
+
+    def test_broken_mech_client_degrades_to_empty_whitelist(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing mechs.json must not take every guarded decision down."""
+        monkeypatch.setattr(
+            "mech_client.infrastructure.config.constants.MECH_CONFIGS",
+            "/nonexistent/mechs.json",
+        )
+        assert default_whitelist() == {}
         assert defaults().mode == MODE_RESTRICTED
 
 
@@ -417,6 +454,274 @@ class TestSignerGuardIntegration:
             restricted_signer.send("testchain", OTHER, value=1, request_id="r2")
 
 
+class FakeMarketplaceService:
+    """Captures send_request kwargs and serves canned mech info."""
+
+    def __init__(self) -> None:
+        """Initialize."""
+        self.calls: list[dict] = []
+        self.result: dict = {"tx_hash": "0x" + "11" * 32, "request_ids": ["ab"]}
+        self.raises: Exception | None = None
+        self.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**16)
+        self.tool_manager = SimpleNamespace(
+            get_tools=lambda service_id: SimpleNamespace(
+                tools=[SimpleNamespace(tool_name="prediction-online")]
+            )
+        )
+
+    def _fetch_mech_info(self, mech: str) -> tuple:
+        """Return the canned (payment_type, service_id, max_delivery_rate)."""
+        return self.mech_info
+
+    async def send_request(self, **kwargs: object) -> dict:
+        """Record the call and return the canned result."""
+        self.calls.append(kwargs)
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+class TestMech:
+    """MechSigner adapter and MechService orchestration."""
+
+    def test_mech_signer_maps_transaction_fields(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Bytes data, missing value/gas and address pass through correctly."""
+        mech_signer = MechSigner(test_signer, "testchain")
+        assert mech_signer.address == test_signer.address
+        tx_hash = mech_signer.send_transaction(
+            {"to": OTHER, "data": b"\x01\x02", "value": None}
+        )
+        assert tx_hash.startswith("0x")
+        assert fake_w3.eth.sent
+
+    def test_mech_signer_signs_digests(self, test_signer: Signer) -> None:
+        """sign_message returns the raw 65-byte signature."""
+        signature = MechSigner(test_signer, "testchain").sign_message(b"\x22" * 32)
+        assert len(signature) == 65
+
+    @pytest.fixture(name="patched_mech")
+    def patched_mech_fixture(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> FakeMarketplaceService:
+        """Route MechService._service construction to the fake."""
+        import mech_client.services.marketplace_service as ms
+        import safe_eth.eth as se
+
+        fake = FakeMarketplaceService()
+        monkeypatch.setattr(ms, "MarketplaceService", lambda **kwargs: fake)
+        monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
+        return fake
+
+    def test_request_maps_arguments(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        activity: ActivityLog,
+    ) -> None:
+        """legacy_on_chain inverts use_offchain; prompts/tools become tuples."""
+        result = mech_service.request(
+            "what is the answer",
+            "prediction",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            auto_deposit=False,
+            timeout=42,
+        )
+        assert result == patched_mech.result
+        call = patched_mech.calls[0]
+        assert call["prompts"] == ("what is the answer",)
+        assert call["tools"] == ("prediction",)
+        assert call["use_offchain"] is False
+        assert call["priority_mech"] == OTHER
+        assert call["auto_deposit"] is False
+        assert call["timeout"] == 42
+        assert any(e["kind"] == "mech_request" for e in activity.recent())
+        # the service is cached per chain
+        mech_service.request(
+            "again", "prediction", chain="testchain", legacy_on_chain=True
+        )
+        assert len(patched_mech.calls) == 2
+
+    def test_request_offchain_denied_in_restricted(
+        self,
+        mech_service: MechService,
+        settings_store: SettingsStore,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """The off-chain preflight names the escape hatch."""
+        settings_store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        with pytest.raises(MechError, match="legacy_on_chain=true"):
+            mech_service.request("q", "tool", chain="testchain")
+        assert not patched_mech.calls
+
+    def test_request_wraps_mech_client_errors(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        activity: ActivityLog,
+    ) -> None:
+        """mech-client exceptions surface as structured MechError + audit entry."""
+        patched_mech.raises = RuntimeError("subgraph down")
+        with pytest.raises(MechError, match="subgraph down"):
+            mech_service.request("q", "tool", chain="testchain", legacy_on_chain=True)
+        assert any(e["kind"] == "mech_request_failed" for e in activity.recent())
+
+    def test_request_passes_signer_errors_through(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """Guard denials inside the flow keep their message."""
+        patched_mech.raises = SignerError("restricted mode: nope")
+        with pytest.raises(SignerError, match="restricted mode"):
+            mech_service.request("q", "tool", chain="testchain", legacy_on_chain=True)
+
+    def test_tools_lists_mechs(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The listing maps subgraph entries and appends the follow-up note."""
+        import mech_client.infrastructure.subgraph.queries as queries
+
+        monkeypatch.setattr(
+            queries,
+            "query_mm_mechs_info",
+            lambda chain: [
+                {
+                    "address": OTHER,
+                    "service": {"id": "42"},
+                    "totalDeliveriesTransactions": "7",
+                    "mech_type": "Fixed price",
+                }
+            ],
+        )
+        listing = mech_service.tools(chain="testchain")
+        assert listing["mechs"] == [
+            {
+                "address": OTHER,
+                "service_id": "42",
+                "total_deliveries": 7,
+                "mech_type": "Fixed price",
+            }
+        ]
+        assert listing["total"] == 1
+        assert listing["offset"] == 0
+        assert "priority_mech" in listing["note"]
+
+    def test_tools_listing_paginates(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """limit/offset slice the listing; out-of-range values are clamped."""
+        import mech_client.infrastructure.subgraph.queries as queries
+
+        entries = [
+            {
+                "address": f"0x{i:040x}",
+                "service": {"id": str(i)},
+                "totalDeliveriesTransactions": str(100 - i),
+                "mech_type": "Fixed price",
+            }
+            for i in range(5)
+        ]
+        monkeypatch.setattr(queries, "query_mm_mechs_info", lambda chain: entries)
+
+        page = mech_service.tools(chain="testchain", limit=2, offset=2)
+        assert [m["service_id"] for m in page["mechs"]] == ["2", "3"]
+        assert page["total"] == 5
+        assert (page["offset"], page["limit"]) == (2, 2)
+
+        # past the end -> empty page, total still tells the caller to stop
+        assert mech_service.tools(chain="testchain", offset=99)["mechs"] == []
+        # nonsense values are clamped instead of erroring
+        clamped = mech_service.tools(chain="testchain", limit=-3, offset=-1)
+        assert (clamped["offset"], clamped["limit"]) == (0, 1)
+        assert len(clamped["mechs"]) == 1
+
+    def test_tools_listing_failure_wraps(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A subgraph failure surfaces as a structured MechError."""
+        import mech_client.infrastructure.subgraph.queries as queries
+
+        monkeypatch.setattr(
+            queries,
+            "query_mm_mechs_info",
+            lambda chain: (_ for _ in ()).throw(RuntimeError("subgraph down")),
+        )
+        with pytest.raises(MechError, match="subgraph down"):
+            mech_service.tools(chain="testchain")
+
+    def test_tools_for_one_mech(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """With priority_mech, payment info and tool names are returned."""
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert info["mech"] == OTHER
+        assert info["payment_type"] == "NATIVE"
+        assert info["service_id"] == 42
+        assert info["tools"] == ["prediction-online"]
+
+    def test_tools_degrade_without_metadata(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A slow/absent IPFS gateway yields a note, not an error."""
+        patched_mech.tool_manager = SimpleNamespace(
+            get_tools=lambda service_id: (_ for _ in ()).throw(TimeoutError("slow"))
+        )
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert "tools" not in info
+        assert "unavailable" in info["tools_note"]
+
+    def test_service_requires_safe_and_known_chain(
+        self, mech_service: MechService
+    ) -> None:
+        """Chains without a safe (or unknown) are rejected before any network IO."""
+        # pylint: disable=protected-access
+        mech_service._config.chains["testchain"].safe_address = None
+        with pytest.raises(MechError, match="no service safe"):
+            mech_service._service("testchain")
+        with pytest.raises(ValueError, match="unknown chain"):
+            mech_service._service("atlantis")
+
+    def test_tools_listing_needs_no_safe(
+        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discovery is a pure subgraph query — no safe, no service build."""
+        import mech_client.infrastructure.subgraph.queries as queries
+
+        monkeypatch.setattr(queries, "query_mm_mechs_info", lambda chain: [])
+        # pylint: disable=protected-access
+        mech_service._config.chains["testchain"].safe_address = None
+        assert mech_service.tools(chain="testchain")["mechs"] == []
+        assert not mech_service._services  # nothing was constructed
+        with pytest.raises(ValueError, match="unknown chain"):
+            mech_service.tools(chain="atlantis")
+
+    def test_request_timeout_is_clamped(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A huge or non-positive timeout cannot pin the worker thread."""
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, timeout=10**9
+        )
+        assert patched_mech.calls[-1]["timeout"] == MAX_DELIVERY_TIMEOUT
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, timeout=-5
+        )
+        assert patched_mech.calls[-1]["timeout"] == 1.0
+
+
 class TestSettingsEndpoints:
     """GET/POST /settings and the UI wiring."""
 
@@ -602,7 +907,7 @@ class TestSettingsEndpoints:
 
 
 class TestMcpGuardrailTools:
-    """New MCP tools: settings."""
+    """New MCP tools: mech_request and settings."""
 
     @pytest.fixture(name="tools")
     def tools_fixture(  # pylint: disable=too-many-arguments
@@ -611,6 +916,7 @@ class TestMcpGuardrailTools:
         app_config: AppConfig,
         activity: ActivityLog,
         guard: Guard,
+        mech_service: MechService,
         settings_store: SettingsStore,
     ) -> dict[str, t.Callable]:
         """Return the registered tool functions keyed by name."""
@@ -621,6 +927,7 @@ class TestMcpGuardrailTools:
             app_config,
             activity,
             guard=guard,
+            mech=mech_service,
             settings_store=settings_store,
         )
         manager = mcp._tool_manager  # pylint: disable=protected-access
@@ -630,7 +937,7 @@ class TestMcpGuardrailTools:
         """The MCP surface must not be able to change the guardrail."""
         writers = [name for name in tools if "settings" in name and name != "settings"]
         assert not writers
-        assert set(tools) >= {"settings", "wallet_info"}
+        assert set(tools) >= {"settings", "mech_request", "wallet_info"}
 
     async def test_settings_reports_enforced_state(
         self, tools: dict[str, t.Callable], settings_store: SettingsStore
@@ -648,3 +955,68 @@ class TestMcpGuardrailTools:
     async def test_wallet_info_reports_mode(self, tools: dict[str, t.Callable]) -> None:
         """wallet_info carries the mode for quick agent orientation."""
         assert (await tools["wallet_info"]())["mode"] == "unrestricted"
+
+    async def test_mech_tools_tool_delegates(
+        self,
+        tools: dict[str, t.Callable],
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The discovery tool passes its arguments through, off the event loop."""
+        calls: list[dict] = []
+
+        def fake_tools(**kwargs: object) -> dict:
+            with pytest.raises(RuntimeError):
+                asyncio.get_running_loop()  # must run in a worker thread
+            calls.append(dict(kwargs))
+            return {"mechs": []}
+
+        monkeypatch.setattr(mech_service, "tools", fake_tools)
+        assert await tools["mech_tools"](
+            "testchain", priority_mech=OTHER, limit=5, offset=10
+        ) == {"mechs": []}
+        assert calls == [
+            {"chain": "testchain", "priority_mech": OTHER, "limit": 5, "offset": 10}
+        ]
+
+    async def test_mech_request_tool_delegates(
+        self,
+        tools: dict[str, t.Callable],
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The tool passes its arguments through to MechService.request."""
+        calls: list[dict] = []
+
+        def fake_request(prompt: str, tool: str, **kwargs: object) -> dict:
+            calls.append({"prompt": prompt, "tool": tool, **kwargs})
+            return {"ok": True}
+
+        monkeypatch.setattr(mech_service, "request", fake_request)
+        result = await tools["mech_request"](
+            "p", "t", chain="testchain", legacy_on_chain=True, timeout=7
+        )
+        assert result == {"ok": True}
+        assert calls[0]["legacy_on_chain"] is True
+        assert calls[0]["chain"] == "testchain"
+        assert calls[0]["timeout"] == 7
+
+    async def test_mech_request_tool_runs_off_the_event_loop(
+        self, tools: dict[str, t.Callable], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MechService.request calls asyncio.run, which raises on a running loop.
+
+        The MCP SDK executes tools on the server's event loop, so the tool must
+        push the whole mech flow to a worker thread. Awaiting the tool under
+        pytest's loop reproduces the server condition end to end.
+        """
+        import mech_client.services.marketplace_service as ms
+        import safe_eth.eth as se
+
+        fake = FakeMarketplaceService()
+        monkeypatch.setattr(ms, "MarketplaceService", lambda **kwargs: fake)
+        monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
+        result = await tools["mech_request"](
+            "q", "t", chain="testchain", legacy_on_chain=True
+        )
+        assert result == fake.result
