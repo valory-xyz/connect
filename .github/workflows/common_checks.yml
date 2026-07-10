@@ -113,6 +113,37 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
 
+  integration-tests:
+    continue-on-error: False
+    needs:
+      - linter_checks
+      - unit-tests
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.12"]
+
+    timeout-minutes: 30
+
+    env:
+      GNOSIS_TESTNET_RPC: ${{ secrets.GNOSIS_TESTNET_RPC }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.15"
+
+      - name: Run integration tests
+        run: |
+          uv pip install --system tomte[tox,cli]==0.7.0 tox-uv
+          tox -e integration-tests
+
   all-checks-passed:
     # Single aggregate gate referenced by branch protection on `main`.
     # When adding/removing mandatory jobs, update `needs` here instead of editing branch protection.
@@ -122,6 +153,7 @@ jobs:
       - package_hashes
       - unit-tests
       - coverage
+      - integration-tests
     if: always()
     runs-on: ubuntu-latest
     steps:
