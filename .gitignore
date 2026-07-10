@@ -31,8 +31,10 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!packaging/pyinstaller.spec
 
 # Installer logs
+log.txt
 pip-log.txt
 pip-delete-this-directory.txt
 
@@ -216,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Olas third-party packages (synced from IPFS via `autonomy packages sync`);
+# only our dev packages and the pinned hashes are tracked.
+packages/*
+!packages/__init__.py
+!packages/packages.json
+!packages/valory/
+packages/valory/*
+!packages/valory/__init__.py
+!packages/valory/agents/
+!packages/valory/services/
+
+# Agent's store
+data/

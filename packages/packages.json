@@ -1,0 +1,12 @@
+{
+    "dev": {
+        "agent/valory/pearl_connect/0.1.0": "bafybeihofho7jddmt53lkalq7gpqycpct3xl6belfmagmegdodchxlnqou",
+        "service/valory/pearl_connect/0.1.0": "bafybeieoc4nocuvt23boullvvr557wobu4ivmextwocq3l2m6u72jwwm7e"
+    },
+    "third_party": {
+        "protocol/valory/ledger_api/1.0.0": "bafybeiecq56phjfws36rgrefw6niyo4ezesloodsfis647mpm5ygqo4ysi",
+        "protocol/valory/contract_api/1.0.0": "bafybeibld2xb5m7kyluiptkamp4nrt6oeomkohz7a3yppbv2oo7qw2e4la",
+        "protocol/open_aea/signing/1.0.0": "bafybeifsjmldwyki3beqyvdt5lzenrg6wyrqaar5plc5rpnvtc4zlentye",
+        "connection/valory/ledger/0.19.0": "bafybeicynh5l5f5f5jpx72qwzis7jvmxk5p4eqltk32uxbj2pgu2x4rqz4"
+    }
+}

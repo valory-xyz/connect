@@ -1,0 +1,132 @@
+name: "Common Checks"
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linter_checks:
+    continue-on-error: False
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.12"]
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    - uses: astral-sh/setup-uv@v6
+      with:
+        version: "0.11.15"
+    - name: Install dependencies
+      run:  |
+        sudo apt-get update --fix-missing
+        sudo apt-get autoremove
+        sudo apt-get autoclean
+        uv pip install --system tomte[tox,cli]==0.7.0 tox-uv
+        uv pip install --system --upgrade setuptools
+    - name: All pre-test checks
+      run: |
+        tox -p -e flake8 -e pylint -e black-check -e isort-check -e bandit -e safety -e mypy -e check-copyright
+
+  package_hashes:
+    name: Package hashes locked
+    runs-on: ubuntu-latest
+    container:
+      image: valory/open-autonomy-user:0.21.26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify packages.json matches package contents
+        run: |
+          export AUTHOR=$(grep 'service/' packages/packages.json | awk -F/ '{print $2}' | head -1)
+          autonomy init --reset --author $AUTHOR --ipfs --remote
+          autonomy packages sync
+          autonomy packages lock --check
+
+  unit-tests:
+    continue-on-error: False
+    needs:
+      - linter_checks
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.15"
+
+      - name: Run unit tests
+        run: |
+          uv pip install --system tomte[tox,cli]==0.7.0 tox-uv
+          tox -e unit-tests
+
+  coverage:
+    continue-on-error: False
+    needs:
+      - linter_checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.15"
+
+      - name: Run unit tests with coverage
+        run: |
+          uv pip install --system tomte[tox,cli]==0.7.0 tox-uv
+          tox -e unit-tests-coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  all-checks-passed:
+    # Single aggregate gate referenced by branch protection on `main`.
+    # When adding/removing mandatory jobs, update `needs` here instead of editing branch protection.
+    name: All checks passed
+    needs:
+      - linter_checks
+      - package_hashes
+      - unit-tests
+      - coverage
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs succeeded
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results"
+          echo "$results" | python -c "import json,sys; r=json.load(sys.stdin); failed=[k for k,v in r.items() if v['result']!='success']; sys.exit(0 if not failed else (print('Failed jobs:', failed) or 1))"
