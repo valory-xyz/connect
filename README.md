@@ -11,19 +11,43 @@ other non-aea agent. It:
    the agent session, and the bundled `pearl-connect` skill;
 3. serves on `127.0.0.1:8716`:
    - Pearl SDK contracts: `GET /healthcheck`, `GET /funds-status`, `GET /`
+   - Settings: `GET /settings` (open) and `POST /settings`
+     (keystore-password-authed, used by the `/` UI)
    - a bearer-authed signing surface: `POST /sign-and-send`,
      `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
-     `send_transaction`, `transaction_status`, `sign_message`;
-4. opens a Claude Code session at the workspace via deep link
-   (`claude://code/new?folder=…` first, `claude-cli://open?cwd=…` as the
-   fallback).
+     `send_transaction`, `transaction_status`, `sign_message`, `settings`;
+4. opens a Claude Code session at the workspace via deep link — the
+   `harness` setting picks which one to try first (`claude_code_desktop`
+   → `claude://code/new?folder=…`, `claude_code_cli` →
+   `claude-cli://open?cwd=…`; the other stays the fallback).
 
 The agent-harness session composes on-chain actions (including service-safe
 `execTransaction` calls via the threshold-1 pre-validated signature) and the
 server signs and broadcasts them — a single audited choke point, no plaintext
-secrets on disk. The guardrail and mech integration land in the stacked
-follow-up PRs.
+secrets on disk.
+
+## Guardrail
+
+The signer enforces one of two persistent modes:
+
+- **unrestricted** — any well-formed request is signed;
+- **restricted** (default) — raw digest signing is off, and the only allowed
+  transactions are EOA→safe native sweeps and safe `execTransaction` CALLs to
+  whitelisted addresses with the gas-refund fields zeroed (a non-zero SafeTx
+  `gasPrice` would pay a refund out of the safe past the whitelist).
+
+There is a single gate with no bypass: the MCP tools and the HTTP signing
+endpoints all pass the same check. State persists in
+`pearl-connect.settings.json` at STORE_PATH, HMAC'd with a key derived from
+the agent private key and verified on every read — an edit by the agent (or
+anything else without the key) fails verification and resets the file to the
+restricted defaults. The MAC of the last file the server wrote is also pinned
+in memory, so replaying an *old* validly-MAC'd settings file (say, captured
+while the mode was unrestricted) fails the same way; only a replay staged
+while the server is stopped escapes the pin. Operators change mode/whitelist in the agent UI at
+`http://127.0.0.1:8716/`; the change is authenticated by re-decrypting the
+keystore with the submitted password, not by the session's bearer token.
 
 ## Development
 

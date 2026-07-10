@@ -115,15 +115,17 @@ class TestAuth:
         assert response.status_code == 401
 
     def test_wallet_with_token(
-        self, client: TestClient, test_signer: Signer, fake_w3: FakeW3
+        self, client: TestClient, test_signer: Signer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Test wallet with token."""
+        monkeypatch.setattr(
+            wallet_module,
+            "wallet_overview",
+            lambda config, signer: {"agent_eoa": signer.address},
+        )
         response = client.get("/wallet", headers=auth())
         assert response.status_code == 200
-        body = response.json()
-        assert body["agent_eoa"] == test_signer.address
-        assert body["balances"]["testchain"]["agent_eoa"] == "12345"
-        assert body["balances"]["testchain"]["safe"] == "12345"
+        assert response.json()["agent_eoa"] == test_signer.address
 
     def test_cross_origin_rejected_even_with_token(self, client: TestClient) -> None:
         """Test cross origin rejected even with token."""

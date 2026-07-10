@@ -28,7 +28,28 @@ private key — and never need to.
   instead of a duplicate broadcast.
 - `transaction_status(chain, tx_hash)` — receipt once mined.
 - `sign_message(digest)` — sign a raw 32-byte digest (0x-hex), **unprefixed**
-  (plain ecrecover semantics; used by off-chain mech requests).
+  (plain ecrecover semantics; used by off-chain mech requests). Unavailable
+  in restricted mode.
+- `settings()` — the enforced guardrail mode, per-chain whitelist and the
+  harness the workspace session opens in (read-only; see "Guardrail
+  modes" below).
+
+## Guardrail modes
+
+The signer runs in one of two user-controlled modes (`wallet_info` reports
+it):
+
+- **unrestricted** — no restrictions beyond authentication.
+- **restricted** (default) — the gate allows only the transaction shape:
+  `execTransaction` on the safe whose inner call is a
+  plain CALL to a whitelisted address (any value, any calldata, no
+  delegatecall) with the refund fields zeroed (`gasPrice=0`, `gasToken=0x0`,
+  `refundReceiver=0x0` — exactly the shape documented below). Raw digest
+  signing (`sign_message`) is disabled entirely.
+
+Every blocked request fails with the violated rule. You cannot lift the
+restrictions; the user changes them in the agent UI with their keystore password.
+Never ask for the password in chat — point them at the UI.
 
 ## Spending from the service safe
 

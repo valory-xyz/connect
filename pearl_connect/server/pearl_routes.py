@@ -72,12 +72,21 @@ def index(request: Request) -> str:
     """Index."""
     state = request.app.state
     chains = state.config.chains
+    settings = state.settings_store.load()
     safes_rows = "".join(
         f"<tr><td>{html.escape(name)}</td>"
         f"<td><code>{html.escape(c.safe_address or '—')}</code></td></tr>"
         for name, c in sorted(chains.items())
     )
-    open_link = workspace.launch_order(state.config.store_path)[0]
+    whitelist_lines = "\n".join(
+        f"{html.escape(chain)}:{html.escape(address)}"
+        for chain, addresses in sorted(settings.whitelist.items())
+        for address in addresses
+    )
+    checked = {True: "checked", False: ""}
+    restricted = settings.mode == "restricted"
+    desktop = settings.harness == "claude_code_desktop"
+    open_link = workspace.launch_order(state.config.store_path, settings.harness)[0]
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Pearl Connect</title>
@@ -88,6 +97,10 @@ def index(request: Request) -> str:
  code {{ font-size: .85em; }}
  .btn {{ display: inline-block; margin-top: 1rem; padding: .6rem 1.2rem; background: #111;
         color: #fff; border-radius: 8px; text-decoration: none; border: 0; cursor: pointer; }}
+ .mode {{ font-weight: 600; text-transform: capitalize; }}
+ textarea {{ width: 100%; min-height: 7rem; font-family: monospace; font-size: .85em; }}
+ input[type=password] {{ width: 100%; }}
+ #settings-result {{ margin-top: .5rem; }}
 </style></head>
 <body>
 <h1>Pearl Connect</h1>
@@ -95,9 +108,64 @@ def index(request: Request) -> str:
 behalf; the Claude session never sees key material.</p>
 <table>
 <tr><th>Agent EOA</th><td><code>{html.escape(state.signer.address)}</code></td></tr>
+<tr><th>Guardrail mode</th><td class="mode">{html.escape(settings.mode)}</td></tr>
+<tr><th>Harness</th><td><code>{html.escape(settings.harness)}</code></td></tr>
 <tr><th>Signer actions</th><td>{state.activity.count} this run</td></tr>
 </table>
 <h2>Service safes</h2>
 <table>{safes_rows or "<tr><td>none configured</td></tr>"}</table>
+<h2>Guardrail settings</h2>
+<p>In <em>restricted</em> mode the agent can only sweep funds into its safes and
+have a safe call whitelisted addresses; raw digest signing is off. Changing
+settings requires the keystore password — the agent session does not have it.</p>
+<form id="settings-form">
+<p><label><input type="radio" name="mode" value="restricted" {checked[restricted]}>
+Restricted</label>
+   <label><input type="radio" name="mode" value="unrestricted" {checked[not restricted]}>
+Unrestricted</label></p>
+<p><label><input type="radio" name="harness" value="claude_code_desktop" {checked[desktop]}>
+Claude Code desktop</label>
+   <label><input type="radio" name="harness" value="claude_code_cli" {checked[not desktop]}>
+Claude Code CLI</label></p>
+<p><label>Whitelist (one <code>chain:address</code> per line)<br>
+<textarea name="whitelist">{whitelist_lines}</textarea></label></p>
+<p><label>Keystore password<br><input type="password" name="password" autocomplete="off"></label></p>
+<button class="btn" type="submit">Apply</button>
+<div id="settings-result"></div>
+</form>
+<script>
+document.getElementById("settings-form").addEventListener("submit", async (e) => {{
+  e.preventDefault();
+  const form = e.target;
+  const whitelist = {{}};
+  for (const line of form.whitelist.value.split("\\n")) {{
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const sep = trimmed.indexOf(":");
+    if (sep < 1) continue;
+    const chain = trimmed.slice(0, sep).trim().toLowerCase();
+    (whitelist[chain] = whitelist[chain] || []).push(trimmed.slice(sep + 1).trim());
+  }}
+  const result = document.getElementById("settings-result");
+  result.textContent = "applying…";
+  const response = await fetch("/settings", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{
+      password: form.password.value,
+      mode: form.mode.value,
+      harness: form.harness.value,
+      whitelist,
+    }}),
+  }});
+  if (response.ok) {{
+    result.textContent = "saved";
+    location.reload();
+  }} else {{
+    const body = await response.json().catch(() => ({{}}));
+    result.textContent = "error: " + (body.detail || response.status);
+  }}
+}});
+</script>
 <a class="btn" href="{html.escape(open_link)}">Open Claude Code</a>
 </body></html>"""

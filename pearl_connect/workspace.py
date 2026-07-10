@@ -34,6 +34,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST
+from pearl_connect.settings import DEFAULT_HARNESS, HARNESS_CLAUDE_CODE_CLI
 
 logger = logging.getLogger("agent")
 
@@ -122,14 +123,17 @@ def cli_deep_link(store_path: Path) -> str:
     return f"claude-cli://open?cwd={quote(str(store_path))}"
 
 
-def launch_order(store_path: Path) -> tuple[str, str]:
-    """Deep links to try: the desktop app first, the CLI as fallback."""
-    return desktop_deep_link(store_path), cli_deep_link(store_path)
+def launch_order(store_path: Path, harness: str = DEFAULT_HARNESS) -> tuple[str, str]:
+    """Deep links to try, the configured harness's first, the other as fallback."""
+    desktop, cli = desktop_deep_link(store_path), cli_deep_link(store_path)
+    if harness == HARNESS_CLAUDE_CODE_CLI:
+        return cli, desktop
+    return desktop, cli
 
 
-def launch_claude(store_path: Path) -> bool:
+def launch_claude(store_path: Path, harness: str = DEFAULT_HARNESS) -> bool:
     """Open a Claude Code session at STORE_PATH via deep link. Never fatal."""
-    for url in launch_order(store_path):
+    for url in launch_order(store_path, harness):
         if _open_url(url):
             logger.info("launched Claude Code via %s", url.split("?", maxsplit=1)[0])
             return True

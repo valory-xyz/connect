@@ -39,9 +39,11 @@ from pearl_connect.config import (
     STORE_PATH_ENV,
     load_config,
 )
+from pearl_connect.guard import Guard
 from pearl_connect.keystore import KeystoreError, load_account
 from pearl_connect.server.auth import AuthMiddleware
 from pearl_connect.server.mcp_tools import build_mcp
+from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer, SignerError
 
 from tests.conftest import FakeW3, TEST_PASSWORD
@@ -111,22 +113,39 @@ class TestMain:
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
 
     def test_wait_and_launch_when_started(
-        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        store_path: Path,
+        settings_store: SettingsStore,
     ) -> None:
-        """Launches once the server reports started."""
-        launched: list[Path] = []
-        monkeypatch.setattr(workspace, "launch_claude", lambda p: launched.append(p))
+        """Launches once started, with the harness from the settings store."""
+        from pearl_connect.settings import Settings
+
+        settings_store.save(
+            Settings(mode="unrestricted", whitelist={}, harness="claude_code_cli")
+        )
+        launched: list[tuple[Path, str]] = []
+        monkeypatch.setattr(
+            workspace,
+            "launch_claude",
+            lambda p, harness=None: launched.append((p, harness)),
+        )
         server = t.cast(uvicorn.Server, StubServer(t.cast(uvicorn.Config, None)))
         server.started = True
-        main_module.wait_and_launch(server, store_path)
-        assert launched == [store_path]
+        main_module.wait_and_launch(server, store_path, settings_store)
+        assert launched == [(store_path, "claude_code_cli")]
 
     def test_wait_and_launch_polls_until_started(
-        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        store_path: Path,
+        settings_store: SettingsStore,
     ) -> None:
         """Polls while the server is starting up."""
         launched: list[Path] = []
-        monkeypatch.setattr(workspace, "launch_claude", lambda p: launched.append(p))
+        monkeypatch.setattr(
+            workspace, "launch_claude", lambda p, harness=None: launched.append(p)
+        )
 
         class SlowServer(StubServer):
             """Server that starts on the second poll."""
@@ -145,17 +164,22 @@ class TestMain:
 
         server = t.cast(uvicorn.Server, SlowServer(t.cast(uvicorn.Config, None)))
         server.should_exit = False
-        main_module.wait_and_launch(server, store_path)
+        main_module.wait_and_launch(server, store_path, settings_store)
         assert launched == [store_path]
 
     def test_wait_and_launch_on_exit(
-        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        store_path: Path,
+        settings_store: SettingsStore,
     ) -> None:
         """Does not launch when the server exits before starting."""
         launched: list[Path] = []
-        monkeypatch.setattr(workspace, "launch_claude", lambda p: launched.append(p))
+        monkeypatch.setattr(
+            workspace, "launch_claude", lambda p, harness=None: launched.append(p)
+        )
         server = t.cast(uvicorn.Server, StubServer(t.cast(uvicorn.Config, None)))
-        main_module.wait_and_launch(server, store_path)
+        main_module.wait_and_launch(server, store_path, settings_store)
         assert not launched
 
 
@@ -298,14 +322,22 @@ class TestMcpTools:
     """MCP tool behavior via the registered tool functions."""
 
     @pytest.fixture
-    def tools(
+    def tools(  # pylint: disable=too-many-arguments
         self,
         test_signer: Signer,
         app_config: AppConfig,
         activity: ActivityLog,
+        guard: Guard,
+        settings_store: SettingsStore,
     ) -> dict[str, t.Callable]:
         """Return the registered tool functions keyed by name."""
-        mcp = build_mcp(test_signer, app_config, activity)
+        mcp = build_mcp(
+            test_signer,
+            app_config,
+            activity,
+            guard=guard,
+            settings_store=settings_store,
+        )
         manager = mcp._tool_manager  # pylint: disable=protected-access
         return {tool.name: tool.fn for tool in manager.list_tools()}
 

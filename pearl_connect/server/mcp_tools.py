@@ -35,6 +35,8 @@ from web3.exceptions import TimeExhausted, TransactionNotFound
 from pearl_connect import wallet
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
+from pearl_connect.guard import Guard
+from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer
 
 RECEIPT_POLL_SECONDS = 2
@@ -45,6 +47,9 @@ def build_mcp(  # pylint: disable=unused-argument
     signer: Signer,
     config: AppConfig,
     activity: ActivityLog,
+    *,
+    guard: Guard,
+    settings_store: SettingsStore,
 ) -> FastMCP:
     """Build mcp."""
     mcp = FastMCP(
@@ -54,7 +59,8 @@ def build_mcp(  # pylint: disable=unused-argument
             "service safes are shown by wallet_info. Every on-chain action is an "
             "EOA transaction sent via send_transaction; safe transactions are "
             "composed as execTransaction calls with the pre-validated signature "
-            "(see the pearl-connect skill)."
+            "(see the pearl-connect skill). A guardrail may restrict what can "
+            "be signed — check settings; blocked requests return the violated rule."
         ),
         stateless_http=True,
         streamable_http_path="/",
@@ -62,8 +68,14 @@ def build_mcp(  # pylint: disable=unused-argument
 
     @mcp.tool()
     async def wallet_info() -> dict:
-        """Agent EOA, per-chain service safes, RPC URLs and balances."""
-        return await asyncio.to_thread(wallet.wallet_overview, config, signer)
+        """Agent EOA, per-chain service safes, RPC URLs, balances and guard mode."""
+
+        def _run() -> dict:
+            overview = wallet.wallet_overview(config, signer)
+            overview["mode"] = guard.mode()
+            return overview
+
+        return await asyncio.to_thread(_run)
 
     @mcp.tool()
     async def send_transaction(  # pylint: disable=too-many-arguments
@@ -133,12 +145,25 @@ def build_mcp(  # pylint: disable=unused-argument
 
     @mcp.tool()
     async def sign_message(digest: str) -> dict:
-        """Sign a raw 32-byte digest (0x-hex), unprefixed — for off-chain mech requests."""
+        """Sign a raw 32-byte digest (0x-hex), unprefixed — for off-chain mech requests.
+
+        Unavailable in restricted mode (the guardrail cannot inspect what a
+        digest commits to).
+        """
         try:
             raw = bytes.fromhex(digest.removeprefix("0x"))
         except ValueError as e:
             raise ValueError(f"digest must be a 0x-hex string: {e}") from e
         return {"signature": await asyncio.to_thread(signer.sign_digest, raw)}
+
+    @mcp.tool()
+    async def settings() -> dict:
+        """Read the enforced settings: guardrail mode, whitelist and harness.
+
+        Read-only. Changes go through the operator's agent UI (GET /), never
+        through this MCP surface.
+        """
+        return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 
     return mcp
 
