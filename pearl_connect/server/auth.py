@@ -40,8 +40,10 @@ from fastapi import HTTPException, Request
 from pearl_connect.activity import ActivityLog
 
 LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
-# TrustedHostMiddleware wants patterns, not a set; port is ignored by it
-ALLOWED_HOSTS = ["127.0.0.1", "localhost", "[::1]"]
+# TrustedHostMiddleware wants patterns, not a set; port is ignored by it.
+# No IPv6 entry: the server binds IPv4 loopback only, and Starlette splits
+# the Host header on ":" so a bracketed IPv6 literal could never match.
+ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 
 MAX_AUTH_FAILURES = 10
 AUTH_FAILURE_WINDOW_SECONDS = 60.0
@@ -51,11 +53,13 @@ _RATE_LIMIT_MESSAGE = "too many failed authentication attempts; retry later"
 class AuthFailureLimiter:
     """Global brake shared by every authenticated surface.
 
-    After MAX_AUTH_FAILURES failed attempts (bad token, bad password or
-    cross-origin) within the window, all authenticated requests are refused
-    with 429 until the window drains. Local single-user server: a global
-    (rather than per-client) brake is the honest model — source addresses on
-    loopback carry no identity.
+    After MAX_AUTH_FAILURES failed attempts (bad token or bad password)
+    within the window, all authenticated requests are refused with 429 until
+    the window drains. Local single-user server: a global (rather than
+    per-client) brake is the honest model — source addresses on loopback
+    carry no identity. Cross-origin rejections are audited but never counted:
+    they require no secret, so counting them would let any webpage's simple
+    requests hold the whole agent at 429.
     """
 
     def __init__(
@@ -118,7 +122,13 @@ class RequireAuth:
     def __call__(self, request: Request) -> None:
         """Call."""
         if not origin_is_local(request.headers.get("origin")):
-            self._fail(request.url.path, "cross-origin")
+            # audited, never brake-counted: a webpage's simple request needs
+            # no secret to arrive with a foreign Origin, while a bad token
+            # cannot be sent cross-origin at all (the Authorization header
+            # forces a CORS preflight, which fails with no CORS enabled)
+            self._activity.record(
+                "auth_failed", path=request.url.path, reason="cross-origin"
+            )
             raise HTTPException(
                 status_code=403, detail="cross-origin requests are not allowed"
             )
@@ -163,7 +173,8 @@ class AuthMiddleware:
         headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
         path = scope.get("path", "")
         if not origin_is_local(headers.get("origin")):
-            self._fail(path, "cross-origin")
+            # audited, never brake-counted — see RequireAuth for the rationale
+            self._activity.record("auth_failed", path=path, reason="cross-origin")
             await _reject(send, 403, "cross-origin requests are not allowed")
             return
         if self._limiter.blocked():

@@ -132,7 +132,15 @@ def _ensure_claude_settings(store_path: Path) -> None:
             if isinstance(existing, dict):
                 config = existing
         except json.JSONDecodeError:
-            logger.warning("existing %s is invalid JSON; rewriting it", path)
+            # the file is user-owned config: one typo must not wipe it —
+            # keep the broken content recoverable next to the rewrite
+            backup = path.with_suffix(".json.bak")
+            path.replace(backup)
+            logger.warning(
+                "existing %s is invalid JSON; backed up to %s and rewriting",
+                path,
+                backup,
+            )
     deny = config.setdefault("permissions", {}).setdefault("deny", [])
     for rule in TOKEN_DENY_RULES:
         if rule not in deny:

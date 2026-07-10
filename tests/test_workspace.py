@@ -129,11 +129,13 @@ def test_claude_settings_deny_rule_merged(store_path: Path) -> None:
     assert "WebFetch" in config["permissions"]["deny"]
     assert "Read(./.mcp.json)" in config["permissions"]["deny"]
 
-    # invalid JSON is rewritten rather than crashing the boot
+    # invalid JSON is backed up, then rewritten rather than crashing the boot
     settings_path.write_text("{nope")
     workspace._ensure_claude_settings(store_path)  # pylint: disable=protected-access
     config = json.loads(settings_path.read_text())
     assert config["permissions"]["deny"] == ["Read(./.mcp.json)"]
+    # the user's broken content stays recoverable next to the rewrite
+    assert settings_path.with_suffix(".json.bak").read_text() == "{nope"
 
 
 def test_populate_provisions_token_hygiene(store_path: Path) -> None:

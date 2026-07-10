@@ -1059,6 +1059,30 @@ class TestSettingsEndpoints:
             == 200
         )
 
+    def test_cross_origin_failures_do_not_engage_the_brake(
+        self, client: TestClient, activity: ActivityLog
+    ) -> None:
+        """Origin failures need no secret; they must never lock the agent out.
+
+        A webpage's simple requests arrive with a foreign Origin at will — if
+        they fed the limiter, a background tab could hold every authenticated
+        surface at 429 indefinitely (including the settings UI).
+        """
+        from pearl_connect.server import auth as auth_module
+
+        headers = {"Origin": "https://evil.example"}
+        for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
+            assert client.get("/wallet", headers=headers).status_code == 403
+            assert client.post("/mcp/", json={}, headers=headers).status_code == 403
+        # loud in the audit log...
+        reasons = [e["reason"] for e in activity.recent() if e["kind"] == "auth_failed"]
+        assert "cross-origin" in reasons
+        # ...but the brake never engages: legitimate access keeps working
+        assert (
+            client.get("/wallet", headers={"Authorization": "Bearer tok"}).status_code
+            == 200
+        )
+
     def test_invalid_mode_and_address_are_400(self, client: TestClient) -> None:
         """Validation errors name the offending value."""
         bad_mode = client.post(
