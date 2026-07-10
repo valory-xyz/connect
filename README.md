@@ -6,16 +6,24 @@ other non-aea agent. It:
 
 1. decrypts the agent EOA keystore (`./ethereum_private_key.txt`) in memory
    using the `--password` argument — key material never leaves the process;
-2. serves on `127.0.0.1:8716`:
+2. populates the service's persistent workspace (`STORE_PATH`) with a
+   `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
+   the agent session, and the bundled `pearl-connect` skill;
+3. serves on `127.0.0.1:8716`:
    - Pearl SDK contracts: `GET /healthcheck`, `GET /funds-status`, `GET /`
    - a bearer-authed signing surface: `POST /sign-and-send`,
      `POST /sign-message`, `GET /wallet`
+   - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
+     `send_transaction`, `transaction_status`, `sign_message`;
+4. opens a Claude Code session at the workspace via deep link
+   (`claude://code/new?folder=…` first, `claude-cli://open?cwd=…` as the
+   fallback).
 
 The agent-harness session composes on-chain actions (including service-safe
 `execTransaction` calls via the threshold-1 pre-validated signature) and the
 server signs and broadcasts them — a single audited choke point, no plaintext
-secrets on disk. The MCP surface, workspace provisioning, guardrail and mech
-integration land in the stacked follow-up PRs.
+secrets on disk. The guardrail and mech integration land in the stacked
+follow-up PRs.
 
 ## Development
 

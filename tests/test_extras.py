@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Tests for entrypoint, wallet helpers, signer and route edge cases."""
+"""Tests for entrypoint, MCP tools, wallet helpers, workspace launch and auth ASGI."""
 
 import json
 import typing as t
@@ -25,10 +25,11 @@ from pathlib import Path
 
 import pytest
 import uvicorn
+from eth_account.signers.local import LocalAccount
 from web3 import Web3
 
 from pearl_connect import __main__ as main_module
-from pearl_connect import wallet
+from pearl_connect import wallet, workspace
 from pearl_connect.activity import ActivityLog, MAX_LOG_BYTES
 from pearl_connect.config import (
     AppConfig,
@@ -39,6 +40,8 @@ from pearl_connect.config import (
     load_config,
 )
 from pearl_connect.keystore import KeystoreError, load_account
+from pearl_connect.server.auth import AuthMiddleware
+from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.signer import Signer, SignerError
 
 from tests.conftest import FakeW3, TEST_PASSWORD
@@ -91,6 +94,69 @@ class TestMain:
         monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
         monkeypatch.setattr(main_module.uvicorn, "Server", StubServer)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert (store_path / ".mcp.json").exists()
+
+    def test_main_survives_populate_failure(
+        self, monkeypatch: pytest.MonkeyPatch, keystore_dir: Path, store_path: Path
+    ) -> None:
+        """A workspace failure is logged but does not abort the server."""
+        monkeypatch.chdir(keystore_dir)
+        monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
+        monkeypatch.setattr(main_module.uvicorn, "Server", StubServer)
+        monkeypatch.setattr(
+            workspace,
+            "populate",
+            lambda *a: (_ for _ in ()).throw(RuntimeError("disk full")),
+        )
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+
+    def test_wait_and_launch_when_started(
+        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
+    ) -> None:
+        """Launches once the server reports started."""
+        launched: list[Path] = []
+        monkeypatch.setattr(workspace, "launch_claude", lambda p: launched.append(p))
+        server = t.cast(uvicorn.Server, StubServer(t.cast(uvicorn.Config, None)))
+        server.started = True
+        main_module.wait_and_launch(server, store_path)
+        assert launched == [store_path]
+
+    def test_wait_and_launch_polls_until_started(
+        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
+    ) -> None:
+        """Polls while the server is starting up."""
+        launched: list[Path] = []
+        monkeypatch.setattr(workspace, "launch_claude", lambda p: launched.append(p))
+
+        class SlowServer(StubServer):
+            """Server that starts on the second poll."""
+
+            _polls = 0
+
+            @property
+            def started(self) -> bool:  # type: ignore[override]
+                """Become started on the second check."""
+                SlowServer._polls += 1
+                return SlowServer._polls > 1
+
+            @started.setter
+            def started(self, value: bool) -> None:
+                """Ignore the base class initializer."""
+
+        server = t.cast(uvicorn.Server, SlowServer(t.cast(uvicorn.Config, None)))
+        server.should_exit = False
+        main_module.wait_and_launch(server, store_path)
+        assert launched == [store_path]
+
+    def test_wait_and_launch_on_exit(
+        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
+    ) -> None:
+        """Does not launch when the server exits before starting."""
+        launched: list[Path] = []
+        monkeypatch.setattr(workspace, "launch_claude", lambda p: launched.append(p))
+        server = t.cast(uvicorn.Server, StubServer(t.cast(uvicorn.Config, None)))
+        main_module.wait_and_launch(server, store_path)
+        assert not launched
 
 
 class TestActivityExtras:
@@ -165,6 +231,216 @@ def test_keystore_valid_json_but_not_keystore(tmp_path: Path) -> None:
     (tmp_path / "ethereum_private_key.txt").write_text('{"hello": "world"}')
     with pytest.raises(KeystoreError, match="failed to decrypt"):
         load_account(TEST_PASSWORD, tmp_path)
+
+
+class TestAuthMiddlewareASGI:
+    """Direct ASGI-level tests of the MCP mount auth."""
+
+    @staticmethod
+    async def _run(
+        middleware: AuthMiddleware, scope: dict
+    ) -> tuple[list[dict], list[str]]:
+        """Invoke the middleware, returning (sent messages, inner-app calls)."""
+        sent: list[dict] = []
+        passed: list[str] = []
+
+        async def inner(scope: t.Any, receive: t.Any, send: t.Any) -> None:
+            passed.append(scope["type"])
+
+        middleware._app = inner  # pylint: disable=protected-access
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        await middleware(scope, None, send)
+        return sent, passed
+
+    async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
+        """Lifespan scopes bypass auth."""
+        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        _, passed = await self._run(middleware, {"type": "lifespan"})
+        assert passed == ["lifespan"]
+
+    async def test_bad_origin_rejected(self, activity: ActivityLog) -> None:
+        """Cross-origin requests get 403."""
+        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        scope = {
+            "type": "http",
+            "headers": [(b"origin", b"https://evil.example")],
+        }
+        sent, passed = await self._run(middleware, scope)
+        assert sent[0]["status"] == 403
+        assert not passed
+
+    async def test_bad_token_rejected(self, activity: ActivityLog) -> None:
+        """Missing token gets 401."""
+        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        sent, passed = await self._run(middleware, {"type": "http", "headers": []})
+        assert sent[0]["status"] == 401
+        assert not passed
+
+    async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
+        """Websocket scopes never reach the inner app; the handshake is closed."""
+        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
+        assert not passed
+        assert sent == [{"type": "websocket.close"}]
+
+    async def test_valid_request_passes(self, activity: ActivityLog) -> None:
+        """Correct token reaches the inner app."""
+        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        scope = {"type": "http", "headers": [(b"authorization", b"Bearer tok")]}
+        _, passed = await self._run(middleware, scope)
+        assert passed == ["http"]
+
+
+class TestMcpTools:
+    """MCP tool behavior via the registered tool functions."""
+
+    @pytest.fixture
+    def tools(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+    ) -> dict[str, t.Callable]:
+        """Return the registered tool functions keyed by name."""
+        mcp = build_mcp(test_signer, app_config, activity)
+        manager = mcp._tool_manager  # pylint: disable=protected-access
+        return {tool.name: tool.fn for tool in manager.list_tools()}
+
+    async def test_wallet_info(
+        self, tools: dict[str, t.Callable], test_signer: Signer
+    ) -> None:
+        """wallet_info reports the agent EOA and balances."""
+        info = await tools["wallet_info"]()
+        assert info["agent_eoa"] == test_signer.address
+        assert info["balances"]["testchain"]["agent_eoa"] == "12345"
+
+    async def test_send_transaction_request_id_idempotency(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """Retrying the tool with the same request_id broadcasts exactly once."""
+        first = await tools["send_transaction"](
+            "testchain", "0x" + "aa" * 20, request_id="r1"
+        )
+        retry = await tools["send_transaction"](
+            "testchain", "0x" + "aa" * 20, request_id="r1"
+        )
+        assert first["tx_hash"] == retry["tx_hash"]
+        assert len(fake_w3.eth.sent) == 1
+
+    async def test_send_transaction_no_wait(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """send_transaction returns the hash immediately."""
+        result = await tools["send_transaction"]("testchain", "0x" + "aa" * 20)
+        assert result["tx_hash"].startswith("0x")
+        assert len(fake_w3.eth.sent) == 1
+
+    async def test_send_transaction_wait_mined(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """send_transaction with wait returns the receipt when mined."""
+        fake_w3.eth.receipt = {
+            "status": 1,
+            "blockNumber": 7,
+            "gasUsed": 21000,
+            "logs": [],
+        }
+        result = await tools["send_transaction"](
+            "testchain", "0x" + "aa" * 20, wait_for_receipt=True, timeout=5
+        )
+        assert result["receipt"]["status"] == 1
+
+    async def test_send_transaction_wait_pending(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """send_transaction with wait times out to pending."""
+        result = await tools["send_transaction"](
+            "testchain", "0x" + "aa" * 20, wait_for_receipt=True, timeout=0
+        )
+        assert result["status"] == "pending"
+
+    async def test_send_transaction_wait_caps_timeout(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """The wait timeout is capped at MAX_RECEIPT_TIMEOUT."""
+        waits: list[float] = []
+
+        def recording_wait(
+            tx_hash: object, timeout: float = 120, poll_latency: float = 0.1
+        ) -> dict:
+            waits.append(timeout)
+            return {"status": 1, "blockNumber": 9, "gasUsed": 21000, "logs": []}
+
+        fake_w3.eth.wait_for_transaction_receipt = (  # type: ignore[method-assign]
+            recording_wait
+        )
+        result = await tools["send_transaction"](
+            "testchain", "0x" + "aa" * 20, wait_for_receipt=True, timeout=10**9
+        )
+        assert result["receipt"]["block_number"] == 9
+        assert waits == [300]
+
+    async def test_transaction_status(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """transaction_status reports pending then mined."""
+        tx_hash = "0x" + "11" * 32
+        pending = await tools["transaction_status"]("testchain", tx_hash)
+        assert pending["status"] == "pending"
+        fake_w3.eth.receipt = {
+            "status": 1,
+            "blockNumber": 7,
+            "gasUsed": 21000,
+            "logs": [],
+        }
+        result = await tools["transaction_status"]("testchain", tx_hash)
+        assert result["receipt"]["block_number"] == 7
+
+    async def test_transaction_status_rejects_malformed_hash(
+        self, tools: dict[str, t.Callable]
+    ) -> None:
+        """A hash that can never resolve raises instead of polling as pending."""
+        with pytest.raises(ValueError, match="32-byte"):
+            await tools["transaction_status"]("testchain", "0xzz")
+        with pytest.raises(ValueError, match="32-byte"):
+            await tools["transaction_status"]("testchain", "0x1234")
+
+    async def test_transaction_status_surfaces_rpc_errors(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """A dead RPC is an error, not a fake "pending"."""
+
+        def broken(tx_hash: object) -> dict:
+            raise RuntimeError("rpc down")
+
+        fake_w3.eth.get_transaction_receipt = broken  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="rpc down"):
+            await tools["transaction_status"]("testchain", "0x" + "11" * 32)
+
+    async def test_sign_message(
+        self, tools: dict[str, t.Callable], account: LocalAccount
+    ) -> None:
+        """sign_message signs a raw digest."""
+        result = await tools["sign_message"]("0x" + "ab" * 32)
+        assert len(bytes.fromhex(result["signature"][2:])) == 65
+
+    async def test_sign_message_rejects_bad_hex(
+        self, tools: dict[str, t.Callable]
+    ) -> None:
+        """Malformed digests get a clean error, matching the HTTP route."""
+        with pytest.raises(ValueError, match="0x-hex"):
+            await tools["sign_message"]("0xzz")
+
+    async def test_send_transaction_rejects_negative_value(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """Negative amounts fail fast, before reaching the signer."""
+        with pytest.raises(ValueError, match="non-negative"):
+            await tools["send_transaction"]("testchain", "0x" + "aa" * 20, value=-1)
+        assert not fake_w3.eth.sent
 
 
 class TestSignerExtras:
@@ -497,3 +773,84 @@ class TestSignerRoutesExtras:
                 headers={"Authorization": "Bearer tok"},
             )
         assert response.status_code == 400
+
+
+class TestWorkspaceExtras:
+    """Workspace population and launch edge cases."""
+
+    def test_assets_dir_meipass(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The PyInstaller _MEIPASS dir containing assets/ is used."""
+        (tmp_path / "assets").mkdir()
+        monkeypatch.setattr(workspace.sys, "_MEIPASS", str(tmp_path), raising=False)
+        assert workspace.assets_dir() == tmp_path / "assets"
+
+    def test_assets_dir_missing_raises(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No assets anywhere raises FileNotFoundError."""
+        monkeypatch.setattr(workspace.sys, "_MEIPASS", str(tmp_path), raising=False)
+        with pytest.raises(FileNotFoundError):
+            workspace.assets_dir()
+
+    def test_invalid_mcp_json_rewritten(self, store_path: Path) -> None:
+        """Corrupt .mcp.json is replaced rather than crashing."""
+        (store_path / ".mcp.json").write_text("{corrupt")
+        workspace.populate(store_path, "tok")
+        config = json.loads((store_path / ".mcp.json").read_text())
+        assert "pearl-connect" in config["mcpServers"]
+
+    def test_stray_file_in_skill_assets_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, store_path: Path
+    ) -> None:
+        """Non-directory entries under assets/skills are ignored."""
+        skills = tmp_path / "assets" / "skills"
+        (skills / "my-skill").mkdir(parents=True)
+        (skills / "my-skill" / "SKILL.md").write_text("hi")
+        (skills / "stray.txt").write_text("not a skill")
+        monkeypatch.setattr(workspace.sys, "_MEIPASS", str(tmp_path), raising=False)
+        workspace.populate(store_path, "tok")
+        installed = store_path / ".claude" / "skills"
+        assert (installed / "my-skill" / "SKILL.md").exists()
+        assert not (installed / "stray.txt").exists()
+
+    def test_launch_claude_fallback_and_failure(
+        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
+    ) -> None:
+        """First link failing falls back; both failing returns False."""
+        attempts: list[str] = []
+
+        def fake_open(url: str) -> bool:
+            attempts.append(url)
+            return len(attempts) == 2  # first fails, fallback succeeds
+
+        monkeypatch.setattr(workspace, "_open_url", fake_open)
+        assert workspace.launch_claude(store_path) is True
+        assert attempts[0].startswith("claude://")
+        assert attempts[1].startswith("claude-cli://")
+
+        monkeypatch.setattr(workspace, "_open_url", lambda url: False)
+        assert workspace.launch_claude(store_path) is False
+
+    def test_open_url_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """xdg-open success, failure and exception paths."""
+
+        class Result:
+            """subprocess result stub."""
+
+            def __init__(self, code: int) -> None:
+                """Initialize."""
+                self.returncode = code
+
+        monkeypatch.setattr(workspace.sys, "platform", "linux")
+        monkeypatch.setattr(workspace.subprocess, "run", lambda *a, **k: Result(0))
+        assert workspace._open_url("claude://x")  # pylint: disable=protected-access
+        monkeypatch.setattr(workspace.subprocess, "run", lambda *a, **k: Result(1))
+        assert not workspace._open_url("claude://x")  # pylint: disable=protected-access
+        monkeypatch.setattr(
+            workspace.subprocess,
+            "run",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("no handler")),
+        )
+        assert not workspace._open_url("claude://x")  # pylint: disable=protected-access

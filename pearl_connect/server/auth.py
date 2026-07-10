@@ -26,6 +26,7 @@ anything non-local is rejected before auth.
 """
 
 import hmac
+import typing as t
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
@@ -70,3 +71,43 @@ class RequireAuth:
             raise HTTPException(
                 status_code=401, detail="invalid or missing bearer token"
             )
+
+
+class AuthMiddleware:
+    """Pure-ASGI equivalent of RequireAuth for mounted sub-apps (the MCP mount)."""
+
+    def __init__(self, app: t.Callable, token: str, activity: ActivityLog) -> None:
+        """Initialize."""
+        self._app = app
+        self._token = token
+        self._activity = activity
+
+    async def __call__(self, scope: t.Any, receive: t.Any, send: t.Any) -> None:
+        """Enforce Origin locality + bearer token, then delegate."""
+        if scope["type"] == "lifespan":
+            await self._app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close"})
+            return  # nothing serves non-http scopes
+        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+        if not origin_is_local(headers.get("origin")):
+            await _reject(send, 403, "cross-origin requests are not allowed")
+            return
+        if not token_matches(self._token, headers.get("authorization")):
+            await _reject(send, 401, "invalid or missing bearer token")
+            return
+        await self._app(scope, receive, send)
+
+
+async def _reject(send: t.Any, status: int, message: str) -> None:
+    body = f'{{"error": "{message}"}}'.encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})

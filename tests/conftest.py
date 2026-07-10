@@ -92,9 +92,11 @@ class FakeEth:
         return self.balance
 
     def get_transaction_receipt(self, tx_hash: object) -> dict:
-        """Return the configured receipt or raise if none."""
+        """Return the configured receipt or raise TransactionNotFound (as web3 does)."""
+        from web3.exceptions import TransactionNotFound
+
         if self.receipt is None:
-            raise ValueError("not mined")
+            raise TransactionNotFound(f"{tx_hash!r} not mined")
         return self.receipt
 
     def wait_for_transaction_receipt(
