@@ -65,11 +65,11 @@ class Guard:
 
     def mode(self) -> str:
         """Return the currently enforced mode."""
-        return self._store.load().mode
+        return self._store.load().protected.mode
 
     def check_sign_digest(self) -> None:
         """Raise unless raw digest signing is allowed in the current mode."""
-        if self._store.load().mode == MODE_RESTRICTED:
+        if self._store.load().protected.mode == MODE_RESTRICTED:
             raise GuardError(
                 "raw digest signing is disabled in restricted mode; ask the "
                 "operator to switch modes via the agent UI if it is required"
@@ -78,7 +78,7 @@ class Guard:
     def check_transaction(self, chain: str, to: str, value: int, data: str) -> None:
         """Raise unless the EOA transaction is allowed in the current mode."""
         settings = self._store.load()
-        if settings.mode != MODE_RESTRICTED:
+        if settings.protected.mode != MODE_RESTRICTED:
             return
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
@@ -95,7 +95,7 @@ class Guard:
         calldata = (data or "0x").removeprefix("0x").lower()
         if not calldata:
             return  # plain native sweep into the safe
-        self._check_safe_exec(chain, settings.whitelist, value, calldata)
+        self._check_safe_exec(chain, settings.protected.whitelist, value, calldata)
 
     def _check_safe_exec(
         self,

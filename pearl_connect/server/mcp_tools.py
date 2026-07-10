@@ -223,10 +223,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
 
     @mcp.tool()
     async def settings() -> dict:
-        """Read the enforced settings: guardrail mode, whitelist and harness.
+        """Read the enforced settings in their canonical shape.
 
-        Read-only. Changes go through the operator's agent UI (GET /), never
-        through this MCP surface.
+        The "protected" object is the guardrail state. Read-only: changes
+        go through the operator's agent UI, never through this MCP surface.
         """
         return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 

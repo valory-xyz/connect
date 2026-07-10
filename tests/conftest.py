@@ -36,6 +36,7 @@ from pearl_connect.guard import Guard
 from pearl_connect.mech import MechService
 from pearl_connect.settings import (
     MODE_UNRESTRICTED,
+    Protected,
     SETTINGS_FILE,
     Settings,
     SettingsStore,
@@ -202,7 +203,7 @@ def settings_store(
     guard/settings tests.
     """
     store = SettingsStore(store_path / SETTINGS_FILE, derive_mac_key(account), activity)
-    store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+    store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
     return store
 
 

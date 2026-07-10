@@ -22,11 +22,17 @@
 The settings file lives inside STORE_PATH, which is also the Claude session's
 workspace — the agent can read it (nothing in it is secret) and could write
 it, so every read verifies an HMAC keyed off the agent private key before the
-content is trusted. A failed verification fails closed: the file is replaced
-with the built-in defaults (restricted mode). Legitimate changes go through
-the password-authed settings endpoint, never through the agent session.
+content is trusted. The canonical shape nests the security-critical fields
+under "protected" ({"protected": {"mode", "whitelist"}, "harness"}) and the
+MAC covers exactly that object (plus the version); a failed verification
+fails closed by resetting it to the built-in defaults (restricted mode).
+Preference fields (harness) live outside "protected" without integrity
+checks: editing them simply applies, and they survive a protected reset.
+Legitimate protected changes go through the password-gated settings PATCH,
+never through the agent session.
 """
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -46,6 +52,12 @@ logger = logging.getLogger("agent")
 SETTINGS_FILE = "pearl-connect.settings.json"
 SETTINGS_VERSION = 1
 
+# The MAC covers the version and the "protected" object of the canonical
+# shape — everything an attacker could profit from editing. The harness is
+# deliberately outside it: a preference, and the worst a tampered value can
+# do is open the workspace in the other Claude Code.
+MAC_FIELDS = ("version", "protected")
+
 MODE_RESTRICTED = "restricted"
 MODE_UNRESTRICTED = "unrestricted"
 MODES = (MODE_RESTRICTED, MODE_UNRESTRICTED)
@@ -63,37 +75,32 @@ EXTRA_DEFAULT_WHITELIST: dict[str, tuple[str, ...]] = {}
 
 
 @dataclass
-class Settings:
-    """The persisted guardrail state."""
+class Protected:
+    """The integrity-checked guardrail state (the "protected" object)."""
 
     mode: str
     # chain -> lowercase addresses the service safe may call in restricted mode
     whitelist: dict[str, tuple[str, ...]]
-    # which Claude Code the server opens the workspace session in
-    harness: str = DEFAULT_HARNESS
 
     def to_dict(self) -> dict:
         """JSON-shaped view: the mode and the whitelist as sorted lists."""
         return {
             "mode": self.mode,
             "whitelist": {c: sorted(a) for c, a in self.whitelist.items()},
-            "harness": self.harness,
         }
 
     @classmethod
-    def from_raw(
-        cls, mode: object, whitelist: t.Mapping, harness: object = DEFAULT_HARNESS
-    ) -> "Settings":
-        """Validate and normalize raw (JSON-shaped) input into Settings.
+    def from_raw(cls, raw: t.Mapping) -> "Protected":
+        """Validate and normalize a raw (JSON-shaped) protected object.
 
-        :raises ValueError: on an unknown mode/harness or a malformed address.
+        :raises ValueError: on an unknown mode or a malformed address;
+        :raises KeyError: on missing fields.
         """
+        mode = raw["mode"]
         if mode not in MODES:
             raise ValueError(f"mode must be one of {list(MODES)}")
-        if harness not in HARNESSES:
-            raise ValueError(f"harness must be one of {list(HARNESSES)}")
         normalized: dict[str, tuple[str, ...]] = {}
-        for chain, addresses in whitelist.items():
+        for chain, addresses in raw["whitelist"].items():
             for address in addresses:
                 if not Web3.is_address(str(address)):
                     raise ValueError(
@@ -102,7 +109,71 @@ class Settings:
             normalized[str(chain).lower()] = tuple(
                 sorted(str(a).lower() for a in addresses)
             )
-        return cls(mode=str(mode), whitelist=normalized, harness=str(harness))
+        return cls(mode=str(mode), whitelist=normalized)
+
+
+def validate_harness(value: object) -> str:
+    """Return the harness value, or :raises ValueError: on unknown ones."""
+    if value not in HARNESSES:
+        raise ValueError(f"harness must be one of {list(HARNESSES)}")
+    return str(value)
+
+
+def _harness_or_default(value: object) -> str:
+    """Return a valid harness; warn and fall back on anything else.
+
+    The lenient counterpart of validate_harness, for values read from disk:
+    the harness is a preference, so a bad value must not count as tamper.
+    """
+    try:
+        return validate_harness(value)
+    except ValueError:
+        logger.warning("invalid harness %r in settings; using default", value)
+        return DEFAULT_HARNESS
+
+
+@dataclass
+class Settings:
+    """The persisted state in its canonical shape: protected + preferences."""
+
+    protected: Protected
+    # which Claude Code the server opens the workspace session in (preference)
+    harness: str = DEFAULT_HARNESS
+
+    def to_dict(self) -> dict:
+        """Canonical nested shape, used everywhere: file, API and MCP tool."""
+        return {"protected": self.protected.to_dict(), "harness": self.harness}
+
+    @classmethod
+    def from_raw(cls, raw: t.Mapping) -> "Settings":
+        """Parse the raw canonical shape: strict protected, lenient harness.
+
+        :raises ValueError:/:raises KeyError: on a malformed protected
+        object; an invalid harness only falls back to the default — it is a
+        preference, not an integrity boundary.
+        """
+        return cls(
+            protected=Protected.from_raw(raw["protected"]),
+            harness=_harness_or_default(raw.get("harness", DEFAULT_HARNESS)),
+        )
+
+    def merged(self, patch: t.Mapping) -> "Settings":
+        """Return a copy updated by a partial canonical-shaped patch.
+
+        Merge-patch semantics for the settings endpoint: absent (or None)
+        fields keep their current values, at both levels of the shape.
+        :raises ValueError: on invalid replacements.
+        """
+        protected = {
+            k: v for k, v in (patch.get("protected") or {}).items() if v is not None
+        }
+        harness = patch.get("harness")
+        return Settings(
+            protected=Protected.from_raw({**self.protected.to_dict(), **protected}),
+            harness=(
+                validate_harness(harness) if harness is not None else self.harness
+            ),
+        )
 
 
 def _mech_system_addresses() -> dict[str, list[str]]:
@@ -158,7 +229,9 @@ def default_whitelist() -> dict[str, tuple[str, ...]]:
 
 def defaults() -> Settings:
     """Return the fail-closed state: restricted, marketplaces whitelisted."""
-    return Settings(mode=MODE_RESTRICTED, whitelist=default_whitelist())
+    return Settings(
+        protected=Protected(mode=MODE_RESTRICTED, whitelist=default_whitelist())
+    )
 
 
 def derive_mac_key(account: LocalAccount) -> bytes:
@@ -198,18 +271,55 @@ class SettingsStore:
     def load(self) -> Settings:
         """Return the verified settings, restoring defaults on any problem."""
         with self._lock:
+            return self._load()
+
+    def patch(self, patch: t.Mapping) -> Settings:
+        """Merge a partial canonical-shaped patch and persist the result.
+
+        One lock spans the read-merge-write: concurrent patches (the UI has
+        independent protected and harness forms) must not lose an update.
+        :raises ValueError: on invalid replacements;
+        :raises OSError: when the merged settings cannot be persisted — an
+        explicit change must never claim success while the disk disagrees
+        (unlike the load path, which degrades to its in-memory value).
+        """
+        with self._lock:
+            settings = self._load().merged(patch)
             try:
-                raw = self._path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                return self._reset(defaults())
-            verified = self._verify(raw)
-            if verified is not None:
-                return verified
-            logger.warning(
-                "settings file %s failed verification; restoring defaults", self._path
-            )
-            self._activity.record("settings_tampered", path=str(self._path))
+                self._save(settings)
+            except OSError as e:
+                self._activity.record(
+                    "settings_persist_failed", path=str(self._path), error=str(e)
+                )
+                raise
+            return settings
+
+    def _load(self) -> Settings:
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return self._reset(defaults())
+        verified = self._verify(raw)
+        if verified is not None:
+            return verified
+        logger.warning(
+            "settings file %s failed verification; restoring defaults", self._path
+        )
+        self._activity.record("settings_tampered", path=str(self._path))
+        fallback = defaults()
+        # the harness is a preference, not a security control: a tampered
+        # mode/whitelist resets those, but must not discard the harness
+        fallback.harness = self._harness_of(raw)
+        return self._reset(fallback)
+
+    @staticmethod
+    def _harness_of(raw: str) -> str:
+        """Best-effort harness from an unverified file (validated, lenient)."""
+        try:
+            harness = json.loads(raw).get("harness", DEFAULT_HARNESS)
+        except (json.JSONDecodeError, AttributeError):
+            return DEFAULT_HARNESS
+        return _harness_or_default(harness)
 
     def save(self, settings: Settings) -> None:
         """Write settings with a fresh MAC, atomically."""
@@ -233,13 +343,18 @@ class SettingsStore:
         payload["mac"] = self._mac(payload)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(self._path)
+        try:
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(self._path)
+        except OSError:
+            with contextlib.suppress(OSError):  # don't mask the write error
+                tmp.unlink()
+            raise
         self._expected_mac = payload["mac"]
 
     def _mac(self, payload: dict) -> str:
         canonical = json.dumps(
-            {k: v for k, v in payload.items() if k != "mac"},
+            {k: payload.get(k) for k in MAC_FIELDS},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -255,11 +370,7 @@ class SettingsStore:
                 return None
             if self._expected_mac is not None and mac != self._expected_mac:
                 return None  # valid MAC, but not the file we last wrote: replay
-            settings = Settings.from_raw(
-                payload["mode"],
-                payload["whitelist"],
-                payload.get("harness", DEFAULT_HARNESS),
-            )
+            settings = Settings.from_raw(payload)
         except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
             return None
         self._expected_mac = mac

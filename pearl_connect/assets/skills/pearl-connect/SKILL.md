@@ -37,9 +37,9 @@ private key — and never need to.
 - `mech_request(prompt, tool, chain, legacy_on_chain, priority_mech, auto_deposit, timeout, max_payment)` —
   send a request to an Olas mech (an on-chain-paid AI service) and wait for its delivery.
   See "Mech requests" below.
-- `settings()` — the enforced guardrail mode, per-chain whitelist and the
-  harness the workspace session opens in (read-only; see "Guardrail
-  modes" below).
+- `settings()` — the enforced settings in their canonical shape:
+  `{"protected": {"mode", "whitelist"}, "harness"}`. The protected object is
+  the guardrail state (read-only here; see "Guardrail modes" below).
 
 ## Guardrail modes
 

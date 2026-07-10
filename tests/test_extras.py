@@ -120,10 +120,13 @@ class TestMain:
         settings_store: SettingsStore,
     ) -> None:
         """Launches once started, with the harness from the settings store."""
-        from pearl_connect.settings import Settings
+        from pearl_connect.settings import Protected, Settings
 
         settings_store.save(
-            Settings(mode="unrestricted", whitelist={}, harness="claude_code_cli")
+            Settings(
+                protected=Protected(mode="unrestricted", whitelist={}),
+                harness="claude_code_cli",
+            )
         )
         launched: list[tuple[Path, str]] = []
         monkeypatch.setattr(

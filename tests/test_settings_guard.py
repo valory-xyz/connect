@@ -22,6 +22,8 @@
 import asyncio
 import json
 import logging
+import threading
+import time
 import typing as t
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +47,7 @@ from pearl_connect.mech import (
 from pearl_connect.settings import (
     MODE_RESTRICTED,
     MODE_UNRESTRICTED,
+    Protected,
     Settings,
     SettingsStore,
     default_whitelist,
@@ -108,25 +111,108 @@ class TestSettingsStore:
     ) -> None:
         """A fresh store fails closed to restricted defaults and persists them."""
         loaded = store.load()
-        assert loaded.mode == MODE_RESTRICTED
-        assert GNOSIS_MARKETPLACE in loaded.whitelist["gnosis"]
+        assert loaded.protected.mode == MODE_RESTRICTED
+        assert GNOSIS_MARKETPLACE in loaded.protected.whitelist["gnosis"]
         assert store._path.exists()  # pylint: disable=protected-access
 
     def test_roundtrip(self, store: SettingsStore) -> None:
         """Saved settings load back identically, immediately (no cache)."""
         store.save(
             Settings(
-                mode=MODE_UNRESTRICTED,
-                whitelist={"gnosis": (OTHER,)},
+                protected=Protected(
+                    mode=MODE_UNRESTRICTED, whitelist={"gnosis": (OTHER,)}
+                ),
                 harness="claude_code_cli",
             )
         )
         loaded = store.load()
-        assert loaded.mode == MODE_UNRESTRICTED
-        assert loaded.whitelist == {"gnosis": (OTHER,)}
+        assert loaded.protected.mode == MODE_UNRESTRICTED
+        assert loaded.protected.whitelist == {"gnosis": (OTHER,)}
         assert loaded.harness == "claude_code_cli"
         # a fresh store defaults to the desktop harness
         assert defaults().harness == "claude_code_desktop"
+
+    def test_concurrent_patches_lose_no_update(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One lock spans read-merge-write: parallel patches both persist.
+
+        Without it, two patches reading the same snapshot would each write
+        back only their own change — the second save silently undoing the
+        first (e.g. a harness save erasing a just-applied mode restriction).
+        """
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        original = Settings.merged
+
+        def merged_slowly(self: Settings, patch: t.Mapping) -> Settings:
+            time.sleep(0.05)  # widen the read-to-write window
+            return original(self, patch)
+
+        monkeypatch.setattr(Settings, "merged", merged_slowly)
+        threads = [
+            threading.Thread(
+                target=store.patch, args=({"protected": {"mode": MODE_RESTRICTED}},)
+            ),
+            threading.Thread(
+                target=store.patch, args=({"harness": "claude_code_cli"},)
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        final = store.load()
+        assert final.protected.mode == MODE_RESTRICTED
+        assert final.harness == "claude_code_cli"
+
+    def test_invalid_patch_persists_nothing(self, store: SettingsStore) -> None:
+        """A patch that fails validation leaves the stored settings untouched."""
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        with pytest.raises(ValueError, match="mode must be"):
+            store.patch({"protected": {"mode": "yolo"}})
+        assert store.load().protected.mode == MODE_UNRESTRICTED
+
+    def test_patch_with_explicit_nones_keeps_current_values(
+        self, store: SettingsStore
+    ) -> None:
+        """None means "keep", at both levels — also for direct store callers.
+
+        The HTTP route strips Nones before they get here (pydantic
+        exclude_none), so this pins the store-level contract on its own.
+        """
+        store.save(
+            Settings(
+                protected=Protected(
+                    mode=MODE_UNRESTRICTED, whitelist={"gnosis": (OTHER,)}
+                ),
+                harness="claude_code_cli",
+            )
+        )
+        patched = store.patch(
+            {"protected": {"mode": None, "whitelist": None}, "harness": None}
+        )
+        assert patched.protected.mode == MODE_UNRESTRICTED
+        assert patched.protected.whitelist == {"gnosis": (OTHER,)}
+        assert patched.harness == "claude_code_cli"
+
+    def test_failed_write_leaves_no_temp_file(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed atomic replace cleans up its temp file and propagates."""
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+
+        def refuse(self: Path, target: Path) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "replace", refuse)
+        with pytest.raises(OSError, match="disk full"):
+            store.save(
+                Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+            )
+        tmp = store._path.with_suffix(".json.tmp")  # pylint: disable=protected-access
+        assert not tmp.exists()
+        # the previously persisted settings are intact
+        assert store.load().protected.mode == MODE_UNRESTRICTED
 
     @pytest.mark.parametrize(
         "corrupt",
@@ -140,65 +226,114 @@ class TestSettingsStore:
         self, store: SettingsStore, activity: ActivityLog, corrupt: str
     ) -> None:
         """Unverifiable content is replaced with defaults and audited."""
-        store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         store._path.write_text(corrupt)  # pylint: disable=protected-access
         loaded = store.load()
-        assert loaded.mode == MODE_RESTRICTED
+        assert loaded.protected.mode == MODE_RESTRICTED
         assert any(e["kind"] == "settings_tampered" for e in activity.recent())
         # the rewritten file verifies again
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
 
     def test_edited_field_fails_mac(self, store: SettingsStore) -> None:
         """Flipping the mode in the JSON without the key fails verification."""
-        store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
         payload = json.loads(path.read_text())
-        payload["mode"] = "unrestricted"  # the attack this file exists to stop
+        payload["protected"][
+            "mode"
+        ] = "unrestricted"  # the attack this file exists to stop
         path.write_text(json.dumps(payload))
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
+
+    def test_harness_edit_applies_without_the_key(self, store: SettingsStore) -> None:
+        """The harness is a preference: a plain file edit simply takes effect."""
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
+        path = store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["harness"] = "claude_code_cli"
+        path.write_text(json.dumps(payload))
+        loaded = store.load()
+        assert loaded.harness == "claude_code_cli"
+        assert loaded.protected.mode == MODE_RESTRICTED  # protected fields untouched
+
+    def test_invalid_harness_falls_back_without_tamper(
+        self, store: SettingsStore, activity: ActivityLog
+    ) -> None:
+        """A bad harness value is not an integrity event."""
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        path = store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["harness"] = "cursor"
+        path.write_text(json.dumps(payload))
+        loaded = store.load()
+        assert loaded.harness == "claude_code_desktop"
+        assert (
+            loaded.protected.mode == MODE_UNRESTRICTED
+        )  # protected fields still verify
+        assert not any(e["kind"] == "settings_tampered" for e in activity.recent())
+
+    def test_tampered_mode_preserves_the_harness_preference(
+        self, store: SettingsStore
+    ) -> None:
+        """A guardrail reset must not discard the unprotected preference."""
+        store.save(
+            Settings(
+                protected=Protected(mode=MODE_RESTRICTED, whitelist={}),
+                harness="claude_code_cli",
+            )
+        )
+        path = store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["protected"][
+            "mode"
+        ] = "unrestricted"  # the attack: protected field edited
+        path.write_text(json.dumps(payload))
+        loaded = store.load()
+        assert loaded.protected.mode == MODE_RESTRICTED  # fails closed
+        assert loaded.harness == "claude_code_cli"  # preference survives
 
     def test_valid_mac_but_bad_mode_rejected(self, store: SettingsStore) -> None:
         """A MAC'd payload with an unknown mode still falls back to defaults."""
-        payload: dict = {"version": 1, "mode": "yolo", "whitelist": {}}
+        payload: dict = {"version": 1, "protected": {"mode": "yolo", "whitelist": {}}}
         payload["mac"] = store._mac(payload)  # pylint: disable=protected-access
         store._path.write_text(json.dumps(payload))  # pylint: disable=protected-access
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
 
     def test_mac_key_requires_the_private_key(
         self, store: SettingsStore, activity: ActivityLog
     ) -> None:
         """A store keyed by a different account rejects the file."""
-        store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         other = SettingsStore(
             store._path,  # pylint: disable=protected-access
             derive_mac_key(Account.create()),
             activity,
         )
-        assert other.load().mode == MODE_RESTRICTED
+        assert other.load().protected.mode == MODE_RESTRICTED
 
     def test_replayed_old_file_is_rejected(
         self, store: SettingsStore, activity: ActivityLog
     ) -> None:
         """Putting back an old validly-MAC'd file fails like any other tamper."""
-        store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
         unrestricted_file = path.read_bytes()  # captured while unrestricted
-        store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
         path.write_bytes(unrestricted_file)  # the rollback attack
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
         assert any(e["kind"] == "settings_tampered" for e in activity.recent())
 
     def test_fresh_process_accepts_any_valid_mac(
         self, store: SettingsStore, account: LocalAccount, activity: ActivityLog
     ) -> None:
         """A new store instance (a restart) pins the first valid file it sees."""
-        store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         restarted = SettingsStore(
             store._path,  # pylint: disable=protected-access
             derive_mac_key(account),
             activity,
         )
-        assert restarted.load().mode == MODE_UNRESTRICTED
+        assert restarted.load().protected.mode == MODE_UNRESTRICTED
 
     def test_unwritable_store_still_fails_closed(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
@@ -210,7 +345,7 @@ class TestSettingsStore:
             "_save",
             lambda self, settings: (_ for _ in ()).throw(OSError("read-only fs")),
         )
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
 
 
 class TestDefaults:
@@ -244,7 +379,7 @@ class TestDefaults:
         whitelist = default_whitelist()
         assert "0x" + "cc" * 20 in whitelist["gnosis"]
         assert whitelist["testchain"] == ("0x" + "dd" * 20,)
-        assert defaults().mode == MODE_RESTRICTED
+        assert defaults().protected.mode == MODE_RESTRICTED
 
     def test_broken_mech_client_degrades_to_empty_whitelist(
         self, monkeypatch: pytest.MonkeyPatch
@@ -255,14 +390,14 @@ class TestDefaults:
             "/nonexistent/mechs.json",
         )
         assert default_whitelist() == {}
-        assert defaults().mode == MODE_RESTRICTED
+        assert defaults().protected.mode == MODE_RESTRICTED
 
 
 def make_guard(
     store: SettingsStore, mode: str, whitelist: dict[str, tuple[str, ...]] | None = None
 ) -> Guard:
     """Save the given state and return a guard over it."""
-    store.save(Settings(mode=mode, whitelist=whitelist or {}))
+    store.save(Settings(protected=Protected(mode=mode, whitelist=whitelist or {})))
     config = AppConfig(
         chains={
             "testchain": ChainConfig(rpc_url="http://127.0.0.1:9", safe_address=SAFE),
@@ -391,7 +526,9 @@ class TestSignerGuardIntegration:
 
         from pearl_connect.signer import _ChainState
 
-        settings_store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
         signer = Signer(
             account=account,
             config=app_config,
@@ -442,9 +579,13 @@ class TestSignerGuardIntegration:
         The transaction already happened; replaying its hash signs nothing
         new. A *fresh* request_id still hits the tightened gate.
         """
-        settings_store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}))
+        )
         tx_hash = restricted_signer.send("testchain", OTHER, value=1, request_id="r1")
-        settings_store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
         assert (
             restricted_signer.send("testchain", OTHER, value=1, request_id="r1")
             == tx_hash
@@ -556,7 +697,9 @@ class TestMech:
         patched_mech: FakeMarketplaceService,
     ) -> None:
         """The off-chain preflight names the escape hatch."""
-        settings_store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
         with pytest.raises(MechError, match="legacy_on_chain=true"):
             mech_service.request("q", "tool", chain="testchain")
         assert not patched_mech.calls
@@ -855,8 +998,7 @@ class TestSettingsEndpoints:
         """GET /settings mirrors the enforced state."""
         body = client.get("/settings").json()
         assert body == {
-            "mode": "unrestricted",
-            "whitelist": {},
+            "protected": {"mode": "unrestricted", "whitelist": {}},
             "harness": "claude_code_desktop",
         }
 
@@ -868,12 +1010,11 @@ class TestSettingsEndpoints:
 
         sleeps: list[float] = []
         monkeypatch.setattr(settings_routes.time, "sleep", sleeps.append)
-        response = client.post(
+        response = client.patch(
             "/settings",
             json={
                 "password": "nope",
-                "mode": "restricted",
-                "whitelist": {},
+                "protected": {"mode": "restricted"},
             },  # nosec B105
         )
         assert response.status_code == 401
@@ -901,9 +1042,9 @@ class TestSettingsEndpoints:
             make_app(test_signer, app_config, activity),
             base_url="http://127.0.0.1:8716",
         ) as client:
-            response = client.post(
+            response = client.patch(
                 "/settings",
-                json={"password": TEST_PASSWORD, "mode": "restricted", "whitelist": {}},
+                json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
             )
         assert response.status_code == 401
 
@@ -911,17 +1052,21 @@ class TestSettingsEndpoints:
         self, client: TestClient, activity: ActivityLog
     ) -> None:
         """A mode flip takes effect on the very next signing request."""
-        response = client.post(
+        response = client.patch(
             "/settings",
             json={
                 "password": TEST_PASSWORD,
-                "mode": "restricted",
-                "whitelist": {"testchain": [WHITELISTED]},
+                "protected": {
+                    "mode": "restricted",
+                    "whitelist": {"testchain": [WHITELISTED]},
+                },
             },
         )
         assert response.status_code == 200
-        assert response.json()["mode"] == "restricted"
-        assert response.json()["whitelist"] == {"testchain": [WHITELISTED.lower()]}
+        assert response.json()["protected"]["mode"] == "restricted"
+        assert response.json()["protected"]["whitelist"] == {
+            "testchain": [WHITELISTED.lower()]
+        }
         assert any(e["kind"] == "settings_changed" for e in activity.recent())
 
         blocked = client.post(
@@ -934,15 +1079,7 @@ class TestSettingsEndpoints:
 
     def test_harness_updates_and_validates(self, client: TestClient) -> None:
         """The harness is updatable from the UI endpoint and validated."""
-        flipped = client.post(
-            "/settings",
-            json={
-                "password": TEST_PASSWORD,
-                "mode": "unrestricted",
-                "whitelist": {},
-                "harness": "claude_code_cli",
-            },
-        )
+        flipped = client.patch("/settings", json={"harness": "claude_code_cli"})
         assert flipped.status_code == 200
         assert flipped.json()["harness"] == "claude_code_cli"
         assert client.get("/settings").json()["harness"] == "claude_code_cli"
@@ -951,15 +1088,7 @@ class TestSettingsEndpoints:
         assert "claude-cli://open?cwd=" in page
         assert 'value="claude_code_cli"' in page
 
-        bad = client.post(
-            "/settings",
-            json={
-                "password": TEST_PASSWORD,
-                "mode": "unrestricted",
-                "whitelist": {},
-                "harness": "cursor",
-            },
-        )
+        bad = client.patch("/settings", json={"harness": "cursor"})
         assert bad.status_code == 400
         assert "harness" in bad.json()["detail"]
 
@@ -972,16 +1101,110 @@ class TestSettingsEndpoints:
         may not have); silence would hide the typo until a call is blocked.
         """
         with caplog.at_level(logging.WARNING):
-            response = client.post(
+            response = client.patch(
                 "/settings",
                 json={
                     "password": TEST_PASSWORD,
-                    "mode": "restricted",
-                    "whitelist": {"gnosiss": [WHITELISTED]},
+                    "protected": {"whitelist": {"gnosiss": [WHITELISTED]}},
                 },
             )
         assert response.status_code == 200
         assert "gnosiss" in caplog.text
+
+    def test_harness_patch_needs_no_password(
+        self, client: TestClient, activity: ActivityLog
+    ) -> None:
+        """The harness is a preference: changing it never asks for the password."""
+        response = client.patch("/settings", json={"harness": "claude_code_cli"})
+        assert response.status_code == 200
+        assert response.json()["harness"] == "claude_code_cli"
+        loaded = client.get("/settings").json()
+        assert loaded["harness"] == "claude_code_cli"
+        # protected fields untouched
+        assert loaded["protected"]["mode"] == "unrestricted"
+        assert any(e["kind"] == "harness_changed" for e in activity.recent())
+        # still validated: unknown harnesses are rejected
+        bad = client.patch("/settings", json={"harness": "cursor"})
+        assert bad.status_code == 400
+
+    def test_protected_patch_requires_the_password(self, client: TestClient) -> None:
+        """Touching the protected object without a password is a clean 401."""
+        response = client.patch("/settings", json={"protected": {"mode": "restricted"}})
+        assert response.status_code == 401
+        assert "password" in response.json()["detail"]
+        # nothing changed, and the missing password did not feed the brake
+        assert client.get("/settings").json()["protected"]["mode"] == "unrestricted"
+
+    def test_missing_password_is_audited_but_never_brakes(
+        self, client: TestClient, activity: ActivityLog
+    ) -> None:
+        """Password-less probes are visible in the log but cost no brake count.
+
+        No guess was made, so feeding the brake would let any local process
+        429-lock every authenticated surface with free requests.
+        """
+        from pearl_connect.server import auth as auth_module
+
+        for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
+            response = client.patch(
+                "/settings", json={"protected": {"mode": "restricted"}}
+            )
+            assert response.status_code == 401  # never 429
+        reasons = [e["reason"] for e in activity.recent() if e["kind"] == "auth_failed"]
+        assert "missing password" in reasons
+        # the real password still works immediately
+        flipped = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
+        )
+        assert flipped.status_code == 200
+
+    def test_empty_patch_is_rejected(self, client: TestClient) -> None:
+        """A patch with nothing to update is an explicit 400, not a silent 200."""
+        assert client.patch("/settings", json={}).status_code == 400
+
+    def test_partial_protected_patch_keeps_other_fields(
+        self, client: TestClient
+    ) -> None:
+        """Merge-patch semantics: omitted fields keep their current values."""
+        client.patch("/settings", json={"harness": "claude_code_cli"})
+        seeded = client.patch(
+            "/settings",
+            json={
+                "password": TEST_PASSWORD,
+                "protected": {"whitelist": {"testchain": [WHITELISTED]}},
+            },
+        )
+        assert seeded.status_code == 200
+        # mode-only patch: whitelist and harness survive
+        response = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["protected"]["mode"] == "restricted"
+        assert body["protected"]["whitelist"] == {"testchain": [WHITELISTED.lower()]}
+        assert body["harness"] == "claude_code_cli"  # preference not reset
+
+    def test_whitelist_can_be_cleared(self, client: TestClient) -> None:
+        """An explicit empty whitelist replaces wholesale: {} is not "keep"."""
+        seeded = client.patch(
+            "/settings",
+            json={
+                "password": TEST_PASSWORD,
+                "protected": {"whitelist": {"testchain": [WHITELISTED]}},
+            },
+        )
+        assert seeded.status_code == 200
+        assert seeded.json()["protected"]["whitelist"] != {}
+        cleared = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"whitelist": {}}},
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["protected"]["whitelist"] == {}
+        assert client.get("/settings").json()["protected"]["whitelist"] == {}
 
     def test_host_header_is_validated(self, client: TestClient) -> None:
         """A rebound (non-loopback) Host header is refused app-wide."""
@@ -989,15 +1212,19 @@ class TestSettingsEndpoints:
         assert response.status_code == 400
 
     def test_settings_routes_reject_cross_origin(self, client: TestClient) -> None:
-        """Both settings routes refuse browser cross-origin requests."""
+        """All settings routes refuse browser cross-origin requests."""
         headers = {"Origin": "https://evil.example"}
         assert client.get("/settings", headers=headers).status_code == 403
-        response = client.post(
+        response = client.patch(
             "/settings",
-            json={"password": TEST_PASSWORD, "mode": "restricted", "whitelist": {}},
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
             headers=headers,
         )
         assert response.status_code == 403
+        harness = client.patch(
+            "/settings", json={"harness": "claude_code_cli"}, headers=headers
+        )
+        assert harness.status_code == 403
 
     def test_auth_failures_are_audited_and_braked(
         self,
@@ -1013,12 +1240,11 @@ class TestSettingsEndpoints:
 
         # a failed token and a failed password both land in the audit log
         assert client.get("/wallet").status_code == 401
-        client.post(
+        client.patch(
             "/settings",
             json={
                 "password": "wrong",
-                "mode": "restricted",
-                "whitelist": {},
+                "protected": {"mode": "restricted"},
             },  # nosec B105
         )
         reasons = [e["reason"] for e in activity.recent() if e["kind"] == "auth_failed"]
@@ -1034,12 +1260,11 @@ class TestSettingsEndpoints:
             == 429
         )
         assert (
-            client.post(
+            client.patch(
                 "/settings",
                 json={
                     "password": TEST_PASSWORD,
-                    "mode": "restricted",
-                    "whitelist": {},
+                    "protected": {"mode": "restricted"},
                 },
             ).status_code
             == 429
@@ -1085,28 +1310,100 @@ class TestSettingsEndpoints:
 
     def test_invalid_mode_and_address_are_400(self, client: TestClient) -> None:
         """Validation errors name the offending value."""
-        bad_mode = client.post(
+        bad_mode = client.patch(
             "/settings",
-            json={"password": TEST_PASSWORD, "mode": "yolo", "whitelist": {}},
+            json={"password": TEST_PASSWORD, "protected": {"mode": "yolo"}},
         )
         assert bad_mode.status_code == 400
-        bad_address = client.post(
+        bad_address = client.patch(
             "/settings",
             json={
                 "password": TEST_PASSWORD,
-                "mode": "restricted",
-                "whitelist": {"testchain": ["not-an-address"]},
+                "protected": {"whitelist": {"testchain": ["not-an-address"]}},
             },
         )
         assert bad_address.status_code == 400
         assert "not-an-address" in bad_address.json()["detail"]
+
+    def test_failed_patch_changes_nothing(self, client: TestClient) -> None:
+        """A patch is atomic: an invalid protected half also drops the harness half."""
+        before = client.get("/settings").json()
+        assert before["harness"] != "claude_code_cli"
+        response = client.patch(
+            "/settings",
+            json={
+                "password": TEST_PASSWORD,
+                "protected": {"mode": "yolo"},
+                "harness": "claude_code_cli",
+            },
+        )
+        assert response.status_code == 400
+        assert client.get("/settings").json() == before
+
+    def test_unknown_patch_fields_are_rejected(self, client: TestClient) -> None:
+        """A typo'd field name is a 422, not a silently-dropped no-op."""
+        typoed_protected = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mdoe": "restricted"}},
+        )
+        assert typoed_protected.status_code == 422
+        typoed_top_level = client.patch("/settings", json={"harnes": "cursor"})
+        assert typoed_top_level.status_code == 422
+
+    def test_patch_over_tampered_file_merges_onto_defaults(
+        self,
+        client: TestClient,
+        settings_store: SettingsStore,
+        activity: ActivityLog,
+    ) -> None:
+        """A patch lands on the post-reset defaults, never the forged payload.
+
+        An unauthenticated harness-only patch must not launder a hand-edited
+        mode back to disk under a fresh valid MAC.
+        """
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
+        path = settings_store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["protected"]["mode"] = "unrestricted"  # forged without the key
+        path.write_text(json.dumps(payload))
+        response = client.patch("/settings", json={"harness": "claude_code_cli"})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["protected"]["mode"] == "restricted"  # reset, not merged
+        assert body["harness"] == "claude_code_cli"
+        assert any(e["kind"] == "settings_tampered" for e in activity.recent())
+
+    def test_unpersistable_patch_is_a_clear_error(
+        self, client: TestClient, activity: ActivityLog
+    ) -> None:
+        """A disk-refused write is an audited 503, not an opaque 500."""
+        # a scoped context, NOT the shared monkeypatch fixture: undoing that
+        # one would also undo the client fixture's chdir to the keystore
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                SettingsStore,
+                "_save",
+                lambda self, settings: (_ for _ in ()).throw(OSError("disk full")),
+            )
+            response = client.patch("/settings", json={"harness": "claude_code_cli"})
+        assert response.status_code == 503
+        assert "persisted" in response.json()["detail"]
+        assert any(e["kind"] == "settings_persist_failed" for e in activity.recent())
+        # nothing changed on disk
+        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
 
     def test_index_shows_mode_and_whitelist(
         self, client: TestClient, settings_store: SettingsStore
     ) -> None:
         """The agent UI renders the mode and the whitelist entries."""
         settings_store.save(
-            Settings(mode=MODE_RESTRICTED, whitelist={"testchain": (WHITELISTED,)})
+            Settings(
+                protected=Protected(
+                    mode=MODE_RESTRICTED, whitelist={"testchain": (WHITELISTED,)}
+                )
+            )
         )
         page = client.get("/").text
         assert "restricted" in page
@@ -1152,13 +1449,12 @@ class TestMcpGuardrailTools:
     ) -> None:
         """The tool reflects the post-verification settings."""
         assert await tools["settings"]() == {
-            "mode": "unrestricted",
-            "whitelist": {},
+            "protected": {"mode": "unrestricted", "whitelist": {}},
             "harness": "claude_code_desktop",
         }
         # tampering is not visible through the tool — only the enforced defaults
         settings_store._path.write_text("garbage")  # pylint: disable=protected-access
-        assert (await tools["settings"]())["mode"] == "restricted"
+        assert (await tools["settings"]())["protected"]["mode"] == "restricted"
 
     async def test_wallet_info_reports_mode(self, tools: dict[str, t.Callable]) -> None:
         """wallet_info carries the mode for quick agent orientation."""
