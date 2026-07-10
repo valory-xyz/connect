@@ -36,7 +36,7 @@ from pearl_connect import wallet
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
 from pearl_connect.guard import Guard
-from pearl_connect.mech import DEFAULT_MECH_CHAIN, MechService
+from pearl_connect.mech import DEFAULT_MAX_PAYMENT, DEFAULT_MECH_CHAIN, MechService
 from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer
 
@@ -168,6 +168,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
         priority_mech: str | None = None,
         auto_deposit: bool = True,
         timeout: float = 300,
+        max_payment: int = DEFAULT_MAX_PAYMENT,
     ) -> dict:
         """Send a request to an Olas mech (AI service) and wait for its delivery.
 
@@ -176,7 +177,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
         through the mech marketplace via the service safe — this works in
         restricted mode because the mech contracts are whitelisted by default.
         auto_deposit tops up the prepaid balance from the safe when the mech
-        answers 402 (insufficient balance) and retries once.
+        answers 402 (insufficient balance) and retries once. A request is
+        refused if the mech's per-request price exceeds max_payment (wei,
+        default 0.1 of the native unit) — raise it explicitly to accept a
+        more expensive mech.
         """
         # mech-client manages its own event loops (asyncio.run + sync gql):
         # it must run in a worker thread, never on the server loop
@@ -189,6 +193,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
             priority_mech=priority_mech,
             auto_deposit=auto_deposit,
             timeout=timeout,
+            max_payment=max_payment,
         )
 
     @mcp.tool()

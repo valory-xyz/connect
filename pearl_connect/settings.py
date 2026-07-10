@@ -119,8 +119,11 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     those explicitly when they want token-paid mechs in restricted mode.
 
     Importing the address (rather than hardcoding a copy) keeps a single
-    source of truth: a mech-client upgrade that moves the marketplace updates
-    the default whitelist with it.
+    source of truth for fresh installs and resets. Existing installs keep
+    their persisted whitelist as-is — it is operator-owned state, and merging
+    defaults at load time would silently re-add an address the operator
+    deliberately removed. An upgrade that moves the marketplace reaches them
+    only when settings are reset or re-saved.
     """
     # pylint: disable=import-outside-toplevel
     try:

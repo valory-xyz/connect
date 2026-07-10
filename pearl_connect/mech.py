@@ -45,6 +45,11 @@ DEFAULT_DELIVERY_TIMEOUT = 300.0
 MAX_DELIVERY_TIMEOUT = 3600.0  # a tool call must not pin its worker forever
 DEFAULT_MECH_PAGE_SIZE = 20
 MAX_MECH_PAGE_SIZE = 100
+# A mech prices its own requests (max_delivery_rate) and the guardrail only
+# checks *where* payments go — this cap bounds *how much* a single request may
+# cost. 0.1 of the chain's native unit; raising it is an explicit, audited
+# per-request choice.
+DEFAULT_MAX_PAYMENT = 10**17
 
 
 class MechError(Exception):
@@ -121,7 +126,13 @@ class MechService:
             if service is None:
                 # mech-client reads the RPC from this process-global env var at
                 # service construction (highest priority, keeps it away from
-                # ~/.operate) — hence the construction lock.
+                # ~/.operate) — hence the construction lock, which must span
+                # the constructor itself: built outside it, two chains could
+                # race the env var and construct against each other's RPC.
+                # First use of one chain therefore stalls the others; the fix
+                # is a constructor arg upstream (valory-xyz/mech-client#247).
+                # The exact ==0.21.2 pin keeps the construction-time-read
+                # behavior from drifting underneath this lock.
                 os.environ["MECHX_CHAIN_RPC"] = chain_config.rpc_url
                 service = MarketplaceService(
                     chain_config=chain,
@@ -190,10 +201,9 @@ class MechService:
         offset = max(0, offset)
         try:
             mechs = query_mm_mechs_info(chain) or []
-        except Exception as e:
-            raise MechError(f"could not list mechs for '{chain}': {e}") from e
-        return {
-            "mechs": [
+            # inside the try: a malformed subgraph entry must surface as the
+            # structured MechError this method promises, not a raw KeyError
+            page = [
                 {
                     "address": m["address"],
                     "service_id": m.get("service", {}).get("id"),
@@ -201,7 +211,11 @@ class MechService:
                     "mech_type": m.get("mech_type"),
                 }
                 for m in mechs[offset : offset + limit]
-            ],
+            ]
+        except Exception as e:
+            raise MechError(f"could not list mechs for '{chain}': {e}") from e
+        return {
+            "mechs": page,
             "total": len(mechs),
             "offset": offset,
             "limit": limit,
@@ -221,11 +235,13 @@ class MechService:
         priority_mech: str | None = None,
         auto_deposit: bool = True,
         timeout: float = DEFAULT_DELIVERY_TIMEOUT,
+        max_payment: int = DEFAULT_MAX_PAYMENT,
     ) -> dict:
         """Send one mech request and wait for its delivery.
 
         ``legacy_on_chain=False`` (default) uses the off-chain prepaid flow;
-        ``True`` sends the request on-chain through the marketplace.
+        ``True`` sends the request on-chain through the marketplace. The
+        mech's per-request price must not exceed ``max_payment`` (wei).
         """
         timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
         if not legacy_on_chain:
@@ -239,6 +255,13 @@ class MechService:
                     "legacy_on_chain=true to send the request on-chain"
                 ) from e
         service = self._service(chain)
+        priority_mech, rate = self._priced_mech(service, chain, priority_mech)
+        if rate > max_payment:
+            raise MechError(
+                f"mech {priority_mech} charges {rate} wei per request, above "
+                f"max_payment={max_payment}; pass a higher max_payment to "
+                "accept that price"
+            )
         try:
             result = asyncio.run(
                 service.send_request(
@@ -264,3 +287,24 @@ class MechService:
             offchain=not legacy_on_chain,
         )
         return dict(result)
+
+    def _priced_mech(
+        self, service: t.Any, chain: str, priority_mech: str | None
+    ) -> tuple[str, int]:
+        """Resolve the target mech and its per-request price (wei).
+
+        Without an explicit mech, the most active listed mech is used: the
+        price cap must bind the mech that is actually paid, so the selection
+        happens here instead of inside mech-client's send path.
+        """
+        if priority_mech is None:
+            listing = self._list_mechs(chain, limit=1, offset=0)
+            if not listing["mechs"]:
+                raise MechError(f"no live mechs found for '{chain}'")
+            priority_mech = str(listing["mechs"][0]["address"])
+        fetch_info = service._fetch_mech_info  # pylint: disable=protected-access
+        try:
+            _, _, max_delivery_rate = fetch_info(priority_mech)
+        except Exception as e:
+            raise MechError(f"could not price mech {priority_mech}: {e}") from e
+        return priority_mech, int(max_delivery_rate)

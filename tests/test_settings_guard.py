@@ -541,7 +541,11 @@ class TestMech:
         assert any(e["kind"] == "mech_request" for e in activity.recent())
         # the service is cached per chain
         mech_service.request(
-            "again", "prediction", chain="testchain", legacy_on_chain=True
+            "again",
+            "prediction",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
         )
         assert len(patched_mech.calls) == 2
 
@@ -566,7 +570,13 @@ class TestMech:
         """mech-client exceptions surface as structured MechError + audit entry."""
         patched_mech.raises = RuntimeError("subgraph down")
         with pytest.raises(MechError, match="subgraph down"):
-            mech_service.request("q", "tool", chain="testchain", legacy_on_chain=True)
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+            )
         assert any(e["kind"] == "mech_request_failed" for e in activity.recent())
 
     def test_request_passes_signer_errors_through(
@@ -577,7 +587,13 @@ class TestMech:
         """Guard denials inside the flow keep their message."""
         patched_mech.raises = SignerError("restricted mode: nope")
         with pytest.raises(SignerError, match="restricted mode"):
-            mech_service.request("q", "tool", chain="testchain", legacy_on_chain=True)
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+            )
 
     def test_tools_lists_mechs(
         self,
@@ -708,16 +724,108 @@ class TestMech:
         with pytest.raises(ValueError, match="unknown chain"):
             mech_service.tools(chain="atlantis")
 
+    def test_request_rejects_overpriced_mech(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A mech pricing above max_payment is refused before any work."""
+        patched_mech.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**18)
+        with pytest.raises(MechError, match="max_payment"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        assert not patched_mech.calls
+        # an explicitly raised cap accepts the same price
+        mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            max_payment=10**19,
+        )
+        assert len(patched_mech.calls) == 1
+
+    def test_request_wraps_pricing_failures(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing price lookup surfaces as MechError, not a raw exception."""
+        monkeypatch.setattr(
+            patched_mech,
+            "_fetch_mech_info",
+            lambda mech: (_ for _ in ()).throw(RuntimeError("rpc down")),
+        )
+        with pytest.raises(MechError, match="could not price"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        assert not patched_mech.calls
+
+    def test_request_resolves_mech_when_unspecified(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without priority_mech the top listed mech is priced and used."""
+        import mech_client.infrastructure.subgraph.queries as queries
+
+        monkeypatch.setattr(
+            queries,
+            "query_mm_mechs_info",
+            lambda chain: [
+                {
+                    "address": OTHER,
+                    "service": {"id": "42"},
+                    "totalDeliveriesTransactions": "7",
+                    "mech_type": "Fixed price",
+                }
+            ],
+        )
+        mech_service.request("q", "t", chain="testchain", legacy_on_chain=True)
+        assert patched_mech.calls[0]["priority_mech"] == OTHER
+        # an empty listing is a structured error, not an opaque one
+        monkeypatch.setattr(queries, "query_mm_mechs_info", lambda chain: [])
+        with pytest.raises(MechError, match="no live mechs"):
+            mech_service.request("q", "t", chain="testchain", legacy_on_chain=True)
+
+    def test_tools_listing_wraps_malformed_entries(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A subgraph entry missing fields surfaces as MechError, not KeyError."""
+        import mech_client.infrastructure.subgraph.queries as queries
+
+        monkeypatch.setattr(
+            queries, "query_mm_mechs_info", lambda chain: [{"address": OTHER}]
+        )
+        with pytest.raises(MechError, match="could not list mechs"):
+            mech_service.tools(chain="testchain")
+
     def test_request_timeout_is_clamped(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """A huge or non-positive timeout cannot pin the worker thread."""
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, timeout=10**9
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            timeout=10**9,
+            priority_mech=OTHER,
         )
         assert patched_mech.calls[-1]["timeout"] == MAX_DELIVERY_TIMEOUT
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, timeout=-5
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            timeout=-5,
+            priority_mech=OTHER,
         )
         assert patched_mech.calls[-1]["timeout"] == 1.0
 
@@ -1017,6 +1125,6 @@ class TestMcpGuardrailTools:
         monkeypatch.setattr(ms, "MarketplaceService", lambda **kwargs: fake)
         monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
         result = await tools["mech_request"](
-            "q", "t", chain="testchain", legacy_on_chain=True
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
         assert result == fake.result

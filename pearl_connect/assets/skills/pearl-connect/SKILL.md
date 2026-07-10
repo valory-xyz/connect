@@ -34,7 +34,7 @@ private key — and never need to.
   (most deliveries first; paginate with limit/offset, `total` tells you
   when to stop) and, given a `priority_mech`, its payment type and tool
   names.
-- `mech_request(prompt, tool, chain, legacy_on_chain, priority_mech, auto_deposit, timeout)` —
+- `mech_request(prompt, tool, chain, legacy_on_chain, priority_mech, auto_deposit, timeout, max_payment)` —
   send a request to an Olas mech (an on-chain-paid AI service) and wait for its delivery.
   See "Mech requests" below.
 - `settings()` — the enforced guardrail mode, per-chain whitelist and the
@@ -76,6 +76,10 @@ payment via the service safe, request, and delivery watching. Start with
   marketplace contract ships in the default whitelist).
 - `timeout` (seconds, default 300) bounds the wait for the mech's answer; on
   timeout you still get the `tx_hash`/`request_ids` and can check later.
+- `max_payment` (wei, default 10^17 = 0.1 of the native unit) caps what one
+  request may cost: a mech pricing above it is refused before any payment.
+  Raising the cap is an explicit choice — check the price first with
+  `mech_tools(priority_mech=...)` (`max_delivery_rate`).
 
 ## Spending from the service safe
 

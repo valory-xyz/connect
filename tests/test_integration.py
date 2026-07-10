@@ -385,6 +385,7 @@ def test_mech_request_on_fork_restricted_mode(
         legacy_on_chain=True,
         priority_mech=mech_address,
         timeout=30,  # no delivery will come on a fork; don't wait the default 5m
+        max_payment=10**18,  # live mech prices vary; the cap itself is unit-tested
     )
     assert result["tx_hash"], result
     assert result["request_ids"], result
