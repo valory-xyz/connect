@@ -1,0 +1,115 @@
+[project]
+name = "pearl-connect"
+version = "0.1.0"
+description = "Pearl BYOA agent server: hosts an MCP + HTTP signing service so any agent harness session can act as an Olas Pearl agent without key access"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.139.0",
+    "uvicorn==0.51.0",
+    "web3==7.16.0",
+    "eth-account==0.13.7",
+    "mcp==1.28.1",
+    "mech-client==0.21.2",
+]
+
+[project.scripts]
+pearl-connect = "pearl_connect.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "httpx==0.28.1",
+    "pyinstaller==6.21.0",
+    "open-autonomy>=0.21.26",
+    "open-aea-cli-ipfs>=2.2.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pearl_connect"]
+
+[tool.black]
+force-exclude = '''packages/(valory/(connections|protocols)|open_aea)/'''
+
+[tool.isort]
+profile = "black"
+order_by_type = false
+case_sensitive = true
+lines_after_imports = -1
+extend_skip_glob = [
+    "packages/valory/connections/*",
+    "packages/valory/protocols/*",
+    "packages/open_aea/*",
+]
+known_first_party = ["pearl_connect", "packages"]
+known_local_folder = ["tests"]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+
+[tool.flake8]
+exclude = [
+    "*_pb2.py",
+    "*_pb2_grpc.py",
+    "packages/valory/connections/",
+    "packages/valory/protocols/",
+    "packages/open_aea/",
+]
+max-line-length = 88
+select = "B,C,D,E,F,I,W,PT"
+# I003 to avoid conflicts with isort
+ignore = "E203,E501,W503,I003"
+
+[tool.pylint.master]
+ignore-patterns = ["contract.py"]
+ignore-paths = [
+    "packages/valory/connections/.*",
+    "packages/valory/protocols/.*",
+    "packages/open_aea/.*",
+]
+
+# https://pylint.readthedocs.io/en/stable/user_guide/messages/messages_overview.html
+# R0903: too-few-public-methods (single-method callables like the auth classes are intentional)
+[tool.pylint."messages control"]
+disable = ["R0903"]
+
+[tool.pylint.imports]
+ignored-modules = ["os", "io", "psutil"]
+
+[tool.pylint.design]
+max-public-methods = 58
+max-args = 6
+max-parents = 10
+max-branches = 36
+max-attributes = 8
+
+[tool.pylint.spelling]
+spelling-ignore-words = "nocover,pragma,params,noqa,kwargs,str,async,json,boolean,config,pytest,args,url,tx,jsonschema,traceback,api,nosec"
+
+[tool.pylint.similarities]
+min-similarity-lines = 10
+ignore-comments = true
+ignore-docstrings = true
+ignore-imports = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# anchorpy (transitive, via mech-client -> olas-operate-middleware) ships a
+# pytest plugin whose own dependency (pytest-xprocess) isn't installed.
+addopts = "-p no:anchorpy"
+markers = [
+    "unit: marks tests as unit tests (fast, no network calls)",
+    "integration: marks tests as integration tests (slow, requires network/RPC)",
+]
+
+[tool.uv]
+# mech-client -> olas-operate-middleware declares fastapi<0.118, but operate is
+# import-only baggage for us (mech-client's operate paths never run: we always
+# set MECHX_CHAIN_RPC and never call its CLI/setup services). Override keeps
+# our own server on the pinned fastapi.
+override-dependencies = ["fastapi==0.139.0"]
