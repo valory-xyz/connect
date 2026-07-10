@@ -68,9 +68,13 @@ signature = signer.sign_digest("0x" + "11" * 32)          # raw digest signing
 ```
 
 Reads (balances, gas estimation, receipts) go straight to the chain RPC;
-only sending passes through the signer. Retries are idempotent — the client
-attaches a `request_id` per logical transaction, so a timed-out send retried
-with the same id returns the original `tx_hash` instead of double-spending.
+only sending passes through the signer. The client mints a `request_id` per
+logical transaction and retries client-side timeouts with the same id, so a
+send whose response was lost replays the original `tx_hash` instead of
+double-spending. If a send still fails, the error names its `request_id`:
+retry with `signer.send_transaction(tx, request_id=...)` to stay idempotent —
+calling `w3.eth.send_transaction` again is a NEW logical transaction and
+will broadcast again.
 
 ## Ground rules
 

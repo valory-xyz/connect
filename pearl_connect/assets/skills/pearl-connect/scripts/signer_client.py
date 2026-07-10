@@ -29,6 +29,7 @@ Usage:
     tx_hash = w3.eth.send_transaction({"to": "0x...", "value": 0, "data": "0x"})
 """
 
+import http.client
 import json
 import typing as t
 import urllib.error
@@ -39,6 +40,7 @@ from pathlib import Path
 from web3 import HTTPProvider, Web3
 
 MCP_SERVER_NAME = "pearl-connect"
+SEND_ATTEMPTS = 3
 
 
 class SignerRequestError(RuntimeError):
@@ -93,17 +95,37 @@ class SignerClient:
             _raise_with_detail(e)
 
     def send_transaction(self, tx: dict, request_id: str | None = None) -> str:
-        """Send transaction."""
+        """Send transaction; client-side timeouts retry with the same request_id.
+
+        The signer may have broadcast before a timeout hit: replaying the same
+        request_id returns the original tx_hash instead of double-spending. If
+        all attempts fail, the raised error names the request_id so a manual
+        retry can stay idempotent too.
+        """
+        request_id = request_id or str(uuid.uuid4())
         payload = {
             "chain": self.chain,
             "to": tx["to"],
             "value": _to_int(tx.get("value", 0)),
             "data": tx.get("data", "0x"),
-            "request_id": request_id or str(uuid.uuid4()),
+            "request_id": request_id,
         }
         if tx.get("gas"):
             payload["gas"] = _to_int(tx["gas"])
-        return self._post("/sign-and-send", payload)["tx_hash"]
+        last_error: Exception | None = None
+        for _ in range(SEND_ATTEMPTS):
+            try:
+                return self._post("/sign-and-send", payload)["tx_hash"]
+            # OSError covers timeouts, URLError and connection resets;
+            # HTTPException covers RemoteDisconnected on the response path
+            # (urllib does not wrap those). HTTP-status errors become
+            # SignerRequestError in _post and are NOT retried.
+            except (OSError, http.client.HTTPException) as e:
+                last_error = e
+        raise SignerRequestError(
+            f"send not confirmed after {SEND_ATTEMPTS} attempts ({last_error}); "
+            f"retry with request_id='{request_id}' to avoid double-spending"
+        ) from last_error
 
     def sign_digest(self, digest: str) -> str:
         """Sign a raw 32-byte digest (0x-hex), unprefixed."""

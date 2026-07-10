@@ -30,7 +30,7 @@ import typing as t
 
 from hexbytes import HexBytes
 from mcp.server.fastmcp import FastMCP
-from web3.exceptions import TimeExhausted
+from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from pearl_connect import wallet
 from pearl_connect.activity import ActivityLog
@@ -109,13 +109,23 @@ def build_mcp(  # pylint: disable=unused-argument
 
     @mcp.tool()
     async def transaction_status(chain: str, tx_hash: str) -> dict:
-        """Receipt for a transaction if mined, else {status: "pending"}."""
+        """Receipt for a transaction if mined, else {status: "pending"}.
+
+        A malformed hash or a failing RPC raises instead of reporting
+        "pending" — a hash that can never resolve must not be polled forever.
+        """
+        try:
+            valid = len(bytes.fromhex(tx_hash.removeprefix("0x"))) == 32
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("tx_hash must be a 0x-prefixed 32-byte hex string")
 
         def _run() -> dict:
             w3 = signer.w3(chain)
             try:
                 receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
-            except Exception:  # pylint: disable=broad-exception-caught
+            except TransactionNotFound:
                 return {"tx_hash": tx_hash, "status": "pending"}
             return {"tx_hash": tx_hash, "receipt": _receipt_to_dict(receipt)}
 

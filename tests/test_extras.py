@@ -279,12 +279,12 @@ class TestAuthMiddlewareASGI:
         assert sent[0]["status"] == 401
         assert not passed
 
-    async def test_websocket_scope_dropped(self, activity: ActivityLog) -> None:
-        """Non-http, non-lifespan scopes never reach the inner app."""
+    async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
+        """Websocket scopes never reach the inner app; the handshake is closed."""
         middleware = AuthMiddleware(lambda *a: None, "tok", activity)
         sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
         assert not passed
-        assert not sent  # dropped, not answered
+        assert sent == [{"type": "websocket.close"}]
 
     async def test_valid_request_passes(self, activity: ActivityLog) -> None:
         """Correct token reaches the inner app."""
@@ -398,6 +398,27 @@ class TestMcpTools:
         }
         result = await tools["transaction_status"]("testchain", tx_hash)
         assert result["receipt"]["block_number"] == 7
+
+    async def test_transaction_status_rejects_malformed_hash(
+        self, tools: dict[str, t.Callable]
+    ) -> None:
+        """A hash that can never resolve raises instead of polling as pending."""
+        with pytest.raises(ValueError, match="32-byte"):
+            await tools["transaction_status"]("testchain", "0xzz")
+        with pytest.raises(ValueError, match="32-byte"):
+            await tools["transaction_status"]("testchain", "0x1234")
+
+    async def test_transaction_status_surfaces_rpc_errors(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """A dead RPC is an error, not a fake "pending"."""
+
+        def broken(tx_hash: object) -> dict:
+            raise RuntimeError("rpc down")
+
+        fake_w3.eth.get_transaction_receipt = broken  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="rpc down"):
+            await tools["transaction_status"]("testchain", "0x" + "11" * 32)
 
     async def test_sign_message(
         self, tools: dict[str, t.Callable], account: LocalAccount

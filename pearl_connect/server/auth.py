@@ -88,7 +88,9 @@ class AuthMiddleware:
             await self._app(scope, receive, send)
             return
         if scope["type"] != "http":
-            return  # drop anything else (e.g. websocket) — nothing serves it
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close"})
+            return  # nothing serves non-http scopes
         headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
         if not origin_is_local(headers.get("origin")):
             await _reject(send, 403, "cross-origin requests are not allowed")
