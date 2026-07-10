@@ -30,7 +30,7 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from pearl_connect import wallet
+from pearl_connect import wallet, workspace
 
 logger = logging.getLogger("agent")
 
@@ -77,6 +77,7 @@ def index(request: Request) -> str:
         f"<td><code>{html.escape(c.safe_address or '—')}</code></td></tr>"
         for name, c in sorted(chains.items())
     )
+    open_link = workspace.launch_order(state.config.store_path)[0]
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Pearl Connect</title>
@@ -85,6 +86,8 @@ def index(request: Request) -> str:
  table {{ border-collapse: collapse; width: 100%; }}
  td, th {{ text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; }}
  code {{ font-size: .85em; }}
+ .btn {{ display: inline-block; margin-top: 1rem; padding: .6rem 1.2rem; background: #111;
+        color: #fff; border-radius: 8px; text-decoration: none; border: 0; cursor: pointer; }}
 </style></head>
 <body>
 <h1>Pearl Connect</h1>
@@ -96,4 +99,5 @@ behalf; the Claude session never sees key material.</p>
 </table>
 <h2>Service safes</h2>
 <table>{safes_rows or "<tr><td>none configured</td></tr>"}</table>
+<a class="btn" href="{html.escape(open_link)}">Open Claude Code</a>
 </body></html>"""

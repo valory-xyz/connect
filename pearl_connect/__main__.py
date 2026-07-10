@@ -29,10 +29,13 @@ import argparse
 import logging
 import secrets
 import sys
+import threading
+import time
 from pathlib import Path
 
 import uvicorn
 
+from pearl_connect import workspace
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
 from pearl_connect.keystore import KeystoreError, load_account
@@ -61,6 +64,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def wait_and_launch(server: uvicorn.Server, store_path: Path) -> None:
+    """Launch Claude Code once the server reports startup complete.
+
+    Runs in a background thread so the MCP endpoint is connectable the moment
+    the session opens.
+    """
+    while not server.started and not server.should_exit:
+        time.sleep(0.2)
+    if server.started:
+        workspace.launch_claude(store_path)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the agent server; return the process exit code."""
     args = parse_args(argv)
@@ -86,6 +101,12 @@ def main(argv: list[str] | None = None) -> int:
     signer = Signer(account=account, config=config, activity=activity)
     token = secrets.token_urlsafe(32)
 
+    try:
+        workspace.populate(config.store_path, token)
+        logger.info("workspace populated at %s", config.store_path)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("workspace population failed; server will start anyway")
+
     activity.write_performance()
 
     app = create_app(
@@ -107,6 +128,12 @@ def main(argv: list[str] | None = None) -> int:
             access_log=config.log_level == "debug",
         )
     )
+
+    threading.Thread(
+        target=wait_and_launch,
+        args=(server, config.store_path),
+        daemon=True,
+    ).start()
 
     logger.info("serving on http://%s:%s", BIND_HOST, AGENT_HTTP_PORT)
     server.run()  # handles SIGTERM/SIGINT itself

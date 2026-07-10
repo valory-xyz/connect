@@ -20,13 +20,16 @@
 """FastAPI application factory."""
 
 import threading
+import typing as t
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
 from pearl_connect.server import pearl_routes, signer_routes
-from pearl_connect.server.auth import RequireAuth
+from pearl_connect.server.auth import AuthMiddleware, RequireAuth
+from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.signer import Signer
 
 
@@ -38,7 +41,15 @@ def create_app(
     token: str,
 ) -> FastAPI:
     """Create app."""
-    app = FastAPI(title="pearl-connect")
+    mcp = build_mcp(signer, config, activity)
+    mcp_app = mcp.streamable_http_app()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> t.AsyncIterator[None]:
+        async with mcp.session_manager.run():
+            yield
+
+    app = FastAPI(title="pearl-connect", lifespan=lifespan)
     app.state.signer = signer
     app.state.config = config
     app.state.activity = activity
@@ -49,4 +60,5 @@ def create_app(
         signer_routes.router,
         dependencies=[Depends(RequireAuth(token, activity))],
     )
+    app.mount("/mcp", AuthMiddleware(mcp_app, token, activity))
     return app

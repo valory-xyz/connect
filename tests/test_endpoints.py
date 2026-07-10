@@ -142,6 +142,10 @@ class TestAuth:
         )
         assert response.status_code == 200
 
+    def test_mcp_mount_requires_token(self, client: TestClient) -> None:
+        """Test mcp mount requires token."""
+        assert client.post("/mcp/", json={}).status_code == 401
+
     def test_sign_message_roundtrip(
         self, client: TestClient, account: LocalAccount
     ) -> None:
