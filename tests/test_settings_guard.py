@@ -20,6 +20,7 @@
 """Tests for the tamper-evident settings store and the guardrail."""
 
 import json
+import logging
 import typing as t
 from pathlib import Path
 
@@ -548,6 +549,26 @@ class TestSettingsEndpoints:
         )
         assert bad.status_code == 400
         assert "harness" in bad.json()["detail"]
+
+    def test_unconfigured_whitelist_chain_warns(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A whitelist entry for an unconfigured chain saves, but loudly.
+
+        Rejecting would break saving the defaults (they span chains this run
+        may not have); silence would hide the typo until a call is blocked.
+        """
+        with caplog.at_level(logging.WARNING):
+            response = client.post(
+                "/settings",
+                json={
+                    "password": TEST_PASSWORD,
+                    "mode": "restricted",
+                    "whitelist": {"gnosiss": [WHITELISTED]},
+                },
+            )
+        assert response.status_code == 200
+        assert "gnosiss" in caplog.text
 
     def test_invalid_mode_and_address_are_400(self, client: TestClient) -> None:
         """Validation errors name the offending value."""

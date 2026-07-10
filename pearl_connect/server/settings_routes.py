@@ -79,6 +79,9 @@ def update_settings(body: SettingsUpdate, request: Request) -> dict:
         settings = Settings.from_raw(body.mode, body.whitelist, body.harness)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    unknown = sorted(set(settings.whitelist) - set(state.config.chains))
+    if unknown:
+        logger.warning("whitelist chains not configured: %s", ", ".join(unknown))
     state.settings_store.save(settings)
     state.activity.record("settings_changed", mode=settings.mode)
     logger.info("settings updated: mode=%s", settings.mode)

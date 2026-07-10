@@ -154,6 +154,10 @@ class Signer:
         self._requests = _IdempotencyCache()
         self._guard = guard
 
+    def set_guard(self, guard: Guard) -> None:
+        """Attach the guardrail; the boot path passes it to the constructor."""
+        self._guard = guard
+
     @property
     def address(self) -> str:
         """Address."""

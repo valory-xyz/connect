@@ -223,7 +223,7 @@ def make_app(guard: Guard, settings_store: SettingsStore) -> t.Callable:
         token: str = "tok",  # nosec B107
     ) -> t.Any:
         # the app's signing endpoints must honor the same guard the app serves
-        signer._guard = guard  # pylint: disable=protected-access
+        signer.set_guard(guard)
         return create_app(
             signer=signer,
             config=config,
