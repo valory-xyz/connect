@@ -20,6 +20,7 @@
 """Test config module."""
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,18 @@ def test_safes_json_format(tmp_path: Path) -> None:
     config = load_config(env)
     assert config.chains["gnosis"].safe_address == safe
     assert config.chains["base"].safe_address is None
+
+
+def test_safe_for_unconfigured_chain_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A safe whose chain has no RPC is dropped with a warning, never silently."""
+    safe = "0x" + "11" * 20
+    env = base_env(tmp_path) | {SAFES_ENV: json.dumps({"gnosiss": safe})}
+    with caplog.at_level(logging.WARNING):
+        config = load_config(env)
+    assert config.chains["gnosis"].safe_address is None
+    assert "gnosiss" in caplog.text
 
 
 def test_safes_invalid_json_raises(tmp_path: Path) -> None:

@@ -232,3 +232,6 @@ packages/valory/*
 
 # Agent's store
 data/
+
+# Local-testing keystore (the runtime reads it from cwd; never commit key material)
+ethereum_private_key.txt

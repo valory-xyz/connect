@@ -25,9 +25,12 @@ knows the env var names.
 """
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger("agent")
 
 AGENT_HTTP_PORT = 8716
 BIND_HOST = "127.0.0.1"
@@ -145,6 +148,12 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
     for chain_name, safe in _parse_safes(env.get(SAFES_ENV, "")).items():
         if chain_name in chains:
             chains[chain_name].safe_address = safe
+        else:
+            # a typo'd chain key must not silently leave a chain safeless
+            logger.warning(
+                "safe address for chain '%s' ignored: no RPC configured for it",
+                chain_name,
+            )
 
     store_raw = env.get(STORE_PATH_ENV, "").strip()
     if not store_raw:
