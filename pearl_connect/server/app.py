@@ -20,7 +20,6 @@
 """FastAPI application factory."""
 
 import threading
-import time
 
 from fastapi import Depends, FastAPI
 
@@ -43,7 +42,6 @@ def create_app(
     app.state.signer = signer
     app.state.config = config
     app.state.activity = activity
-    app.state.started_at = time.monotonic()
     app.state.funds_cache = {"at": 0.0, "value": {}, "lock": threading.Lock()}
 
     app.include_router(pearl_routes.router)

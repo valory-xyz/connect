@@ -74,6 +74,21 @@ class TestSigner:
         assert first == second
         assert len(fake_w3.eth.sent) == 1  # broadcast exactly once
 
+    def test_failed_send_resyncs_nonce_from_node(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """A failed send drops the local counter so the next send re-reads pending."""
+        test_signer.send("testchain", to="0x" + "aa" * 20)  # local counter -> 6
+        fake_w3.eth.fail_broadcast = True
+        with pytest.raises(SignerError):
+            test_signer.send("testchain", to="0x" + "aa" * 20)
+        fake_w3.eth.fail_broadcast = False
+        test_signer.send("testchain", to="0x" + "aa" * 20)
+        nonces = [_tx_nonce(raw) for raw in fake_w3.eth.sent]
+        # the retry resynced from the node's pending count (still 5), instead
+        # of continuing from the stale local counter (which would send 6)
+        assert nonces == [5, 5]
+
     def test_nonces_are_sequential_under_concurrency(
         self, test_signer: Signer, fake_w3: FakeW3, account: LocalAccount
     ) -> None:

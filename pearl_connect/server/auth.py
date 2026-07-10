@@ -47,7 +47,9 @@ def token_matches(expected: str, header: str | None) -> bool:
     """Token matches."""
     if not header or not header.startswith("Bearer "):
         return False
-    return hmac.compare_digest(expected, header.removeprefix("Bearer "))
+    return hmac.compare_digest(
+        expected.encode(), header.removeprefix("Bearer ").encode()
+    )
 
 
 class RequireAuth:

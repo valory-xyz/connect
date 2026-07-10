@@ -60,10 +60,9 @@ class TestOpenEndpoints:
         """Test healthcheck."""
         response = client.get("/healthcheck")
         assert response.status_code == 200
-        body = response.json()
-        assert body["is_healthy"] is True
-        assert "rounds" in body
-        assert "seconds_since_last_transition" in body
+        # is_healthy is the only field the middleware's HealthChecker reads;
+        # no decorative FSM fields (rounds, transition counters)
+        assert response.json() == {"is_healthy": True}
 
     def test_funds_status_empty_without_requirements(self, client: TestClient) -> None:
         """Test funds status empty without requirements."""
@@ -102,6 +101,18 @@ class TestAuth:
             client.get("/wallet", headers={"Authorization": "Bearer nope"}).status_code
             == 401
         )
+
+    def test_non_ascii_token_is_401_not_500(self, client: TestClient) -> None:
+        """A malformed (non-ASCII) bearer header is a clean 401, not a crash.
+
+        hmac.compare_digest raises TypeError on non-ASCII strs; the header is
+        sent as latin-1 bytes because that is what the wire allows and how
+        Starlette decodes it.
+        """
+        response = client.get(
+            "/wallet", headers={b"Authorization": "Bearer é".encode("latin-1")}
+        )
+        assert response.status_code == 401
 
     def test_wallet_with_token(
         self, client: TestClient, test_signer: Signer, fake_w3: FakeW3

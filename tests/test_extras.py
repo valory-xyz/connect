@@ -263,6 +263,18 @@ class TestSignerExtras:
         assert cache.run("k", lambda: "0xaaa") == "0xaaa"
         assert cache.run("k", lambda: "0xbbb") == "0xaaa"  # action not re-run
 
+    def test_idempotency_cache_evicts_oldest(self) -> None:
+        """The result cache is bounded; the oldest replays are dropped first."""
+        from pearl_connect.signer import _IdempotencyCache
+
+        cache = _IdempotencyCache(max_results=2)
+        cache.run("a", lambda: "0xa")
+        cache.run("b", lambda: "0xb")
+        cache.run("c", lambda: "0xc")
+        assert cache.cached("a") is None  # evicted; a very late retry re-runs
+        assert cache.cached("b") == "0xb"
+        assert cache.cached("c") == "0xc"
+
     def test_failed_send_releases_request_id(
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:

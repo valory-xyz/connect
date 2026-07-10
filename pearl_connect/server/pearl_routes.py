@@ -40,15 +40,12 @@ FUNDS_STATUS_CACHE_SECONDS = 30
 
 
 @router.get("/healthcheck")
-def healthcheck(request: Request) -> dict:
-    """Healthcheck."""
-    return {
-        "is_healthy": True,
-        "rounds": {"current": "idle", "previous": "idle"},
-        "seconds_since_last_transition": int(
-            time.monotonic() - request.app.state.started_at
-        ),
-    }
+def healthcheck() -> dict:
+    """Healthcheck.
+
+    The middleware's HealthChecker reads only is_healthy
+    """
+    return {"is_healthy": True}
 
 
 @router.get("/funds-status")

@@ -80,13 +80,17 @@ class _ChainPool:
             return self._states.setdefault(chain, state)
 
 
+MAX_CACHED_RESULTS = 1024
+
+
 class _IdempotencyCache:
     """At-most-once execution of actions keyed by caller-chosen request ids."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_results: int = MAX_CACHED_RESULTS) -> None:
         """Initialize."""
         self._lock = threading.Lock()
-        self._results: dict[str, str] = {}  # request_id -> tx_hash
+        self._max_results = max_results
+        self._results: dict[str, str] = {}  # request_id -> tx_hash, insertion-ordered
         self._in_flight: set[str] = set()  # request_ids currently executing
 
     def run(self, key: str, action: t.Callable[[], str]) -> str:
@@ -124,6 +128,11 @@ class _IdempotencyCache:
         with self._lock:
             self._results[key] = result
             self._in_flight.discard(key)
+            # bound memory over a long run: a request_id evicted here and
+            # retried much later re-broadcasts, which is the right trade at
+            # that distance — retries cluster within seconds of the original
+            while len(self._results) > self._max_results:
+                del self._results[next(iter(self._results))]
         return result
 
 
@@ -208,7 +217,11 @@ class Signer:
                 ).to_0x_hex()
             except Exception as e:
                 # covers gas-estimation reverts (the common failure), RPC and
-                # signing errors — all must surface as a structured SignerError
+                # signing errors — all must surface as a structured SignerError.
+                # A failure may also mean the local nonce counter is wrong
+                # (e.g. "nonce too low" after a pool drop): forget it so the
+                # next send resyncs from the node's pending count.
+                state.next_nonce = None
                 self._activity.record(
                     "send_failed", chain=chain, to=to, value=str(value), error=str(e)
                 )
