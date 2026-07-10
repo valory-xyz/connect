@@ -97,6 +97,55 @@ def test_user_files_survive(store_path: Path) -> None:
     assert (user_skill / "SKILL.md").read_text() == "mine too"
 
 
+def test_gitignore_provisioned_and_preserved(store_path: Path) -> None:
+    """The token file is gitignored; user entries survive; idempotent."""
+    workspace._ensure_gitignore(store_path)  # pylint: disable=protected-access
+    content = (store_path / ".gitignore").read_text()
+    assert ".mcp.json" in content
+
+    (store_path / ".gitignore").write_text("user-stuff/\n")
+    workspace._ensure_gitignore(store_path)  # pylint: disable=protected-access
+    content = (store_path / ".gitignore").read_text()
+    assert "user-stuff/" in content
+    assert ".mcp.json" in content
+
+    before = (store_path / ".gitignore").read_text()
+    workspace._ensure_gitignore(store_path)  # pylint: disable=protected-access
+    assert (store_path / ".gitignore").read_text() == before  # no growth
+
+
+def test_claude_settings_deny_rule_merged(store_path: Path) -> None:
+    """The Read deny rule lands without clobbering user settings."""
+    import json
+
+    settings_path = store_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(
+        json.dumps({"permissions": {"deny": ["WebFetch"]}, "model": "opus"})
+    )
+    workspace._ensure_claude_settings(store_path)  # pylint: disable=protected-access
+    config = json.loads(settings_path.read_text())
+    assert config["model"] == "opus"
+    assert "WebFetch" in config["permissions"]["deny"]
+    assert "Read(./.mcp.json)" in config["permissions"]["deny"]
+
+    # invalid JSON is rewritten rather than crashing the boot
+    settings_path.write_text("{nope")
+    workspace._ensure_claude_settings(store_path)  # pylint: disable=protected-access
+    config = json.loads(settings_path.read_text())
+    assert config["permissions"]["deny"] == ["Read(./.mcp.json)"]
+
+
+def test_populate_provisions_token_hygiene(store_path: Path) -> None:
+    """populate() ships the gitignore and the deny rule alongside the skill."""
+    import json
+
+    workspace.populate(store_path, "tok")
+    assert ".mcp.json" in (store_path / ".gitignore").read_text()
+    config = json.loads((store_path / ".claude" / "settings.json").read_text())
+    assert "Read(./.mcp.json)" in config["permissions"]["deny"]
+
+
 def test_deep_links(store_path: Path) -> None:
     """Deep links and the harness-dependent launch order."""
     assert workspace.desktop_deep_link(store_path).startswith(

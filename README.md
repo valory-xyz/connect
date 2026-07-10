@@ -57,6 +57,24 @@ while the server is stopped escapes the pin. Operators change mode/whitelist in 
 `http://127.0.0.1:8716/`; the change is authenticated by re-decrypting the
 keystore with the submitted password, not by the session's bearer token.
 
+## Threat-model notes
+
+Binding to `127.0.0.1` does **not** make the server unreachable from the web:
+any page the user's browser visits can fire requests at localhost, and DNS
+rebinding defeats some browser-side protections. Hence: every state-changing
+route requires the bearer token (or the keystore password for `/settings`),
+Origin headers are validated, only loopback Host headers are accepted, and no
+CORS is enabled. Repeated auth failures are audited to the activity log and
+rate-limited (429) so a probed token is loud, not silent. The token itself is
+header-only, rotated per run, dies with the process, and the provisioned
+workspace ships a `.gitignore` and a Claude Code `Read` deny rule so it is
+neither committed nor read into session transcripts.
+
+Out of scope for v1: SSH port forwarding or running on a shared/remote
+machine voids the loopback assumption entirely, and same-user local malware
+can read `.mcp.json` directly — the guardrail (not the token) is the defense
+that survives those.
+
 ## Mech requests
 
 The `mech_request` MCP tool drives [mech](https://olas.network/services/ai-mechs)

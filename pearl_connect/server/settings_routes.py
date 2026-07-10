@@ -57,8 +57,11 @@ def get_settings(request: Request) -> dict:
     return request.app.state.settings_store.load().to_dict()
 
 
-def _reject_password() -> HTTPException:
-    """Throttle a failed password attempt, returning the 401 to raise."""
+def _reject_password(request: Request) -> HTTPException:
+    """Audit + brake a failed password attempt, returning the 401 to raise."""
+    state = request.app.state
+    state.activity.record("auth_failed", path="/settings", reason="bad password")
+    state.auth_limiter.record_failure()
     time.sleep(WRONG_PASSWORD_DELAY_SECONDS)  # throttle guessing
     return HTTPException(status_code=401, detail="invalid password")
 
@@ -67,13 +70,18 @@ def _reject_password() -> HTTPException:
 def update_settings(body: SettingsUpdate, request: Request) -> dict:
     """Update mode/whitelist after proving knowledge of the keystore password."""
     state = request.app.state
+    if state.auth_limiter.blocked():
+        raise HTTPException(
+            status_code=429,
+            detail="too many failed authentication attempts; retry later",
+        )
     try:
         account = load_account(body.password)
     except KeystoreError as e:
-        raise _reject_password() from e
+        raise _reject_password(request) from e
     if account.address != state.signer.address:
         # a different keystore at the path than the one we booted from
-        raise _reject_password()
+        raise _reject_password(request)
 
     try:
         settings = Settings.from_raw(body.mode, body.whitelist, body.harness)

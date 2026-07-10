@@ -983,6 +983,82 @@ class TestSettingsEndpoints:
         assert response.status_code == 200
         assert "gnosiss" in caplog.text
 
+    def test_host_header_is_validated(self, client: TestClient) -> None:
+        """A rebound (non-loopback) Host header is refused app-wide."""
+        response = client.get("/healthcheck", headers={"host": "evil.example:8716"})
+        assert response.status_code == 400
+
+    def test_settings_routes_reject_cross_origin(self, client: TestClient) -> None:
+        """Both settings routes refuse browser cross-origin requests."""
+        headers = {"Origin": "https://evil.example"}
+        assert client.get("/settings", headers=headers).status_code == 403
+        response = client.post(
+            "/settings",
+            json={"password": TEST_PASSWORD, "mode": "restricted", "whitelist": {}},
+            headers=headers,
+        )
+        assert response.status_code == 403
+
+    def test_auth_failures_are_audited_and_braked(
+        self,
+        client: TestClient,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Probing is recorded and, past the threshold, answered with 429."""
+        from pearl_connect.server import auth as auth_module
+        from pearl_connect.server import settings_routes
+
+        monkeypatch.setattr(settings_routes.time, "sleep", lambda _: None)
+
+        # a failed token and a failed password both land in the audit log
+        assert client.get("/wallet").status_code == 401
+        client.post(
+            "/settings",
+            json={
+                "password": "wrong",
+                "mode": "restricted",
+                "whitelist": {},
+            },  # nosec B105
+        )
+        reasons = [e["reason"] for e in activity.recent() if e["kind"] == "auth_failed"]
+        assert "bad token" in reasons
+        assert "bad password" in reasons
+
+        # cross the threshold: every authenticated surface goes 429
+        for _ in range(auth_module.MAX_AUTH_FAILURES):
+            client.get("/wallet")
+        assert client.get("/wallet").status_code == 429
+        assert (
+            client.get("/wallet", headers={"Authorization": "Bearer tok"}).status_code
+            == 429
+        )
+        assert (
+            client.post(
+                "/settings",
+                json={
+                    "password": TEST_PASSWORD,
+                    "mode": "restricted",
+                    "whitelist": {},
+                },
+            ).status_code
+            == 429
+        )
+        assert client.post("/mcp/", json={}).status_code == 429
+
+        # the brake releases once the window drains
+        real_monotonic = auth_module.time.monotonic
+        monkeypatch.setattr(
+            auth_module.time,
+            "monotonic",
+            lambda: real_monotonic() + auth_module.AUTH_FAILURE_WINDOW_SECONDS + 1,
+        )
+        assert client.get("/healthcheck").status_code == 200
+        assert (
+            client.get("/wallet", headers={"Authorization": "Bearer tok"}).status_code
+            == 200
+        )
+
     def test_invalid_mode_and_address_are_400(self, client: TestClient) -> None:
         """Validation errors name the offending value."""
         bad_mode = client.post(

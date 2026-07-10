@@ -21,6 +21,8 @@ pearl-connect server owns — don't hand-edit them:
 - `.claude/skills/pearl-connect/` — your skill, kept up to date by the server
 - `pearl-connect.settings.json` — agent wallet's settings; integrity-checked, any
   hand-edit is detected and reset to safe defaults
+- `.gitignore` / `.claude/settings.json` — the server re-adds its token-hygiene
+  entries (never commit or Read `.mcp.json`) if they go missing
 - this `CLAUDE.md` itself
 
 The pearl-connect server that launched this session runs on

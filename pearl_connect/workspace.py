@@ -41,6 +41,12 @@ logger = logging.getLogger("agent")
 MCP_SERVER_NAME = "pearl-connect"
 MCP_CONFIG_FILE = ".mcp.json"
 SKILLS_SUBDIR = Path(".claude") / "skills"
+CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
+# the harness itself reads .mcp.json; the model never needs to, and reading
+# it would put the bearer token into the session transcript
+TOKEN_DENY_RULES = ("Read(./.mcp.json)",)
+# a `git init` in the workspace must never be able to stage the token
+GITIGNORE_ENTRIES = (".mcp.json",)
 
 
 def assets_dir() -> Path:
@@ -61,6 +67,8 @@ def populate(store_path: Path, token: str) -> None:
     """Populate the workspace: MCP config, agent context, bundled skills."""
     store_path.mkdir(parents=True, exist_ok=True)
     _ensure_mcp_config(store_path, token)
+    _ensure_gitignore(store_path)
+    _ensure_claude_settings(store_path)
     _install_claude_md(store_path)
     _install_skills(store_path)
 
@@ -96,6 +104,41 @@ def _ensure_mcp_config(store_path: Path, token: str) -> None:
     tmp.write_text(json.dumps(config, indent=2), encoding="utf-8")
     tmp.chmod(0o600)
     tmp.replace(path)
+
+
+def _ensure_gitignore(store_path: Path) -> None:
+    """Keep the token file out of any repo the agent may init here."""
+    path = store_path / ".gitignore"
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    missing = [entry for entry in GITIGNORE_ENTRIES if entry not in existing]
+    if not missing:
+        return
+    lines = existing + ["# pearl-connect: never commit the signer token"] + missing
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _ensure_claude_settings(store_path: Path) -> None:
+    """Merge our token-hygiene deny rules into .claude/settings.json.
+
+    Denying the Read tool keeps the token out of session transcripts; the
+    Claude Code harness parses .mcp.json itself, the model never needs it.
+    User-added settings in the file are preserved.
+    """
+    path = store_path / CLAUDE_SETTINGS_FILE
+    config: dict = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                config = existing
+        except json.JSONDecodeError:
+            logger.warning("existing %s is invalid JSON; rewriting it", path)
+    deny = config.setdefault("permissions", {}).setdefault("deny", [])
+    for rule in TOKEN_DENY_RULES:
+        if rule not in deny:
+            deny.append(rule)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
 def _install_skills(store_path: Path) -> None:

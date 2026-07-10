@@ -42,7 +42,7 @@ from pearl_connect.config import (
 from pearl_connect.guard import Guard
 from pearl_connect.keystore import KeystoreError, load_account
 from pearl_connect.mech import MechService
-from pearl_connect.server.auth import AuthMiddleware
+from pearl_connect.server.auth import AuthFailureLimiter, AuthMiddleware
 from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer, SignerError
@@ -282,13 +282,17 @@ class TestAuthMiddlewareASGI:
 
     async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
         """Lifespan scopes bypass auth."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         _, passed = await self._run(middleware, {"type": "lifespan"})
         assert passed == ["lifespan"]
 
     async def test_bad_origin_rejected(self, activity: ActivityLog) -> None:
         """Cross-origin requests get 403."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         scope = {
             "type": "http",
             "headers": [(b"origin", b"https://evil.example")],
@@ -299,21 +303,27 @@ class TestAuthMiddlewareASGI:
 
     async def test_bad_token_rejected(self, activity: ActivityLog) -> None:
         """Missing token gets 401."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         sent, passed = await self._run(middleware, {"type": "http", "headers": []})
         assert sent[0]["status"] == 401
         assert not passed
 
     async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
         """Websocket scopes never reach the inner app; the handshake is closed."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
         assert not passed
         assert sent == [{"type": "websocket.close"}]
 
     async def test_valid_request_passes(self, activity: ActivityLog) -> None:
         """Correct token reaches the inner app."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         scope = {"type": "http", "headers": [(b"authorization", b"Bearer tok")]}
         _, passed = await self._run(middleware, scope)
         assert passed == ["http"]
