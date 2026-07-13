@@ -20,6 +20,7 @@
 """Test endpoints module."""
 
 import typing as t
+from pathlib import Path
 
 import pytest
 from eth_account.signers.local import LocalAccount
@@ -49,6 +50,17 @@ def client(
         yield client
 
 
+def _complete_bundle(assets: Path) -> None:
+    """Give a fake bundle what the workspace provisions from.
+
+    A bundle is not only a UI: without CLAUDE.md and the skills the workspace
+    cannot be provisioned, and the server would report itself unhealthy — which
+    is exactly what these tests must NOT be measuring.
+    """
+    (assets / "CLAUDE.md").write_text("brief")
+    (assets / "skills").mkdir(exist_ok=True)
+
+
 def auth(extra: dict | None = None) -> dict:
     """Auth."""
     return {"Authorization": f"Bearer {TOKEN}", **(extra or {})}
@@ -64,6 +76,71 @@ class TestOpenEndpoints:
         # is_healthy is the only field the middleware's HealthChecker reads;
         # no decorative FSM fields (rounds, transition counters)
         assert response.json() == {"is_healthy": True}
+
+    def test_bundled_ui_is_served_and_shadows_nothing(
+        self,
+        make_app: t.Callable,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A UI build in assets/ui is served at /, with the API untouched.
+
+        The whole integration contract: replace what is in that directory,
+        change nothing else.
+        """
+        assets = tmp_path / "assets"
+        ui = assets / "ui"
+        (ui / "assets").mkdir(parents=True)
+        (ui / "index.html").write_text("<!doctype html><title>the real ui</title>")
+        (ui / "assets" / "app.js").write_text("console.log('hi')")
+        _complete_bundle(assets)  # the workspace provisions from it too
+        monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+
+        with TestClient(
+            make_app(test_signer, app_config, activity),
+            base_url="http://127.0.0.1:8716",
+        ) as client:
+            page = client.get("/")
+            assert page.status_code == 200
+            assert "<title>the real ui</title>" in page.text  # not the stand-in
+            assert "Pearl Connect" not in page.text
+            assert client.get("/assets/app.js").status_code == 200
+            # the API keeps precedence: the mount only sees what no route took
+            assert client.get("/healthcheck").json() == {"is_healthy": True}
+            assert client.get("/settings").status_code == 200
+
+    def test_ships_a_stand_in_ui(self, client: TestClient) -> None:
+        """The bundled stand-in page serves until the real UI replaces it."""
+        page = client.get("/")
+        assert page.status_code == 200
+        assert "Pearl Connect" in page.text
+        # it drives the endpoints rather than being rendered by the server
+        assert 'id="open-session"' in page.text
+        assert 'fetch("/settings")' in page.text
+
+    def test_api_survives_a_bundle_without_a_ui(
+        self,
+        make_app: t.Callable,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A bundle with no UI at all still serves the agent, just no page."""
+        assets = tmp_path / "assets"
+        assets.mkdir()
+        _complete_bundle(assets)
+        monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+        with TestClient(
+            make_app(test_signer, app_config, activity),
+            base_url="http://127.0.0.1:8716",
+        ) as client:
+            assert client.get("/").status_code == 404
+            assert client.get("/healthcheck").json() == {"is_healthy": True}
 
     def test_healthcheck_reports_unready(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch

@@ -19,11 +19,13 @@
 
 """FastAPI application factory."""
 
+import logging
 import threading
 import typing as t
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from pearl_connect.activity import ActivityLog
@@ -41,7 +43,9 @@ from pearl_connect.server.auth import (
 from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer
-from pearl_connect.workspace import Workspace
+from pearl_connect.workspace import Workspace, ui_build_dir
+
+logger = logging.getLogger("agent")
 
 
 def create_app(  # pylint: disable=too-many-arguments
@@ -95,4 +99,13 @@ def create_app(  # pylint: disable=too-many-arguments
         dependencies=[Depends(RequireAuth(token, activity, limiter))],
     )
     app.mount("/mcp", AuthMiddleware(mcp_app, token, activity, limiter))
+
+    # the agent UI last, so it can own / without shadowing an endpoint: routes
+    # match in registration order, and this mount would swallow anything below
+    # it. The bundle ships a stand-in page;
+    # a bundle with no UI at all still serves the API (see ui_build_dir).
+    ui = ui_build_dir()
+    if ui is not None:
+        logger.info("serving the agent UI from %s", ui)
+        app.mount("/", StaticFiles(directory=ui, html=True), name="ui")
     return app

@@ -1224,9 +1224,11 @@ class TestSettingsEndpoints:
         assert flipped.status_code == 200
         assert flipped.json()["harness"] == "claude_code_cli"
         assert client.get("/settings").json()["harness"] == "claude_code_cli"
-        # the UI reflects the choice; POST /session is what acts on it
+        # the page offers both harnesses; which one is current it reads back
+        # from /settings, and POST /session is what acts on it
         page = client.get("/").text
         assert 'value="claude_code_cli"' in page
+        assert 'value="claude_code_desktop"' in page
         # the button must exist *before* the inline script that binds it:
         # getElementById returns null for an element the parser has not reached,
         # so a button emitted after </script> throws and silently does nothing
@@ -1716,10 +1718,15 @@ class TestSettingsEndpoints:
         # nothing changed on disk
         assert client.get("/settings").json()["harness"] == "claude_code_desktop"
 
-    def test_index_shows_mode_and_whitelist(
+    def test_the_ui_reads_the_settings_it_shows(
         self, client: TestClient, settings_store: SettingsStore
     ) -> None:
-        """The agent UI renders the mode and the whitelist entries."""
+        """The page is static: what it renders comes from GET /settings.
+
+        So the guardrail state the operator sees is whatever the store hands
+        back — including a reset after a tamper — with no second rendering
+        path to drift from it.
+        """
         settings_store.save(
             Settings(
                 protected=Protected(
@@ -1728,9 +1735,10 @@ class TestSettingsEndpoints:
             )
         )
         page = client.get("/").text
-        assert "restricted" in page
-        assert f"testchain:{WHITELISTED}" in page
-        assert "Guardrail settings" in page
+        assert "Guardrail settings" in page  # the page the UI mount serves
+        served = client.get("/settings").json()  # ...and the state it fetches
+        assert served["protected"]["mode"] == "restricted"
+        assert served["protected"]["whitelist"] == {"testchain": [WHITELISTED.lower()]}
 
 
 class TestMcpGuardrailTools:

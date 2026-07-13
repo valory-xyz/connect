@@ -169,6 +169,23 @@ def test_deep_links(store_path: Path) -> None:
     assert agent_workspace.deep_link("claude_code_cli").startswith("claude-cli://")
 
 
+def test_ui_build_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The UI turns on when a build is dropped in, and never breaks boot."""
+    assets = tmp_path / "assets"
+    (assets / "ui").mkdir(parents=True)
+    monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+    assert workspace.ui_build_dir() is None  # a bare dir is not a build
+    (assets / "ui" / "index.html").write_text("<!doctype html>")
+    assert workspace.ui_build_dir() == assets / "ui"
+
+    # a bundle missing altogether must not take the server down with it
+    def no_assets() -> Path:
+        raise FileNotFoundError("bundled assets not found")
+
+    monkeypatch.setattr(workspace, "assets_dir", no_assets)
+    assert workspace.ui_build_dir() is None
+
+
 def test_deep_link_rejects_an_unknown_harness(store_path: Path) -> None:
     """A harness with no link raises, instead of quietly opening the desktop."""
     agent_workspace = Workspace(store_path, "tok")  # nosec B106

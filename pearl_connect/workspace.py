@@ -52,6 +52,7 @@ logger = logging.getLogger("agent")
 
 MCP_SERVER_NAME = "pearl-connect"
 MCP_CONFIG_FILE = ".mcp.json"
+UI_SUBDIR = "ui"  # where a bundled agent-UI build is dropped in (see assets/ui/README.md)
 SKILLS_SUBDIR = Path(".claude") / "skills"
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harness itself reads .mcp.json; the model never needs to, and reading
@@ -77,6 +78,19 @@ def assets_dir() -> Path:
 def mcp_url() -> str:
     """Mcp url."""
     return f"http://{BIND_HOST}:{AGENT_HTTP_PORT}/mcp"
+
+
+def ui_build_dir() -> Path | None:
+    """Return the bundled agent UI, or None if no build has been dropped in.
+
+    The UI ships as a static build (index.html + its assets) under
+    assets/ui — see the README there.
+    """
+    try:
+        candidate = assets_dir() / UI_SUBDIR
+    except FileNotFoundError:  # no bundle at all (a source checkout under test)
+        return None
+    return candidate if (candidate / "index.html").is_file() else None
 
 
 def desktop_deep_link(store_path: Path) -> str:
