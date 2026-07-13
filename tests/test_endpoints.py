@@ -118,8 +118,38 @@ class TestOpenEndpoints:
         assert page.status_code == 200
         assert "Pearl Connect" in page.text
         # it drives the endpoints rather than being rendered by the server
-        assert 'id="open-session"' in page.text
         assert 'fetch("/settings")' in page.text
+        # and its button is bindable: an element emitted after the inline
+        # script is null when the handler runs, so the button would look
+        # right and do nothing at all
+        assert 0 < page.text.index('id="open-session"') < page.text.index("<script>")
+
+    def test_the_stand_in_ui_matches_the_api_it_drives(
+        self, client: TestClient
+    ) -> None:
+        """The page's contract with the server, pinned.
+
+        Nothing in the Python suite executes this page's JavaScript, and it is
+        the operator's only way to change the guardrail. So at least hold it to
+        the endpoints and the settings shape it reads: renaming either would
+        otherwise break the control surface with every test still green.
+        """
+        page = client.get("/").text
+        for call in ('fetch("/settings")', 'fetch("/settings", {', 'fetch("/session"'):
+            assert call in page
+        for method in ('method: "PATCH"', 'method: "POST"'):
+            assert method in page
+        # the inputs its script reads by name: renaming one silently breaks it
+        for field in ('name="mode"', 'name="whitelist"', 'name="password"'):
+            assert field in page
+        assert 'name="harness"' in page
+        # the canonical shape it renders, exactly as GET /settings returns it
+        served = client.get("/settings").json()
+        assert set(served) == {"protected", "harness"}
+        assert set(served["protected"]) == {"mode", "whitelist"}
+        for path in ("settings.protected.mode", "settings.protected.whitelist"):
+            assert path in page
+        assert "settings.harness" in page
 
     def test_api_survives_a_bundle_without_a_ui(
         self,

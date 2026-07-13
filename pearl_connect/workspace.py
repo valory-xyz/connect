@@ -52,7 +52,8 @@ logger = logging.getLogger("agent")
 
 MCP_SERVER_NAME = "pearl-connect"
 MCP_CONFIG_FILE = ".mcp.json"
-UI_SUBDIR = "ui"  # where a bundled agent-UI build is dropped in (see assets/ui/README.md)
+# where a bundled agent-UI build is dropped in (see assets/ui/README.md)
+UI_SUBDIR = "ui"
 SKILLS_SUBDIR = Path(".claude") / "skills"
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harness itself reads .mcp.json; the model never needs to, and reading

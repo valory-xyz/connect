@@ -1224,15 +1224,6 @@ class TestSettingsEndpoints:
         assert flipped.status_code == 200
         assert flipped.json()["harness"] == "claude_code_cli"
         assert client.get("/settings").json()["harness"] == "claude_code_cli"
-        # the page offers both harnesses; which one is current it reads back
-        # from /settings, and POST /session is what acts on it
-        page = client.get("/").text
-        assert 'value="claude_code_cli"' in page
-        assert 'value="claude_code_desktop"' in page
-        # the button must exist *before* the inline script that binds it:
-        # getElementById returns null for an element the parser has not reached,
-        # so a button emitted after </script> throws and silently does nothing
-        assert 0 < page.index('id="open-session"') < page.index("<script>")
 
         bad = client.patch("/settings", json={"harness": "cursor"})
         assert bad.status_code == 400

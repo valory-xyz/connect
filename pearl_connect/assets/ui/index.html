@@ -58,16 +58,25 @@ without the password.</p>
 function setResult(id, text) { document.getElementById(id).textContent = text; }
 
 async function load() {
-  const response = await fetch("/settings");
-  const settings = await response.json();
-  document.getElementById("mode").textContent = settings.protected.mode;
-  document.getElementById("current-harness").textContent = settings.harness;
-  const form = document.getElementById("settings-form");
-  form.mode.value = settings.protected.mode;
-  form.whitelist.value = Object.entries(settings.protected.whitelist)
-    .flatMap(([chain, addresses]) => addresses.map((a) => chain + ":" + a))
-    .join("\n");
-  document.getElementById("harness-form").harness.value = settings.harness;
+  try {
+    const response = await fetch("/settings");
+    if (!response.ok) throw new Error("/settings returned " + response.status);
+    const settings = await response.json();
+    document.getElementById("mode").textContent = settings.protected.mode;
+    document.getElementById("current-harness").textContent = settings.harness;
+    const form = document.getElementById("settings-form");
+    form.mode.value = settings.protected.mode;
+    form.whitelist.value = Object.entries(settings.protected.whitelist)
+      .flatMap(([chain, addresses]) => addresses.map((a) => chain + ":" + a))
+      .join("\n");
+    document.getElementById("harness-form").harness.value = settings.harness;
+  } catch (err) {
+    // say so: a page stuck on its placeholders looks like a slow load, and
+    // the operator would act on a guardrail state it never actually read
+    setResult("mode", "unavailable");
+    setResult("current-harness", "unavailable");
+    setResult("settings-result", "could not read the settings: " + err);
+  }
 }
 
 async function patchSettings(resultId, payload) {
