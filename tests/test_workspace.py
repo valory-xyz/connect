@@ -163,13 +163,19 @@ def test_deep_links(store_path: Path) -> None:
     )
 
 
+def test_deep_link_rejects_an_unknown_harness(store_path: Path) -> None:
+    """A harness with no link raises, instead of quietly opening the desktop."""
+    with pytest.raises(ValueError, match="cursor"):
+        workspace.deep_link(store_path, "cursor")
+
+
 def test_open_session_never_falls_back(
     store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On demand, only the chosen harness counts: no silent other-harness open.
 
-    launch_claude may fall back at boot; open_session must not — the operator
-    picked a harness and needs to see it fail, not to get the other one.
+    The operator picked a harness: they need to see that one fail, not to be
+    handed the other one and told it worked.
     """
     tried: list[str] = []
 

@@ -17,11 +17,15 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Populate the agent workspace (STORE_PATH) and launch the Claude Code session.
+"""Populate the agent workspace (STORE_PATH), and open sessions into it.
 
 STORE_PATH is the persistent_data dir Pearl reserves for this service. On every
 start we ensure our MCP entry in .mcp.json (rotating the token) and overwrite
 our bundled skill, leaving every other file in the workspace alone.
+
+Populating and opening a session are separate concerns: populate() runs once at
+boot and must succeed for the server to report healthy, while open_session()
+runs only when Pearl asks for a session (POST /session).
 """
 
 import json
@@ -34,7 +38,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST
-from pearl_connect.settings import DEFAULT_HARNESS, HARNESS_CLAUDE_CODE_CLI
+from pearl_connect.settings import (
+    DEFAULT_HARNESS,
+    HARNESS_CLAUDE_CODE_CLI,
+    HARNESS_CLAUDE_CODE_DESKTOP,
+)
 
 logger = logging.getLogger("agent")
 
@@ -78,12 +86,14 @@ def populate(store_path: Path, token: str) -> None:
 
 
 def _install_claude_md(store_path: Path) -> None:
-    """Overwrite CLAUDE.md (the agent's identity/context brief) from assets."""
+    """Overwrite CLAUDE.md (the agent's identity/context brief) from assets.
+
+    :raises FileNotFoundError: when the bundled CLAUDE.md is absent.
+    """
     source = assets_dir() / "CLAUDE.md"
-    if source.exists():
-        shutil.copyfile(source, store_path / "CLAUDE.md")
-    else:
-        logger.warning("bundled CLAUDE.md not found under %s", source)
+    if not source.exists():
+        raise FileNotFoundError(f"bundled CLAUDE.md not found under {source}")
+    shutil.copyfile(source, store_path / "CLAUDE.md")
 
 
 def _ensure_mcp_config(store_path: Path, token: str) -> None:
@@ -179,15 +189,31 @@ def cli_deep_link(store_path: Path) -> str:
 
 
 def deep_link(store_path: Path, harness: str = DEFAULT_HARNESS) -> str:
-    """Return the deep link that opens STORE_PATH in the configured harness."""
-    if harness == HARNESS_CLAUDE_CODE_CLI:
-        return cli_deep_link(store_path)
-    return desktop_deep_link(store_path)
+    """Return the deep link that opens STORE_PATH in the given harness.
+
+    Exhaustive by construction: a harness added to HARNESSES without a link
+    here fails loudly instead of quietly opening the desktop app.
+
+    :raises ValueError: on a harness with no deep link.
+    """
+    links = {
+        HARNESS_CLAUDE_CODE_DESKTOP: desktop_deep_link,
+        HARNESS_CLAUDE_CODE_CLI: cli_deep_link,
+    }
+    if harness not in links:
+        raise ValueError(f"no deep link for harness {harness!r}")
+    return links[harness](store_path)
 
 
 def open_session(store_path: Path, harness: str = DEFAULT_HARNESS) -> None:
     """Open a Claude Code session at STORE_PATH, in the chosen harness only.
 
+    Success means the URL handler accepted the deep link, which is as much as
+    the OS tells us: `xdg-open` (and `open`) can exit 0 without any handler
+    having actually opened a window. So a "launched" answer is a best effort,
+    not a proof that the session appeared on screen.
+
+    :raises ValueError: on an unknown harness;
     :raises LaunchError: when that harness's deep link does not open.
     """
     url = deep_link(store_path, harness)

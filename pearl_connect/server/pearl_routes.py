@@ -85,9 +85,12 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
 
     Pearl calls this once /healthcheck reports healthy; nothing is launched at
     boot, so a launch failure reaches the operator's UI instead of dying in
-    this process's log. Always 200 with {launched, harness, error?}: a deep
-    link that will not open is the operator's environment, not a server fault,
-    and the UI needs the reason to raise a dismissable alert.
+    this process's log.
+
+    A deep link that will not open is the operator's environment, not a server
+    fault, so it answers 200 with {launched: false, harness, error} for the UI
+    to show — where a bad request does not: 503 before the workspace is ready,
+    400 on an unknown harness, 403 cross-origin.
 
     An explicit `harness` overrides the saved preference for this launch only:
     the session opens where the caller asked without rewriting what the

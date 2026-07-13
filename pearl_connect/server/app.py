@@ -52,7 +52,7 @@ def create_app(  # pylint: disable=too-many-arguments
     guard: Guard,
     settings_store: SettingsStore,
     mech: MechService,
-    ready: bool = True,
+    ready: bool,
 ) -> FastAPI:
     """Create app."""
     mcp = build_mcp(

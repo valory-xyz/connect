@@ -262,6 +262,7 @@ def make_app(
             guard=guard,
             settings_store=settings_store,
             mech=mech_service,
+            ready=True,
         )
 
     return _make

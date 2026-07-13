@@ -34,7 +34,7 @@ from pathlib import Path
 import uvicorn
 
 from pearl_connect import workspace
-from pearl_connect.activity import ActivityLog
+from pearl_connect.activity import ActivityLog, PERFORMANCE_FILE
 from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
 from pearl_connect.guard import Guard
 from pearl_connect.keystore import KeystoreError, load_account
@@ -102,7 +102,6 @@ def main(argv: list[str] | None = None) -> int:
     # .mcp.json and the skills, the session cannot reach the signer at all.
     try:
         workspace.populate(config.store_path, token)
-        activity.write_performance()
         logger.info("workspace populated at %s", config.store_path)
         ready = True
     except Exception:  # pylint: disable=broad-exception-caught
@@ -110,6 +109,14 @@ def main(argv: list[str] | None = None) -> int:
         # loop the middleware just keeps restarting
         logger.exception("workspace population failed;")
         ready = False
+
+    try:
+        # Pearl reads it whatever our health, so write it
+        # even on a degraded boot. Only a dead disk stops us — and that must not
+        # take the process down with it either.
+        activity.write_performance()
+    except OSError:
+        logger.exception("could not write %s", PERFORMANCE_FILE)
 
     app = create_app(
         signer=signer,

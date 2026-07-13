@@ -155,6 +155,7 @@ def _fork_app(
         guard=guard,
         settings_store=store,
         mech=MechService(signer, config, activity, guard),
+        ready=True,
     )
 
 

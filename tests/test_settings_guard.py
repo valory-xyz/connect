@@ -765,6 +765,31 @@ class TestMech:
         )
         assert len(patched_mech.calls) == 2
 
+    def test_delivered_request_survives_an_unwritable_audit_log(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A paid-for delivery must not be lost to a failing audit write.
+
+        The audit runs after the mech answered: raising would discard a
+        result the operator already paid for, and invite paying again.
+        """
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        result = mech_service.request(
+            "what is the answer",
+            "prediction",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+        )
+        assert result == patched_mech.result
+
     def test_request_offchain_denied_in_restricted(
         self,
         mech_service: MechService,
@@ -1226,6 +1251,30 @@ class TestSettingsEndpoints:
         assert client.get("/settings").json()["harness"] == "claude_code_desktop"
         client.post("/session")
         assert opened == ["claude_code_cli", "claude_code_desktop"]
+
+    def test_session_survives_an_unwritable_audit_log(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The session opened; a failing audit write must not report otherwise.
+
+        Reporting failure after the deep link already fired would have the
+        operator open a second session for work that succeeded.
+        """
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module,
+            "open_session",
+            lambda path, harness: opened.append(harness),
+        )
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        response = client.post("/session")
+        assert response.status_code == 200
+        assert response.json()["launched"] is True
+        assert opened == ["claude_code_desktop"]
 
     def test_session_rejects_an_unknown_harness(self, client: TestClient) -> None:
         """An unknown harness is a 400, not a deep link nobody can open."""
