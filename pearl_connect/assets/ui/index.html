@@ -34,8 +34,8 @@ these requires the keystore password — the agent session does not have it.</p>
 <form id="settings-form">
 <p><label><input type="radio" name="mode" value="restricted"> Restricted</label>
    <label><input type="radio" name="mode" value="unrestricted"> Unrestricted</label></p>
-<p><label>Whitelist (one <code>chain:address</code> per line)<br>
-<textarea name="whitelist"></textarea></label></p>
+<p>Whitelisted targets (not editable yet):</p>
+<pre id="whitelist">…</pre>
 <p><label>Keystore password<br><input type="password" name="password" autocomplete="off"></label></p>
 <button class="btn" type="submit">Apply</button>
 <div class="result" id="settings-result"></div>
@@ -66,9 +66,10 @@ async function load() {
     document.getElementById("current-harness").textContent = settings.harness;
     const form = document.getElementById("settings-form");
     form.mode.value = settings.protected.mode;
-    form.whitelist.value = Object.entries(settings.protected.whitelist)
-      .flatMap(([chain, addresses]) => addresses.map((a) => chain + ":" + a))
-      .join("\n");
+    document.getElementById("whitelist").textContent =
+      Object.entries(settings.protected.whitelist)
+        .flatMap(([chain, addresses]) => addresses.map((a) => chain + ":" + a))
+        .join("\n") || "none";
     document.getElementById("harness-form").harness.value = settings.harness;
   } catch (err) {
     // say so: a page stuck on its placeholders looks like a slow load, and
@@ -102,18 +103,11 @@ async function patchSettings(resultId, payload) {
 document.getElementById("settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = e.target;
-  const whitelist = {};
-  for (const line of form.whitelist.value.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const sep = trimmed.indexOf(":");
-    if (sep < 1) continue;
-    const chain = trimmed.slice(0, sep).trim().toLowerCase();
-    (whitelist[chain] = whitelist[chain] || []).push(trimmed.slice(sep + 1).trim());
-  }
+  // mode only: the whitelist is frozen at the API (a whitelist in a patch is
+  // a 422), so sending the one we rendered would fail every save
   await patchSettings("settings-result", {
     password: form.password.value,
-    protected: {mode: form.mode.value, whitelist},
+    protected: {mode: form.mode.value},
   });
 });
 

@@ -140,9 +140,11 @@ class TestOpenEndpoints:
         for method in ('method: "PATCH"', 'method: "POST"'):
             assert method in page
         # the inputs its script reads by name: renaming one silently breaks it
-        for field in ('name="mode"', 'name="whitelist"', 'name="password"'):
+        for field in ('name="mode"', 'name="password"', 'name="harness"'):
             assert field in page
-        assert 'name="harness"' in page
+        # and it must not offer to edit what the API refuses: a whitelist in a
+        # patch is a 422, so a whitelist input here would fail every save
+        assert 'name="whitelist"' not in page
         # the canonical shape it renders, exactly as GET /settings returns it
         served = client.get("/settings").json()
         assert set(served) == {"protected", "harness"}
