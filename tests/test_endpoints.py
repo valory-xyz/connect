@@ -64,6 +64,16 @@ class TestOpenEndpoints:
         # no decorative FSM fields (rounds, transition counters)
         assert response.json() == {"is_healthy": True}
 
+    def test_healthcheck_reports_unready(self, client: TestClient) -> None:
+        """Health is the FE's cue to open a session, so it must not lie.
+
+        POST /session lands the moment this turns true; an unready server says
+        so, and refuses the session it could not have honored.
+        """
+        client.app.state.ready = False  # type: ignore[attr-defined]
+        assert client.get("/healthcheck").json() == {"is_healthy": False}
+        assert client.post("/session").status_code == 503
+
     def test_funds_status_empty_without_requirements(self, client: TestClient) -> None:
         """Test funds status empty without requirements."""
         response = client.get("/funds-status")

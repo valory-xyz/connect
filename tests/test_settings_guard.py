@@ -34,6 +34,7 @@ from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 
 from pearl_connect import settings as settings_module
+from pearl_connect import workspace as workspace_module
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig, ChainConfig
 from pearl_connect.guard import EXEC_TRANSACTION_SELECTOR, Guard, GuardError
@@ -1149,14 +1150,90 @@ class TestSettingsEndpoints:
         assert flipped.status_code == 200
         assert flipped.json()["harness"] == "claude_code_cli"
         assert client.get("/settings").json()["harness"] == "claude_code_cli"
-        # the UI's Open button now targets the CLI deep link
+        # the UI reflects the choice; POST /session is what acts on it
         page = client.get("/").text
-        assert "claude-cli://open?cwd=" in page
         assert 'value="claude_code_cli"' in page
+        assert 'id="open-session"' in page
 
         bad = client.patch("/settings", json={"harness": "cursor"})
         assert bad.status_code == 400
         assert "harness" in bad.json()["detail"]
+
+    def test_session_opens_the_configured_harness(
+        self,
+        client: TestClient,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POST /session opens a session on demand, in the chosen harness."""
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module,
+            "open_session",
+            lambda path, harness: opened.append(harness),
+        )
+        client.patch("/settings", json={"harness": "claude_code_cli"})
+        response = client.post("/session")
+        assert response.status_code == 200
+        assert response.json() == {"launched": True, "harness": "claude_code_cli"}
+        assert opened == ["claude_code_cli"]
+        assert "session_launched" in audit_kinds(store_path)
+
+    def test_session_launch_failure_is_reported(
+        self,
+        client: TestClient,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deep link that will not open is a 200 the UI can show, not a 500.
+
+        The FE needs the reason to raise a dismissable alert: a harness that
+        is not installed is the operator's environment, not a server fault.
+        """
+
+        def refuse(path: Path, harness: str) -> None:
+            raise workspace_module.LaunchError(f"could not open {harness}")
+
+        monkeypatch.setattr(workspace_module, "open_session", refuse)
+        response = client.post("/session")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["launched"] is False
+        assert body["harness"] == "claude_code_desktop"
+        assert "could not open claude_code_desktop" in body["error"]
+        assert "session_launch_failed" in audit_kinds(store_path)
+
+    def test_session_rejects_cross_origin(self, client: TestClient) -> None:
+        """A webpage must not be able to spawn agent sessions."""
+        response = client.post("/session", headers={"Origin": "https://evil.example"})
+        assert response.status_code == 403
+
+    def test_session_harness_override_does_not_persist(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit harness opens there once, leaving the preference alone."""
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module,
+            "open_session",
+            lambda path, harness: opened.append(harness),
+        )
+        response = client.post("/session", json={"harness": "claude_code_cli"})
+        assert response.status_code == 200
+        assert response.json() == {"launched": True, "harness": "claude_code_cli"}
+        assert opened == ["claude_code_cli"]
+        # the saved preference is untouched: the next default launch uses it
+        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
+        client.post("/session")
+        assert opened == ["claude_code_cli", "claude_code_desktop"]
+
+    def test_session_rejects_an_unknown_harness(self, client: TestClient) -> None:
+        """An unknown harness is a 400, not a deep link nobody can open."""
+        response = client.post("/session", json={"harness": "cursor"})
+        assert response.status_code == 400
+        assert "harness" in response.json()["detail"]
+        # and a typo'd field is refused outright
+        assert client.post("/session", json={"harnes": "x"}).status_code == 422
 
     def test_whitelist_editing_is_refused(self, client: TestClient) -> None:
         """The whitelist is frozen at the API: an attempt is loud, not ignored.

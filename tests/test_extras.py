@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 import uvicorn
 from eth_account.signers.local import LocalAccount
+from fastapi.testclient import TestClient
 from web3 import Web3
 
 from pearl_connect import __main__ as main_module
@@ -99,92 +100,85 @@ class TestMain:
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         assert (store_path / ".mcp.json").exists()
 
-    def test_main_survives_populate_failure(
+    def test_populate_failure_serves_unhealthy(
         self, monkeypatch: pytest.MonkeyPatch, keystore_dir: Path, store_path: Path
     ) -> None:
-        """A workspace failure is logged but does not abort the server."""
+        """A workspace failure keeps the server up, but never claims health.
+
+        Pearl opens the session as soon as we report healthy — with no
+        .mcp.json and no skills, that session could not reach the signer, so
+        the honest answer is unhealthy rather than an invitation we cannot
+        honor.
+        """
         monkeypatch.chdir(keystore_dir)
         monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
-        monkeypatch.setattr(main_module.uvicorn, "Server", StubServer)
+        served: list[StubServer] = []
+
+        def record(config: uvicorn.Config) -> StubServer:
+            served.append(StubServer(config))
+            return served[-1]
+
+        monkeypatch.setattr(main_module.uvicorn, "Server", record)
         monkeypatch.setattr(
             workspace,
             "populate",
             lambda *a: (_ for _ in ()).throw(RuntimeError("disk full")),
         )
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        app = served[0].config.app
+        assert app.state.ready is False
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            assert client.get("/healthcheck").json() == {"is_healthy": False}
+            # and the session Pearl would start is refused, not half-opened
+            assert client.post("/session").status_code == 503
 
-    def test_wait_and_launch_when_started(
+    def test_unwritable_store_serves_unhealthy(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        store_path: Path,
-        settings_store: SettingsStore,
+        keystore_dir: Path,
+        tmp_path: Path,
     ) -> None:
-        """Launches once started, with the harness from the settings store."""
-        from pearl_connect.settings import Protected, Settings
+        """A store we cannot write to must not crash-loop the binary.
 
-        settings_store.save(
-            Settings(
-                protected=Protected(mode="unrestricted", whitelist={}),
-                harness="claude_code_cli",
-            )
-        )
-        launched: list[tuple[Path, str]] = []
-        monkeypatch.setattr(
-            workspace,
-            "launch_claude",
-            lambda p, harness=None: launched.append((p, harness)),
-        )
-        server = t.cast(uvicorn.Server, StubServer(t.cast(uvicorn.Config, None)))
-        server.started = True
-        main_module.wait_and_launch(server, store_path, settings_store)
-        assert launched == [(store_path, "claude_code_cli")]
+        Everything that provisions the store fails here — populate and the
+        performance file alike — and the middleware would just restart a
+        process that dies. Serve, and report unhealthy.
+        """
+        readonly = tmp_path / "readonly"
+        readonly.mkdir(mode=0o500)
+        monkeypatch.chdir(keystore_dir)
+        monkeypatch.setenv(STORE_PATH_ENV, str(readonly / "store"))
+        monkeypatch.delenv(SAFES_ENV, raising=False)
+        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+        served: list[StubServer] = []
 
-    def test_wait_and_launch_polls_until_started(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        store_path: Path,
-        settings_store: SettingsStore,
+        def record(config: uvicorn.Config) -> StubServer:
+            served.append(StubServer(config))
+            return served[-1]
+
+        monkeypatch.setattr(main_module.uvicorn, "Server", record)
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0  # not a crash
+        assert served[0].config.app.state.ready is False
+
+    def test_boot_opens_no_session(
+        self, monkeypatch: pytest.MonkeyPatch, keystore_dir: Path, store_path: Path
     ) -> None:
-        """Polls while the server is starting up."""
-        launched: list[Path] = []
+        """Booting never opens a session: Pearl drives POST /session itself.
+
+        Launching here would strand a failure in this process's log, where
+        neither the FE nor the operator can see it.
+        """
+        monkeypatch.chdir(keystore_dir)
+        monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
+        monkeypatch.delenv(SAFES_ENV, raising=False)
+        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+        monkeypatch.setattr(main_module.uvicorn, "Server", StubServer)
+        opened: list[Path] = []
         monkeypatch.setattr(
-            workspace, "launch_claude", lambda p, harness=None: launched.append(p)
+            workspace, "open_session", lambda p, harness=None: opened.append(p)
         )
-
-        class SlowServer(StubServer):
-            """Server that starts on the second poll."""
-
-            _polls = 0
-
-            @property
-            def started(self) -> bool:  # type: ignore[override]
-                """Become started on the second check."""
-                SlowServer._polls += 1
-                return SlowServer._polls > 1
-
-            @started.setter
-            def started(self, value: bool) -> None:
-                """Ignore the base class initializer."""
-
-        server = t.cast(uvicorn.Server, SlowServer(t.cast(uvicorn.Config, None)))
-        server.should_exit = False
-        main_module.wait_and_launch(server, store_path, settings_store)
-        assert launched == [store_path]
-
-    def test_wait_and_launch_on_exit(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        store_path: Path,
-        settings_store: SettingsStore,
-    ) -> None:
-        """Does not launch when the server exits before starting."""
-        launched: list[Path] = []
-        monkeypatch.setattr(
-            workspace, "launch_claude", lambda p, harness=None: launched.append(p)
-        )
-        server = t.cast(uvicorn.Server, StubServer(t.cast(uvicorn.Config, None)))
-        main_module.wait_and_launch(server, store_path, settings_store)
-        assert not launched
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert not opened
 
 
 class TestActivityExtras:
@@ -870,24 +864,6 @@ class TestWorkspaceExtras:
         installed = store_path / ".claude" / "skills"
         assert (installed / "my-skill" / "SKILL.md").exists()
         assert not (installed / "stray.txt").exists()
-
-    def test_launch_claude_fallback_and_failure(
-        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
-    ) -> None:
-        """First link failing falls back; both failing returns False."""
-        attempts: list[str] = []
-
-        def fake_open(url: str) -> bool:
-            attempts.append(url)
-            return len(attempts) == 2  # first fails, fallback succeeds
-
-        monkeypatch.setattr(workspace, "_open_url", fake_open)
-        assert workspace.launch_claude(store_path) is True
-        assert attempts[0].startswith("claude://")
-        assert attempts[1].startswith("claude-cli://")
-
-        monkeypatch.setattr(workspace, "_open_url", lambda url: False)
-        assert workspace.launch_claude(store_path) is False
 
     def test_open_url_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """xdg-open success, failure and exception paths."""

@@ -49,6 +49,10 @@ TOKEN_DENY_RULES = ("Read(./.mcp.json)",)
 GITIGNORE_ENTRIES = (".mcp.json",)
 
 
+class LaunchError(Exception):
+    """A Claude Code session could not be opened in the requested harness."""
+
+
 def assets_dir() -> Path:
     """Bundled assets location — PyInstaller extracts to sys._MEIPASS."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -174,24 +178,25 @@ def cli_deep_link(store_path: Path) -> str:
     return f"claude-cli://open?cwd={quote(str(store_path))}"
 
 
-def launch_order(store_path: Path, harness: str = DEFAULT_HARNESS) -> tuple[str, str]:
-    """Deep links to try, the configured harness's first, the other as fallback."""
-    desktop, cli = desktop_deep_link(store_path), cli_deep_link(store_path)
+def deep_link(store_path: Path, harness: str = DEFAULT_HARNESS) -> str:
+    """Return the deep link that opens STORE_PATH in the configured harness."""
     if harness == HARNESS_CLAUDE_CODE_CLI:
-        return cli, desktop
-    return desktop, cli
+        return cli_deep_link(store_path)
+    return desktop_deep_link(store_path)
 
 
-def launch_claude(store_path: Path, harness: str = DEFAULT_HARNESS) -> bool:
-    """Open a Claude Code session at STORE_PATH via deep link. Never fatal."""
-    for url in launch_order(store_path, harness):
-        if _open_url(url):
-            logger.info("launched Claude Code via %s", url.split("?", maxsplit=1)[0])
-            return True
-    logger.warning(
-        "could not launch Claude Code via deep link; open it manually at %s", store_path
-    )
-    return False
+def open_session(store_path: Path, harness: str = DEFAULT_HARNESS) -> None:
+    """Open a Claude Code session at STORE_PATH, in the chosen harness only.
+
+    :raises LaunchError: when that harness's deep link does not open.
+    """
+    url = deep_link(store_path, harness)
+    if not _open_url(url):
+        raise LaunchError(
+            f"could not open {harness} via its deep link — "
+            f"is it installed? the workspace is at {store_path}"
+        )
+    logger.info("launched %s via %s", harness, url.split("?", maxsplit=1)[0])
 
 
 def _open_url(url: str) -> bool:

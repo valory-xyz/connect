@@ -24,6 +24,8 @@ import stat
 import sys
 from pathlib import Path
 
+import pytest
+
 from pearl_connect import workspace
 
 
@@ -149,16 +151,44 @@ def test_populate_provisions_token_hygiene(store_path: Path) -> None:
 
 
 def test_deep_links(store_path: Path) -> None:
-    """Deep links and the harness-dependent launch order."""
+    """Deep links, and the one the configured harness resolves to."""
     assert workspace.desktop_deep_link(store_path).startswith(
         "claude://code/new?folder="
     )
     assert workspace.cli_deep_link(store_path).startswith("claude-cli://open?cwd=")
-    # desktop harness (the default): desktop first, CLI as fallback
-    first, second = workspace.launch_order(store_path)
-    assert first.startswith("claude://")
-    assert second.startswith("claude-cli://")
-    # CLI harness reverses the order
-    first, second = workspace.launch_order(store_path, "claude_code_cli")
-    assert first.startswith("claude-cli://")
-    assert second.startswith("claude://")
+    # the harness resolves to exactly one link — the other is never a fallback
+    assert workspace.deep_link(store_path).startswith("claude://")
+    assert workspace.deep_link(store_path, "claude_code_cli").startswith(
+        "claude-cli://"
+    )
+
+
+def test_open_session_never_falls_back(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On demand, only the chosen harness counts: no silent other-harness open.
+
+    launch_claude may fall back at boot; open_session must not — the operator
+    picked a harness and needs to see it fail, not to get the other one.
+    """
+    tried: list[str] = []
+
+    def refuse(url: str) -> bool:
+        tried.append(url)
+        return False
+
+    monkeypatch.setattr(workspace, "_open_url", refuse)
+    with pytest.raises(workspace.LaunchError, match="claude_code_cli"):
+        workspace.open_session(store_path, "claude_code_cli")
+    assert len(tried) == 1  # the desktop link was never tried as a fallback
+    assert tried[0].startswith("claude-cli://")
+
+    tried.clear()
+
+    def accept(url: str) -> bool:
+        tried.append(url)
+        return True
+
+    monkeypatch.setattr(workspace, "_open_url", accept)
+    workspace.open_session(store_path, "claude_code_cli")
+    assert tried == [workspace.cli_deep_link(store_path)]

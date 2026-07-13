@@ -17,20 +17,23 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Pearl SDK endpoints: /healthcheck, /funds-status, and the / HTML page.
+"""Pearl SDK endpoints: /healthcheck, /funds-status, /session and the / page.
 
-These are unauthenticated: the middleware's pollers have no token. They must
-never expose the session token.
+The pollers' endpoints are unauthenticated: the middleware has no token. They
+must never expose the session token.
 """
 
 import html
 import logging
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, ConfigDict
 
 from pearl_connect import wallet, workspace
+from pearl_connect.server.auth import require_local_origin
+from pearl_connect.settings import validate_harness
 
 logger = logging.getLogger("agent")
 
@@ -40,12 +43,12 @@ FUNDS_STATUS_CACHE_SECONDS = 30
 
 
 @router.get("/healthcheck")
-def healthcheck() -> dict:
+def healthcheck(request: Request) -> dict:
     """Healthcheck.
 
     The middleware's HealthChecker reads only is_healthy
     """
-    return {"is_healthy": True}
+    return {"is_healthy": bool(request.app.state.ready)}
 
 
 @router.get("/funds-status")
@@ -65,6 +68,51 @@ def funds_status(request: Request) -> dict:
         cache["at"] = now
         cache["value"] = value
     return value
+
+
+class SessionRequest(BaseModel):
+    """Optional overrides for a single session launch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # open in this harness instead of the saved preference, just this once
+    harness: str | None = None
+
+
+@router.post("/session", dependencies=[Depends(require_local_origin)])
+def start_session(request: Request, body: SessionRequest | None = None) -> dict:
+    """Open a Claude Code session in the configured harness, on demand.
+
+    Pearl calls this once /healthcheck reports healthy; nothing is launched at
+    boot, so a launch failure reaches the operator's UI instead of dying in
+    this process's log. Always 200 with {launched, harness, error?}: a deep
+    link that will not open is the operator's environment, not a server fault,
+    and the UI needs the reason to raise a dismissable alert.
+
+    An explicit `harness` overrides the saved preference for this launch only:
+    the session opens where the caller asked without rewriting what the
+    operator chose — PATCH /settings is how that preference changes.
+    """
+    state = request.app.state
+    if not state.ready:
+        raise HTTPException(status_code=503, detail="the agent server is not ready")
+    override = body.harness if body else None
+    try:
+        harness = (
+            validate_harness(override)
+            if override is not None
+            else state.settings_store.load().harness
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    try:
+        workspace.open_session(state.config.store_path, harness)
+    except workspace.LaunchError as e:
+        logger.warning("session launch failed: %s", e)
+        state.activity.record("session_launch_failed", harness=harness)
+        return {"launched": False, "harness": harness, "error": str(e)}
+    state.activity.record("session_launched", harness=harness)
+    return {"launched": True, "harness": harness}
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -89,7 +137,6 @@ def index(request: Request) -> str:
     checked = {True: "checked", False: ""}
     restricted = settings.protected.mode == "restricted"
     desktop = settings.harness == "claude_code_desktop"
-    open_link = workspace.launch_order(state.config.store_path, settings.harness)[0]
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Pearl Connect</title>
@@ -177,6 +224,20 @@ document.getElementById("harness-form").addEventListener("submit", async (e) => 
   e.preventDefault();
   await applySettingsPatch("harness-result", {{harness: e.target.harness.value}});
 }});
+document.getElementById("open-session").addEventListener("click", async () => {{
+  const result = document.getElementById("session-result");
+  result.textContent = "opening…";
+  try {{
+    const response = await fetch("/session", {{method: "POST"}});
+    const body = await response.json().catch(() => ({{}}));
+    result.textContent = body.launched
+      ? "opened in " + body.harness
+      : "error: " + (body.error || body.detail || response.status);
+  }} catch (err) {{
+    result.textContent = "error: " + err;
+  }}
+}});
 </script>
-<a class="btn" href="{html.escape(open_link)}">Open Claude Code</a>
+<button class="btn" id="open-session" type="button">Open Claude Code</button>
+<div id="session-result"></div>
 </body></html>"""

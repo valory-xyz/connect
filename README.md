@@ -10,20 +10,32 @@ other non-aea agent. It:
    `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
    the agent session, and the bundled `pearl-connect` skill;
 3. serves on `127.0.0.1:8716`:
-   - Pearl SDK contracts: `GET /healthcheck`, `GET /funds-status`, `GET /`
+   - Pearl SDK contracts: `GET /healthcheck`, `GET /funds-status`, `GET /`.
+     `is_healthy` turns true only once the workspace is populated — Pearl
+     opens the session the moment it does, so health is a promise the server
+     has to be able to keep
    - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its
      editing semantics are specced — while the `harness` preference needs none)
+   - `POST /session` (origin-gated, no token): opens a Claude Code session in
+     the configured harness (`claude_code_desktop` →
+     `claude://code/new?folder=…`, `claude_code_cli` →
+     `claude-cli://open?cwd=…`) and answers `{launched, harness, error?}`.
+     An optional `{"harness": …}` body overrides the saved preference for that
+     launch alone — it opens where the caller asked without rewriting what the
+     operator chose
    - a bearer-authed signing surface: `POST /sign-and-send`,
      `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `send_transaction`, `transaction_status`, `sign_message`,
-     `mech_tools`, `mech_request`, `settings`;
-4. opens a Claude Code session at the workspace via deep link — the
-   `harness` setting picks which one to try first (`claude_code_desktop`
-   → `claude://code/new?folder=…`, `claude_code_cli` →
-   `claude-cli://open?cwd=…`; the other stays the fallback).
+     `mech_tools`, `mech_request`, `settings`.
+
+The binary opens no session itself: Pearl waits for `is_healthy`, then calls
+`POST /session`. A launch failure (harness not installed, deep link unhandled)
+then reaches the operator's UI as a dismissable error instead of dying in this
+process's log — which is also why `/session` never falls back to the harness
+the operator did not choose.
 
 The agent-harness session composes on-chain actions (including service-safe
 `execTransaction` calls via the threshold-1 pre-validated signature) and the
