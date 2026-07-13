@@ -41,6 +41,7 @@ from pearl_connect.server.auth import (
 from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer
+from pearl_connect.workspace import Workspace
 
 
 def create_app(  # pylint: disable=too-many-arguments
@@ -52,7 +53,7 @@ def create_app(  # pylint: disable=too-many-arguments
     guard: Guard,
     settings_store: SettingsStore,
     mech: MechService,
-    ready: bool,
+    workspace: Workspace,
 ) -> FastAPI:
     """Create app."""
     mcp = build_mcp(
@@ -82,7 +83,7 @@ def create_app(  # pylint: disable=too-many-arguments
     app.state.settings_store = settings_store
     app.state.mech = mech
     app.state.auth_limiter = limiter
-    app.state.ready = ready
+    app.state.workspace = workspace
     app.state.funds_cache = {"at": 0.0, "value": {}, "lock": threading.Lock()}
 
     app.include_router(pearl_routes.router)

@@ -1227,7 +1227,10 @@ class TestSettingsEndpoints:
         # the UI reflects the choice; POST /session is what acts on it
         page = client.get("/").text
         assert 'value="claude_code_cli"' in page
-        assert 'id="open-session"' in page
+        # the button must exist *before* the inline script that binds it:
+        # getElementById returns null for an element the parser has not reached,
+        # so a button emitted after </script> throws and silently does nothing
+        assert 0 < page.index('id="open-session"') < page.index("<script>")
 
         bad = client.patch("/settings", json={"harness": "cursor"})
         assert bad.status_code == 400
@@ -1242,9 +1245,9 @@ class TestSettingsEndpoints:
         """POST /session opens a session on demand, in the chosen harness."""
         opened: list[str] = []
         monkeypatch.setattr(
-            workspace_module,
+            workspace_module.Workspace,
             "open_session",
-            lambda path, harness: opened.append(harness),
+            lambda self, harness: opened.append(harness),
         )
         client.patch("/settings", json={"harness": "claude_code_cli"})
         response = client.post("/session")
@@ -1265,10 +1268,10 @@ class TestSettingsEndpoints:
         is not installed is the operator's environment, not a server fault.
         """
 
-        def refuse(path: Path, harness: str) -> None:
+        def refuse(self: workspace_module.Workspace, harness: str) -> None:
             raise workspace_module.LaunchError(f"could not open {harness}")
 
-        monkeypatch.setattr(workspace_module, "open_session", refuse)
+        monkeypatch.setattr(workspace_module.Workspace, "open_session", refuse)
         response = client.post("/session")
         assert response.status_code == 200
         body = response.json()
@@ -1288,9 +1291,9 @@ class TestSettingsEndpoints:
         """An explicit harness opens there once, leaving the preference alone."""
         opened: list[str] = []
         monkeypatch.setattr(
-            workspace_module,
+            workspace_module.Workspace,
             "open_session",
-            lambda path, harness: opened.append(harness),
+            lambda self, harness: opened.append(harness),
         )
         response = client.post("/session", json={"harness": "claude_code_cli"})
         assert response.status_code == 200
@@ -1311,9 +1314,9 @@ class TestSettingsEndpoints:
         """
         opened: list[str] = []
         monkeypatch.setattr(
-            workspace_module,
+            workspace_module.Workspace,
             "open_session",
-            lambda path, harness: opened.append(harness),
+            lambda self, harness: opened.append(harness),
         )
         monkeypatch.setattr(
             ActivityLog,

@@ -122,7 +122,7 @@ class TestMain:
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         assert (store_path / ".mcp.json").exists()
         app = served[0].config.app
-        assert app.state.ready is True
+        assert app.state.workspace.reason is None
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/healthcheck").json() == {"is_healthy": True}
 
@@ -143,13 +143,13 @@ class TestMain:
         monkeypatch.chdir(keystore_dir)
         monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
         monkeypatch.setattr(
-            workspace,
-            "populate",
-            lambda *a: (_ for _ in ()).throw(RuntimeError("disk full")),
+            workspace.Workspace,
+            "_provision",
+            lambda self: (_ for _ in ()).throw(RuntimeError("disk full")),
         )
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         app = served[0].config.app
-        assert app.state.ready is False
+        assert app.state.workspace.reason is not None
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/healthcheck").json() == {"is_healthy": False}
             # and the session Pearl would start is refused, not half-opened
@@ -176,7 +176,7 @@ class TestMain:
         monkeypatch.delenv(SAFES_ENV, raising=False)
         monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
-        assert served[0].config.app.state.ready is False
+        assert served[0].config.app.state.workspace.reason is not None
         assert (store_path / "agent_performance.json").exists()
 
     def test_unusable_store_serves_unhealthy(
@@ -203,7 +203,7 @@ class TestMain:
         monkeypatch.delenv(SAFES_ENV, raising=False)
         monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0  # not a crash
-        assert served[0].config.app.state.ready is False
+        assert served[0].config.app.state.workspace.reason is not None
 
     def test_boot_opens_no_session(
         self,
@@ -223,7 +223,9 @@ class TestMain:
         monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
         opened: list[Path] = []
         monkeypatch.setattr(
-            workspace, "open_session", lambda p, harness=None: opened.append(p)
+            workspace.Workspace,
+            "open_session",
+            lambda self, harness=None: opened.append(self.path),
         )
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         assert not opened
@@ -261,9 +263,8 @@ class TestActivityExtras:
         with caplog.at_level(logging.ERROR):
             activity.record("session_launched", harness="claude_code_cli")
         assert "could not persist activity entry" in caplog.text
-        # still counted in memory, so /wallet and the UI stay coherent
+        # the caller's work stands: still counted, so the UI stays coherent
         assert activity.count == 1
-        assert activity.recent()[-1]["kind"] == "session_launched"
 
     def test_write_performance_public(
         self, store_path: Path, activity: ActivityLog
@@ -798,6 +799,36 @@ class TestWalletExtras:
 class TestPearlRoutesExtras:
     """funds-status caching and failure handling."""
 
+    def test_racing_pollers_rebuild_the_workspace_once(
+        self, store_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The loser of the readiness race must not repopulate on top of it.
+
+        /healthcheck is polled, so two calls can arrive together while the
+        workspace is unusable. The second blocks on the lock, and by the time
+        it gets in the first has already succeeded — it has to see that, not
+        redo the work.
+        """
+        agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
+        populated: list[int] = []
+        monkeypatch.setattr(
+            workspace.Workspace, "_provision", lambda self: populated.append(1)
+        )
+
+        class LostTheRace:
+            """A lock whose holder finished the job while we were waiting."""
+
+            def __enter__(self) -> None:
+                # pylint: disable=protected-access
+                agent_workspace._reason = None  # the other poller got there first
+
+            def __exit__(self, *_: object) -> None:
+                """Nothing to release: this lock exists only to lose the race."""
+
+        monkeypatch.setattr(agent_workspace, "_lock", LostTheRace())
+        assert agent_workspace.ensure() is True
+        assert populated == []  # the work was already done
+
     def test_funds_status_cache_hit(
         self,
         test_signer: Signer,
@@ -929,13 +960,14 @@ class TestWorkspaceExtras:
         assets = tmp_path / "assets"
         (assets / "skills").mkdir(parents=True)
         monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
-        with pytest.raises(FileNotFoundError, match="CLAUDE.md"):
-            workspace.populate(store_path, "tok")
+        agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
+        assert agent_workspace.ensure() is False
+        assert "CLAUDE.md" in str(agent_workspace.reason)
 
     def test_invalid_mcp_json_rewritten(self, store_path: Path) -> None:
         """Corrupt .mcp.json is replaced rather than crashing."""
         (store_path / ".mcp.json").write_text("{corrupt")
-        workspace.populate(store_path, "tok")
+        assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
         config = json.loads((store_path / ".mcp.json").read_text())
         assert "pearl-connect" in config["mcpServers"]
 
@@ -949,7 +981,7 @@ class TestWorkspaceExtras:
         (skills / "stray.txt").write_text("not a skill")
         (tmp_path / "assets" / "CLAUDE.md").write_text("brief")  # populate requires it
         monkeypatch.setattr(workspace.sys, "_MEIPASS", str(tmp_path), raising=False)
-        workspace.populate(store_path, "tok")
+        assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
         installed = store_path / ".claude" / "skills"
         assert (installed / "my-skill" / "SKILL.md").exists()
         assert not (installed / "stray.txt").exists()

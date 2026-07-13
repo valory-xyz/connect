@@ -81,9 +81,18 @@ class ActivityLog:
             f.write(json.dumps(entry) + "\n")
 
     def write_performance(self) -> None:
-        """Write performance."""
+        """Write the SDK contract file; a failing disk is loud, never fatal.
+
+        Same contract as record(): this class reports what happened, it does
+        not decide whether the caller's work stands. A boot that cannot write
+        agent_performance.json is degraded, not dead — so callers do not wrap
+        this, and there is one error contract to remember rather than two.
+        """
         with self._lock:
-            self._write_performance()
+            try:
+                self._write_performance()
+            except OSError:
+                logger.exception("could not write %s", PERFORMANCE_FILE)
 
     def _write_performance(self) -> None:
         payload = {

@@ -34,7 +34,7 @@ from pathlib import Path
 import uvicorn
 
 from pearl_connect import workspace
-from pearl_connect.activity import ActivityLog, PERFORMANCE_FILE
+from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
 from pearl_connect.guard import Guard
 from pearl_connect.keystore import KeystoreError, load_account
@@ -97,26 +97,19 @@ def main(argv: list[str] | None = None) -> int:
     token = secrets.token_urlsafe(32)
 
     # readiness gates the healthcheck: Pearl starts the Claude session (POST
-    # /session) as soon as we report healthy, so we must not claim health
-    # until the workspace that session opens into actually exists — without
-    # .mcp.json and the skills, the session cannot reach the signer at all.
-    try:
-        workspace.populate(config.store_path, token)
-        logger.info("workspace populated at %s", config.store_path)
-        ready = True
-    except Exception:  # pylint: disable=broad-exception-caught
-        # keep serving: an unhealthy agent the operator can see beats a crash
-        # loop the middleware just keeps restarting
-        logger.exception("workspace population failed;")
-        ready = False
+    # /session) as soon as we report healthy, so we must not claim health until
+    # the workspace that session opens into actually exists — without .mcp.json
+    # and the skills, the session cannot reach the signer at all. A failure
+    # here keeps the server up but unhealthy (an agent the operator can see
+    # beats a crash loop the middleware just keeps restarting); the workspace
+    # re-attempts its own population on every /healthcheck, so a condition that
+    # clears by itself heals without a restart.
+    agent_workspace = workspace.Workspace(config.store_path, token)
+    agent_workspace.ensure()
 
-    try:
-        # Pearl reads it whatever our health, so write it
-        # even on a degraded boot. Only a dead disk stops us — and that must not
-        # take the process down with it either.
-        activity.write_performance()
-    except OSError:
-        logger.exception("could not write %s", PERFORMANCE_FILE)
+    # Pearl reads it whatever our health, so write it even on a degraded boot.
+    # A dead disk must not take the process down with it.
+    activity.write_performance()
 
     app = create_app(
         signer=signer,
@@ -126,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         guard=guard,
         settings_store=settings_store,
         mech=mech,
-        ready=ready,
+        workspace=agent_workspace,
     )
 
     server = uvicorn.Server(

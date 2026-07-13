@@ -46,9 +46,12 @@ FUNDS_STATUS_CACHE_SECONDS = 30
 def healthcheck(request: Request) -> dict:
     """Healthcheck.
 
-    The middleware's HealthChecker reads only is_healthy
+    The middleware's HealthChecker reads only is_healthy. Asking the workspace
+    is also what re-attempts a failed population: Pearl calls POST /session
+    only once we report healthy, so a server that can never become healthy
+    would never be asked to heal — the retry has to sit on the poller's path.
     """
-    return {"is_healthy": bool(request.app.state.ready)}
+    return {"is_healthy": request.app.state.workspace.ensure()}
 
 
 @router.get("/funds-status")
@@ -97,8 +100,11 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
     operator chose — PATCH /settings is how that preference changes.
     """
     state = request.app.state
-    if not state.ready:
-        raise HTTPException(status_code=503, detail="the agent server is not ready")
+    if not state.workspace.ensure():
+        raise HTTPException(
+            status_code=503,
+            detail=f"the agent server is not ready: {state.workspace.reason}",
+        )
     override = body.harness if body else None
     try:
         harness = (
@@ -106,13 +112,18 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
             if override is not None
             else state.settings_store.load().harness
         )
+        # a harness the operator may choose but nobody can open is a bug, not a
+        # server fault to 500 over: answer the caller the same way as any other
+        # unusable harness (a test pins DEEP_LINKS against HARNESSES so this
+        # cannot go unnoticed)
+        state.workspace.open_session(harness)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    try:
-        workspace.open_session(state.config.store_path, harness)
     except workspace.LaunchError as e:
         logger.warning("session launch failed: %s", e)
-        state.activity.record("session_launch_failed", harness=harness)
+        # the reason, not just the harness: log.txt rotates, and "not
+        # installed" and "no handler for the deep link" need different answers
+        state.activity.record("session_launch_failed", harness=harness, error=str(e))
         return {"launched": False, "harness": harness, "error": str(e)}
     state.activity.record("session_launched", harness=harness)
     return {"launched": True, "harness": harness}
@@ -194,6 +205,8 @@ Claude Code CLI</label></p>
 <button class="btn" type="submit">Apply</button>
 <div id="harness-result"></div>
 </form>
+<button class="btn" id="open-session" type="button">Open Claude Code</button>
+<div id="session-result"></div>
 <script>
 async function applySettingsPatch(resultId, payload) {{
   const result = document.getElementById(resultId);
@@ -241,6 +254,4 @@ document.getElementById("open-session").addEventListener("click", async () => {{
   }}
 }});
 </script>
-<button class="btn" id="open-session" type="button">Open Claude Code</button>
-<div id="session-result"></div>
 </body></html>"""
