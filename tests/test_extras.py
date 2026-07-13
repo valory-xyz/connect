@@ -47,7 +47,7 @@ from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer, SignerError
 
-from tests.conftest import FakeW3, TEST_PASSWORD
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
 
 
 class StubServer:
@@ -120,10 +120,13 @@ class TestMain:
         settings_store: SettingsStore,
     ) -> None:
         """Launches once started, with the harness from the settings store."""
-        from pearl_connect.settings import Settings
+        from pearl_connect.settings import Protected, Settings
 
         settings_store.save(
-            Settings(mode="unrestricted", whitelist={}, harness="claude_code_cli")
+            Settings(
+                protected=Protected(mode="unrestricted", whitelist={}),
+                harness="claude_code_cli",
+            )
         )
         launched: list[tuple[Path, str]] = []
         monkeypatch.setattr(
@@ -517,16 +520,24 @@ class TestSignerExtras:
         assert test_signer.w3("otherchain") is fake_w3  # cached
 
     def test_broadcast_failure(
-        self, test_signer: Signer, fake_w3: FakeW3, activity: ActivityLog
+        self,
+        store_path: Path,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        activity: ActivityLog,
     ) -> None:
         """A node rejection surfaces as SignerError and is logged."""
         fake_w3.eth.fail_broadcast = True
         with pytest.raises(SignerError, match="send failed"):
             test_signer.send("testchain", to="0x" + "aa" * 20)
-        assert activity.recent()[-1]["kind"] == "send_failed"
+        assert audit_kinds(store_path)[-1] == "send_failed"
 
     def test_estimation_failure_is_signer_error(
-        self, test_signer: Signer, fake_w3: FakeW3, activity: ActivityLog
+        self,
+        store_path: Path,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        activity: ActivityLog,
     ) -> None:
         """A gas-estimation revert surfaces as SignerError, not a raw exception."""
 
@@ -536,7 +547,7 @@ class TestSignerExtras:
         fake_w3.eth.estimate_gas = reverting_estimate  # type: ignore[method-assign]
         with pytest.raises(SignerError, match="execution reverted"):
             test_signer.send("testchain", to="0x" + "aa" * 20)
-        assert activity.recent()[-1]["kind"] == "send_failed"
+        assert audit_kinds(store_path)[-1] == "send_failed"
 
     def test_concurrent_duplicate_request_id_rejected(
         self, test_signer: Signer, fake_w3: FakeW3

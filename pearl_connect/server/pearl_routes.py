@@ -78,13 +78,16 @@ def index(request: Request) -> str:
         f"<td><code>{html.escape(c.safe_address or '—')}</code></td></tr>"
         for name, c in sorted(chains.items())
     )
-    whitelist_lines = "\n".join(
-        f"{html.escape(chain)}:{html.escape(address)}"
-        for chain, addresses in sorted(settings.whitelist.items())
-        for address in addresses
+    whitelist_lines = (
+        "\n".join(
+            f"{html.escape(chain)}:{html.escape(address)}"
+            for chain, addresses in sorted(settings.protected.whitelist.items())
+            for address in addresses
+        )
+        or "none"
     )
     checked = {True: "checked", False: ""}
-    restricted = settings.mode == "restricted"
+    restricted = settings.protected.mode == "restricted"
     desktop = settings.harness == "claude_code_desktop"
     open_link = workspace.launch_order(state.config.store_path, settings.harness)[0]
     return f"""<!DOCTYPE html>
@@ -98,7 +101,8 @@ def index(request: Request) -> str:
  .btn {{ display: inline-block; margin-top: 1rem; padding: .6rem 1.2rem; background: #111;
         color: #fff; border-radius: 8px; text-decoration: none; border: 0; cursor: pointer; }}
  .mode {{ font-weight: 600; text-transform: capitalize; }}
- textarea {{ width: 100%; min-height: 7rem; font-family: monospace; font-size: .85em; }}
+ pre {{ background: #f6f6f6; padding: .6rem; border-radius: 6px; font-size: .85em;
+       overflow-x: auto; }}
  input[type=password] {{ width: 100%; }}
  #settings-result {{ margin-top: .5rem; }}
 </style></head>
@@ -108,7 +112,7 @@ def index(request: Request) -> str:
 behalf; the Claude session never sees key material.</p>
 <table>
 <tr><th>Agent EOA</th><td><code>{html.escape(state.signer.address)}</code></td></tr>
-<tr><th>Guardrail mode</th><td class="mode">{html.escape(settings.mode)}</td></tr>
+<tr><th>Guardrail mode</th><td class="mode">{html.escape(settings.protected.mode)}</td></tr>
 <tr><th>Harness</th><td><code>{html.escape(settings.harness)}</code></td></tr>
 <tr><th>Signer actions</th><td>{state.activity.count} this run</td></tr>
 </table>
@@ -123,48 +127,55 @@ settings requires the keystore password — the agent session does not have it.<
 Restricted</label>
    <label><input type="radio" name="mode" value="unrestricted" {checked[not restricted]}>
 Unrestricted</label></p>
-<p><label><input type="radio" name="harness" value="claude_code_desktop" {checked[desktop]}>
-Claude Code desktop</label>
-   <label><input type="radio" name="harness" value="claude_code_cli" {checked[not desktop]}>
-Claude Code CLI</label></p>
-<p><label>Whitelist (one <code>chain:address</code> per line)<br>
-<textarea name="whitelist">{whitelist_lines}</textarea></label></p>
+<p>Whitelisted targets (not editable yet):</p>
+<pre>{whitelist_lines}</pre>
 <p><label>Keystore password<br><input type="password" name="password" autocomplete="off"></label></p>
 <button class="btn" type="submit">Apply</button>
 <div id="settings-result"></div>
 </form>
+<h2>Harness</h2>
+<p>Which Claude Code the workspace session opens in — a preference, saved
+without the password.</p>
+<form id="harness-form">
+<p><label><input type="radio" name="harness" value="claude_code_desktop" {checked[desktop]}>
+Claude Code desktop</label>
+   <label><input type="radio" name="harness" value="claude_code_cli" {checked[not desktop]}>
+Claude Code CLI</label></p>
+<button class="btn" type="submit">Apply</button>
+<div id="harness-result"></div>
+</form>
 <script>
+async function applySettingsPatch(resultId, payload) {{
+  const result = document.getElementById(resultId);
+  result.textContent = "applying…";
+  try {{
+    const response = await fetch("/settings", {{
+      method: "PATCH",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify(payload),
+    }});
+    if (response.ok) {{
+      result.textContent = "saved";
+      location.reload();
+    }} else {{
+      const body = await response.json().catch(() => ({{}}));
+      result.textContent = "error: " + (body.detail || response.status);
+    }}
+  }} catch (err) {{
+    result.textContent = "error: " + err;
+  }}
+}}
 document.getElementById("settings-form").addEventListener("submit", async (e) => {{
   e.preventDefault();
   const form = e.target;
-  const whitelist = {{}};
-  for (const line of form.whitelist.value.split("\\n")) {{
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const sep = trimmed.indexOf(":");
-    if (sep < 1) continue;
-    const chain = trimmed.slice(0, sep).trim().toLowerCase();
-    (whitelist[chain] = whitelist[chain] || []).push(trimmed.slice(sep + 1).trim());
-  }}
-  const result = document.getElementById("settings-result");
-  result.textContent = "applying…";
-  const response = await fetch("/settings", {{
-    method: "POST",
-    headers: {{"Content-Type": "application/json"}},
-    body: JSON.stringify({{
-      password: form.password.value,
-      mode: form.mode.value,
-      harness: form.harness.value,
-      whitelist,
-    }}),
+  await applySettingsPatch("settings-result", {{
+    password: form.password.value,
+    protected: {{mode: form.mode.value}},
   }});
-  if (response.ok) {{
-    result.textContent = "saved";
-    location.reload();
-  }} else {{
-    const body = await response.json().catch(() => ({{}}));
-    result.textContent = "error: " + (body.detail || response.status);
-  }}
+}});
+document.getElementById("harness-form").addEventListener("submit", async (e) => {{
+  e.preventDefault();
+  await applySettingsPatch("harness-result", {{harness: e.target.harness.value}});
 }});
 </script>
 <a class="btn" href="{html.escape(open_link)}">Open Claude Code</a>

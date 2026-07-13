@@ -11,8 +11,10 @@ other non-aea agent. It:
    the agent session, and the bundled `pearl-connect` skill;
 3. serves on `127.0.0.1:8716`:
    - Pearl SDK contracts: `GET /healthcheck`, `GET /funds-status`, `GET /`
-   - Settings: `GET /settings` (open) and `POST /settings`
-     (keystore-password-authed, used by the `/` UI)
+   - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
+     the canonical shape; the keystore password gates the `protected`
+     object — currently the mode; the whitelist is read-only until its
+     editing semantics are specced — while the `harness` preference needs none)
    - a bearer-authed signing surface: `POST /sign-and-send`,
      `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
@@ -47,15 +49,22 @@ The signer enforces one of two persistent modes:
 
 There is a single gate with no bypass: the MCP tools, the HTTP signing
 endpoints and the mech request flow all pass the same check. State persists in
-`pearl-connect.settings.json` at STORE_PATH, HMAC'd with a key derived from
-the agent private key and verified on every read — an edit by the agent (or
-anything else without the key) fails verification and resets the file to the
-restricted defaults. The MAC of the last file the server wrote is also pinned
+`pearl-connect.settings.json` at STORE_PATH; the security-critical fields
+(mode, whitelist) are HMAC'd with a key derived from the agent private key
+and verified on every read — an edit by the agent (or anything else without
+the key) fails verification and resets them to the restricted defaults. The
+`harness` preference is stored alongside without integrity checks (the worst
+a tampered value can do is open the workspace in the other Claude Code) and
+survives a guardrail reset. The MAC of the last file the server wrote is also pinned
 in memory, so replaying an *old* validly-MAC'd settings file (say, captured
 while the mode was unrestricted) fails the same way; only a replay staged
-while the server is stopped escapes the pin. Operators change mode/whitelist in the agent UI at
+while the server is stopped escapes the pin. Operators change the mode in the agent UI at
 `http://127.0.0.1:8716/`; the change is authenticated by re-decrypting the
-keystore with the submitted password, not by the session's bearer token.
+keystore with the submitted password, not by the session's bearer token. The
+whitelist is not editable through the API yet — a patch replaces it wholesale
+across all chains and only its address *format* can be validated here, so it
+stays frozen at the defaults (a `whitelist` in a patch is a 422) until those
+semantics are designed.
 
 ## Threat-model notes
 
