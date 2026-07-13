@@ -30,7 +30,7 @@ from eth_account.signers.local import LocalAccount
 from hexbytes import HexBytes
 from web3 import Web3
 
-from pearl_connect.activity import ActivityLog
+from pearl_connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from pearl_connect.config import AppConfig, ChainConfig
 from pearl_connect.guard import Guard
 from pearl_connect.mech import MechService
@@ -67,6 +67,24 @@ def store_path(tmp_path: Path) -> Path:
     store = tmp_path / "persistent_data"
     store.mkdir()
     return store
+
+
+def audit_entries(store_path: Path) -> list[dict]:
+    """Read the audit trail as the operator reads it: the log file on disk.
+
+    The one source of truth for what was recorded — the server keeps no
+    in-memory copy to assert against, so a test that passes here passes
+    against the artifact itself.
+    """
+    path = store_path / ACTIVITY_LOG_FILE
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def audit_kinds(store_path: Path) -> list[str]:
+    """Return the recorded kinds, in order."""
+    return [entry["kind"] for entry in audit_entries(store_path)]
 
 
 @pytest.fixture

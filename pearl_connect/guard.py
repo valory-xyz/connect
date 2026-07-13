@@ -147,7 +147,10 @@ class Guard:
                 "would pay out of the safe outside the whitelist"
             )
         if inner_to.lower() not in whitelist.get(chain, ()):
+            # the whitelist is not editable through the API yet, so pointing at
+            # it would send the operator down a path that does not exist
             raise GuardError(
                 f"restricted mode: {inner_to} is not in the {chain} whitelist; "
-                "ask the operator to whitelist it via the agent UI"
+                "ask the operator to switch to unrestricted mode via the agent "
+                "UI if it is required"
             )

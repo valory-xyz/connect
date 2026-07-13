@@ -32,15 +32,17 @@ import logging
 import time
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from pearl_connect.keystore import KeystoreError, load_account
+from pearl_connect.settings import SettingsPersistError
 
 logger = logging.getLogger("agent")
 
 router = APIRouter()
 
 WRONG_PASSWORD_DELAY_SECONDS = 1.0
+WHITELIST_FROZEN = "whitelist editing via the API is not supported yet"
 
 
 class ProtectedPatch(BaseModel):
@@ -49,7 +51,25 @@ class ProtectedPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: str | None = None
-    whitelist: dict[str, list[str]] | None = None  # replaced wholesale if given
+    whitelist: dict[str, list[str]] | None = None
+
+    @field_validator("whitelist")
+    @classmethod
+    def _whitelist_is_frozen(cls, value: object) -> object:
+        """Refuse whitelist writes: the semantics are not specced yet.
+
+        A patch replaces the whitelist wholesale, so a single-chain edit would
+        silently drop the other chains — including their default marketplace
+        entries — and the only validation available here is the address format:
+        no chain check, no proof the address is even a contract. Until that is
+        designed, an attempt is a loud 422 rather than a quiet misfire. The
+        field stays declared (rather than left to extra="forbid") so a caller
+        gets that answer instead of "extra inputs are not permitted"; the store
+        still accepts whitelists internally, from defaults().
+        """
+        if value is not None:
+            raise ValueError(WHITELIST_FROZEN)
+        return value  # an explicit null is the merge-patch "keep", not an edit
 
 
 class SettingsPatch(BaseModel):
@@ -97,9 +117,11 @@ def patch_settings(body: SettingsPatch, request: Request) -> dict:
                 status_code=429,
                 detail="too many failed authentication attempts; retry later",
             )
-        if body.password is None:
-            # no guess was made: audit the attempt, but don't burn a decrypt,
-            # a delay or a brake count on it
+        if not body.password:
+            # no guess was made — an omitted password, or the empty string a
+            # blank form field submits: audit the attempt, but don't burn a
+            # decrypt, a delay or a brake count on it. Counting these would let
+            # anyone 429-lock every authenticated surface for free.
             state.activity.record(
                 "auth_failed", path="/settings", reason="missing password"
             )
@@ -117,28 +139,25 @@ def patch_settings(body: SettingsPatch, request: Request) -> dict:
 
     try:
         # the store's patch holds one lock across read-merge-write, so two
-        # concurrent PATCHes (the UI's two forms) cannot lose an update
-        settings = state.settings_store.patch(
-            body.model_dump(exclude={"password"}, exclude_none=True)
+        # concurrent PATCHes (the UI's two forms) cannot lose an update. The
+        # None-means-keep rule lives there alone: dumping the body as-is keeps
+        # HTTP callers and direct store callers on one merge semantics.
+        previous, settings = state.settings_store.patch(
+            body.model_dump(exclude={"password"})
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    except OSError as e:
+    except SettingsPersistError as e:
         raise HTTPException(
             status_code=503, detail="settings could not be persisted"
         ) from e
-    if body.protected is not None:
-        if body.protected.whitelist is not None:
-            unknown = sorted(
-                set(settings.protected.whitelist) - set(state.config.chains)
-            )
-            if unknown:
-                logger.warning(
-                    "whitelist chains not configured: %s", ", ".join(unknown)
-                )
+    # audit what moved, not what was submitted: a patch restating the stored
+    # values is a no-op, and an audit trail claiming guardrail changes that
+    # never happened is worse than no entry at all
+    if settings.protected != previous.protected:
         state.activity.record("settings_changed", mode=settings.protected.mode)
         logger.info("settings updated: mode=%s", settings.protected.mode)
-    if body.harness is not None:
+    if settings.harness != previous.harness:
         state.activity.record("harness_changed", harness=settings.harness)
         logger.info("harness updated: %s", settings.harness)
     return settings.to_dict()

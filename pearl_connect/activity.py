@@ -32,7 +32,6 @@ from pathlib import Path
 ACTIVITY_LOG_FILE = "activity_log.jsonl"
 PERFORMANCE_FILE = "agent_performance.json"
 MAX_LOG_BYTES = 5 * 1024 * 1024  # rotate to .1 beyond this
-RECENT_ENTRIES = 50
 
 
 class ActivityLog:
@@ -43,7 +42,6 @@ class ActivityLog:
         self._path = store_path / ACTIVITY_LOG_FILE
         self._performance_path = store_path / PERFORMANCE_FILE
         self._lock = threading.Lock()
-        self._recent: list[dict] = []
         self._count = 0
         self._tx_count = 0
         self._last_activity: str | None = None
@@ -56,15 +54,8 @@ class ActivityLog:
             if kind == "transaction":
                 self._tx_count += 1
             self._last_activity = kind
-            self._recent.append(entry)
-            del self._recent[:-RECENT_ENTRIES]
             self._append(entry)
             self._write_performance()
-
-    def recent(self) -> list[dict]:
-        """Recent."""
-        with self._lock:
-            return list(self._recent)
 
     @property
     def count(self) -> int:

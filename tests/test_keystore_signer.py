@@ -31,7 +31,7 @@ from pearl_connect.activity import ActivityLog
 from pearl_connect.keystore import KeystoreError, load_account
 from pearl_connect.signer import Signer, SignerError
 
-from tests.conftest import FakeW3, TEST_PASSWORD
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
 
 
 class TestKeystore:
@@ -57,14 +57,18 @@ class TestSigner:
     """TestSigner."""
 
     def test_send_returns_hash_and_logs(
-        self, test_signer: Signer, fake_w3: FakeW3, activity: ActivityLog
+        self,
+        store_path: Path,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        activity: ActivityLog,
     ) -> None:
         """Test send returns hash and logs."""
         tx_hash = test_signer.send("testchain", to="0x" + "aa" * 20, value=1)
         assert tx_hash.startswith("0x")
         assert len(tx_hash) == 66
         assert len(fake_w3.eth.sent) == 1
-        kinds = [e["kind"] for e in activity.recent()]
+        kinds = audit_kinds(store_path)
         assert "transaction" in kinds
 
     def test_request_id_idempotency(self, test_signer: Signer, fake_w3: FakeW3) -> None:

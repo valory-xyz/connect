@@ -55,7 +55,10 @@ SETTINGS_VERSION = 1
 # The MAC covers the version and the "protected" object of the canonical
 # shape — everything an attacker could profit from editing. The harness is
 # deliberately outside it: a preference, and the worst a tampered value can
-# do is open the workspace in the other Claude Code.
+# do is open the workspace in the other Claude Code. A new top-level field
+# ships outside the MAC unless it is named here, so a test pins the file's
+# top-level keys against this tuple: adding one fails it until its integrity
+# coverage is a decision rather than an oversight.
 MAC_FIELDS = ("version", "protected")
 
 MODE_RESTRICTED = "restricted"
@@ -245,6 +248,22 @@ def derive_mac_key(account: LocalAccount) -> bytes:
     return hmac.new(prk, _MAC_KEY_INFO + b"\x01", hashlib.sha256).digest()
 
 
+class SettingsPersistError(OSError):
+    """The settings could not be written to disk.
+
+    Distinct from the OSErrors of the read path (which fail closed to the
+    defaults in-memory): only this one means the caller's change did not land,
+    so only this one may be reported as such.
+    """
+
+
+class PatchResult(t.NamedTuple):
+    """The settings on either side of a patch, for callers auditing changes."""
+
+    previous: Settings
+    updated: Settings
+
+
 class SettingsStore:
     """Verified reads and signed writes of the settings file.
 
@@ -273,33 +292,41 @@ class SettingsStore:
         with self._lock:
             return self._load()
 
-    def patch(self, patch: t.Mapping) -> Settings:
+    def patch(self, patch: t.Mapping) -> PatchResult:
         """Merge a partial canonical-shaped patch and persist the result.
 
         One lock spans the read-merge-write: concurrent patches (the UI has
         independent protected and harness forms) must not lose an update.
+        Returns both sides of the change, so a caller can audit what actually
+        moved rather than what was submitted.
         :raises ValueError: on invalid replacements;
-        :raises OSError: when the merged settings cannot be persisted — an
-        explicit change must never claim success while the disk disagrees
-        (unlike the load path, which degrades to its in-memory value).
+        :raises SettingsPersistError: when the merged settings cannot be
+        persisted — an explicit change must never claim success while the disk
+        disagrees (unlike the load path, which degrades to its in-memory value).
         """
         with self._lock:
-            settings = self._load().merged(patch)
+            previous = self._load()
+            updated = previous.merged(patch)
             try:
-                self._save(settings)
+                self._save(updated)
             except OSError as e:
                 self._activity.record(
                     "settings_persist_failed", path=str(self._path), error=str(e)
                 )
-                raise
-            return settings
+                raise SettingsPersistError(str(e)) from e
+            return PatchResult(previous=previous, updated=updated)
 
     def _load(self) -> Settings:
         try:
             raw = self._path.read_text(encoding="utf-8")
-        except FileNotFoundError:
+        except OSError:
+            # not only a missing file: an unreadable one (bad permissions, a
+            # store path that is not a directory, a failing disk) must fail
+            # closed too. Every guarded action loads settings, so raising here
+            # would take the process down rather than merely restrict it.
             return self._reset(defaults())
-        verified = self._verify(raw)
+        payload = self._parse(raw)
+        verified = self._verify(payload)
         if verified is not None:
             return verified
         logger.warning(
@@ -309,17 +336,23 @@ class SettingsStore:
         fallback = defaults()
         # the harness is a preference, not a security control: a tampered
         # mode/whitelist resets those, but must not discard the harness
-        fallback.harness = self._harness_of(raw)
+        fallback.harness = _harness_or_default(payload.get("harness", DEFAULT_HARNESS))
         return self._reset(fallback)
 
     @staticmethod
-    def _harness_of(raw: str) -> str:
-        """Best-effort harness from an unverified file (validated, lenient)."""
+    def _parse(raw: str) -> dict:
+        """Return the file's payload — empty if it is not even a JSON object.
+
+        The single parse of the file: an unverifiable payload is still read for
+        the harness (a preference that survives a guardrail reset), and a
+        tampered file is re-read on every guarded decision until the reset
+        write lands, so one parse with one error path is worth having.
+        """
         try:
-            harness = json.loads(raw).get("harness", DEFAULT_HARNESS)
-        except (json.JSONDecodeError, AttributeError):
-            return DEFAULT_HARNESS
-        return _harness_or_default(harness)
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     def save(self, settings: Settings) -> None:
         """Write settings with a fresh MAC, atomically."""
@@ -360,18 +393,15 @@ class SettingsStore:
         )
         return hmac.new(self._mac_key, canonical.encode(), hashlib.sha256).hexdigest()
 
-    def _verify(self, raw: str) -> Settings | None:
+    def _verify(self, payload: dict) -> Settings | None:
+        mac = str(payload.get("mac", ""))
+        if not hmac.compare_digest(mac, self._mac(payload)):
+            return None
+        if self._expected_mac is not None and mac != self._expected_mac:
+            return None  # valid MAC, but not the file we last wrote: replay
         try:
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                return None
-            mac = str(payload.get("mac", ""))
-            if not hmac.compare_digest(mac, self._mac(payload)):
-                return None
-            if self._expected_mac is not None and mac != self._expected_mac:
-                return None  # valid MAC, but not the file we last wrote: replay
             settings = Settings.from_raw(payload)
-        except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
+        except (ValueError, KeyError, TypeError, AttributeError):
             return None
         self._expected_mac = mac
         return settings

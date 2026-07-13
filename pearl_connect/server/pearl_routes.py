@@ -78,10 +78,13 @@ def index(request: Request) -> str:
         f"<td><code>{html.escape(c.safe_address or '—')}</code></td></tr>"
         for name, c in sorted(chains.items())
     )
-    whitelist_lines = "\n".join(
-        f"{html.escape(chain)}:{html.escape(address)}"
-        for chain, addresses in sorted(settings.protected.whitelist.items())
-        for address in addresses
+    whitelist_lines = (
+        "\n".join(
+            f"{html.escape(chain)}:{html.escape(address)}"
+            for chain, addresses in sorted(settings.protected.whitelist.items())
+            for address in addresses
+        )
+        or "none"
     )
     checked = {True: "checked", False: ""}
     restricted = settings.protected.mode == "restricted"
@@ -98,7 +101,8 @@ def index(request: Request) -> str:
  .btn {{ display: inline-block; margin-top: 1rem; padding: .6rem 1.2rem; background: #111;
         color: #fff; border-radius: 8px; text-decoration: none; border: 0; cursor: pointer; }}
  .mode {{ font-weight: 600; text-transform: capitalize; }}
- textarea {{ width: 100%; min-height: 7rem; font-family: monospace; font-size: .85em; }}
+ pre {{ background: #f6f6f6; padding: .6rem; border-radius: 6px; font-size: .85em;
+       overflow-x: auto; }}
  input[type=password] {{ width: 100%; }}
  #settings-result {{ margin-top: .5rem; }}
 </style></head>
@@ -123,8 +127,8 @@ settings requires the keystore password — the agent session does not have it.<
 Restricted</label>
    <label><input type="radio" name="mode" value="unrestricted" {checked[not restricted]}>
 Unrestricted</label></p>
-<p><label>Whitelist (one <code>chain:address</code> per line)<br>
-<textarea name="whitelist">{whitelist_lines}</textarea></label></p>
+<p>Whitelisted targets (not editable yet):</p>
+<pre>{whitelist_lines}</pre>
 <p><label>Keystore password<br><input type="password" name="password" autocomplete="off"></label></p>
 <button class="btn" type="submit">Apply</button>
 <div id="settings-result"></div>
@@ -164,18 +168,9 @@ async function applySettingsPatch(resultId, payload) {{
 document.getElementById("settings-form").addEventListener("submit", async (e) => {{
   e.preventDefault();
   const form = e.target;
-  const whitelist = {{}};
-  for (const line of form.whitelist.value.split("\\n")) {{
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const sep = trimmed.indexOf(":");
-    if (sep < 1) continue;
-    const chain = trimmed.slice(0, sep).trim().toLowerCase();
-    (whitelist[chain] = whitelist[chain] || []).push(trimmed.slice(sep + 1).trim());
-  }}
   await applySettingsPatch("settings-result", {{
     password: form.password.value,
-    protected: {{mode: form.mode.value, whitelist}},
+    protected: {{mode: form.mode.value}},
   }});
 }});
 document.getElementById("harness-form").addEventListener("submit", async (e) => {{

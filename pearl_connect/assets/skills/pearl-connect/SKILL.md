@@ -56,8 +56,9 @@ it):
   off-chain mech requests — use `mech_request(..., legacy_on_chain=true)`.
 
 Every blocked request fails with the violated rule. You cannot lift the
-restrictions; the user changes them in the agent UI with their keystore password.
-Never ask for the password in chat — point them at the UI.
+restrictions; the user changes the mode in the agent UI with their keystore
+password. Never ask for the password in chat — point them at the UI. The
+whitelist itself cannot be edited yet.
 
 ## Mech requests
 
