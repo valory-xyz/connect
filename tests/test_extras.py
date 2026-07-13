@@ -179,7 +179,7 @@ class TestMain:
         assert served[0].config.app.state.ready is False
         assert (store_path / "agent_performance.json").exists()
 
-    def test_unwritable_store_serves_unhealthy(
+    def test_unusable_store_serves_unhealthy(
         self,
         monkeypatch: pytest.MonkeyPatch,
         keystore_dir: Path,
@@ -191,11 +191,15 @@ class TestMain:
         Everything that provisions the store fails here — populate and the
         performance file alike — and the middleware would just restart a
         process that dies. Serve, and report unhealthy.
+
+        The store is placed under a regular file rather than a chmod'd
+        directory: permission bits do not stop a write on Windows, and this
+        failure must be reproduced on every platform we ship to.
         """
-        readonly = tmp_path / "readonly"
-        readonly.mkdir(mode=0o500)
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("a file where the store's parent should be")
         monkeypatch.chdir(keystore_dir)
-        monkeypatch.setenv(STORE_PATH_ENV, str(readonly / "store"))
+        monkeypatch.setenv(STORE_PATH_ENV, str(blocker / "store"))
         monkeypatch.delenv(SAFES_ENV, raising=False)
         monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0  # not a crash

@@ -185,6 +185,22 @@ class TestSettingsStore:
         assert final.protected.mode == MODE_RESTRICTED
         assert final.harness == "claude_code_cli"
 
+    def test_unreadable_file_fails_closed(
+        self, account: LocalAccount, activity: ActivityLog, tmp_path: Path
+    ) -> None:
+        """An unreadable settings file restricts, it does not crash the agent.
+
+        A missing file is not the only way a read fails: the store path may
+        not even be a directory. Every guarded action loads settings, so
+        raising here would kill the process instead of the read.
+        """
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("a file where the store should be")
+        store = SettingsStore(
+            blocker / "pearl-connect.settings.json", derive_mac_key(account), activity
+        )
+        assert store.load().protected.mode == MODE_RESTRICTED
+
     def test_invalid_patch_persists_nothing(self, store: SettingsStore) -> None:
         """A patch that fails validation leaves the stored settings untouched."""
         store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
