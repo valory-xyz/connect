@@ -201,6 +201,39 @@ class TestSettingsStore:
         )
         assert store.load().protected.mode == MODE_RESTRICTED
 
+    def test_an_unreadable_file_is_never_overwritten(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A read that fails must not destroy the settings it could not read.
+
+        A missing file is safe to re-create; a momentarily unreadable one is
+        not — a virus scanner or a backup tool holding it raises here, and
+        resetting would permanently clobber the operator's mode, whitelist and
+        harness over a condition that clears by itself. Restrict in memory,
+        leave the file alone.
+        """
+        store.save(
+            Settings(
+                protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}),
+                harness="claude_code_cli",
+            )
+        )
+        before = store._path.read_bytes()  # pylint: disable=protected-access
+
+        def refuse(self: Path, **kwargs: object) -> str:
+            raise PermissionError("held by another process")
+
+        monkeypatch.setattr(Path, "read_text", refuse)
+        assert store.load().protected.mode == MODE_RESTRICTED  # fails closed
+        monkeypatch.undo()
+
+        # the file survived untouched, and so did everything in it — including
+        # the MAC pin, so the surviving file is not then rejected as a replay
+        assert store._path.read_bytes() == before  # pylint: disable=protected-access
+        restored = store.load()
+        assert restored.protected.mode == MODE_UNRESTRICTED
+        assert restored.harness == "claude_code_cli"
+
     def test_invalid_patch_persists_nothing(self, store: SettingsStore) -> None:
         """A patch that fails validation leaves the stored settings untouched."""
         store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
