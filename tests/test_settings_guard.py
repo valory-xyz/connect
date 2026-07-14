@@ -34,6 +34,7 @@ from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 
 from pearl_connect import settings as settings_module
+from pearl_connect import workspace as workspace_module
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig, ChainConfig
 from pearl_connect.guard import EXEC_TRANSACTION_SELECTOR, Guard, GuardError
@@ -183,6 +184,55 @@ class TestSettingsStore:
         final = store.load()
         assert final.protected.mode == MODE_RESTRICTED
         assert final.harness == "claude_code_cli"
+
+    def test_unreadable_file_fails_closed(
+        self, account: LocalAccount, activity: ActivityLog, tmp_path: Path
+    ) -> None:
+        """An unreadable settings file restricts, it does not crash the agent.
+
+        A missing file is not the only way a read fails: the store path may
+        not even be a directory. Every guarded action loads settings, so
+        raising here would kill the process instead of the read.
+        """
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("a file where the store should be")
+        store = SettingsStore(
+            blocker / "pearl-connect.settings.json", derive_mac_key(account), activity
+        )
+        assert store.load().protected.mode == MODE_RESTRICTED
+
+    def test_an_unreadable_file_is_never_overwritten(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A read that fails must not destroy the settings it could not read.
+
+        A missing file is safe to re-create; a momentarily unreadable one is
+        not — a virus scanner or a backup tool holding it raises here, and
+        resetting would permanently clobber the operator's mode, whitelist and
+        harness over a condition that clears by itself. Restrict in memory,
+        leave the file alone.
+        """
+        store.save(
+            Settings(
+                protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}),
+                harness="claude_code_cli",
+            )
+        )
+        before = store._path.read_bytes()  # pylint: disable=protected-access
+
+        def refuse(self: Path, **kwargs: object) -> str:
+            raise PermissionError("held by another process")
+
+        monkeypatch.setattr(Path, "read_text", refuse)
+        assert store.load().protected.mode == MODE_RESTRICTED  # fails closed
+        monkeypatch.undo()
+
+        # the file survived untouched, and so did everything in it — including
+        # the MAC pin, so the surviving file is not then rejected as a replay
+        assert store._path.read_bytes() == before  # pylint: disable=protected-access
+        restored = store.load()
+        assert restored.protected.mode == MODE_UNRESTRICTED
+        assert restored.harness == "claude_code_cli"
 
     def test_invalid_patch_persists_nothing(self, store: SettingsStore) -> None:
         """A patch that fails validation leaves the stored settings untouched."""
@@ -764,6 +814,31 @@ class TestMech:
         )
         assert len(patched_mech.calls) == 2
 
+    def test_delivered_request_survives_an_unwritable_audit_log(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A paid-for delivery must not be lost to a failing audit write.
+
+        The audit runs after the mech answered: raising would discard a
+        result the operator already paid for, and invite paying again.
+        """
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        result = mech_service.request(
+            "what is the answer",
+            "prediction",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+        )
+        assert result == patched_mech.result
+
     def test_request_offchain_denied_in_restricted(
         self,
         mech_service: MechService,
@@ -1149,14 +1224,117 @@ class TestSettingsEndpoints:
         assert flipped.status_code == 200
         assert flipped.json()["harness"] == "claude_code_cli"
         assert client.get("/settings").json()["harness"] == "claude_code_cli"
-        # the UI's Open button now targets the CLI deep link
+        # the UI reflects the choice; POST /session is what acts on it
         page = client.get("/").text
-        assert "claude-cli://open?cwd=" in page
         assert 'value="claude_code_cli"' in page
+        # the button must exist *before* the inline script that binds it:
+        # getElementById returns null for an element the parser has not reached,
+        # so a button emitted after </script> throws and silently does nothing
+        assert 0 < page.index('id="open-session"') < page.index("<script>")
 
         bad = client.patch("/settings", json={"harness": "cursor"})
         assert bad.status_code == 400
         assert "harness" in bad.json()["detail"]
+
+    def test_session_opens_the_configured_harness(
+        self,
+        client: TestClient,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POST /session opens a session on demand, in the chosen harness."""
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module.Workspace,
+            "open_session",
+            lambda self, harness: opened.append(harness),
+        )
+        client.patch("/settings", json={"harness": "claude_code_cli"})
+        response = client.post("/session")
+        assert response.status_code == 200
+        assert response.json() == {"launched": True, "harness": "claude_code_cli"}
+        assert opened == ["claude_code_cli"]
+        assert "session_launched" in audit_kinds(store_path)
+
+    def test_session_launch_failure_is_reported(
+        self,
+        client: TestClient,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deep link that will not open is a 200 the UI can show, not a 500.
+
+        The FE needs the reason to raise a dismissable alert: a harness that
+        is not installed is the operator's environment, not a server fault.
+        """
+
+        def refuse(self: workspace_module.Workspace, harness: str) -> None:
+            raise workspace_module.LaunchError(f"could not open {harness}")
+
+        monkeypatch.setattr(workspace_module.Workspace, "open_session", refuse)
+        response = client.post("/session")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["launched"] is False
+        assert body["harness"] == "claude_code_desktop"
+        assert "could not open claude_code_desktop" in body["error"]
+        assert "session_launch_failed" in audit_kinds(store_path)
+
+    def test_session_rejects_cross_origin(self, client: TestClient) -> None:
+        """A webpage must not be able to spawn agent sessions."""
+        response = client.post("/session", headers={"Origin": "https://evil.example"})
+        assert response.status_code == 403
+
+    def test_session_harness_override_does_not_persist(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit harness opens there once, leaving the preference alone."""
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module.Workspace,
+            "open_session",
+            lambda self, harness: opened.append(harness),
+        )
+        response = client.post("/session", json={"harness": "claude_code_cli"})
+        assert response.status_code == 200
+        assert response.json() == {"launched": True, "harness": "claude_code_cli"}
+        assert opened == ["claude_code_cli"]
+        # the saved preference is untouched: the next default launch uses it
+        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
+        client.post("/session")
+        assert opened == ["claude_code_cli", "claude_code_desktop"]
+
+    def test_session_survives_an_unwritable_audit_log(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The session opened; a failing audit write must not report otherwise.
+
+        Reporting failure after the deep link already fired would have the
+        operator open a second session for work that succeeded.
+        """
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module.Workspace,
+            "open_session",
+            lambda self, harness: opened.append(harness),
+        )
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        response = client.post("/session")
+        assert response.status_code == 200
+        assert response.json()["launched"] is True
+        assert opened == ["claude_code_desktop"]
+
+    def test_session_rejects_an_unknown_harness(self, client: TestClient) -> None:
+        """An unknown harness is a 400, not a deep link nobody can open."""
+        response = client.post("/session", json={"harness": "cursor"})
+        assert response.status_code == 400
+        assert "harness" in response.json()["detail"]
+        # and a typo'd field is refused outright
+        assert client.post("/session", json={"harnes": "x"}).status_code == 422
 
     def test_whitelist_editing_is_refused(self, client: TestClient) -> None:
         """The whitelist is frozen at the API: an attempt is loud, not ignored.

@@ -71,6 +71,27 @@ class TestSigner:
         kinds = audit_kinds(store_path)
         assert "transaction" in kinds
 
+    def test_broadcast_survives_an_unwritable_audit_log(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing audit write must not turn a sent transaction into an error.
+
+        The audit happens after the broadcast: raising here would hand the
+        caller a failure for a transaction that is already on-chain, and the
+        obvious response — retry — would spend the funds twice.
+        """
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        tx_hash = test_signer.send("testchain", to="0x" + "aa" * 20, value=1)
+        assert tx_hash.startswith("0x")
+        assert len(fake_w3.eth.sent) == 1  # broadcast once, and reported as such
+
     def test_request_id_idempotency(self, test_signer: Signer, fake_w3: FakeW3) -> None:
         """Test request id idempotency."""
         first = test_signer.send("testchain", to="0x" + "aa" * 20, request_id="r-1")

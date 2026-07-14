@@ -24,7 +24,11 @@ import stat
 import sys
 from pathlib import Path
 
+import pytest
+
 from pearl_connect import workspace
+from pearl_connect.settings import HARNESSES
+from pearl_connect.workspace import Workspace
 
 
 def mcp_entry(store_path: Path) -> dict:
@@ -34,9 +38,16 @@ def mcp_entry(store_path: Path) -> dict:
     ]
 
 
-def test_populate_writes_mcp_config_0600(store_path: Path) -> None:
-    """Test populate writes mcp config 0600."""
-    workspace.populate(store_path, "tok-1")
+def provisioned(store_path: Path, token: str = "tok") -> Workspace:  # nosec B107
+    """Return a workspace that provisioned itself, as a healthy boot leaves it."""
+    agent_workspace = Workspace(store_path, token)
+    assert agent_workspace.ensure() is True, agent_workspace.reason
+    return agent_workspace
+
+
+def test_provisioning_writes_mcp_config_0600(store_path: Path) -> None:
+    """Test provisioning writes mcp config 0600."""
+    provisioned(store_path, "tok-1")
     path = store_path / ".mcp.json"
     if sys.platform != "win32":  # Windows does not enforce POSIX mode bits
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -45,43 +56,47 @@ def test_populate_writes_mcp_config_0600(store_path: Path) -> None:
     assert entry["headers"]["Authorization"] == "Bearer tok-1"
 
 
-def test_populate_preserves_other_mcp_servers(store_path: Path) -> None:
-    """Test populate preserves other mcp servers."""
+def test_provisioning_preserves_other_mcp_servers(store_path: Path) -> None:
+    """Test provisioning preserves other mcp servers."""
     (store_path / ".mcp.json").write_text(
         json.dumps({"mcpServers": {"other": {"type": "stdio", "command": "x"}}})
     )
-    workspace.populate(store_path, "tok-1")
+    provisioned(store_path, "tok-1")
     config = json.loads((store_path / ".mcp.json").read_text())
     assert "other" in config["mcpServers"]
     assert "pearl-connect" in config["mcpServers"]
 
 
-def test_second_populate_rotates_token(store_path: Path) -> None:
-    """Test second populate rotates token."""
-    workspace.populate(store_path, "tok-1")
-    workspace.populate(store_path, "tok-2")
+def test_a_second_run_rotates_the_token(store_path: Path) -> None:
+    """The token is minted per run, so the next run's workspace rewrites it.
+
+    Two workspaces over one store is what a restart looks like: the same
+    persistent_data dir, a fresh token.
+    """
+    provisioned(store_path, "tok-1")
+    provisioned(store_path, "tok-2")
     assert mcp_entry(store_path)["headers"]["Authorization"] == "Bearer tok-2"
 
 
 def test_skills_installed_and_overwritten(store_path: Path) -> None:
     """Test skills installed and overwritten."""
-    workspace.populate(store_path, "tok")
+    provisioned(store_path)
     skill_md = store_path / ".claude" / "skills" / "pearl-connect" / "SKILL.md"
     assert skill_md.exists()
-    # a stale file inside our skill dir is removed on re-populate
+    # a stale file inside our skill dir is removed on the next run
     stale = skill_md.parent / "stale.txt"
     stale.write_text("old")
-    workspace.populate(store_path, "tok")
+    provisioned(store_path)
     assert not stale.exists()
 
 
 def test_claude_md_installed_and_overwritten(store_path: Path) -> None:
     """CLAUDE.md is installed from assets and rewritten on each start."""
-    workspace.populate(store_path, "tok")
+    provisioned(store_path)
     claude_md = store_path / "CLAUDE.md"
     assert "pearl-connect skill" in claude_md.read_text()
     claude_md.write_text("user edits")
-    workspace.populate(store_path, "tok")
+    provisioned(store_path)
     assert claude_md.read_text() != "user edits"
 
 
@@ -92,38 +107,34 @@ def test_user_files_survive(store_path: Path) -> None:
     user_skill = store_path / ".claude" / "skills" / "my-skill"
     user_skill.mkdir(parents=True)
     (user_skill / "SKILL.md").write_text("mine too")
-    workspace.populate(store_path, "tok")
+    provisioned(store_path)
     assert user_file.read_text() == "mine"
     assert (user_skill / "SKILL.md").read_text() == "mine too"
 
 
 def test_gitignore_provisioned_and_preserved(store_path: Path) -> None:
     """The token file is gitignored; user entries survive; idempotent."""
-    workspace._ensure_gitignore(store_path)  # pylint: disable=protected-access
-    content = (store_path / ".gitignore").read_text()
-    assert ".mcp.json" in content
+    provisioned(store_path)
+    assert ".mcp.json" in (store_path / ".gitignore").read_text()
 
     (store_path / ".gitignore").write_text("user-stuff/\n")
-    workspace._ensure_gitignore(store_path)  # pylint: disable=protected-access
+    provisioned(store_path)
     content = (store_path / ".gitignore").read_text()
     assert "user-stuff/" in content
     assert ".mcp.json" in content
 
-    before = (store_path / ".gitignore").read_text()
-    workspace._ensure_gitignore(store_path)  # pylint: disable=protected-access
-    assert (store_path / ".gitignore").read_text() == before  # no growth
+    provisioned(store_path)
+    assert (store_path / ".gitignore").read_text() == content  # no growth
 
 
 def test_claude_settings_deny_rule_merged(store_path: Path) -> None:
     """The Read deny rule lands without clobbering user settings."""
-    import json
-
     settings_path = store_path / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True)
     settings_path.write_text(
         json.dumps({"permissions": {"deny": ["WebFetch"]}, "model": "opus"})
     )
-    workspace._ensure_claude_settings(store_path)  # pylint: disable=protected-access
+    provisioned(store_path)
     config = json.loads(settings_path.read_text())
     assert config["model"] == "opus"
     assert "WebFetch" in config["permissions"]["deny"]
@@ -131,34 +142,78 @@ def test_claude_settings_deny_rule_merged(store_path: Path) -> None:
 
     # invalid JSON is backed up, then rewritten rather than crashing the boot
     settings_path.write_text("{nope")
-    workspace._ensure_claude_settings(store_path)  # pylint: disable=protected-access
+    provisioned(store_path)
     config = json.loads(settings_path.read_text())
     assert config["permissions"]["deny"] == ["Read(./.mcp.json)"]
     # the user's broken content stays recoverable next to the rewrite
     assert settings_path.with_suffix(".json.bak").read_text() == "{nope"
 
 
-def test_populate_provisions_token_hygiene(store_path: Path) -> None:
-    """populate() ships the gitignore and the deny rule alongside the skill."""
-    import json
-
-    workspace.populate(store_path, "tok")
+def test_provisioning_ships_token_hygiene(store_path: Path) -> None:
+    """The gitignore and the deny rule ship alongside the skill, not apart."""
+    provisioned(store_path)
     assert ".mcp.json" in (store_path / ".gitignore").read_text()
     config = json.loads((store_path / ".claude" / "settings.json").read_text())
     assert "Read(./.mcp.json)" in config["permissions"]["deny"]
 
 
 def test_deep_links(store_path: Path) -> None:
-    """Deep links and the harness-dependent launch order."""
+    """Deep links, and the one the configured harness resolves to."""
     assert workspace.desktop_deep_link(store_path).startswith(
         "claude://code/new?folder="
     )
     assert workspace.cli_deep_link(store_path).startswith("claude-cli://open?cwd=")
-    # desktop harness (the default): desktop first, CLI as fallback
-    first, second = workspace.launch_order(store_path)
-    assert first.startswith("claude://")
-    assert second.startswith("claude-cli://")
-    # CLI harness reverses the order
-    first, second = workspace.launch_order(store_path, "claude_code_cli")
-    assert first.startswith("claude-cli://")
-    assert second.startswith("claude://")
+    # the harness resolves to exactly one link — the other is never a fallback
+    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    assert agent_workspace.deep_link().startswith("claude://")
+    assert agent_workspace.deep_link("claude_code_cli").startswith("claude-cli://")
+
+
+def test_deep_link_rejects_an_unknown_harness(store_path: Path) -> None:
+    """A harness with no link raises, instead of quietly opening the desktop."""
+    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    with pytest.raises(ValueError, match="cursor"):
+        agent_workspace.deep_link("cursor")
+
+
+def test_every_choosable_harness_can_be_opened() -> None:
+    """Whatever the operator may choose, we must be able to open.
+
+    HARNESSES is what PATCH /settings and POST /session accept; DEEP_LINKS is
+    what can actually be launched. A member of the first missing from the
+    second is a dead end the operator only meets when a session refuses to
+    start — so the two are pinned to each other here rather than left to drift.
+    """
+    assert set(workspace.DEEP_LINKS) == set(HARNESSES)
+
+
+def test_open_session_never_falls_back(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On demand, only the chosen harness counts: no silent other-harness open.
+
+    The operator picked a harness: they need to see that one fail, not to be
+    handed the other one and told it worked.
+    """
+    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    tried: list[str] = []
+
+    def refuse(url: str) -> bool:
+        tried.append(url)
+        return False
+
+    monkeypatch.setattr(workspace, "_open_url", refuse)
+    with pytest.raises(workspace.LaunchError, match="claude_code_cli"):
+        agent_workspace.open_session("claude_code_cli")
+    assert len(tried) == 1  # the desktop link was never tried as a fallback
+    assert tried[0].startswith("claude-cli://")
+
+    tried.clear()
+
+    def accept(url: str) -> bool:
+        tried.append(url)
+        return True
+
+    monkeypatch.setattr(workspace, "_open_url", accept)
+    agent_workspace.open_session("claude_code_cli")
+    assert tried == [workspace.cli_deep_link(store_path)]

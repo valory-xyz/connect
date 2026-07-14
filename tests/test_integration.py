@@ -48,6 +48,7 @@ from pearl_connect.settings import (
     derive_mac_key,
 )
 from pearl_connect.signer import Signer
+from pearl_connect.workspace import Workspace
 
 from tests.conftest import TEST_PASSWORD
 
@@ -155,6 +156,7 @@ def _fork_app(
         guard=guard,
         settings_store=store,
         mech=MechService(signer, config, activity, guard),
+        workspace=Workspace(store_path, token),
     )
 
 

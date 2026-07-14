@@ -25,9 +25,12 @@ app reads from STORE_PATH.
 """
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
+
+logger = logging.getLogger("agent")
 
 ACTIVITY_LOG_FILE = "activity_log.jsonl"
 PERFORMANCE_FILE = "agent_performance.json"
@@ -47,15 +50,24 @@ class ActivityLog:
         self._last_activity: str | None = None
 
     def record(self, kind: str, **fields: object) -> None:
-        """Record."""
+        """Record an entry; a failing disk never fails the caller's action.
+
+        Recording happens after the fact (the transaction is broadcast, the
+        session is open, the settings are saved). Raising here would report
+        those as failures and invite the operator to retry work already done —
+        so an unwritable log is loud in log.txt and in memory, but not fatal.
+        """
         entry = {"timestamp": int(time.time()), "kind": kind, **fields}
         with self._lock:
             self._count += 1
             if kind == "transaction":
                 self._tx_count += 1
             self._last_activity = kind
-            self._append(entry)
-            self._write_performance()
+            try:
+                self._append(entry)
+                self._write_performance()
+            except OSError:
+                logger.exception("could not persist activity entry %r", kind)
 
     @property
     def count(self) -> int:
@@ -69,9 +81,18 @@ class ActivityLog:
             f.write(json.dumps(entry) + "\n")
 
     def write_performance(self) -> None:
-        """Write performance."""
+        """Write the SDK contract file; a failing disk is loud, never fatal.
+
+        Same contract as record(): this class reports what happened, it does
+        not decide whether the caller's work stands. A boot that cannot write
+        agent_performance.json is degraded, not dead — so callers do not wrap
+        this, and there is one error contract to remember rather than two.
+        """
         with self._lock:
-            self._write_performance()
+            try:
+                self._write_performance()
+            except OSError:
+                logger.exception("could not write %s", PERFORMANCE_FILE)
 
     def _write_performance(self) -> None:
         payload = {

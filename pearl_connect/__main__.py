@@ -29,8 +29,6 @@ import argparse
 import logging
 import secrets
 import sys
-import threading
-import time
 from pathlib import Path
 
 import uvicorn
@@ -67,21 +65,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def wait_and_launch(
-    server: uvicorn.Server, store_path: Path, settings_store: SettingsStore
-) -> None:
-    """Launch Claude Code once the server reports startup complete.
-
-    Runs in a background thread so the MCP endpoint is connectable the moment
-    the session opens. The configured harness decides which Claude Code the
-    workspace opens in (the other stays the fallback).
-    """
-    while not server.started and not server.should_exit:
-        time.sleep(0.2)
-    if server.started:
-        workspace.launch_claude(store_path, harness=settings_store.load().harness)
-
-
 def main(argv: list[str] | None = None) -> int:
     """Run the agent server; return the process exit code."""
     args = parse_args(argv)
@@ -113,12 +96,19 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("guardrail mode: %s", guard.mode())
     token = secrets.token_urlsafe(32)
 
-    try:
-        workspace.populate(config.store_path, token)
-        logger.info("workspace populated at %s", config.store_path)
-    except Exception:  # pylint: disable=broad-exception-caught
-        logger.exception("workspace population failed; server will start anyway")
+    # readiness gates the healthcheck: Pearl starts the Claude session (POST
+    # /session) as soon as we report healthy, so we must not claim health until
+    # the workspace that session opens into actually exists — without .mcp.json
+    # and the skills, the session cannot reach the signer at all. A failure
+    # here keeps the server up but unhealthy (an agent the operator can see
+    # beats a crash loop the middleware just keeps restarting); the workspace
+    # re-attempts its own population on every /healthcheck, so a condition that
+    # clears by itself heals without a restart.
+    agent_workspace = workspace.Workspace(config.store_path, token)
+    agent_workspace.ensure()
 
+    # Pearl reads it whatever our health, so write it even on a degraded boot.
+    # A dead disk must not take the process down with it.
     activity.write_performance()
 
     app = create_app(
@@ -129,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         guard=guard,
         settings_store=settings_store,
         mech=mech,
+        workspace=agent_workspace,
     )
 
     server = uvicorn.Server(
@@ -143,12 +134,6 @@ def main(argv: list[str] | None = None) -> int:
             access_log=config.log_level == "debug",
         )
     )
-
-    threading.Thread(
-        target=wait_and_launch,
-        args=(server, config.store_path, settings_store),
-        daemon=True,
-    ).start()
 
     logger.info("serving on http://%s:%s", BIND_HOST, AGENT_HTTP_PORT)
     server.run()  # handles SIGTERM/SIGINT itself

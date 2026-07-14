@@ -54,8 +54,11 @@ SETTINGS_VERSION = 1
 
 # The MAC covers the version and the "protected" object of the canonical
 # shape — everything an attacker could profit from editing. The harness is
-# deliberately outside it: a preference, and the worst a tampered value can
-# do is open the workspace in the other Claude Code. A new top-level field
+# deliberately outside it: it cannot move funds or widen the guardrail. It is
+# not free of consequence, though — /session never falls back to a harness the
+# operator did not choose, so a tampered value denies session launches until
+# it is changed back, which is visible in the UI and recoverable there. A new
+# top-level field
 # ships outside the MAC unless it is named here, so a test pins the file's
 # top-level keys against this tuple: adding one fails it until its integrity
 # coverage is a decision rather than an oversight.
@@ -319,12 +322,22 @@ class SettingsStore:
     def _load(self) -> Settings:
         try:
             raw = self._path.read_text(encoding="utf-8")
-        except OSError:
-            # not only a missing file: an unreadable one (bad permissions, a
-            # store path that is not a directory, a failing disk) must fail
-            # closed too. Every guarded action loads settings, so raising here
-            # would take the process down rather than merely restrict it.
-            return self._reset(defaults())
+        except FileNotFoundError:
+            return self._reset(defaults())  # nothing to lose: create it
+        except OSError as e:
+            # An unreadable file is NOT a missing one, and must not be written
+            # over: another process or a backup tool briefly holding the file
+            # raises here, and resetting would destroy the operator's mode and
+            # harness — permanently, silently — over a condition that clears by
+            # itself. Fail closed in memory instead: restricted until we can
+            # read it again. Raising is not an option either, since every
+            # guarded action loads the settings.
+            logger.warning(
+                "settings file %s could not be read (%s); restricting until it can be",
+                self._path,
+                e,
+            )
+            return defaults()
         payload = self._parse(raw)
         verified = self._verify(payload)
         if verified is not None:

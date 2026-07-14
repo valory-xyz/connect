@@ -10,20 +10,32 @@ other non-aea agent. It:
    `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
    the agent session, and the bundled `pearl-connect` skill;
 3. serves on `127.0.0.1:8716`:
-   - Pearl SDK contracts: `GET /healthcheck`, `GET /funds-status`, `GET /`
+   - Pearl SDK contracts: `GET /healthcheck`, `GET /funds-status`, `GET /`.
+     `is_healthy` turns true only once the workspace is populated — Pearl
+     opens the session the moment it does, so health is a promise the server
+     has to be able to keep
    - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its
      editing semantics are specced — while the `harness` preference needs none)
+   - `POST /session` (origin-gated, no token): opens a Claude Code session in
+     the configured harness (`claude_code_desktop` →
+     `claude://code/new?folder=…`, `claude_code_cli` →
+     `claude-cli://open?cwd=…`) and answers `{launched, harness, error?}`.
+     An optional `{"harness": …}` body overrides the saved preference for that
+     launch alone — it opens where the caller asked without rewriting what the
+     operator chose
    - a bearer-authed signing surface: `POST /sign-and-send`,
      `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `send_transaction`, `transaction_status`, `sign_message`,
-     `mech_tools`, `mech_request`, `settings`;
-4. opens a Claude Code session at the workspace via deep link — the
-   `harness` setting picks which one to try first (`claude_code_desktop`
-   → `claude://code/new?folder=…`, `claude_code_cli` →
-   `claude-cli://open?cwd=…`; the other stays the fallback).
+     `mech_tools`, `mech_request`, `settings`.
+
+The binary opens no session itself: Pearl waits for `is_healthy`, then calls
+`POST /session`. A launch failure (harness not installed, deep link unhandled)
+then reaches the operator's UI as a dismissable error instead of dying in this
+process's log — which is also why `/session` never falls back to the harness
+the operator did not choose.
 
 The agent-harness session composes on-chain actions (including service-safe
 `execTransaction` calls via the threshold-1 pre-validated signature) and the
@@ -53,9 +65,13 @@ endpoints and the mech request flow all pass the same check. State persists in
 (mode, whitelist) are HMAC'd with a key derived from the agent private key
 and verified on every read — an edit by the agent (or anything else without
 the key) fails verification and resets them to the restricted defaults. The
-`harness` preference is stored alongside without integrity checks (the worst
-a tampered value can do is open the workspace in the other Claude Code) and
-survives a guardrail reset. The MAC of the last file the server wrote is also pinned
+`harness` preference is stored alongside without integrity checks and survives
+a guardrail reset. It is outside the MAC because it cannot move funds or widen
+the guardrail — but it is not free of consequence: since `/session` never falls
+back to the harness the operator did not choose, a tampered (or simply
+uninstalled) harness makes every launch answer `launched: false` until someone
+changes it back. That is visible and recoverable in the UI, which is the trade
+we are making. The MAC of the last file the server wrote is also pinned
 in memory, so replaying an *old* validly-MAC'd settings file (say, captured
 while the mode was unrestricted) fails the same way; only a replay staged
 while the server is stopped escapes the pin. Operators change the mode in the agent UI at
@@ -70,10 +86,16 @@ semantics are designed.
 
 Binding to `127.0.0.1` does **not** make the server unreachable from the web:
 any page the user's browser visits can fire requests at localhost, and DNS
-rebinding defeats some browser-side protections. Hence: every state-changing
-route requires the bearer token (or the keystore password for `/settings`),
-Origin headers are validated, only loopback Host headers are accepted, and no
-CORS is enabled. Repeated auth failures are audited to the activity log and
+rebinding defeats some browser-side protections. Hence: every route that moves
+funds or changes the guardrail requires the bearer token (or the keystore
+password for the `protected` settings), Origin headers are validated, only
+loopback Host headers are accepted, and no CORS is enabled. Two state-changing
+routes are gated on **origin locality alone**, because the FE that calls them
+holds no token: `POST /session` (spawns a Claude Code session on the operator's
+machine) and the harness half of `PATCH /settings`. Neither can move funds or
+widen the guardrail; the deliberate trade is that any local process — including
+the agent's own session — can open a session window or change which Claude Code
+it opens in. Repeated auth failures are audited to the activity log and
 rate-limited (429) so a probed token is loud, not silent. The token itself is
 header-only, rotated per run, dies with the process, and the provisioned
 workspace ships a `.gitignore` and a Claude Code `Read` deny rule so it is

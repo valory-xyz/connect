@@ -43,6 +43,7 @@ from pearl_connect.settings import (
     derive_mac_key,
 )
 from pearl_connect.signer import Signer, _ChainState
+from pearl_connect.workspace import Workspace
 
 TEST_PASSWORD = "test-password"  # nosec B105
 
@@ -262,6 +263,10 @@ def make_app(
             guard=guard,
             settings_store=settings_store,
             mech=mech_service,
+            # unpopulated, as at boot: the first /healthcheck or /session
+            # populates it — so a test that needs it broken breaks populate(),
+            # rather than reaching into the app's state to fake a flag
+            workspace=Workspace(config.store_path, token),
         )
 
     return _make

@@ -26,6 +26,7 @@ from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 
 from pearl_connect import wallet as wallet_module
+from pearl_connect import workspace
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
 from pearl_connect.signer import Signer
@@ -63,6 +64,51 @@ class TestOpenEndpoints:
         # is_healthy is the only field the middleware's HealthChecker reads;
         # no decorative FSM fields (rounds, transition counters)
         assert response.json() == {"is_healthy": True}
+
+    def test_healthcheck_reports_unready(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Health is the FE's cue to open a session, so it must not lie.
+
+        POST /session lands the moment this turns true; a server whose
+        workspace it could not build says so, and refuses the session it could
+        not have honored — naming the reason, not an opaque "unhealthy".
+        """
+        monkeypatch.setattr(
+            workspace.Workspace,
+            "_provision",
+            lambda self: (_ for _ in ()).throw(OSError("store volume not mounted")),
+        )
+        assert client.get("/healthcheck").json() == {"is_healthy": False}
+        session = client.post("/session")
+        assert session.status_code == 503
+        assert "store volume not mounted" in session.json()["detail"]
+
+    def test_a_transient_workspace_failure_heals_itself(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A boot failure that clears on its own must not need a restart.
+
+        Pearl only calls POST /session once we report healthy, so a server that
+        can never become healthy is never asked to heal — the retry has to sit
+        on the poller's path, or one unlucky boot bricks the agent until
+        somebody restarts it.
+        """
+        state = client.app.state  # type: ignore[attr-defined]
+        attempts: list[int] = []
+
+        def flaky(self: workspace.Workspace) -> None:
+            attempts.append(1)
+            if len(attempts) == 1:  # the store volume was still mounting
+                raise OSError("store volume not mounted")
+
+        monkeypatch.setattr(workspace.Workspace, "_provision", flaky)
+        assert client.get("/healthcheck").json() == {"is_healthy": False}
+        assert client.get("/healthcheck").json() == {"is_healthy": True}
+        assert state.workspace.reason is None
+        # and healthy stays healthy: no repopulating on every poll thereafter
+        assert client.get("/healthcheck").json() == {"is_healthy": True}
+        assert len(attempts) == 2
 
     def test_funds_status_empty_without_requirements(self, client: TestClient) -> None:
         """Test funds status empty without requirements."""
