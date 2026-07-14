@@ -21,11 +21,19 @@ private key — and never need to.
 ## MCP tools (connect server)
 
 - `wallet_info()` — addresses, per-chain RPC URLs, native balances.
+- `safe_transaction(chain, target, value, data, request_id, wait_for_receipt, timeout)`
+  — **the normal way to act on-chain.** Describes the call the *safe* makes —
+  an approval, a swap, a stake, a claim, a transfer, anything. Most carry no
+  `value`; any they do carry leaves the safe, where the working funds are. The
+  server wraps the call in the safe's own transaction, so you never compose one
+  and never need the safe's address. Returns `{tx_hash}` (plus `receipt` if you
+  asked to wait and it mined in time).
 - `send_transaction(chain, to, value, data, request_id, wait_for_receipt, timeout)`
-  — sign + broadcast one EOA transaction. Returns `{tx_hash}` (plus `receipt`
-  if you asked to wait and it mined in time). When retrying an uncertain
-  send, reuse the same `request_id`: you get the original `tx_hash` back
-  instead of a duplicate broadcast.
+  — the same call, made by the **EOA**, whose funds are for gas fees. Rarely what you
+  want; in restricted mode it can reach nothing but the safe.
+- For either: when retrying a send whose outcome you are unsure about, reuse
+  the same `request_id` and you get the original `tx_hash` back instead of
+  spending twice.
 - `transaction_status(chain, tx_hash)` — receipt once mined.
 - `sign_message(digest)` — sign a raw 32-byte digest (0x-hex), **unprefixed**
   (plain ecrecover semantics; used by off-chain mech requests). Unavailable
@@ -43,17 +51,19 @@ private key — and never need to.
 
 ## Guardrail modes
 
-The signer runs in one of two user-controlled modes (`wallet_info` reports
-it):
+Two rules hold in **every** mode: the safe may not delegatecall, and the safe
+may not call itself. No mode lifts them, so don't plan around them — if you
+think you need one, you need the operator, not a workaround.
 
-- **unrestricted** — no restrictions beyond authentication.
-- **restricted** (default) — the gate allows only the transaction shape:
-  `execTransaction` on the safe whose inner call is a
-  plain CALL to a whitelisted address (any value, any calldata, no
-  delegatecall) with the refund fields zeroed (`gasPrice=0`, `gasToken=0x0`,
-  `refundReceiver=0x0` — exactly the shape documented below). Raw digest
-  signing (`sign_message`) is disabled entirely, which also disables
-  off-chain mech requests — use `mech_request(..., legacy_on_chain=true)`.
+On top of that floor, the signer runs in one of two user-controlled modes
+(`wallet_info` reports which):
+
+- **unrestricted** — anything else you ask for is signed.
+- **restricted** (default) — the safe may only CALL a **whitelisted** address
+  (any value, any calldata). Raw digest signing (`sign_message`) is disabled
+  entirely, which also disables off-chain mech requests — use
+  `mech_request(..., legacy_on_chain=true)`. A `send_transaction` from the EOA
+  can reach nothing but the safe.
 
 Every blocked request fails with the violated rule. You cannot lift the
 restrictions; the user changes the mode in the agent UI with their keystore
@@ -82,29 +92,12 @@ payment via the service safe, request, and delivery watching. Start with
   Raising the cap is an explicit choice — check the price first with
   `mech_tools(priority_mech=...)` (`max_delivery_rate`).
 
-## Spending from the service safe
-
-The safe has threshold 1 and the agent EOA is its owner, so no off-chain
-signature collection is needed. Encode the inner call as
-`execTransaction(to, value, data, operation=0, safeTxGas=0, baseGas=0,
-gasPrice=0, gasToken=0x0, refundReceiver=0x0, signatures=<pre-validated>)`
-where the pre-validated signature is:
-
-```
-r = agent EOA address, left-padded to 32 bytes
-s = 0 (32 bytes)
-v = 1
-```
-
-This is valid because the outer transaction's `msg.sender` IS the agent EOA.
-Then send the outer transaction to the safe's address via `send_transaction`
-(or the web3 client below).
-
 ## Python scripts: scripts/signer_client.py
 
 Spawned processes cannot call MCP tools. For web3.py code, use the bundled
-client, which routes `eth_sendTransaction` to the signer's HTTP door
-(`POST /sign-and-send`, same token as the MCP config):
+client, which routes `eth_sendTransaction` through the service safe
+(`POST /safe-transaction`, same token as the MCP config) — so a send from a
+script is a call made *by the safe*, exactly as `safe_transaction` is:
 
 ```python
 from signer_client import connect

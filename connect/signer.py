@@ -33,6 +33,7 @@ from eth_typing import Hash32
 from web3 import Web3
 from web3.types import TxParams
 
+from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
@@ -150,6 +151,7 @@ class Signer:
         """Initialize."""
         self._account = account
         self._activity = activity
+        self._config = config
         self._chains = _ChainPool(config)
         self._requests = _IdempotencyCache()
         self._guard = guard
@@ -204,6 +206,51 @@ class Signer:
         if request_id is None:
             return broadcast()
         return self._requests.run(request_id, broadcast)
+
+    def send_via_safe(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        target: str,
+        *,
+        value: int = 0,
+        data: str = "0x",
+        request_id: str | None = None,
+        gas: int | None = None,
+    ) -> str:
+        """Act as the service safe: wrap one inner call and send it.
+
+        `target`, `value` and `data` are the call the *safe* makes — most carry
+        no value at all (an approve, a stake, a claim); any they do carry leaves
+        the safe rather than the EOA. The distinct parameter name is deliberate:
+        this is not send()'s outer recipient, and the two must not be confused.
+
+        The composed transaction goes back through send(), so it meets the same
+        guard as anything else — a caller of the gate, not a way around it.
+        """
+        safe = self._config.chain(chain).safe_address
+        if safe is None:
+            raise SignerError(
+                f"no service safe is configured for chain '{chain}', so the "
+                "agent cannot act there"
+            )
+        try:
+            calldata = safe_module.exec_transaction(
+                target=target, value=value, data=data, owner=self.address
+            )
+        except Exception as e:  # eth_abi rejects a bad address or an oversized value
+            # composition fails on the caller's input, not the chain — a 400, the
+            # same answer send() gives for a malformed EOA transaction, not a 500
+            raise SignerError(f"cannot compose the safe call: {e}") from e
+        return self.send(
+            chain,
+            safe,
+            value=0,  # the outer transaction carries none; the safe pays
+            data=calldata,
+            # the safe path keeps its own idempotency namespace: the same id on
+            # the EOA path is a different logical action and must not collide
+            request_id=None if request_id is None else f"safe:{request_id}",
+            gas=gas,
+        )
 
     def _send(  # pylint: disable=too-many-arguments
         self,

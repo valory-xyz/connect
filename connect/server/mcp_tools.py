@@ -57,12 +57,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     mcp = FastMCP(
         name="connect",
         instructions=(
-            "Signing service for this Pearl agent. The agent EOA and per-chain "
-            "service safes are shown by wallet_info. Every on-chain action is an "
-            "EOA transaction sent via send_transaction; safe transactions are "
-            "composed as execTransaction calls with the pre-validated signature "
-            "(see the pearl-connect skill). A guardrail may restrict what can "
-            "be signed — check settings; blocked requests return the violated rule."
+            "Signing service for this Pearl agent: it holds the key, you name "
+            "the actions. Act on-chain with safe_transaction; a guardrail may "
+            "refuse, and every refusal names the rule it violated."
         ),
         stateless_http=True,
         streamable_http_path="/",
@@ -80,6 +77,42 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
         return await asyncio.to_thread(_run)
 
     @mcp.tool()
+    async def safe_transaction(  # pylint: disable=too-many-arguments
+        chain: str,
+        target: str,
+        value: int = 0,
+        data: str = "0x",
+        *,
+        request_id: str | None = None,
+        wait_for_receipt: bool = False,
+        timeout: int = 60,
+    ) -> dict:
+        """Make the service safe call `target` — the normal way to act on-chain.
+
+        The safe is the agent's on-chain identity: approvals, swaps, stakes,
+        claims and transfers are all calls it makes. `target`, `value` and
+        `data` are that call — most carry no value at all; any they do carry
+        leaves the safe, not the EOA. The server composes the safe's transaction
+        around it. Prefer this over send_transaction, whose `to` is the EOA's
+        own outer recipient — a different account with different funds.
+
+        Returns {tx_hash}; with wait_for_receipt, also a top-level `status`
+        (mined / reverted / pending) and the receipt. Retrying with the same
+        request_id returns the original tx_hash rather than acting twice.
+        """
+        return await _dispatch(
+            signer.send_via_safe,
+            signer,
+            chain=chain,
+            address=target,
+            value=value,
+            data=data,
+            request_id=request_id,
+            wait_for_receipt=wait_for_receipt,
+            timeout=timeout,
+        )
+
+    @mcp.tool()
     async def send_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         to: str,
@@ -90,43 +123,37 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
         wait_for_receipt: bool = False,
         timeout: int = 60,
     ) -> dict:
-        """Sign and broadcast a transaction from the agent EOA on the given chain.
+        """Sign and broadcast a transaction from the agent EOA — the rarer path.
 
-        Returns {tx_hash}; with wait_for_receipt, also the receipt if it mines
-        within `timeout` seconds, else {tx_hash, status: "pending"}.
+        `to` is the EOA's own outer recipient, not a call the safe makes; the
+        EOA's funds are for gas. For spending or acting on-chain, use
+        safe_transaction instead. In restricted mode this can reach nothing but
+        the safe.
 
-        When retrying a send whose outcome you are unsure about, pass the same
-        request_id as the original attempt: the signer will return the original
-        tx_hash instead of broadcasting a duplicate transaction.
+        Returns {tx_hash}; with wait_for_receipt, also a top-level `status`
+        (mined / reverted / pending) and the receipt. Retrying with the same
+        request_id returns the original tx_hash instead of a duplicate.
         """
-        if value < 0:
-            raise ValueError("value must be a non-negative amount in wei")
-
-        def _run() -> dict:
-            tx_hash = signer.send(
-                chain=chain, to=to, value=value, data=data, request_id=request_id
-            )
-            if not wait_for_receipt:
-                return {"tx_hash": tx_hash}
-            w3 = signer.w3(chain)
-            try:
-                receipt = w3.eth.wait_for_transaction_receipt(
-                    HexBytes(tx_hash),
-                    timeout=min(timeout, MAX_RECEIPT_TIMEOUT),
-                    poll_latency=RECEIPT_POLL_SECONDS,
-                )
-            except TimeExhausted:
-                return {"tx_hash": tx_hash, "status": "pending"}
-            return {"tx_hash": tx_hash, "receipt": _receipt_to_dict(receipt)}
-
-        return await asyncio.to_thread(_run)
+        return await _dispatch(
+            signer.send,
+            signer,
+            chain=chain,
+            address=to,
+            value=value,
+            data=data,
+            request_id=request_id,
+            wait_for_receipt=wait_for_receipt,
+            timeout=timeout,
+        )
 
     @mcp.tool()
     async def transaction_status(chain: str, tx_hash: str) -> dict:
-        """Receipt for a transaction if mined, else {status: "pending"}.
+        """Settlement of a transaction: mined / reverted / pending.
 
-        A malformed hash or a failing RPC raises instead of reporting
-        "pending" — a hash that can never resolve must not be polled forever.
+        The same top-level `status` the send tools return, so a tx polled here
+        after a send is read the same way — a revert is not mistaken for success.
+        A malformed hash or a failing RPC raises instead of reporting "pending":
+        a hash that can never resolve must not be polled forever.
         """
         try:
             valid = len(bytes.fromhex(tx_hash.removeprefix("0x"))) == 32
@@ -141,7 +168,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
                 receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
             except TransactionNotFound:
                 return {"tx_hash": tx_hash, "status": "pending"}
-            return {"tx_hash": tx_hash, "receipt": _receipt_to_dict(receipt)}
+            return _mined_result(tx_hash, receipt)
 
         return await asyncio.to_thread(_run)
 
@@ -231,6 +258,82 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
         return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 
     return mcp
+
+
+async def _dispatch(  # pylint: disable=too-many-arguments
+    method: t.Callable[..., str],
+    signer: Signer,
+    *,
+    chain: str,
+    address: str,
+    value: int,
+    data: str,
+    request_id: str | None,
+    wait_for_receipt: bool,
+    timeout: int,
+) -> dict:
+    """Validate, run one signer method off the event loop, and settle it.
+
+    The two send tools differ only in which signer method acts and what its
+    address means (EOA recipient vs. the safe's call target); everything else —
+    the value guard, the worker-thread offload, the settle — is shared here.
+    """
+    if value < 0:
+        raise ValueError("value must be a non-negative amount in wei")
+
+    def _run() -> dict:
+        tx_hash = method(chain, address, value=value, data=data, request_id=request_id)
+        return _settled(signer, chain, tx_hash, wait_for_receipt, timeout)
+
+    return await asyncio.to_thread(_run)
+
+
+def _settled(
+    signer: Signer,
+    chain: str,
+    tx_hash: str,
+    wait_for_receipt: bool,
+    timeout: int,
+) -> dict:
+    """Return the hash, and how it settled if the caller waited.
+
+    When the caller waits, a top-level `status` says which of pending / mined /
+    reverted it is, so a reverted execTransaction is not read as success from a
+    receipt whose 0/1 is buried a level down. And once the transaction is
+    broadcast the hash is never dropped: a post-send RPC error is reported as
+    still-pending, not as a failure that would invite a double-spending resend.
+    """
+    if not wait_for_receipt:
+        return {"tx_hash": tx_hash}
+    try:
+        receipt = signer.w3(chain).eth.wait_for_transaction_receipt(
+            HexBytes(tx_hash),
+            timeout=min(timeout, MAX_RECEIPT_TIMEOUT),
+            poll_latency=RECEIPT_POLL_SECONDS,
+        )
+        # inside the try on purpose: reading the receipt must not drop the hash
+        # either, so a malformed one is reported pending, not raised
+        return _mined_result(tx_hash, receipt)
+    except TimeExhausted:
+        return {"tx_hash": tx_hash, "status": "pending"}
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # the send already happened; a receipt-read hiccup must not lose the hash
+        return {"tx_hash": tx_hash, "status": "pending", "receipt_error": str(e)}
+
+
+def _mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
+    """Return a settled receipt with `mined`/`reverted` lifted to a top-level status.
+
+    Every tool that hands back a mined receipt goes through here, so a caller
+    reads one field to tell success from a revert — the 0/1 is never left buried
+    in the receipt for one tool while another surfaces it.
+    """
+    info = _receipt_to_dict(receipt)
+    return {
+        "tx_hash": tx_hash,
+        "status": "mined" if info["status"] == 1 else "reverted",
+        "receipt": info,
+    }
 
 
 def _receipt_to_dict(receipt: t.Mapping[str, t.Any]) -> dict:

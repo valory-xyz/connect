@@ -33,6 +33,7 @@ import httpx
 import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from web3 import Web3
 
 from connect.activity import ActivityLog
 from connect.config import AppConfig, ChainConfig
@@ -206,6 +207,56 @@ def test_sign_and_send_mines_on_fork(
     _wait_mined(funded_signer, tx_hash)
 
 
+def test_safe_transaction_mines_a_server_composed_call_on_fork(
+    rpc_url: str,
+    funded_signer: Signer,
+    fork_config: AppConfig,
+    fork_store: SettingsStore,
+    store_path: Path,
+    account: LocalAccount,
+) -> None:
+    """A safe_transaction the server composed executes on a real Safe.
+
+    This is the test that proves the pre-validated signature: a wrong r/s/v
+    would make the real Safe reject execTransaction and the tx would revert
+    (status 0), failing _wait_mined. The server composes the call, the Safe
+    accepts it, and the value leaves the *safe* — not the EOA — and arrives.
+    FakeW3 never checks a signature; this is the one place the encoding meets a
+    real contract.
+    """
+    _set_balance(rpc_url, account.address, 10**18)  # gas for deploy + broadcast
+    safe_address = _deploy_safe(rpc_url, funded_signer, account)
+    _set_balance(rpc_url, safe_address, 5 * 10**18)
+    fork_config.chains["gnosis"].safe_address = safe_address
+    fork_store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+    token = secrets.token_urlsafe(16)
+    app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
+
+    w3 = funded_signer.w3("gnosis")
+    # a random recipient, not a fixed one: the fork persists state across runs,
+    # so a reused address would already hold what a prior run sent it
+    recipient = Web3.to_checksum_address("0x" + secrets.token_hex(20))
+    before = w3.eth.get_balance(recipient)
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        response = client.post(
+            "/safe-transaction",
+            json={
+                "chain": "gnosis",
+                "to": recipient,  # the call the *safe* makes
+                "value": 10**17,
+                "request_id": f"it-{secrets.token_hex(8)}",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        tx_hash = response.json()["tx_hash"]
+
+    receipt = _wait_mined(funded_signer, tx_hash)  # asserts status == 1
+    # the execTransaction ran, and the value moved out of the SAFE to the target
+    assert receipt["to"].lower() == safe_address.lower()  # outer tx hit the safe
+    assert w3.eth.get_balance(recipient) == before + 10**17
+
+
 def test_funds_status_reports_live_balance(
     funded_signer: Signer,
     fork_config: AppConfig,
@@ -236,8 +287,9 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
 ) -> None:
     """Fresh settings boot restricted; the password-authed endpoint flips them.
 
-    Covers: blocked arbitrary transfer, allowed EOA->safe sweep, blocked raw
-    digest signing, wrong password 401, and live effect of the mode change.
+    Covers: blocked arbitrary transfer, blocked bare transfer to the safe,
+    blocked raw digest signing, wrong password 401, the live effect of the mode
+    change — and the floor surviving it.
     """
     monkeypatch.chdir(keystore_dir)  # POST /settings re-decrypts the keystore
     fork_config.chains["gnosis"].safe_address = "0x" + "33" * 20
@@ -257,8 +309,10 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
         assert blocked.status_code == 400
         assert "restricted mode" in blocked.json()["detail"]
 
-        # EOA -> safe native sweep: allowed and mined
-        sweep = client.post(
+        # even a bare transfer to the safe is refused: funding the safe is the
+        # operator's job, and a permission the agent never needed is one the
+        # gate should not carry
+        bare = client.post(
             "/sign-and-send",
             json={
                 "chain": "gnosis",
@@ -267,8 +321,8 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
             },
             headers=headers,
         )
-        assert sweep.status_code == 200, sweep.text
-        _wait_mined(funded_signer, sweep.json()["tx_hash"])
+        assert bare.status_code == 400
+        assert "must be execTransaction" in bare.json()["detail"]
 
         # raw digest signing: off in restricted mode
         digest_denied = client.post(
@@ -299,6 +353,19 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
             headers=headers,
         )
         assert allowed.status_code == 200, allowed.text
+
+        # ...but the floor does not move with the mode. Unrestricted widens the
+        # gate; it does not open the one door that would outlast it — a module
+        # or owner installed here would keep moving funds after the operator
+        # switched back, and the switch would have meant nothing.
+        safe_address = fork_config.chains["gnosis"].safe_address
+        self_call = client.post(
+            "/safe-transaction",
+            json={"chain": "gnosis", "to": safe_address, "data": "0x610b5925"},
+            headers=headers,
+        )
+        assert self_call.status_code == 400
+        assert "may not call itself" in self_call.json()["detail"]
 
 
 def _deploy_safe(rpc_url: str, signer: Signer, account: LocalAccount) -> str:

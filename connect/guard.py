@@ -20,39 +20,71 @@
 """The transaction guardrail — one gate for every signing path.
 
 There is deliberately no bypass: the mech request flow, the MCP tools and the
-HTTP signing endpoints all funnel into the same two checks. In restricted mode
-the agent EOA may only (a) sweep native funds into its own service safe or
-(b) have the safe CALL a whitelisted address via execTransaction; raw digest
-signing is disabled entirely (which also rules out off-chain mech requests —
-their request-id digest is an opaque hash this gate cannot inspect).
+HTTP signing endpoints all funnel into the same checks.
+
+Two of those checks hold in *every* mode. The safe may never delegatecall, and
+the safe may never call itself. Both are how a Safe changes what it is —
+enableModule, addOwnerWithThreshold, setGuard, or arbitrary code run against
+its own storage — and what they install goes on moving funds after this signer
+stops signing: on-chain, directly, forever. They would outlive a switch back to
+restricted mode, which is the one thing an operator flipping that switch is
+relying on. Unrestricted is meant to be a wider gate, not a one-way door.
+
+Everything else is the mode. In restricted mode the agent EOA may only have the
+safe CALL a whitelisted address via execTransaction; raw digest signing is
+disabled entirely (which also rules out off-chain mech requests — their
+request-id digest is an opaque hash this gate cannot inspect).
 """
+
+from dataclasses import dataclass
 
 from eth_abi import decode as abi_decode
 
 from connect.config import AppConfig
+from connect.safe import (
+    EXEC_TRANSACTION_SELECTOR,
+    EXEC_TRANSACTION_TYPES,
+    OPERATION_CALL,
+    ZERO_ADDRESS,
+)
 from connect.settings import MODE_RESTRICTED, SettingsStore
-
-# Safe v1.x execTransaction(address,uint256,bytes,uint8,uint256,uint256,
-#                           uint256,address,address,bytes)
-EXEC_TRANSACTION_SELECTOR = "6a761202"
-_EXEC_TRANSACTION_TYPES = [
-    "address",  # to
-    "uint256",  # value
-    "bytes",  # data
-    "uint8",  # operation (0 = CALL, 1 = DELEGATECALL)
-    "uint256",  # safeTxGas
-    "uint256",  # baseGas
-    "uint256",  # gasPrice
-    "address",  # gasToken
-    "address",  # refundReceiver
-    "bytes",  # signatures
-]
-_OPERATION_CALL = 0
-_ZERO_ADDRESS = "0x" + "00" * 20
 
 
 class GuardError(Exception):
     """A transaction or signing request denied by the guardrail."""
+
+
+@dataclass(frozen=True)
+class _SafeExec:
+    """The execTransaction fields this gate has an opinion about."""
+
+    to: str
+    operation: int
+    gas_price: int
+    gas_token: str
+    refund_receiver: str
+
+    @classmethod
+    def decode(cls, calldata: str) -> "_SafeExec":
+        """Read an execTransaction, or :raises GuardError: if it will not read.
+
+        Calldata we cannot parse is calldata we cannot judge, so it is refused
+        rather than waved through — mech-client's transactions arrive here too,
+        and the agent can still hand-roll its own.
+        """
+        try:
+            decoded = tuple(
+                abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
+            )
+        except Exception as e:
+            raise GuardError(f"could not decode execTransaction calldata: {e}") from e
+        return cls(
+            to=str(decoded[0]),
+            operation=decoded[3],
+            gas_price=decoded[6],
+            gas_token=str(decoded[7]),
+            refund_receiver=str(decoded[8]),
+        )
 
 
 class Guard:
@@ -76,12 +108,61 @@ class Guard:
             )
 
     def check_transaction(self, chain: str, to: str, value: int, data: str) -> None:
-        """Raise unless the EOA transaction is allowed in the current mode."""
-        settings = self._store.load()
-        if settings.protected.mode != MODE_RESTRICTED:
-            return
+        """Raise unless the EOA transaction is allowed.
+
+        The floor is checked first and holds in every mode; the rest is the
+        mode. Decoding happens once, here, so both answer the same bytes.
+        """
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
+        calldata = (data or "0x").removeprefix("0x").lower()
+        exec_call = None
+        if calldata.startswith(EXEC_TRANSACTION_SELECTOR):
+            # decode and floor-check every execTransaction, whatever it targets
+            # and whether or not a safe is configured here: the floor protects
+            # any safe the agent reaches, and "protected only if configured"
+            # would be a hole an unconfigured chain walks straight through.
+            exec_call = _SafeExec.decode(calldata)
+            self._check_floor(to, exec_call)
+        if self._store.load().protected.mode == MODE_RESTRICTED:
+            self._check_restricted(
+                chain,
+                safe=safe,
+                to=to,
+                value=value,
+                calldata=calldata,
+                exec_call=exec_call,
+            )
+
+    def _check_floor(self, target: str, exec_call: "_SafeExec") -> None:
+        """Enforce the two rules no mode lifts; see the module docstring for why.
+
+        `target` is the contract the execTransaction is sent to — the safe
+        whose call this is. A safe calling itself is how it changes its own
+        owners, modules or guard.
+        """
+        if exec_call.operation != OPERATION_CALL:
+            raise GuardError(
+                "the safe may not delegatecall (got operation="
+                f"{exec_call.operation}) — no mode allows it"
+            )
+        if exec_call.to.lower() == target.lower():
+            raise GuardError(
+                "the safe may not call itself (owner, module and guard changes "
+                "are made that way) — no mode allows it"
+            )
+
+    def _check_restricted(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        *,
+        safe: str | None,
+        to: str,
+        value: int,
+        calldata: str,
+        exec_call: "_SafeExec | None",
+    ) -> None:
+        """Restricted mode: the safe CALLs a whitelisted address, or nothing."""
         if safe is None:
             raise GuardError(
                 f"restricted mode: no service safe is configured for chain "
@@ -92,19 +173,7 @@ class Guard:
                 f"restricted mode: transactions may only target the service "
                 f"safe {safe}, not {to}"
             )
-        calldata = (data or "0x").removeprefix("0x").lower()
-        if not calldata:
-            return  # plain native sweep into the safe
-        self._check_safe_exec(chain, settings.protected.whitelist, value, calldata)
-
-    def _check_safe_exec(
-        self,
-        chain: str,
-        whitelist: dict[str, tuple[str, ...]],
-        value: int,
-        calldata: str,
-    ) -> None:
-        if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
+        if exec_call is None:
             raise GuardError(
                 "restricted mode: calls to the safe must be execTransaction "
                 f"(selector 0x{EXEC_TRANSACTION_SELECTOR}), got 0x{calldata[:8]}"
@@ -114,43 +183,25 @@ class Guard:
                 "restricted mode: execTransaction calls must not carry native "
                 "value on the outer transaction"
             )
-        try:
-            decoded = tuple(
-                abi_decode(_EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
-            )
-        except Exception as e:
-            raise GuardError(
-                f"restricted mode: could not decode execTransaction calldata: {e}"
-            ) from e
-        inner_to, operation = str(decoded[0]), decoded[3]
-        gas_price, gas_token, refund_receiver = (
-            decoded[6],
-            str(decoded[7]),
-            str(decoded[8]),
-        )
-        if operation != _OPERATION_CALL:
-            raise GuardError(
-                "restricted mode: only CALL operations are allowed from the "
-                f"safe (got operation={operation})"
-            )
         # A non-zero gasPrice makes the safe pay a refund (in gasToken, to
         # refundReceiver or tx.origin) — funds leaving the safe past the
         # whitelist. The standard flow always zeroes all three fields.
         if (
-            gas_price != 0
-            or gas_token.lower() != _ZERO_ADDRESS
-            or refund_receiver.lower() != _ZERO_ADDRESS
+            exec_call.gas_price != 0
+            or exec_call.gas_token.lower() != ZERO_ADDRESS
+            or exec_call.refund_receiver.lower() != ZERO_ADDRESS
         ):
             raise GuardError(
                 "restricted mode: execTransaction refund fields must be zero "
                 "(gasPrice=0, gasToken=0x0, refundReceiver=0x0) — a gas refund "
                 "would pay out of the safe outside the whitelist"
             )
-        if inner_to.lower() not in whitelist.get(chain, ()):
+        whitelist = self._store.load().protected.whitelist
+        if exec_call.to.lower() not in whitelist.get(chain, ()):
             # the whitelist is not editable through the API yet, so pointing at
             # it would send the operator down a path that does not exist
             raise GuardError(
-                f"restricted mode: {inner_to} is not in the {chain} whitelist; "
-                "ask the operator to switch to unrestricted mode via the agent "
-                "UI if it is required"
+                f"restricted mode: {exec_call.to} is not in the {chain} "
+                "whitelist; ask the operator to switch to unrestricted mode "
+                "via the agent UI if it is required"
             )

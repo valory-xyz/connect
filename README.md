@@ -29,11 +29,11 @@ other non-aea agent. It:
      An optional `{"harness": …}` body overrides the saved preference for that
      launch alone — it opens where the caller asked without rewriting what the
      operator chose
-   - a bearer-authed signing surface: `POST /sign-and-send`,
-     `POST /sign-message`, `GET /wallet`
+   - a bearer-authed signing surface: `POST /safe-transaction`,
+     `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
-     `send_transaction`, `transaction_status`, `sign_message`,
-     `mech_tools`, `mech_request`, `settings`.
+     `safe_transaction`, `send_transaction`, `transaction_status`,
+     `sign_message`, `mech_tools`, `mech_request`, `settings`.
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)
@@ -41,27 +41,39 @@ then reaches the operator's UI as a dismissable error instead of dying in this
 process's log — which is also why `/session` never falls back to the harness
 the operator did not choose.
 
-The agent-harness session composes on-chain actions (including service-safe
-`execTransaction` calls via the threshold-1 pre-validated signature) and the
-server signs and broadcasts them — a single audited choke point, no plaintext
-secrets on disk.
+The agent-harness session names the actions; the server signs and broadcasts
+them — a single audited choke point, no plaintext secrets on disk. The agent
+acts *as the service safe*: it is the `msg.sender` contracts see, and approvals,
+swaps, stakes, transfers, etc. are all calls it makes. The session never composes
+one, though — it names the inner call (`safe_transaction`, `POST
+/safe-transaction`) and the server wraps it in the safe's `execTransaction`,
+threshold-1 pre-validated signature and all. Nothing about the safe — its
+address, its ABI, its signature convention — is the session's problem.
 
 ## Guardrail
 
-The signer enforces one of two persistent modes:
+Two rules hold in **every** mode, and no setting lifts them: the safe may not
+`delegatecall`, and the safe may not call itself (`enableModule`,
+`addOwnerWithThreshold`, `setGuard` — the ways a Safe changes what it *is*).
+Both would outlive a switch back to restricted mode, so the guardrail refuses
+them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
 
-- **unrestricted** — any well-formed request is signed;
+On that floor, the signer enforces one of two persistent modes:
+
+- **unrestricted** — any other well-formed request is signed;
 - **restricted** (default) — raw digest signing is off, and the only allowed
-  transactions are EOA→safe native sweeps and safe `execTransaction` CALLs to
-  whitelisted addresses with the gas-refund fields zeroed (a non-zero SafeTx
-  `gasPrice` would pay a refund out of the safe past the whitelist). The
-  MechMarketplace contract per chain (imported from
-  the pinned mech-client) is whitelisted by default — the only contract the
-  safe calls in the on-chain mech flow — so mech requests work out of the box.
-  Balance trackers and payment tokens are deliberately not whitelisted: the
-  whitelist is address-level (any calldata), so a token entry would permit
-  arbitrary transfers, and the safe only calls trackers for prepaid deposits,
-  an off-chain-flow (unrestricted-mode) concern.
+  transaction is a safe `execTransaction` CALL to a whitelisted address with
+  the gas-refund fields zeroed (a non-zero SafeTx `gasPrice` would pay a refund
+  out of the safe past the whitelist). The MechMarketplace contract per chain
+  (imported from the pinned mech-client) is whitelisted by default — the only
+  contract the safe calls in the on-chain mech flow — so mech requests work out
+  of the box. Balance trackers and payment tokens are deliberately not
+  whitelisted: the whitelist is address-level (any calldata), so a token entry
+  would permit arbitrary transfers, and the safe only calls trackers for prepaid
+  deposits, an off-chain-flow (unrestricted-mode) concern.
+
+Funding the safe is the operator's job, through Pearl — the agent has no
+EOA→safe sweep, because it never needed one.
 
 There is a single gate with no bypass: the MCP tools, the HTTP signing
 endpoints and the mech request flow all pass the same check. State persists in
