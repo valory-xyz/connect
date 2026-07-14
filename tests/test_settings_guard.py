@@ -1709,28 +1709,6 @@ class TestSettingsEndpoints:
         # nothing changed on disk
         assert client.get("/settings").json()["harness"] == "claude_code_desktop"
 
-    def test_the_ui_reads_the_settings_it_shows(
-        self, client: TestClient, settings_store: SettingsStore
-    ) -> None:
-        """The page is static: what it renders comes from GET /settings.
-
-        So the guardrail state the operator sees is whatever the store hands
-        back — including a reset after a tamper — with no second rendering
-        path to drift from it.
-        """
-        settings_store.save(
-            Settings(
-                protected=Protected(
-                    mode=MODE_RESTRICTED, whitelist={"testchain": (WHITELISTED,)}
-                )
-            )
-        )
-        page = client.get("/").text
-        assert "Guardrail settings" in page  # the page the UI mount serves
-        served = client.get("/settings").json()  # ...and the state it fetches
-        assert served["protected"]["mode"] == "restricted"
-        assert served["protected"]["whitelist"] == {"testchain": [WHITELISTED.lower()]}
-
 
 class TestMcpGuardrailTools:
     """New MCP tools: mech_request and settings."""

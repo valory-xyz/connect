@@ -20,12 +20,12 @@
 """FastAPI application factory."""
 
 import logging
+import mimetypes
 import threading
 import typing as t
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
-from fastapi.staticfiles import StaticFiles
+from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from pearl_connect.activity import ActivityLog
@@ -43,7 +43,7 @@ from pearl_connect.server.auth import (
 from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer
-from pearl_connect.workspace import Workspace, ui_build_dir
+from pearl_connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
 
@@ -101,11 +101,25 @@ def create_app(  # pylint: disable=too-many-arguments
     app.mount("/mcp", AuthMiddleware(mcp_app, token, activity, limiter))
 
     # the agent UI last, so it can own / without shadowing an endpoint: routes
-    # match in registration order, and this mount would swallow anything below
-    # it. The bundle ships a stand-in page;
-    # a bundle with no UI at all still serves the API (see ui_build_dir).
-    ui = ui_build_dir()
+    # match in registration order, and this catch-all would swallow anything
+    # registered below it. The bundle ships a stand-in page; a bundle with no
+    # UI at all still serves the API (see load_ui_bundle).
+    ui = load_ui_bundle()
     if ui is not None:
-        logger.info("serving the agent UI from %s", ui)
-        app.mount("/", StaticFiles(directory=ui, html=True), name="ui")
+        logger.info("serving the agent UI: %d file(s), read at boot", len(ui))
+
+        @app.get("/{asset_path:path}", include_in_schema=False)
+        def agent_ui(asset_path: str) -> Response:
+            """Serve the UI snapshot taken at boot.
+
+            Every file in the build is published as-is: the drop-in directory
+            is the contract, so a build that ships a sourcemap ships it here
+            too (see docs/agent-ui.md).
+            """
+            body = ui.get(asset_path or UI_INDEX)
+            if body is None:
+                raise HTTPException(status_code=404, detail="not found")
+            media_type, _ = mimetypes.guess_type(asset_path or UI_INDEX)
+            return Response(body, media_type=media_type or "application/octet-stream")
+
     return app

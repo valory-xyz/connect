@@ -15,8 +15,9 @@ other non-aea agent. It:
      opens the session the moment it does, so health is a promise the server
      has to be able to keep
    - the agent UI at `GET /`: the bundled build in `pearl_connect/assets/ui`,
-     served as static files. It ships a stand-in page (settings, harness, open
-     a session — everything it shows comes from `GET /settings`); see the README there
+     read into memory at boot and served from there. It ships a stand-in page
+     (settings, harness, open a session — everything it shows comes from
+     `GET /settings`); see [docs/agent-ui.md](docs/agent-ui.md)
    - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its

@@ -11,8 +11,9 @@
  code { font-size: .85em; }
  .btn { display: inline-block; margin-top: 1rem; padding: .6rem 1.2rem; background: #111;
         color: #fff; border-radius: 8px; text-decoration: none; border: 0; cursor: pointer; }
+ .btn:disabled { background: #999; cursor: not-allowed; }
  .mode { font-weight: 600; text-transform: capitalize; }
- textarea { width: 100%; min-height: 7rem; font-family: monospace; font-size: .85em; }
+ pre { background: #f6f6f6; padding: .6rem; overflow-x: auto; }
  input[type=password] { width: 100%; }
  .result { margin-top: .5rem; }
 </style>
@@ -21,6 +22,7 @@
 <h1>Pearl Connect</h1>
 <p>BYOA agent powered by a Claude Code session. This server signs on the agent's
 behalf; the Claude session never sees key material.</p>
+<p>Your wallet addresses and balances live in Pearl, not here.</p>
 
 <table>
 <tr><th>Guardrail mode</th><td class="mode" id="mode">…</td></tr>
@@ -37,7 +39,7 @@ these requires the keystore password — the agent session does not have it.</p>
 <p>Whitelisted targets (not editable yet):</p>
 <pre id="whitelist">…</pre>
 <p><label>Keystore password<br><input type="password" name="password" autocomplete="off"></label></p>
-<button class="btn" type="submit">Apply</button>
+<button class="btn" id="settings-apply" type="submit" disabled>Apply</button>
 <div class="result" id="settings-result"></div>
 </form>
 
@@ -47,37 +49,68 @@ without the password.</p>
 <form id="harness-form">
 <p><label><input type="radio" name="harness" value="claude_code_desktop"> Claude Code desktop</label>
    <label><input type="radio" name="harness" value="claude_code_cli"> Claude Code CLI</label></p>
-<button class="btn" type="submit">Apply</button>
+<button class="btn" id="harness-apply" type="submit" disabled>Apply</button>
 <div class="result" id="harness-result"></div>
 </form>
 
-<button class="btn" id="open-session" type="button">Open Claude Code</button>
-<div class="result" id="session-result"></div>
+<button class="btn" id="open-session" type="button" disabled>Open Claude Code</button>
+<div class="result" id="session-result">waiting for the agent to be ready…</div>
 
 <script>
 function setResult(id, text) { document.getElementById(id).textContent = text; }
+
+// the forms stay disabled until a GET /settings has actually landed: a radio
+// group nobody has touched reads .value as "", so a live form over unread
+// state either sends mode:"" (burning a keystore decrypt to earn a 400) or
+// lets the operator flip the guardrail from a page that never read it
+function enableSettings(enabled) {
+  document.getElementById("settings-apply").disabled = !enabled;
+  document.getElementById("harness-apply").disabled = !enabled;
+}
+
+function render(settings) {
+  document.getElementById("mode").textContent = settings.protected.mode;
+  document.getElementById("current-harness").textContent = settings.harness;
+  document.getElementById("settings-form").mode.value = settings.protected.mode;
+  document.getElementById("harness-form").harness.value = settings.harness;
+  document.getElementById("whitelist").textContent =
+    Object.entries(settings.protected.whitelist)
+      .flatMap(([chain, addresses]) => addresses.map((a) => chain + ":" + a))
+      .join("\n") || "none";
+  enableSettings(true);
+}
 
 async function load() {
   try {
     const response = await fetch("/settings");
     if (!response.ok) throw new Error("/settings returned " + response.status);
-    const settings = await response.json();
-    document.getElementById("mode").textContent = settings.protected.mode;
-    document.getElementById("current-harness").textContent = settings.harness;
-    const form = document.getElementById("settings-form");
-    form.mode.value = settings.protected.mode;
-    document.getElementById("whitelist").textContent =
-      Object.entries(settings.protected.whitelist)
-        .flatMap(([chain, addresses]) => addresses.map((a) => chain + ":" + a))
-        .join("\n") || "none";
-    document.getElementById("harness-form").harness.value = settings.harness;
+    render(await response.json());
   } catch (err) {
     // say so: a page stuck on its placeholders looks like a slow load, and
     // the operator would act on a guardrail state it never actually read
+    enableSettings(false);
     setResult("mode", "unavailable");
     setResult("current-harness", "unavailable");
-    setResult("settings-result", "could not read the settings: " + err);
+    setResult("settings-result", "could not read the settings: " + err + " — retrying…");
+    setTimeout(load, 2000);
   }
+}
+
+// the server refuses POST /session with a 503 until the workspace is
+// provisioned, so don't offer the button before it can work
+async function waitUntilReady() {
+  try {
+    const response = await fetch("/healthcheck");
+    const body = await response.json();
+    if (body.is_healthy) {
+      document.getElementById("open-session").disabled = false;
+      setResult("session-result", "");
+      return;
+    }
+  } catch (err) {
+    // the server is not answering yet; the retry below is the whole handling
+  }
+  setTimeout(waitUntilReady, 2000);
 }
 
 async function patchSettings(resultId, payload) {
@@ -88,16 +121,27 @@ async function patchSettings(resultId, payload) {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(payload),
     });
+    const body = await response.json().catch(() => ({}));
     if (response.ok) {
+      // the response IS the settings, in the shape render() draws: reloading
+      // would throw it away and wipe this message before it could be read
+      render(body);
       setResult(resultId, "saved");
-      location.reload();
     } else {
-      const body = await response.json().catch(() => ({}));
-      setResult(resultId, "error: " + (body.detail || response.status));
+      setResult(resultId, "error: " + errorText(body, response.status));
     }
   } catch (err) {
     setResult(resultId, "error: " + err);
   }
+}
+
+// a 422 detail is a list of pydantic errors, not a string: printing it raw
+// gives the operator "[object Object]"
+function errorText(body, status) {
+  const detail = body.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) return detail.map((e) => e.msg || String(e)).join("; ");
+  return String(status);
 }
 
 document.getElementById("settings-form").addEventListener("submit", async (e) => {
@@ -125,7 +169,7 @@ document.getElementById("open-session").addEventListener("click", async () => {
       "session-result",
       body.launched
         ? "opened in " + body.harness
-        : "error: " + (body.error || body.detail || response.status)
+        : "error: " + (body.error || errorText(body, response.status))
     );
   } catch (err) {
     setResult("session-result", "error: " + err);
@@ -133,6 +177,7 @@ document.getElementById("open-session").addEventListener("click", async () => {
 });
 
 load();
+waitUntilReady();
 </script>
 </body>
 </html>

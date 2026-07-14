@@ -30,11 +30,24 @@ from pearl_connect import wallet as wallet_module
 from pearl_connect import workspace
 from pearl_connect.activity import ActivityLog
 from pearl_connect.config import AppConfig
+from pearl_connect.settings import HARNESSES, MODES
 from pearl_connect.signer import Signer
 
 from tests.conftest import FakeW3
 
 TOKEN = "unit-test-token"  # nosec B105
+
+
+def stand_in_page() -> str:
+    """Return the bundled stand-in page, read as the source artifact it is.
+
+    Not through GET /: that route serves whatever build sits in assets/ui, and
+    the documented integration is to replace it. Asserting the stand-in's own
+    markup through the server would mean that following our own instructions
+    turns the suite red.
+    """
+    path = workspace.assets_dir() / workspace.UI_SUBDIR / workspace.UI_INDEX
+    return path.read_text(encoding="utf-8")
 
 
 @pytest.fixture
@@ -99,30 +112,74 @@ class TestOpenEndpoints:
         _complete_bundle(assets)  # the workspace provisions from it too
         monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
 
-        with TestClient(
-            make_app(test_signer, app_config, activity),
-            base_url="http://127.0.0.1:8716",
-        ) as client:
+        app = make_app(test_signer, app_config, activity)
+        # the UI is the last route by construction, not by hope: a router
+        # appended below this catch-all would be silently swallowed
+        assert app.router.routes[-1].path == "/{asset_path:path}"
+
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             page = client.get("/")
             assert page.status_code == 200
             assert "<title>the real ui</title>" in page.text  # not the stand-in
             assert "Pearl Connect" not in page.text
-            assert client.get("/assets/app.js").status_code == 200
-            # the API keeps precedence: the mount only sees what no route took
+            asset = client.get("/assets/app.js")
+            assert asset.status_code == 200
+            assert asset.headers["content-type"].startswith("text/javascript")
+            # no SPA history fallback: an unknown path is a 404, not index.html
+            assert client.get("/dashboard").status_code == 404
+            # the API keeps precedence: the UI only sees what no route took
             assert client.get("/healthcheck").json() == {"is_healthy": True}
             assert client.get("/settings").status_code == 200
 
-    def test_ships_a_stand_in_ui(self, client: TestClient) -> None:
-        """The bundled stand-in page serves until the real UI replaces it."""
+    def test_the_ui_is_read_once_at_boot(
+        self,
+        make_app: t.Callable,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A rewrite of index.html after boot does not reach the operator.
+
+        The bundle lives in PyInstaller's extraction dir, writable by the same
+        user the agent session runs as — and this is the page where the
+        operator types the keystore password, the one secret the whole design
+        keeps from the agent. Serving from disk would let a compromised session
+        swap the page between two visits, with no restart to notice.
+        """
+        assets = tmp_path / "assets"
+        ui = assets / "ui"
+        ui.mkdir(parents=True)
+        index = ui / "index.html"
+        index.write_text("<!doctype html><title>the shipped page</title>")
+        _complete_bundle(assets)
+        monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+
+        with TestClient(
+            make_app(test_signer, app_config, activity),
+            base_url="http://127.0.0.1:8716",
+        ) as client:
+            index.write_text("<!doctype html><title>password harvester</title>")
+            page = client.get("/")
+            assert "the shipped page" in page.text
+            assert "harvester" not in page.text
+
+    def test_a_ui_is_served_at_root(self, client: TestClient) -> None:
+        """Whatever build is bundled, / answers with it — and only that.
+
+        Held to what must be true of ANY build, because the real UI replaces
+        this directory: pinning the stand-in's markup here is what would make
+        the documented integration ("replace the directory, change nothing
+        else") turn the suite red. The stand-in's own contract is pinned
+        against the file on disk instead.
+        """
         page = client.get("/")
         assert page.status_code == 200
-        assert "Pearl Connect" in page.text
-        # it drives the endpoints rather than being rendered by the server
-        assert 'fetch("/settings")' in page.text
-        # and its button is bindable: an element emitted after the inline
-        # script is null when the handler runs, so the button would look
-        # right and do nothing at all
-        assert 0 < page.text.index('id="open-session"') < page.text.index("<script>")
+        assert page.headers["content-type"].startswith("text/html")
+        # the API keeps precedence: the UI only sees what no route took
+        assert client.get("/healthcheck").json() == {"is_healthy": True}
+        assert client.get("/settings").status_code == 200
 
     def test_the_stand_in_ui_matches_the_api_it_drives(
         self, client: TestClient
@@ -131,17 +188,26 @@ class TestOpenEndpoints:
 
         Nothing in the Python suite executes this page's JavaScript, and it is
         the operator's only way to change the guardrail. So at least hold it to
-        the endpoints and the settings shape it reads: renaming either would
-        otherwise break the control surface with every test still green.
+        the endpoints it calls, the fields its script reads, and — above all —
+        the literal values it sends: renaming any of them would otherwise break
+        the control surface with every test still green.
         """
-        page = client.get("/").text
-        for call in ('fetch("/settings")', 'fetch("/settings", {', 'fetch("/session"'):
-            assert call in page
-        for method in ('method: "PATCH"', 'method: "POST"'):
-            assert method in page
+        page = stand_in_page()
+        for endpoint in ('fetch("/settings")', 'fetch("/settings"', 'fetch("/session"'):
+            assert endpoint in page
+        # it waits for the workspace before offering a session, as the server
+        # 503s until then (and as docs/agent-ui.md tells the real UI to)
+        assert 'fetch("/healthcheck")' in page
         # the inputs its script reads by name: renaming one silently breaks it
         for field in ('name="mode"', 'name="password"', 'name="harness"'):
             assert field in page
+        # the values it actually submits must be values the API accepts — this
+        # is the control surface, and a typo here is invisible to every other
+        # test in the suite
+        for mode in MODES:
+            assert f'name="mode" value="{mode}"' in page
+        for harness in HARNESSES:
+            assert f'name="harness" value="{harness}"' in page
         # and it must not offer to edit what the API refuses: a whitelist in a
         # patch is a 422, so a whitelist input here would fail every save
         assert 'name="whitelist"' not in page
@@ -149,9 +215,21 @@ class TestOpenEndpoints:
         served = client.get("/settings").json()
         assert set(served) == {"protected", "harness"}
         assert set(served["protected"]) == {"mode", "whitelist"}
-        for path in ("settings.protected.mode", "settings.protected.whitelist"):
-            assert path in page
-        assert "settings.harness" in page
+
+    def test_the_stand_in_offers_nothing_it_cannot_yet_do(self) -> None:
+        """Every control starts disabled, and its button is bindable.
+
+        A radio group nobody has touched reads .value as "", so a form left
+        live over a failed GET /settings would either send mode:"" — burning a
+        keystore decrypt to earn a 400 — or flip the guardrail from a page that
+        never read it. And an element emitted after the inline script is null
+        when the handler runs, so the button would look right and do nothing.
+        """
+        page = stand_in_page()
+        for control in ("settings-apply", "harness-apply", "open-session"):
+            button = page[page.index(f'id="{control}"') :]
+            assert "disabled" in button[: button.index(">")]
+        assert 0 < page.index('id="open-session"') < page.index("<script>")
 
     def test_api_survives_a_bundle_without_a_ui(
         self,
