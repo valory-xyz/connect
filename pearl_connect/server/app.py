@@ -24,6 +24,7 @@ import mimetypes
 import threading
 import typing as t
 from contextlib import asynccontextmanager
+from pathlib import PurePosixPath
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -46,6 +47,42 @@ from pearl_connect.signer import Signer
 from pearl_connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
+
+# What a static web build ships, typed here rather than by mimetypes: on
+# Windows mimetypes reads HKEY_CLASSES_ROOT, so the type served for .js is
+# whatever that machine's registry says. A box mapping it to text/plain would
+# have the browser refuse to execute the script — the UI would break for that
+# operator alone, on a machine we cannot reproduce. The bytes we serve are
+# fixed at boot; the type we serve them under should be just as fixed.
+UI_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".map": "application/json",
+    ".wasm": "application/wasm",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+
+def _media_type(name: str) -> str:
+    """Return the content type to serve a bundled UI file under."""
+    suffix = PurePosixPath(name).suffix.lower()
+    if suffix in UI_CONTENT_TYPES:
+        return UI_CONTENT_TYPES[suffix]
+    guessed, _ = mimetypes.guess_type(name)  # anything the build surprises us with
+    return guessed or "application/octet-stream"
 
 
 def create_app(  # pylint: disable=too-many-arguments
@@ -116,10 +153,10 @@ def create_app(  # pylint: disable=too-many-arguments
             is the contract, so a build that ships a sourcemap ships it here
             too (see docs/agent-ui.md).
             """
-            body = ui.get(asset_path or UI_INDEX)
+            name = asset_path or UI_INDEX
+            body = ui.get(name)
             if body is None:
                 raise HTTPException(status_code=404, detail="not found")
-            media_type, _ = mimetypes.guess_type(asset_path or UI_INDEX)
-            return Response(body, media_type=media_type or "application/octet-stream")
+            return Response(body, media_type=_media_type(name))
 
     return app

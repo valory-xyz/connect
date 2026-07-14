@@ -109,6 +109,7 @@ class TestOpenEndpoints:
         (ui / "assets").mkdir(parents=True)
         (ui / "index.html").write_text("<!doctype html><title>the real ui</title>")
         (ui / "assets" / "app.js").write_text("console.log('hi')")
+        (ui / "assets" / "blob.q7x").write_bytes(b"\x00\x01")  # nothing types this
         _complete_bundle(assets)  # the workspace provisions from it too
         monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
 
@@ -124,7 +125,15 @@ class TestOpenEndpoints:
             assert "Pearl Connect" not in page.text
             asset = client.get("/assets/app.js")
             assert asset.status_code == 200
-            assert asset.headers["content-type"].startswith("text/javascript")
+            # the same type on every operator's machine: mimetypes would ask
+            # the Windows registry, and a box that answers text/plain for .js
+            # has the browser refuse to run the script — a UI that breaks for
+            # one operator, on a machine we cannot reproduce
+            assert asset.headers["content-type"] == "text/javascript; charset=utf-8"
+            assert client.get("/").headers["content-type"] == "text/html; charset=utf-8"
+            # a build can ship anything; what nothing types, we do not guess at
+            binary = client.get("/assets/blob.q7x")
+            assert binary.headers["content-type"] == "application/octet-stream"
             # no SPA history fallback: an unknown path is a 404, not index.html
             assert client.get("/dashboard").status_code == 404
             # the API keeps precedence: the UI only sees what no route took
