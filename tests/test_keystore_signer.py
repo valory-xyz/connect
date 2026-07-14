@@ -27,11 +27,11 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from hexbytes import HexBytes
 
-from pearl_connect.activity import ActivityLog
-from pearl_connect.keystore import KeystoreError, load_account
-from pearl_connect.signer import Signer, SignerError
+from connect.activity import ActivityLog
+from connect.keystore import KeystoreError, load_account
+from connect.signer import Signer, SignerError
 
-from tests.conftest import FakeW3, TEST_PASSWORD
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
 
 
 class TestKeystore:
@@ -57,15 +57,40 @@ class TestSigner:
     """TestSigner."""
 
     def test_send_returns_hash_and_logs(
-        self, test_signer: Signer, fake_w3: FakeW3, activity: ActivityLog
+        self,
+        store_path: Path,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        activity: ActivityLog,
     ) -> None:
         """Test send returns hash and logs."""
         tx_hash = test_signer.send("testchain", to="0x" + "aa" * 20, value=1)
         assert tx_hash.startswith("0x")
         assert len(tx_hash) == 66
         assert len(fake_w3.eth.sent) == 1
-        kinds = [e["kind"] for e in activity.recent()]
+        kinds = audit_kinds(store_path)
         assert "transaction" in kinds
+
+    def test_broadcast_survives_an_unwritable_audit_log(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing audit write must not turn a sent transaction into an error.
+
+        The audit happens after the broadcast: raising here would hand the
+        caller a failure for a transaction that is already on-chain, and the
+        obvious response — retry — would spend the funds twice.
+        """
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        tx_hash = test_signer.send("testchain", to="0x" + "aa" * 20, value=1)
+        assert tx_hash.startswith("0x")
+        assert len(fake_w3.eth.sent) == 1  # broadcast once, and reported as such
 
     def test_request_id_idempotency(self, test_signer: Signer, fake_w3: FakeW3) -> None:
         """Test request id idempotency."""

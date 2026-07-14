@@ -20,18 +20,20 @@
 """Tests for entrypoint, MCP tools, wallet helpers, workspace launch and auth ASGI."""
 
 import json
+import logging
 import typing as t
 from pathlib import Path
 
 import pytest
 import uvicorn
 from eth_account.signers.local import LocalAccount
+from fastapi.testclient import TestClient
 from web3 import Web3
 
-from pearl_connect import __main__ as main_module
-from pearl_connect import wallet, workspace
-from pearl_connect.activity import ActivityLog, MAX_LOG_BYTES
-from pearl_connect.config import (
+from connect import __main__ as main_module
+from connect import wallet, workspace
+from connect.activity import ActivityLog, MAX_LOG_BYTES
+from connect.config import (
     AppConfig,
     ChainConfig,
     FUND_REQUIREMENTS_ENV,
@@ -39,15 +41,15 @@ from pearl_connect.config import (
     STORE_PATH_ENV,
     load_config,
 )
-from pearl_connect.guard import Guard
-from pearl_connect.keystore import KeystoreError, load_account
-from pearl_connect.mech import MechService
-from pearl_connect.server.auth import AuthMiddleware
-from pearl_connect.server.mcp_tools import build_mcp
-from pearl_connect.settings import SettingsStore
-from pearl_connect.signer import Signer, SignerError
+from connect.guard import Guard
+from connect.keystore import KeystoreError, load_account
+from connect.mech import MechService
+from connect.server.auth import AuthFailureLimiter, AuthMiddleware
+from connect.server.mcp_tools import build_mcp
+from connect.settings import SettingsStore
+from connect.signer import Signer, SignerError
 
-from tests.conftest import FakeW3, TEST_PASSWORD
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
 
 
 class StubServer:
@@ -61,6 +63,19 @@ class StubServer:
 
     def run(self) -> None:
         """Do nothing."""
+
+
+@pytest.fixture(name="served")
+def served_fixture(monkeypatch: pytest.MonkeyPatch) -> list[StubServer]:
+    """Capture the servers main() builds, so tests can read the app it served."""
+    servers: list[StubServer] = []
+
+    def record(config: uvicorn.Config) -> StubServer:
+        servers.append(StubServer(config))
+        return servers[-1]
+
+    monkeypatch.setattr(main_module.uvicorn, "Server", record)
+    return servers
 
 
 class TestMain:
@@ -88,100 +103,133 @@ class TestMain:
         assert main_module.main(["--password", "x"]) == 1
 
     def test_main_happy_path(
-        self, monkeypatch: pytest.MonkeyPatch, keystore_dir: Path, store_path: Path
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        keystore_dir: Path,
+        store_path: Path,
+        served: list[StubServer],
     ) -> None:
-        """Full boot with a stubbed uvicorn server returns 0."""
+        """A clean boot provisions the workspace and reports itself healthy.
+
+        The mirror of the unhealthy cases below: Pearl only opens a session
+        once is_healthy turns true, so a regression that left a good boot
+        unhealthy would quietly mean no session ever opens.
+        """
         monkeypatch.chdir(keystore_dir)
         monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
         monkeypatch.delenv(SAFES_ENV, raising=False)
         monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
-        monkeypatch.setattr(main_module.uvicorn, "Server", StubServer)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         assert (store_path / ".mcp.json").exists()
+        app = served[0].config.app
+        assert app.state.workspace.reason is None
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            assert client.get("/healthcheck").json() == {"is_healthy": True}
 
-    def test_main_survives_populate_failure(
-        self, monkeypatch: pytest.MonkeyPatch, keystore_dir: Path, store_path: Path
+    def test_populate_failure_serves_unhealthy(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        keystore_dir: Path,
+        store_path: Path,
+        served: list[StubServer],
     ) -> None:
-        """A workspace failure is logged but does not abort the server."""
+        """A workspace failure keeps the server up, but never claims health.
+
+        Pearl opens the session as soon as we report healthy — with no
+        .mcp.json and no skills, that session could not reach the signer, so
+        the honest answer is unhealthy rather than an invitation we cannot
+        honor.
+        """
         monkeypatch.chdir(keystore_dir)
         monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
-        monkeypatch.setattr(main_module.uvicorn, "Server", StubServer)
         monkeypatch.setattr(
-            workspace,
-            "populate",
-            lambda *a: (_ for _ in ()).throw(RuntimeError("disk full")),
+            workspace.Workspace,
+            "_provision",
+            lambda self: (_ for _ in ()).throw(RuntimeError("disk full")),
         )
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        app = served[0].config.app
+        assert app.state.workspace.reason is not None
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            assert client.get("/healthcheck").json() == {"is_healthy": False}
+            # and the session Pearl would start is refused, not half-opened
+            assert client.post("/session").status_code == 503
 
-    def test_wait_and_launch_when_started(
+    def test_degraded_boot_still_writes_the_sdk_contract_file(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        keystore_dir: Path,
         store_path: Path,
-        settings_store: SettingsStore,
+        served: list[StubServer],
     ) -> None:
-        """Launches once started, with the harness from the settings store."""
-        from pearl_connect.settings import Settings
+        """Pearl reads agent_performance.json whatever our health says.
 
-        settings_store.save(
-            Settings(mode="unrestricted", whitelist={}, harness="claude_code_cli")
-        )
-        launched: list[tuple[Path, str]] = []
-        monkeypatch.setattr(
-            workspace,
-            "launch_claude",
-            lambda p, harness=None: launched.append((p, harness)),
-        )
-        server = t.cast(uvicorn.Server, StubServer(t.cast(uvicorn.Config, None)))
-        server.started = True
-        main_module.wait_and_launch(server, store_path, settings_store)
-        assert launched == [(store_path, "claude_code_cli")]
+        A workspace that failed to populate (here: a bundle with no CLAUDE.md)
+        still leaves a readable store — withholding the SDK contract file on
+        top of reporting unhealthy would just break the desktop app twice.
+        """
+        assets = store_path / "fake-assets"
+        (assets / "skills").mkdir(parents=True)  # no CLAUDE.md: populate raises
+        monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+        monkeypatch.chdir(keystore_dir)
+        monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
+        monkeypatch.delenv(SAFES_ENV, raising=False)
+        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert served[0].config.app.state.workspace.reason is not None
+        assert (store_path / "agent_performance.json").exists()
 
-    def test_wait_and_launch_polls_until_started(
+    def test_unusable_store_serves_unhealthy(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        store_path: Path,
-        settings_store: SettingsStore,
+        keystore_dir: Path,
+        tmp_path: Path,
+        served: list[StubServer],
     ) -> None:
-        """Polls while the server is starting up."""
-        launched: list[Path] = []
-        monkeypatch.setattr(
-            workspace, "launch_claude", lambda p, harness=None: launched.append(p)
-        )
+        """A store we cannot write to must not crash-loop the binary.
 
-        class SlowServer(StubServer):
-            """Server that starts on the second poll."""
+        Everything that provisions the store fails here — populate and the
+        performance file alike — and the middleware would just restart a
+        process that dies. Serve, and report unhealthy.
 
-            _polls = 0
+        The store is placed under a regular file rather than a chmod'd
+        directory: permission bits do not stop a write on Windows, and this
+        failure must be reproduced on every platform we ship to.
+        """
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("a file where the store's parent should be")
+        monkeypatch.chdir(keystore_dir)
+        monkeypatch.setenv(STORE_PATH_ENV, str(blocker / "store"))
+        monkeypatch.delenv(SAFES_ENV, raising=False)
+        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0  # not a crash
+        assert served[0].config.app.state.workspace.reason is not None
 
-            @property
-            def started(self) -> bool:  # type: ignore[override]
-                """Become started on the second check."""
-                SlowServer._polls += 1
-                return SlowServer._polls > 1
-
-            @started.setter
-            def started(self, value: bool) -> None:
-                """Ignore the base class initializer."""
-
-        server = t.cast(uvicorn.Server, SlowServer(t.cast(uvicorn.Config, None)))
-        server.should_exit = False
-        main_module.wait_and_launch(server, store_path, settings_store)
-        assert launched == [store_path]
-
-    def test_wait_and_launch_on_exit(
+    def test_boot_opens_no_session(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        keystore_dir: Path,
         store_path: Path,
-        settings_store: SettingsStore,
+        served: list[StubServer],
     ) -> None:
-        """Does not launch when the server exits before starting."""
-        launched: list[Path] = []
+        """Booting never opens a session: Pearl drives POST /session itself.
+
+        Launching here would strand a failure in this process's log, where
+        neither the FE nor the operator can see it.
+        """
+        monkeypatch.chdir(keystore_dir)
+        monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
+        monkeypatch.delenv(SAFES_ENV, raising=False)
+        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+        opened: list[Path] = []
         monkeypatch.setattr(
-            workspace, "launch_claude", lambda p, harness=None: launched.append(p)
+            workspace.Workspace,
+            "open_session",
+            lambda self, harness=None: opened.append(self.path),
         )
-        server = t.cast(uvicorn.Server, StubServer(t.cast(uvicorn.Config, None)))
-        main_module.wait_and_launch(server, store_path, settings_store)
-        assert not launched
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert not opened
+        assert served  # it did serve — it just did not launch anything
 
 
 class TestActivityExtras:
@@ -193,6 +241,30 @@ class TestActivityExtras:
         log_file.write_text("x" * (MAX_LOG_BYTES + 1))
         activity.record("transaction", chain="testchain")
         assert (store_path / "activity_log.jsonl.1").exists()
+
+    def test_unwritable_log_never_fails_the_caller(
+        self,
+        store_path: Path,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failing disk must not undo work the caller already completed.
+
+        record() runs after the fact — the transaction is broadcast, the
+        session is open. Raising here would report those as failures and
+        invite a retry of work that already happened.
+        """
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        with caplog.at_level(logging.ERROR):
+            activity.record("session_launched", harness="claude_code_cli")
+        assert "could not persist activity entry" in caplog.text
+        # the caller's work stands: still counted, so the UI stays coherent
+        assert activity.count == 1
 
     def test_write_performance_public(
         self, store_path: Path, activity: ActivityLog
@@ -282,13 +354,17 @@ class TestAuthMiddlewareASGI:
 
     async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
         """Lifespan scopes bypass auth."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         _, passed = await self._run(middleware, {"type": "lifespan"})
         assert passed == ["lifespan"]
 
     async def test_bad_origin_rejected(self, activity: ActivityLog) -> None:
         """Cross-origin requests get 403."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         scope = {
             "type": "http",
             "headers": [(b"origin", b"https://evil.example")],
@@ -299,21 +375,27 @@ class TestAuthMiddlewareASGI:
 
     async def test_bad_token_rejected(self, activity: ActivityLog) -> None:
         """Missing token gets 401."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         sent, passed = await self._run(middleware, {"type": "http", "headers": []})
         assert sent[0]["status"] == 401
         assert not passed
 
     async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
         """Websocket scopes never reach the inner app; the handshake is closed."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
         assert not passed
         assert sent == [{"type": "websocket.close"}]
 
     async def test_valid_request_passes(self, activity: ActivityLog) -> None:
         """Correct token reaches the inner app."""
-        middleware = AuthMiddleware(lambda *a: None, "tok", activity)
+        middleware = AuthMiddleware(
+            lambda *a: None, "tok", activity, AuthFailureLimiter()
+        )
         scope = {"type": "http", "headers": [(b"authorization", b"Bearer tok")]}
         _, passed = await self._run(middleware, scope)
         assert passed == ["http"]
@@ -485,7 +567,7 @@ class TestSignerExtras:
         self, monkeypatch: pytest.MonkeyPatch, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
         """Unknown-but-configured chains get a Web3 client, cached."""
-        from pearl_connect import signer as signer_module
+        from connect import signer as signer_module
 
         pool = test_signer._chains  # pylint: disable=protected-access
         pool._config.chains["otherchain"] = (  # pylint: disable=protected-access
@@ -507,16 +589,24 @@ class TestSignerExtras:
         assert test_signer.w3("otherchain") is fake_w3  # cached
 
     def test_broadcast_failure(
-        self, test_signer: Signer, fake_w3: FakeW3, activity: ActivityLog
+        self,
+        store_path: Path,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        activity: ActivityLog,
     ) -> None:
         """A node rejection surfaces as SignerError and is logged."""
         fake_w3.eth.fail_broadcast = True
         with pytest.raises(SignerError, match="send failed"):
             test_signer.send("testchain", to="0x" + "aa" * 20)
-        assert activity.recent()[-1]["kind"] == "send_failed"
+        assert audit_kinds(store_path)[-1] == "send_failed"
 
     def test_estimation_failure_is_signer_error(
-        self, test_signer: Signer, fake_w3: FakeW3, activity: ActivityLog
+        self,
+        store_path: Path,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        activity: ActivityLog,
     ) -> None:
         """A gas-estimation revert surfaces as SignerError, not a raw exception."""
 
@@ -526,7 +616,7 @@ class TestSignerExtras:
         fake_w3.eth.estimate_gas = reverting_estimate  # type: ignore[method-assign]
         with pytest.raises(SignerError, match="execution reverted"):
             test_signer.send("testchain", to="0x" + "aa" * 20)
-        assert activity.recent()[-1]["kind"] == "send_failed"
+        assert audit_kinds(store_path)[-1] == "send_failed"
 
     def test_concurrent_duplicate_request_id_rejected(
         self, test_signer: Signer, fake_w3: FakeW3
@@ -568,7 +658,7 @@ class TestSignerExtras:
 
     def test_idempotency_cache_returns_cached_inside_run(self) -> None:
         """run() itself replays a completed key (guards the racing-caller path)."""
-        from pearl_connect.signer import _IdempotencyCache
+        from connect.signer import _IdempotencyCache
 
         cache = _IdempotencyCache()
         assert cache.run("k", lambda: "0xaaa") == "0xaaa"
@@ -576,7 +666,7 @@ class TestSignerExtras:
 
     def test_idempotency_cache_evicts_oldest(self) -> None:
         """The result cache is bounded; the oldest replays are dropped first."""
-        from pearl_connect.signer import _IdempotencyCache
+        from connect.signer import _IdempotencyCache
 
         cache = _IdempotencyCache(max_results=2)
         cache.run("a", lambda: "0xa")
@@ -709,6 +799,36 @@ class TestWalletExtras:
 class TestPearlRoutesExtras:
     """funds-status caching and failure handling."""
 
+    def test_racing_pollers_rebuild_the_workspace_once(
+        self, store_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The loser of the readiness race must not repopulate on top of it.
+
+        /healthcheck is polled, so two calls can arrive together while the
+        workspace is unusable. The second blocks on the lock, and by the time
+        it gets in the first has already succeeded — it has to see that, not
+        redo the work.
+        """
+        agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
+        populated: list[int] = []
+        monkeypatch.setattr(
+            workspace.Workspace, "_provision", lambda self: populated.append(1)
+        )
+
+        class LostTheRace:
+            """A lock whose holder finished the job while we were waiting."""
+
+            def __enter__(self) -> None:
+                # pylint: disable=protected-access
+                agent_workspace._reason = None  # the other poller got there first
+
+            def __exit__(self, *_: object) -> None:
+                """Nothing to release: this lock exists only to lose the race."""
+
+        monkeypatch.setattr(agent_workspace, "_lock", LostTheRace())
+        assert agent_workspace.ensure() is True
+        assert populated == []  # the work was already done
+
     def test_funds_status_cache_hit(
         self,
         test_signer: Signer,
@@ -829,10 +949,25 @@ class TestWorkspaceExtras:
         with pytest.raises(FileNotFoundError):
             workspace.assets_dir()
 
+    def test_missing_claude_md_fails_the_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, store_path: Path
+    ) -> None:
+        """A bundle with no CLAUDE.md fails populate, so boot reports unhealthy.
+
+        Warning and carrying on would open the session into a workspace with
+        no idea what it is — while the server claimed to be healthy.
+        """
+        assets = tmp_path / "assets"
+        (assets / "skills").mkdir(parents=True)
+        monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+        agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
+        assert agent_workspace.ensure() is False
+        assert "CLAUDE.md" in str(agent_workspace.reason)
+
     def test_invalid_mcp_json_rewritten(self, store_path: Path) -> None:
         """Corrupt .mcp.json is replaced rather than crashing."""
         (store_path / ".mcp.json").write_text("{corrupt")
-        workspace.populate(store_path, "tok")
+        assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
         config = json.loads((store_path / ".mcp.json").read_text())
         assert "pearl-connect" in config["mcpServers"]
 
@@ -844,29 +979,12 @@ class TestWorkspaceExtras:
         (skills / "my-skill").mkdir(parents=True)
         (skills / "my-skill" / "SKILL.md").write_text("hi")
         (skills / "stray.txt").write_text("not a skill")
+        (tmp_path / "assets" / "CLAUDE.md").write_text("brief")  # populate requires it
         monkeypatch.setattr(workspace.sys, "_MEIPASS", str(tmp_path), raising=False)
-        workspace.populate(store_path, "tok")
+        assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
         installed = store_path / ".claude" / "skills"
         assert (installed / "my-skill" / "SKILL.md").exists()
         assert not (installed / "stray.txt").exists()
-
-    def test_launch_claude_fallback_and_failure(
-        self, monkeypatch: pytest.MonkeyPatch, store_path: Path
-    ) -> None:
-        """First link failing falls back; both failing returns False."""
-        attempts: list[str] = []
-
-        def fake_open(url: str) -> bool:
-            attempts.append(url)
-            return len(attempts) == 2  # first fails, fallback succeeds
-
-        monkeypatch.setattr(workspace, "_open_url", fake_open)
-        assert workspace.launch_claude(store_path) is True
-        assert attempts[0].startswith("claude://")
-        assert attempts[1].startswith("claude-cli://")
-
-        monkeypatch.setattr(workspace, "_open_url", lambda url: False)
-        assert workspace.launch_claude(store_path) is False
 
     def test_open_url_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """xdg-open success, failure and exception paths."""

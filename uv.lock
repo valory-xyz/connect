@@ -701,6 +701,49 @@ wheels = [
 ]
 
 [[package]]
+name = "connect"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "eth-account" },
+    { name = "fastapi" },
+    { name = "mcp" },
+    { name = "mech-client" },
+    { name = "uvicorn" },
+    { name = "web3" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "httpx" },
+    { name = "open-aea-cli-ipfs" },
+    { name = "open-autonomy" },
+    { name = "pyinstaller" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "eth-account", specifier = "==0.13.7" },
+    { name = "fastapi", specifier = "==0.139.0" },
+    { name = "mcp", specifier = "==1.28.1" },
+    { name = "mech-client", specifier = "==0.21.2" },
+    { name = "uvicorn", specifier = "==0.51.0" },
+    { name = "web3", specifier = "==7.16.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "open-aea-cli-ipfs", specifier = ">=2.2.9" },
+    { name = "open-autonomy", specifier = ">=0.21.26" },
+    { name = "pyinstaller", specifier = "==6.21.0" },
+    { name = "pytest", specifier = "==9.1.1" },
+    { name = "pytest-asyncio", specifier = "==1.4.0" },
+]
+
+[[package]]
 name = "construct"
 version = "2.10.68"
 source = { registry = "https://pypi.org/simple" }
@@ -2109,49 +2152,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7b/91/abdc50c4ef06fdf8d047f60ee777ca9b2a7885e1a9cea81343fbecda52d7/parsimonious-0.10.0.tar.gz", hash = "sha256:8281600da180ec8ae35427a4ab4f7b82bfec1e3d1e52f80cb60ea82b9512501c", size = 52172, upload-time = "2022-09-03T17:01:17.004Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/aa/0f/c8b64d9b54ea631fcad4e9e3c8dbe8c11bb32a623be94f22974c88e71eaf/parsimonious-0.10.0-py3-none-any.whl", hash = "sha256:982ab435fabe86519b57f6b35610aa4e4e977e9f02a14353edf4bbc75369fc0f", size = 48427, upload-time = "2022-09-03T17:01:13.814Z" },
-]
-
-[[package]]
-name = "pearl-connect"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "eth-account" },
-    { name = "fastapi" },
-    { name = "mcp" },
-    { name = "mech-client" },
-    { name = "uvicorn" },
-    { name = "web3" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "httpx" },
-    { name = "open-aea-cli-ipfs" },
-    { name = "open-autonomy" },
-    { name = "pyinstaller" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "eth-account", specifier = "==0.13.7" },
-    { name = "fastapi", specifier = "==0.139.0" },
-    { name = "mcp", specifier = "==1.28.1" },
-    { name = "mech-client", specifier = "==0.21.2" },
-    { name = "uvicorn", specifier = "==0.51.0" },
-    { name = "web3", specifier = "==7.16.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "httpx", specifier = "==0.28.1" },
-    { name = "open-aea-cli-ipfs", specifier = ">=2.2.9" },
-    { name = "open-autonomy", specifier = ">=0.21.26" },
-    { name = "pyinstaller", specifier = "==6.21.0" },
-    { name = "pytest", specifier = "==9.1.1" },
-    { name = "pytest-asyncio", specifier = "==1.4.0" },
 ]
 
 [[package]]

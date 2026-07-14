@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pearl Connect</title>
+<style>
+ body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 640px; color: #222; }
+ table { border-collapse: collapse; width: 100%; }
+ td, th { text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; }
+ code { font-size: .85em; }
+ .btn { display: inline-block; margin-top: 1rem; padding: .6rem 1.2rem; background: #111;
+        color: #fff; border-radius: 8px; text-decoration: none; border: 0; cursor: pointer; }
+ .btn:disabled { background: #999; cursor: not-allowed; }
+ .mode { font-weight: 600; text-transform: capitalize; }
+ pre { background: #f6f6f6; padding: .6rem; overflow-x: auto; }
+ input[type=password] { width: 100%; }
+ .result { margin-top: .5rem; }
+</style>
+</head>
+<body>
+<h1>Pearl Connect</h1>
+<p>BYOA agent powered by a Claude Code session. This server signs on the agent's
+behalf; the Claude session never sees key material.</p>
+<p>Your wallet addresses and balances live in Pearl, not here.</p>
+
+<table>
+<tr><th>Guardrail mode</th><td class="mode" id="mode">…</td></tr>
+<tr><th>Harness</th><td><code id="current-harness">…</code></td></tr>
+</table>
+
+<h2>Guardrail settings</h2>
+<p>In <em>restricted</em> mode the agent can only sweep funds into its safes and
+have a safe call whitelisted addresses; raw digest signing is off. Changing
+these requires the keystore password — the agent session does not have it.</p>
+<form id="settings-form">
+<p><label><input type="radio" name="mode" value="restricted"> Restricted</label>
+   <label><input type="radio" name="mode" value="unrestricted"> Unrestricted</label></p>
+<p>Whitelisted targets (not editable yet):</p>
+<pre id="whitelist">…</pre>
+<p><label>Keystore password<br><input type="password" name="password" autocomplete="off"></label></p>
+<button class="btn" id="settings-apply" type="submit" disabled>Apply</button>
+<div class="result" id="settings-result"></div>
+</form>
+
+<h2>Harness</h2>
+<p>Which Claude Code the workspace session opens in — a preference, saved
+without the password.</p>
+<form id="harness-form">
+<p><label><input type="radio" name="harness" value="claude_code_desktop"> Claude Code desktop</label>
+   <label><input type="radio" name="harness" value="claude_code_cli"> Claude Code CLI</label></p>
+<button class="btn" id="harness-apply" type="submit" disabled>Apply</button>
+<div class="result" id="harness-result"></div>
+</form>
+
+<button class="btn" id="open-session" type="button" disabled>Open Claude Code</button>
+<div class="result" id="session-result">waiting for the agent to be ready…</div>
+
+<script>
+function setResult(id, text) { document.getElementById(id).textContent = text; }
+
+// the forms stay disabled until a GET /settings has actually landed: a radio
+// group nobody has touched reads .value as "", so a live form over unread
+// state either sends mode:"" (burning a keystore decrypt to earn a 400) or
+// lets the operator flip the guardrail from a page that never read it
+function enableSettings(enabled) {
+  document.getElementById("settings-apply").disabled = !enabled;
+  document.getElementById("harness-apply").disabled = !enabled;
+}
+
+function render(settings) {
+  document.getElementById("mode").textContent = settings.protected.mode;
+  document.getElementById("current-harness").textContent = settings.harness;
+  document.getElementById("settings-form").mode.value = settings.protected.mode;
+  document.getElementById("harness-form").harness.value = settings.harness;
+  document.getElementById("whitelist").textContent =
+    Object.entries(settings.protected.whitelist)
+      .flatMap(([chain, addresses]) => addresses.map((a) => chain + ":" + a))
+      .join("\n") || "none";
+  enableSettings(true);
+}
+
+async function load() {
+  try {
+    const response = await fetch("/settings");
+    if (!response.ok) throw new Error("/settings returned " + response.status);
+    render(await response.json());
+  } catch (err) {
+    // say so: a page stuck on its placeholders looks like a slow load, and
+    // the operator would act on a guardrail state it never actually read
+    enableSettings(false);
+    setResult("mode", "unavailable");
+    setResult("current-harness", "unavailable");
+    setResult("settings-result", "could not read the settings: " + err + " — retrying…");
+    setTimeout(load, 2000);
+  }
+}
+
+// the server refuses POST /session with a 503 until the workspace is
+// provisioned, so don't offer the button before it can work
+async function waitUntilReady() {
+  try {
+    const response = await fetch("/healthcheck");
+    const body = await response.json();
+    if (body.is_healthy) {
+      document.getElementById("open-session").disabled = false;
+      setResult("session-result", "");
+      return;
+    }
+  } catch (err) {
+    // the server is not answering yet; the retry below is the whole handling
+  }
+  setTimeout(waitUntilReady, 2000);
+}
+
+async function patchSettings(resultId, payload) {
+  setResult(resultId, "applying…");
+  try {
+    const response = await fetch("/settings", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (response.ok) {
+      // the response IS the settings, in the shape render() draws: reloading
+      // would throw it away and wipe this message before it could be read
+      render(body);
+      setResult(resultId, "saved");
+    } else {
+      setResult(resultId, "error: " + errorText(body, response.status));
+    }
+  } catch (err) {
+    setResult(resultId, "error: " + err);
+  }
+}
+
+// a 422 detail is a list of pydantic errors, not a string: printing it raw
+// gives the operator "[object Object]"
+function errorText(body, status) {
+  const detail = body.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) return detail.map((e) => e.msg || String(e)).join("; ");
+  return String(status);
+}
+
+document.getElementById("settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  // mode only: the whitelist is frozen at the API (a whitelist in a patch is
+  // a 422), so sending the one we rendered would fail every save
+  await patchSettings("settings-result", {
+    password: form.password.value,
+    protected: {mode: form.mode.value},
+  });
+});
+
+document.getElementById("harness-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  await patchSettings("harness-result", {harness: e.target.harness.value});
+});
+
+document.getElementById("open-session").addEventListener("click", async () => {
+  setResult("session-result", "opening…");
+  try {
+    const response = await fetch("/session", {method: "POST"});
+    const body = await response.json().catch(() => ({}));
+    setResult(
+      "session-result",
+      body.launched
+        ? "opened in " + body.harness
+        : "error: " + (body.error || errorText(body, response.status))
+    );
+  } catch (err) {
+    setResult("session-result", "error: " + err);
+  }
+});
+
+load();
+waitUntilReady();
+</script>
+</body>
+</html>

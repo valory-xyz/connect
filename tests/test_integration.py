@@ -34,19 +34,21 @@ import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig, ChainConfig
-from pearl_connect.guard import Guard
-from pearl_connect.mech import MechError, MechService
-from pearl_connect.server.app import create_app
-from pearl_connect.settings import (
+from connect.activity import ActivityLog
+from connect.config import AppConfig, ChainConfig
+from connect.guard import Guard
+from connect.mech import MechError, MechService
+from connect.server.app import create_app
+from connect.settings import (
     MODE_UNRESTRICTED,
+    Protected,
     SETTINGS_FILE,
     Settings,
     SettingsStore,
     derive_mac_key,
 )
-from pearl_connect.signer import Signer
+from connect.signer import Signer
+from connect.workspace import Workspace
 
 from tests.conftest import TEST_PASSWORD
 
@@ -154,6 +156,7 @@ def _fork_app(
         guard=guard,
         settings_store=store,
         mech=MechService(signer, config, activity, guard),
+        workspace=Workspace(store_path, token),
     )
 
 
@@ -179,7 +182,7 @@ def test_sign_and_send_mines_on_fork(
     account: LocalAccount,
 ) -> None:
     """A transfer sent through /sign-and-send is broadcast and mined."""
-    fork_store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+    fork_store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
     token = secrets.token_urlsafe(16)
     app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
@@ -242,7 +245,7 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
     app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
     headers = {"Authorization": f"Bearer {token}"}
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
-        assert client.get("/settings").json()["mode"] == "restricted"
+        assert client.get("/settings").json()["protected"]["mode"] == "restricted"
         assert client.get("/wallet", headers=headers).json()["mode"] == "restricted"
 
         # arbitrary transfer: blocked with the violated rule in the message
@@ -275,21 +278,20 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
         assert "restricted" in digest_denied.json()["detail"]
 
         # settings write: wrong password rejected, right one applies live
-        denied = client.post(
+        denied = client.patch(
             "/settings",
             json={
                 "password": "wrong",
-                "mode": "unrestricted",
-                "whitelist": {},
+                "protected": {"mode": "unrestricted"},
             },  # nosec B105
         )
         assert denied.status_code == 401
-        flipped = client.post(
+        flipped = client.patch(
             "/settings",
-            json={"password": TEST_PASSWORD, "mode": "unrestricted", "whitelist": {}},
+            json={"password": TEST_PASSWORD, "protected": {"mode": "unrestricted"}},
         )
         assert flipped.status_code == 200, flipped.text
-        assert flipped.json()["mode"] == "unrestricted"
+        assert flipped.json()["protected"]["mode"] == "unrestricted"
 
         allowed = client.post(
             "/sign-and-send",

@@ -1,0 +1,55 @@
+name: connect
+author: valory
+version: 0.1.0
+description: Connect service whose brain is an agent-harness session
+aea_version: '>=2.0.0, <3.0.0'
+license: Apache-2.0
+fingerprint:
+  README.md: bafybeidxuxfxjugoikbhjdziunxjd6kcnn4qukp7s3tzn6uoplxkki6dje
+fingerprint_ignore_patterns: []
+agent: valory/connect:0.1.0:bafybeieuja63vl5hj3a3bsrx5nzqajhnjjr3zx5skc7ldvzrvfoxmtnpf4
+number_of_agents: 1
+deployment: {}
+---
+public_id: valory/ledger:0.19.0
+type: connection
+config:
+  ledger_apis:
+    ethereum:
+      address: ${ETHEREUM_LEDGER_RPC:str:https://eth.drpc.org}
+      chain_id: ${ETHEREUM_CHAIN_ID:int:1}
+      poa_chain: ${IS_POA_CHAIN:bool:false}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+    gnosis:
+      address: ${GNOSIS_LEDGER_RPC:str:https://rpc.gnosischain.com}
+      chain_id: ${GNOSIS_CHAIN_ID:int:100}
+      poa_chain: ${IS_POA_CHAIN:bool:false}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+    base:
+      address: ${BASE_LEDGER_RPC:str:https://mainnet.base.org}
+      chain_id: ${BASE_CHAIN_ID:int:8453}
+      poa_chain: ${IS_POA_CHAIN:bool:false}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+    optimism:
+      address: ${OPTIMISM_LEDGER_RPC:str:https://mainnet.optimism.io}
+      chain_id: ${OPTIMISM_CHAIN_ID:int:10}
+      poa_chain: ${IS_POA_CHAIN:bool:true}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+    polygon:
+      address: ${POLYGON_LEDGER_RPC:str:https://polygon-rpc.com}
+      chain_id: ${POLYGON_CHAIN_ID:int:137}
+      poa_chain: ${IS_POA_CHAIN:bool:true}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+    mode:
+      address: ${MODE_LEDGER_RPC:str:https://mainnet.mode.network}
+      chain_id: ${MODE_CHAIN_ID:int:34443}
+      poa_chain: ${IS_POA_CHAIN:bool:false}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+---
+public_id: valory/configs:0.1.0
+type: connection
+config:
+  safe_contract_addresses: ${SAFE_CONTRACT_ADDRESSES:str:{}}
+  store_path: ${STORE_PATH:str:./data}
+  fund_requirements: ${FUND_REQUIREMENTS:str:{}}
+  log_level: ${LOG_LEVEL:str:info}

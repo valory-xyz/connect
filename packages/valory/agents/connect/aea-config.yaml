@@ -1,0 +1,41 @@
+agent_name: connect
+author: valory
+version: 0.1.0
+license: Apache-2.0
+description: Connect agent whose brain is an agent-harness session
+aea_version: '>=2.0.0, <3.0.0'
+fingerprint:
+  README.md: bafybeigxuuq5vgoe33jkzomfdriv2unlvqrdqkygyr3pusmjymksuhc4a4
+  __init__.py: bafybeiaxhzo47u7yvolses5owohcykc5fkzjn4hork6nouf5qkcv3zbsby
+fingerprint_ignore_patterns: []
+skills: []
+connections:
+- valory/ledger:0.19.0:bafybeicynh5l5f5f5jpx72qwzis7jvmxk5p4eqltk32uxbj2pgu2x4rqz4
+contracts: []
+protocols: []
+customs: []
+default_ledger: ethereum
+required_ledgers:
+- ethereum
+default_routing: {}
+connection_private_key_paths: {}
+private_key_paths: {}
+logging_config:
+  disable_existing_loggers: false
+  version: 1
+dependencies:
+  open-aea-ledger-cosmos:
+    version: ==2.2.7
+  open-aea-ledger-ethereum:
+    version: ==2.2.7
+default_connection: null
+---
+public_id: valory/ledger:0.19.0
+type: connection
+config:
+  ledger_apis:
+    gnosis:
+      address: ${GNOSIS_LEDGER_RPC:str:https://rpc.gnosischain.com}
+      chain_id: ${GNOSIS_CHAIN_ID:int:100}
+      poa_chain: ${IS_POA_CHAIN:bool:false}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}

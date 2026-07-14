@@ -1,0 +1,242 @@
+# -*- coding: utf-8 -*-
+# ------------------------------------------------------------------------------
+#
+#   Copyright 2026 Valory AG
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# ------------------------------------------------------------------------------
+
+"""MCP tools for the Claude Code session — thin adapters over the signer/wallet.
+
+Tool handlers execute on the server's event loop (the MCP SDK calls sync
+tools inline), so every blocking body is pushed to a worker thread via
+asyncio.to_thread: slow RPC calls and receipt waits must not stall the loop
+that also serves the Pearl endpoints.
+"""
+
+import asyncio
+import typing as t
+
+from hexbytes import HexBytes
+from mcp.server.fastmcp import FastMCP
+from web3.exceptions import TimeExhausted, TransactionNotFound
+
+from connect import wallet
+from connect.activity import ActivityLog
+from connect.config import AppConfig
+from connect.guard import Guard
+from connect.mech import DEFAULT_MAX_PAYMENT, DEFAULT_MECH_CHAIN, MechService
+from connect.settings import SettingsStore
+from connect.signer import Signer
+
+RECEIPT_POLL_SECONDS = 2
+MAX_RECEIPT_TIMEOUT = 300
+
+
+def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
+    signer: Signer,
+    config: AppConfig,
+    activity: ActivityLog,
+    *,
+    guard: Guard,
+    mech: MechService,
+    settings_store: SettingsStore,
+) -> FastMCP:
+    """Build mcp."""
+    mcp = FastMCP(
+        name="connect",
+        instructions=(
+            "Signing service for this Pearl agent. The agent EOA and per-chain "
+            "service safes are shown by wallet_info. Every on-chain action is an "
+            "EOA transaction sent via send_transaction; safe transactions are "
+            "composed as execTransaction calls with the pre-validated signature "
+            "(see the pearl-connect skill). A guardrail may restrict what can "
+            "be signed — check settings; blocked requests return the violated rule."
+        ),
+        stateless_http=True,
+        streamable_http_path="/",
+    )
+
+    @mcp.tool()
+    async def wallet_info() -> dict:
+        """Agent EOA, per-chain service safes, RPC URLs, balances and guard mode."""
+
+        def _run() -> dict:
+            overview = wallet.wallet_overview(config, signer)
+            overview["mode"] = guard.mode()
+            return overview
+
+        return await asyncio.to_thread(_run)
+
+    @mcp.tool()
+    async def send_transaction(  # pylint: disable=too-many-arguments
+        chain: str,
+        to: str,
+        value: int = 0,
+        data: str = "0x",
+        *,
+        request_id: str | None = None,
+        wait_for_receipt: bool = False,
+        timeout: int = 60,
+    ) -> dict:
+        """Sign and broadcast a transaction from the agent EOA on the given chain.
+
+        Returns {tx_hash}; with wait_for_receipt, also the receipt if it mines
+        within `timeout` seconds, else {tx_hash, status: "pending"}.
+
+        When retrying a send whose outcome you are unsure about, pass the same
+        request_id as the original attempt: the signer will return the original
+        tx_hash instead of broadcasting a duplicate transaction.
+        """
+        if value < 0:
+            raise ValueError("value must be a non-negative amount in wei")
+
+        def _run() -> dict:
+            tx_hash = signer.send(
+                chain=chain, to=to, value=value, data=data, request_id=request_id
+            )
+            if not wait_for_receipt:
+                return {"tx_hash": tx_hash}
+            w3 = signer.w3(chain)
+            try:
+                receipt = w3.eth.wait_for_transaction_receipt(
+                    HexBytes(tx_hash),
+                    timeout=min(timeout, MAX_RECEIPT_TIMEOUT),
+                    poll_latency=RECEIPT_POLL_SECONDS,
+                )
+            except TimeExhausted:
+                return {"tx_hash": tx_hash, "status": "pending"}
+            return {"tx_hash": tx_hash, "receipt": _receipt_to_dict(receipt)}
+
+        return await asyncio.to_thread(_run)
+
+    @mcp.tool()
+    async def transaction_status(chain: str, tx_hash: str) -> dict:
+        """Receipt for a transaction if mined, else {status: "pending"}.
+
+        A malformed hash or a failing RPC raises instead of reporting
+        "pending" — a hash that can never resolve must not be polled forever.
+        """
+        try:
+            valid = len(bytes.fromhex(tx_hash.removeprefix("0x"))) == 32
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("tx_hash must be a 0x-prefixed 32-byte hex string")
+
+        def _run() -> dict:
+            w3 = signer.w3(chain)
+            try:
+                receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
+            except TransactionNotFound:
+                return {"tx_hash": tx_hash, "status": "pending"}
+            return {"tx_hash": tx_hash, "receipt": _receipt_to_dict(receipt)}
+
+        return await asyncio.to_thread(_run)
+
+    @mcp.tool()
+    async def sign_message(digest: str) -> dict:
+        """Sign a raw 32-byte digest (0x-hex), unprefixed — for off-chain mech requests.
+
+        Unavailable in restricted mode (the guardrail cannot inspect what a
+        digest commits to).
+        """
+        try:
+            raw = bytes.fromhex(digest.removeprefix("0x"))
+        except ValueError as e:
+            raise ValueError(f"digest must be a 0x-hex string: {e}") from e
+        return {"signature": await asyncio.to_thread(signer.sign_digest, raw)}
+
+    @mcp.tool()
+    async def mech_request(  # pylint: disable=too-many-arguments
+        prompt: str,
+        tool: str,
+        chain: str = DEFAULT_MECH_CHAIN,
+        *,
+        legacy_on_chain: bool = False,
+        priority_mech: str | None = None,
+        auto_deposit: bool = True,
+        timeout: float = 300,
+        max_payment: int = DEFAULT_MAX_PAYMENT,
+    ) -> dict:
+        """Send a request to an Olas mech (AI service) and wait for its delivery.
+
+        By default the request goes off-chain (prepaid balance, no transaction;
+        needs unrestricted mode). With legacy_on_chain=true it is sent on-chain
+        through the mech marketplace via the service safe — this works in
+        restricted mode because the mech contracts are whitelisted by default.
+        auto_deposit tops up the prepaid balance from the safe when the mech
+        answers 402 (insufficient balance) and retries once. A request is
+        refused if the mech's per-request price exceeds max_payment (wei,
+        default 0.1 of the native unit) — raise it explicitly to accept a
+        more expensive mech.
+        """
+        # mech-client manages its own event loops (asyncio.run + sync gql):
+        # it must run in a worker thread, never on the server loop
+        return await asyncio.to_thread(
+            mech.request,
+            prompt,
+            tool,
+            chain=chain,
+            legacy_on_chain=legacy_on_chain,
+            priority_mech=priority_mech,
+            auto_deposit=auto_deposit,
+            timeout=timeout,
+            max_payment=max_payment,
+        )
+
+    @mcp.tool()
+    async def mech_tools(
+        chain: str = DEFAULT_MECH_CHAIN,
+        priority_mech: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict:
+        """Discover Olas mechs and the tools they serve, for use with mech_request.
+
+        Without priority_mech: a page of live marketplace mechs (most
+        deliveries first; `total` reports how many exist — page with
+        limit/offset). With priority_mech: that mech's payment type, service
+        id and available tool names — pass one as mech_request's `tool`
+        argument (limit/offset are ignored then).
+        """
+        # same as mech_request: the sync gql subgraph client refuses to run
+        # on an already-running loop
+        return await asyncio.to_thread(
+            mech.tools,
+            chain=chain,
+            priority_mech=priority_mech,
+            limit=limit,
+            offset=offset,
+        )
+
+    @mcp.tool()
+    async def settings() -> dict:
+        """Read the enforced settings in their canonical shape.
+
+        The "protected" object is the guardrail state. Read-only: changes
+        go through the operator's agent UI, never through this MCP surface.
+        """
+        return await asyncio.to_thread(lambda: settings_store.load().to_dict())
+
+    return mcp
+
+
+def _receipt_to_dict(receipt: t.Mapping[str, t.Any]) -> dict:
+    return {
+        "status": receipt["status"],
+        "block_number": receipt["blockNumber"],
+        "gas_used": receipt["gasUsed"],
+        "logs": len(receipt["logs"]),
+    }

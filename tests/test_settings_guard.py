@@ -21,7 +21,8 @@
 
 import asyncio
 import json
-import logging
+import threading
+import time
 import typing as t
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,28 +33,32 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 
-from pearl_connect import settings as settings_module
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig, ChainConfig
-from pearl_connect.guard import EXEC_TRANSACTION_SELECTOR, Guard, GuardError
-from pearl_connect.mech import (
+from connect import settings as settings_module
+from connect import workspace as workspace_module
+from connect.activity import ActivityLog
+from connect.config import AppConfig, ChainConfig
+from connect.guard import EXEC_TRANSACTION_SELECTOR, Guard, GuardError
+from connect.mech import (
     MAX_DELIVERY_TIMEOUT,
     MechError,
     MechService,
     MechSigner,
 )
-from pearl_connect.settings import (
+from connect.server.settings_routes import WHITELIST_FROZEN
+from connect.settings import (
+    MAC_FIELDS,
     MODE_RESTRICTED,
     MODE_UNRESTRICTED,
+    Protected,
     Settings,
     SettingsStore,
     default_whitelist,
     defaults,
     derive_mac_key,
 )
-from pearl_connect.signer import Signer, SignerError
+from connect.signer import Signer, SignerError
 
-from tests.conftest import FakeW3, TEST_PASSWORD
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
 
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
@@ -108,25 +113,221 @@ class TestSettingsStore:
     ) -> None:
         """A fresh store fails closed to restricted defaults and persists them."""
         loaded = store.load()
-        assert loaded.mode == MODE_RESTRICTED
-        assert GNOSIS_MARKETPLACE in loaded.whitelist["gnosis"]
+        assert loaded.protected.mode == MODE_RESTRICTED
+        assert GNOSIS_MARKETPLACE in loaded.protected.whitelist["gnosis"]
         assert store._path.exists()  # pylint: disable=protected-access
 
     def test_roundtrip(self, store: SettingsStore) -> None:
         """Saved settings load back identically, immediately (no cache)."""
         store.save(
             Settings(
-                mode=MODE_UNRESTRICTED,
-                whitelist={"gnosis": (OTHER,)},
+                protected=Protected(
+                    mode=MODE_UNRESTRICTED, whitelist={"gnosis": (OTHER,)}
+                ),
                 harness="claude_code_cli",
             )
         )
         loaded = store.load()
-        assert loaded.mode == MODE_UNRESTRICTED
-        assert loaded.whitelist == {"gnosis": (OTHER,)}
+        assert loaded.protected.mode == MODE_UNRESTRICTED
+        assert loaded.protected.whitelist == {"gnosis": (OTHER,)}
         assert loaded.harness == "claude_code_cli"
         # a fresh store defaults to the desktop harness
         assert defaults().harness == "claude_code_desktop"
+
+    def test_every_persisted_field_has_decided_its_mac_coverage(
+        self, store: SettingsStore
+    ) -> None:
+        """A new top-level field must choose: inside the MAC, or outside it.
+
+        The MAC covers an allowlist (MAC_FIELDS), so a field added to the
+        canonical shape ships *unprotected* by default, silently. This test is
+        the reminder: if it fails because you added a field, decide whether it
+        belongs under "protected" (integrity-checked, password-gated) or is a
+        preference like the harness (freely editable, survives a reset), then
+        pin that choice here.
+        """
+        store.load()  # writes the defaults
+        payload = json.loads(
+            store._path.read_text()
+        )  # pylint: disable=protected-access
+        assert set(payload) == set(MAC_FIELDS) | {"harness", "mac"}
+
+    def test_concurrent_patches_lose_no_update(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One lock spans read-merge-write: parallel patches both persist.
+
+        Without it, two patches reading the same snapshot would each write
+        back only their own change — the second save silently undoing the
+        first (e.g. a harness save erasing a just-applied mode restriction).
+        """
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        original = Settings.merged
+
+        def merged_slowly(self: Settings, patch: t.Mapping) -> Settings:
+            time.sleep(0.05)  # widen the read-to-write window
+            return original(self, patch)
+
+        monkeypatch.setattr(Settings, "merged", merged_slowly)
+        threads = [
+            threading.Thread(
+                target=store.patch, args=({"protected": {"mode": MODE_RESTRICTED}},)
+            ),
+            threading.Thread(
+                target=store.patch, args=({"harness": "claude_code_cli"},)
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        final = store.load()
+        assert final.protected.mode == MODE_RESTRICTED
+        assert final.harness == "claude_code_cli"
+
+    def test_unreadable_file_fails_closed(
+        self, account: LocalAccount, activity: ActivityLog, tmp_path: Path
+    ) -> None:
+        """An unreadable settings file restricts, it does not crash the agent.
+
+        A missing file is not the only way a read fails: the store path may
+        not even be a directory. Every guarded action loads settings, so
+        raising here would kill the process instead of the read.
+        """
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("a file where the store should be")
+        store = SettingsStore(
+            blocker / "pearl-connect.settings.json", derive_mac_key(account), activity
+        )
+        assert store.load().protected.mode == MODE_RESTRICTED
+
+    def test_an_unreadable_file_is_never_overwritten(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A read that fails must not destroy the settings it could not read.
+
+        A missing file is safe to re-create; a momentarily unreadable one is
+        not — a virus scanner or a backup tool holding it raises here, and
+        resetting would permanently clobber the operator's mode, whitelist and
+        harness over a condition that clears by itself. Restrict in memory,
+        leave the file alone.
+        """
+        store.save(
+            Settings(
+                protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}),
+                harness="claude_code_cli",
+            )
+        )
+        before = store._path.read_bytes()  # pylint: disable=protected-access
+
+        def refuse(self: Path, **kwargs: object) -> str:
+            raise PermissionError("held by another process")
+
+        monkeypatch.setattr(Path, "read_text", refuse)
+        assert store.load().protected.mode == MODE_RESTRICTED  # fails closed
+        monkeypatch.undo()
+
+        # the file survived untouched, and so did everything in it — including
+        # the MAC pin, so the surviving file is not then rejected as a replay
+        assert store._path.read_bytes() == before  # pylint: disable=protected-access
+        restored = store.load()
+        assert restored.protected.mode == MODE_UNRESTRICTED
+        assert restored.harness == "claude_code_cli"
+
+    def test_invalid_patch_persists_nothing(self, store: SettingsStore) -> None:
+        """A patch that fails validation leaves the stored settings untouched."""
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        with pytest.raises(ValueError, match="mode must be"):
+            store.patch({"protected": {"mode": "yolo"}})
+        assert store.load().protected.mode == MODE_UNRESTRICTED
+
+    def test_malformed_whitelist_addresses_are_rejected(
+        self, store: SettingsStore
+    ) -> None:
+        """The store still validates addresses, though the API cannot send any.
+
+        Whitelist writes are frozen at the HTTP surface, but defaults() and any
+        future editing path come through here — the check must not rot away
+        with the endpoint that used to exercise it.
+        """
+        with pytest.raises(ValueError, match="not-an-address"):
+            store.patch({"protected": {"whitelist": {"testchain": ["not-an-address"]}}})
+
+    def test_patch_with_explicit_nones_keeps_current_values(
+        self, store: SettingsStore
+    ) -> None:
+        """None means "keep", at both levels — for every caller.
+
+        The store owns this rule alone: the route hands the request body
+        through as dumped, Nones and all, so HTTP callers and direct store
+        callers cannot drift onto two different merge semantics.
+        """
+        store.save(
+            Settings(
+                protected=Protected(
+                    mode=MODE_UNRESTRICTED, whitelist={"gnosis": (OTHER,)}
+                ),
+                harness="claude_code_cli",
+            )
+        )
+        previous, updated = store.patch(
+            {"protected": {"mode": None, "whitelist": None}, "harness": None}
+        )
+        assert updated.protected.mode == MODE_UNRESTRICTED
+        assert updated.protected.whitelist == {"gnosis": (OTHER,)}
+        assert updated.harness == "claude_code_cli"
+        # nothing moved, and the caller can see that: it is what lets the
+        # route audit only real changes
+        assert previous == updated
+
+    def test_patch_reports_what_moved(self, store: SettingsStore) -> None:
+        """The patch result carries both sides, so a no-op is recognizable."""
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
+        previous, updated = store.patch({"protected": {"mode": MODE_UNRESTRICTED}})
+        assert previous.protected.mode == MODE_RESTRICTED
+        assert updated.protected.mode == MODE_UNRESTRICTED
+
+    def test_an_unreadable_file_is_not_a_persist_failure(
+        self,
+        store_path: Path,
+        store: SettingsStore,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A read that fails restricts; it is never reported as a failed write.
+
+        Every guarded decision loads the settings, so an unreadable file must
+        fail closed in memory rather than raise — and it must not masquerade
+        as a persist failure to the operator, who would go looking at a write
+        that was never attempted.
+        """
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+
+        def refuse(self: Path, **kwargs: object) -> str:
+            raise PermissionError("locked")
+
+        monkeypatch.setattr(Path, "read_text", refuse)
+        assert store.load().protected.mode == MODE_RESTRICTED  # fails closed
+        assert "settings_persist_failed" not in audit_kinds(store_path)
+
+    def test_failed_write_leaves_no_temp_file(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed atomic replace cleans up its temp file and propagates."""
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+
+        def refuse(self: Path, target: Path) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "replace", refuse)
+        with pytest.raises(OSError, match="disk full"):
+            store.save(
+                Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+            )
+        tmp = store._path.with_suffix(".json.tmp")  # pylint: disable=protected-access
+        assert not tmp.exists()
+        # the previously persisted settings are intact
+        assert store.load().protected.mode == MODE_UNRESTRICTED
 
     @pytest.mark.parametrize(
         "corrupt",
@@ -137,68 +338,121 @@ class TestSettingsStore:
         ],
     )
     def test_tampered_content_restores_defaults(
-        self, store: SettingsStore, activity: ActivityLog, corrupt: str
+        self,
+        store_path: Path,
+        store: SettingsStore,
+        activity: ActivityLog,
+        corrupt: str,
     ) -> None:
         """Unverifiable content is replaced with defaults and audited."""
-        store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         store._path.write_text(corrupt)  # pylint: disable=protected-access
         loaded = store.load()
-        assert loaded.mode == MODE_RESTRICTED
-        assert any(e["kind"] == "settings_tampered" for e in activity.recent())
+        assert loaded.protected.mode == MODE_RESTRICTED
+        assert "settings_tampered" in audit_kinds(store_path)
         # the rewritten file verifies again
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
 
     def test_edited_field_fails_mac(self, store: SettingsStore) -> None:
         """Flipping the mode in the JSON without the key fails verification."""
-        store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
         payload = json.loads(path.read_text())
-        payload["mode"] = "unrestricted"  # the attack this file exists to stop
+        payload["protected"][
+            "mode"
+        ] = "unrestricted"  # the attack this file exists to stop
         path.write_text(json.dumps(payload))
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
+
+    def test_harness_edit_applies_without_the_key(self, store: SettingsStore) -> None:
+        """The harness is a preference: a plain file edit simply takes effect."""
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
+        path = store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["harness"] = "claude_code_cli"
+        path.write_text(json.dumps(payload))
+        loaded = store.load()
+        assert loaded.harness == "claude_code_cli"
+        assert loaded.protected.mode == MODE_RESTRICTED  # protected fields untouched
+
+    def test_invalid_harness_falls_back_without_tamper(
+        self, store_path: Path, store: SettingsStore, activity: ActivityLog
+    ) -> None:
+        """A bad harness value is not an integrity event."""
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        path = store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["harness"] = "cursor"
+        path.write_text(json.dumps(payload))
+        loaded = store.load()
+        assert loaded.harness == "claude_code_desktop"
+        assert (
+            loaded.protected.mode == MODE_UNRESTRICTED
+        )  # protected fields still verify
+        assert "settings_tampered" not in audit_kinds(store_path)
+
+    def test_tampered_mode_preserves_the_harness_preference(
+        self, store: SettingsStore
+    ) -> None:
+        """A guardrail reset must not discard the unprotected preference."""
+        store.save(
+            Settings(
+                protected=Protected(mode=MODE_RESTRICTED, whitelist={}),
+                harness="claude_code_cli",
+            )
+        )
+        path = store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["protected"][
+            "mode"
+        ] = "unrestricted"  # the attack: protected field edited
+        path.write_text(json.dumps(payload))
+        loaded = store.load()
+        assert loaded.protected.mode == MODE_RESTRICTED  # fails closed
+        assert loaded.harness == "claude_code_cli"  # preference survives
 
     def test_valid_mac_but_bad_mode_rejected(self, store: SettingsStore) -> None:
         """A MAC'd payload with an unknown mode still falls back to defaults."""
-        payload: dict = {"version": 1, "mode": "yolo", "whitelist": {}}
+        payload: dict = {"version": 1, "protected": {"mode": "yolo", "whitelist": {}}}
         payload["mac"] = store._mac(payload)  # pylint: disable=protected-access
         store._path.write_text(json.dumps(payload))  # pylint: disable=protected-access
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
 
     def test_mac_key_requires_the_private_key(
         self, store: SettingsStore, activity: ActivityLog
     ) -> None:
         """A store keyed by a different account rejects the file."""
-        store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         other = SettingsStore(
             store._path,  # pylint: disable=protected-access
             derive_mac_key(Account.create()),
             activity,
         )
-        assert other.load().mode == MODE_RESTRICTED
+        assert other.load().protected.mode == MODE_RESTRICTED
 
     def test_replayed_old_file_is_rejected(
-        self, store: SettingsStore, activity: ActivityLog
+        self, store_path: Path, store: SettingsStore, activity: ActivityLog
     ) -> None:
         """Putting back an old validly-MAC'd file fails like any other tamper."""
-        store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
         unrestricted_file = path.read_bytes()  # captured while unrestricted
-        store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
         path.write_bytes(unrestricted_file)  # the rollback attack
-        assert store.load().mode == MODE_RESTRICTED
-        assert any(e["kind"] == "settings_tampered" for e in activity.recent())
+        assert store.load().protected.mode == MODE_RESTRICTED
+        assert "settings_tampered" in audit_kinds(store_path)
 
     def test_fresh_process_accepts_any_valid_mac(
         self, store: SettingsStore, account: LocalAccount, activity: ActivityLog
     ) -> None:
         """A new store instance (a restart) pins the first valid file it sees."""
-        store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         restarted = SettingsStore(
             store._path,  # pylint: disable=protected-access
             derive_mac_key(account),
             activity,
         )
-        assert restarted.load().mode == MODE_UNRESTRICTED
+        assert restarted.load().protected.mode == MODE_UNRESTRICTED
 
     def test_unwritable_store_still_fails_closed(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
@@ -210,7 +464,7 @@ class TestSettingsStore:
             "_save",
             lambda self, settings: (_ for _ in ()).throw(OSError("read-only fs")),
         )
-        assert store.load().mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_RESTRICTED
 
 
 class TestDefaults:
@@ -244,7 +498,7 @@ class TestDefaults:
         whitelist = default_whitelist()
         assert "0x" + "cc" * 20 in whitelist["gnosis"]
         assert whitelist["testchain"] == ("0x" + "dd" * 20,)
-        assert defaults().mode == MODE_RESTRICTED
+        assert defaults().protected.mode == MODE_RESTRICTED
 
     def test_broken_mech_client_degrades_to_empty_whitelist(
         self, monkeypatch: pytest.MonkeyPatch
@@ -255,14 +509,14 @@ class TestDefaults:
             "/nonexistent/mechs.json",
         )
         assert default_whitelist() == {}
-        assert defaults().mode == MODE_RESTRICTED
+        assert defaults().protected.mode == MODE_RESTRICTED
 
 
 def make_guard(
     store: SettingsStore, mode: str, whitelist: dict[str, tuple[str, ...]] | None = None
 ) -> Guard:
     """Save the given state and return a guard over it."""
-    store.save(Settings(mode=mode, whitelist=whitelist or {}))
+    store.save(Settings(protected=Protected(mode=mode, whitelist=whitelist or {})))
     config = AppConfig(
         chains={
             "testchain": ChainConfig(rpc_url="http://127.0.0.1:9", safe_address=SAFE),
@@ -389,9 +643,11 @@ class TestSignerGuardIntegration:
 
         from web3 import Web3
 
-        from pearl_connect.signer import _ChainState
+        from connect.signer import _ChainState
 
-        settings_store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
         signer = Signer(
             account=account,
             config=app_config,
@@ -404,12 +660,16 @@ class TestSignerGuardIntegration:
         return signer
 
     def test_blocked_send_is_audited(
-        self, restricted_signer: Signer, activity: ActivityLog, fake_w3: FakeW3
+        self,
+        store_path: Path,
+        restricted_signer: Signer,
+        activity: ActivityLog,
+        fake_w3: FakeW3,
     ) -> None:
         """A denied send raises SignerError, records 'blocked', broadcasts nothing."""
         with pytest.raises(SignerError, match="restricted mode"):
             restricted_signer.send("testchain", OTHER, value=1)
-        assert any(e["kind"] == "blocked" for e in activity.recent())
+        assert "blocked" in audit_kinds(store_path)
         assert not fake_w3.eth.sent
 
     def test_sweep_passes_the_gate(
@@ -421,14 +681,14 @@ class TestSignerGuardIntegration:
         assert fake_w3.eth.sent
 
     def test_blocked_sign_digest_is_audited(
-        self, restricted_signer: Signer, activity: ActivityLog
+        self, store_path: Path, restricted_signer: Signer, activity: ActivityLog
     ) -> None:
         """A denied digest signing raises SignerError and records 'blocked'."""
         with pytest.raises(SignerError, match="digest signing is disabled"):
             restricted_signer.sign_digest(b"\x11" * 32)
         assert any(
             e["kind"] == "blocked" and e.get("action") == "sign_digest"
-            for e in activity.recent()
+            for e in audit_entries(store_path)
         )
 
     def test_completed_request_id_replays_across_tightening(
@@ -442,9 +702,13 @@ class TestSignerGuardIntegration:
         The transaction already happened; replaying its hash signs nothing
         new. A *fresh* request_id still hits the tightened gate.
         """
-        settings_store.save(Settings(mode=MODE_UNRESTRICTED, whitelist={}))
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}))
+        )
         tx_hash = restricted_signer.send("testchain", OTHER, value=1, request_id="r1")
-        settings_store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
         assert (
             restricted_signer.send("testchain", OTHER, value=1, request_id="r1")
             == tx_hash
@@ -516,6 +780,7 @@ class TestMech:
 
     def test_request_maps_arguments(
         self,
+        store_path: Path,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         activity: ActivityLog,
@@ -538,7 +803,7 @@ class TestMech:
         assert call["priority_mech"] == OTHER
         assert call["auto_deposit"] is False
         assert call["timeout"] == 42
-        assert any(e["kind"] == "mech_request" for e in activity.recent())
+        assert "mech_request" in audit_kinds(store_path)
         # the service is cached per chain
         mech_service.request(
             "again",
@@ -549,6 +814,31 @@ class TestMech:
         )
         assert len(patched_mech.calls) == 2
 
+    def test_delivered_request_survives_an_unwritable_audit_log(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A paid-for delivery must not be lost to a failing audit write.
+
+        The audit runs after the mech answered: raising would discard a
+        result the operator already paid for, and invite paying again.
+        """
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        result = mech_service.request(
+            "what is the answer",
+            "prediction",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+        )
+        assert result == patched_mech.result
+
     def test_request_offchain_denied_in_restricted(
         self,
         mech_service: MechService,
@@ -556,13 +846,16 @@ class TestMech:
         patched_mech: FakeMarketplaceService,
     ) -> None:
         """The off-chain preflight names the escape hatch."""
-        settings_store.save(Settings(mode=MODE_RESTRICTED, whitelist={}))
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
         with pytest.raises(MechError, match="legacy_on_chain=true"):
             mech_service.request("q", "tool", chain="testchain")
         assert not patched_mech.calls
 
     def test_request_wraps_mech_client_errors(
         self,
+        store_path: Path,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         activity: ActivityLog,
@@ -577,7 +870,7 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=OTHER,
             )
-        assert any(e["kind"] == "mech_request_failed" for e in activity.recent())
+        assert "mech_request_failed" in audit_kinds(store_path)
 
     def test_request_passes_signer_errors_through(
         self,
@@ -855,8 +1148,7 @@ class TestSettingsEndpoints:
         """GET /settings mirrors the enforced state."""
         body = client.get("/settings").json()
         assert body == {
-            "mode": "unrestricted",
-            "whitelist": {},
+            "protected": {"mode": "unrestricted", "whitelist": {}},
             "harness": "claude_code_desktop",
         }
 
@@ -864,16 +1156,15 @@ class TestSettingsEndpoints:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Bad passwords burn a second and reveal nothing."""
-        from pearl_connect.server import settings_routes
+        from connect.server import settings_routes
 
         sleeps: list[float] = []
         monkeypatch.setattr(settings_routes.time, "sleep", sleeps.append)
-        response = client.post(
+        response = client.patch(
             "/settings",
             json={
                 "password": "nope",
-                "mode": "restricted",
-                "whitelist": {},
+                "protected": {"mode": "restricted"},
             },  # nosec B105
         )
         assert response.status_code == 401
@@ -894,35 +1185,28 @@ class TestSettingsEndpoints:
         keystore = Account.encrypt(Account.create().key, TEST_PASSWORD)
         (other_dir / "ethereum_private_key.txt").write_text(json.dumps(keystore))
         monkeypatch.chdir(other_dir)
-        monkeypatch.setattr(
-            "pearl_connect.server.settings_routes.time.sleep", lambda _: None
-        )
+        monkeypatch.setattr("connect.server.settings_routes.time.sleep", lambda _: None)
         with TestClient(
             make_app(test_signer, app_config, activity),
             base_url="http://127.0.0.1:8716",
         ) as client:
-            response = client.post(
+            response = client.patch(
                 "/settings",
-                json={"password": TEST_PASSWORD, "mode": "restricted", "whitelist": {}},
+                json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
             )
         assert response.status_code == 401
 
     def test_valid_password_applies_live(
-        self, client: TestClient, activity: ActivityLog
+        self, store_path: Path, client: TestClient, activity: ActivityLog
     ) -> None:
         """A mode flip takes effect on the very next signing request."""
-        response = client.post(
+        response = client.patch(
             "/settings",
-            json={
-                "password": TEST_PASSWORD,
-                "mode": "restricted",
-                "whitelist": {"testchain": [WHITELISTED]},
-            },
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
         )
         assert response.status_code == 200
-        assert response.json()["mode"] == "restricted"
-        assert response.json()["whitelist"] == {"testchain": [WHITELISTED.lower()]}
-        assert any(e["kind"] == "settings_changed" for e in activity.recent())
+        assert response.json()["protected"]["mode"] == "restricted"
+        assert "settings_changed" in audit_kinds(store_path)
 
         blocked = client.post(
             "/sign-and-send",
@@ -934,84 +1218,494 @@ class TestSettingsEndpoints:
 
     def test_harness_updates_and_validates(self, client: TestClient) -> None:
         """The harness is updatable from the UI endpoint and validated."""
-        flipped = client.post(
-            "/settings",
-            json={
-                "password": TEST_PASSWORD,
-                "mode": "unrestricted",
-                "whitelist": {},
-                "harness": "claude_code_cli",
-            },
-        )
+        flipped = client.patch("/settings", json={"harness": "claude_code_cli"})
         assert flipped.status_code == 200
         assert flipped.json()["harness"] == "claude_code_cli"
         assert client.get("/settings").json()["harness"] == "claude_code_cli"
-        # the UI's Open button now targets the CLI deep link
-        page = client.get("/").text
-        assert "claude-cli://open?cwd=" in page
-        assert 'value="claude_code_cli"' in page
 
-        bad = client.post(
-            "/settings",
-            json={
-                "password": TEST_PASSWORD,
-                "mode": "unrestricted",
-                "whitelist": {},
-                "harness": "cursor",
-            },
-        )
+        bad = client.patch("/settings", json={"harness": "cursor"})
         assert bad.status_code == 400
         assert "harness" in bad.json()["detail"]
 
-    def test_unconfigured_whitelist_chain_warns(
-        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    def test_session_opens_the_configured_harness(
+        self,
+        client: TestClient,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A whitelist entry for an unconfigured chain saves, but loudly.
+        """POST /session opens a session on demand, in the chosen harness."""
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module.Workspace,
+            "open_session",
+            lambda self, harness: opened.append(harness),
+        )
+        client.patch("/settings", json={"harness": "claude_code_cli"})
+        response = client.post("/session")
+        assert response.status_code == 200
+        assert response.json() == {"launched": True, "harness": "claude_code_cli"}
+        assert opened == ["claude_code_cli"]
+        assert "session_launched" in audit_kinds(store_path)
 
-        Rejecting would break saving the defaults (they span chains this run
-        may not have); silence would hide the typo until a call is blocked.
+    def test_session_launch_failure_is_reported(
+        self,
+        client: TestClient,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deep link that will not open is a 200 the UI can show, not a 500.
+
+        The FE needs the reason to raise a dismissable alert: a harness that
+        is not installed is the operator's environment, not a server fault.
         """
-        with caplog.at_level(logging.WARNING):
-            response = client.post(
+
+        def refuse(self: workspace_module.Workspace, harness: str) -> None:
+            raise workspace_module.LaunchError(f"could not open {harness}")
+
+        monkeypatch.setattr(workspace_module.Workspace, "open_session", refuse)
+        response = client.post("/session")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["launched"] is False
+        assert body["harness"] == "claude_code_desktop"
+        assert "could not open claude_code_desktop" in body["error"]
+        assert "session_launch_failed" in audit_kinds(store_path)
+
+    def test_session_rejects_cross_origin(self, client: TestClient) -> None:
+        """A webpage must not be able to spawn agent sessions."""
+        response = client.post("/session", headers={"Origin": "https://evil.example"})
+        assert response.status_code == 403
+
+    def test_session_harness_override_does_not_persist(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit harness opens there once, leaving the preference alone."""
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module.Workspace,
+            "open_session",
+            lambda self, harness: opened.append(harness),
+        )
+        response = client.post("/session", json={"harness": "claude_code_cli"})
+        assert response.status_code == 200
+        assert response.json() == {"launched": True, "harness": "claude_code_cli"}
+        assert opened == ["claude_code_cli"]
+        # the saved preference is untouched: the next default launch uses it
+        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
+        client.post("/session")
+        assert opened == ["claude_code_cli", "claude_code_desktop"]
+
+    def test_session_survives_an_unwritable_audit_log(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The session opened; a failing audit write must not report otherwise.
+
+        Reporting failure after the deep link already fired would have the
+        operator open a second session for work that succeeded.
+        """
+        opened: list[str] = []
+        monkeypatch.setattr(
+            workspace_module.Workspace,
+            "open_session",
+            lambda self, harness: opened.append(harness),
+        )
+        monkeypatch.setattr(
+            ActivityLog,
+            "_append",
+            lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        response = client.post("/session")
+        assert response.status_code == 200
+        assert response.json()["launched"] is True
+        assert opened == ["claude_code_desktop"]
+
+    def test_session_rejects_an_unknown_harness(self, client: TestClient) -> None:
+        """An unknown harness is a 400, not a deep link nobody can open."""
+        response = client.post("/session", json={"harness": "cursor"})
+        assert response.status_code == 400
+        assert "harness" in response.json()["detail"]
+        # and a typo'd field is refused outright
+        assert client.post("/session", json={"harnes": "x"}).status_code == 422
+
+    def test_whitelist_editing_is_refused(self, client: TestClient) -> None:
+        """The whitelist is frozen at the API: an attempt is loud, not ignored.
+
+        A patch replaces the whitelist wholesale across all chains, and only
+        the address format can be checked here — so until those semantics are
+        specced, writing one is a 422 naming the reason. Silently dropping the
+        field would let a caller believe an edit landed.
+        """
+        store = client.app.state.settings_store  # type: ignore[attr-defined]
+        store.patch({"protected": {"whitelist": {"testchain": [WHITELISTED]}}})
+
+        for whitelist in ({"testchain": [OTHER]}, {}):  # replacing and clearing
+            refused = client.patch(
                 "/settings",
                 json={
                     "password": TEST_PASSWORD,
-                    "mode": "restricted",
-                    "whitelist": {"gnosiss": [WHITELISTED]},
+                    "protected": {"whitelist": whitelist},
                 },
             )
-        assert response.status_code == 200
-        assert "gnosiss" in caplog.text
+            assert refused.status_code == 422
+            assert WHITELIST_FROZEN in refused.text
 
-    def test_invalid_mode_and_address_are_400(self, client: TestClient) -> None:
-        """Validation errors name the offending value."""
-        bad_mode = client.post(
-            "/settings",
-            json={"password": TEST_PASSWORD, "mode": "yolo", "whitelist": {}},
-        )
-        assert bad_mode.status_code == 400
-        bad_address = client.post(
+        # an explicit null is not an edit — it is the merge-patch "keep"
+        kept = client.patch(
             "/settings",
             json={
                 "password": TEST_PASSWORD,
-                "mode": "restricted",
-                "whitelist": {"testchain": ["not-an-address"]},
+                "protected": {"mode": "restricted", "whitelist": None},
             },
         )
-        assert bad_address.status_code == 400
-        assert "not-an-address" in bad_address.json()["detail"]
+        assert kept.status_code == 200
 
-    def test_index_shows_mode_and_whitelist(
-        self, client: TestClient, settings_store: SettingsStore
+        # the stored whitelist is untouched throughout
+        assert client.get("/settings").json()["protected"]["whitelist"] == {
+            "testchain": [WHITELISTED.lower()]
+        }
+
+    def test_harness_patch_needs_no_password(
+        self, store_path: Path, client: TestClient, activity: ActivityLog
     ) -> None:
-        """The agent UI renders the mode and the whitelist entries."""
-        settings_store.save(
-            Settings(mode=MODE_RESTRICTED, whitelist={"testchain": (WHITELISTED,)})
+        """The harness is a preference: changing it never asks for the password."""
+        response = client.patch("/settings", json={"harness": "claude_code_cli"})
+        assert response.status_code == 200
+        assert response.json()["harness"] == "claude_code_cli"
+        loaded = client.get("/settings").json()
+        assert loaded["harness"] == "claude_code_cli"
+        # protected fields untouched
+        assert loaded["protected"]["mode"] == "unrestricted"
+        assert "harness_changed" in audit_kinds(store_path)
+        # still validated: unknown harnesses are rejected
+        bad = client.patch("/settings", json={"harness": "cursor"})
+        assert bad.status_code == 400
+
+    def test_protected_patch_requires_the_password(self, client: TestClient) -> None:
+        """Touching the protected object without a password is a clean 401."""
+        response = client.patch("/settings", json={"protected": {"mode": "restricted"}})
+        assert response.status_code == 401
+        assert "password" in response.json()["detail"]
+        # nothing changed, and the missing password did not feed the brake
+        assert client.get("/settings").json()["protected"]["mode"] == "unrestricted"
+
+    def test_missing_password_is_audited_but_never_brakes(
+        self, store_path: Path, client: TestClient, activity: ActivityLog
+    ) -> None:
+        """Password-less probes are visible in the log but cost no brake count.
+
+        No guess was made, so feeding the brake would let any local process
+        429-lock every authenticated surface with free requests.
+        """
+        from connect.server import auth as auth_module
+
+        for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
+            response = client.patch(
+                "/settings", json={"protected": {"mode": "restricted"}}
+            )
+            assert response.status_code == 401  # never 429
+        reasons = [
+            e["reason"] for e in audit_entries(store_path) if e["kind"] == "auth_failed"
+        ]
+        assert "missing password" in reasons
+        # the real password still works immediately
+        flipped = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
         )
-        page = client.get("/").text
-        assert "restricted" in page
-        assert f"testchain:{WHITELISTED}" in page
-        assert "Guardrail settings" in page
+        assert flipped.status_code == 200
+
+    def test_empty_patch_is_rejected(self, client: TestClient) -> None:
+        """A patch with nothing to update is an explicit 400, not a silent 200."""
+        assert client.patch("/settings", json={}).status_code == 400
+
+    def test_partial_protected_patch_keeps_other_fields(
+        self, client: TestClient
+    ) -> None:
+        """Merge-patch semantics: omitted fields keep their current values."""
+        store = client.app.state.settings_store  # type: ignore[attr-defined]
+        store.patch({"protected": {"whitelist": {"testchain": [WHITELISTED]}}})
+        client.patch("/settings", json={"harness": "claude_code_cli"})
+        # mode-only patch: the whitelist and the harness survive it
+        response = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["protected"]["mode"] == "restricted"
+        assert body["protected"]["whitelist"] == {"testchain": [WHITELISTED.lower()]}
+        assert body["harness"] == "claude_code_cli"  # preference not reset
+
+    def test_a_patch_that_changes_nothing_is_audited_as_nothing(
+        self, store_path: Path, client: TestClient, activity: ActivityLog
+    ) -> None:
+        """Restating the stored values records no change — it made none.
+
+        An audit trail that reports guardrail changes which never happened is
+        worse than one that stays quiet: it is the record an operator reaches
+        for when something has gone wrong.
+        """
+        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
+        noop = client.patch(
+            "/settings",
+            json={
+                "password": TEST_PASSWORD,
+                "protected": {},  # every field None: merges nothing
+                "harness": "claude_code_desktop",  # already the stored value
+            },
+        )
+        assert noop.status_code == 200
+        kinds = audit_kinds(store_path)
+        assert "settings_changed" not in kinds
+        assert "harness_changed" not in kinds
+
+        # a real change still lands
+        client.patch("/settings", json={"harness": "claude_code_cli"})
+        assert "harness_changed" in audit_kinds(store_path)
+
+    def test_host_header_is_validated(self, client: TestClient) -> None:
+        """A rebound (non-loopback) Host header is refused app-wide."""
+        response = client.get("/healthcheck", headers={"host": "evil.example:8716"})
+        assert response.status_code == 400
+
+    def test_settings_routes_reject_cross_origin(self, client: TestClient) -> None:
+        """All settings routes refuse browser cross-origin requests."""
+        headers = {"Origin": "https://evil.example"}
+        assert client.get("/settings", headers=headers).status_code == 403
+        response = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
+            headers=headers,
+        )
+        assert response.status_code == 403
+        harness = client.patch(
+            "/settings", json={"harness": "claude_code_cli"}, headers=headers
+        )
+        assert harness.status_code == 403
+
+    def test_auth_failures_are_audited_and_braked(
+        self,
+        store_path: Path,
+        client: TestClient,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Probing is recorded and, past the threshold, answered with 429."""
+        from connect.server import auth as auth_module
+        from connect.server import settings_routes
+
+        monkeypatch.setattr(settings_routes.time, "sleep", lambda _: None)
+
+        # a failed token and a failed password both land in the audit log
+        assert client.get("/wallet").status_code == 401
+        client.patch(
+            "/settings",
+            json={
+                "password": "wrong",
+                "protected": {"mode": "restricted"},
+            },  # nosec B105
+        )
+        reasons = [
+            e["reason"] for e in audit_entries(store_path) if e["kind"] == "auth_failed"
+        ]
+        assert "bad token" in reasons
+        assert "bad password" in reasons
+
+        # cross the threshold: every authenticated surface goes 429
+        for _ in range(auth_module.MAX_AUTH_FAILURES):
+            client.get("/wallet")
+        assert client.get("/wallet").status_code == 429
+        assert (
+            client.get("/wallet", headers={"Authorization": "Bearer tok"}).status_code
+            == 429
+        )
+        assert (
+            client.patch(
+                "/settings",
+                json={
+                    "password": TEST_PASSWORD,
+                    "protected": {"mode": "restricted"},
+                },
+            ).status_code
+            == 429
+        )
+        assert client.post("/mcp/", json={}).status_code == 429
+
+        # the brake releases once the window drains
+        real_monotonic = auth_module.time.monotonic
+        monkeypatch.setattr(
+            auth_module.time,
+            "monotonic",
+            lambda: real_monotonic() + auth_module.AUTH_FAILURE_WINDOW_SECONDS + 1,
+        )
+        assert client.get("/healthcheck").status_code == 200
+        assert (
+            client.get("/wallet", headers={"Authorization": "Bearer tok"}).status_code
+            == 200
+        )
+
+    def test_cross_origin_failures_do_not_engage_the_brake(
+        self, store_path: Path, client: TestClient, activity: ActivityLog
+    ) -> None:
+        """Origin failures need no secret; they must never lock the agent out.
+
+        A webpage's simple requests arrive with a foreign Origin at will — if
+        they fed the limiter, a background tab could hold every authenticated
+        surface at 429 indefinitely (including the settings UI).
+        """
+        from connect.server import auth as auth_module
+
+        headers = {"Origin": "https://evil.example"}
+        for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
+            assert client.get("/wallet", headers=headers).status_code == 403
+            assert client.post("/mcp/", json={}, headers=headers).status_code == 403
+        # loud in the audit log...
+        reasons = [
+            e["reason"] for e in audit_entries(store_path) if e["kind"] == "auth_failed"
+        ]
+        assert "cross-origin" in reasons
+        # ...but the brake never engages: legitimate access keeps working
+        assert (
+            client.get("/wallet", headers={"Authorization": "Bearer tok"}).status_code
+            == 200
+        )
+
+    def test_invalid_mode_is_400(self, client: TestClient) -> None:
+        """Validation errors name the offending value."""
+        bad_mode = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mode": "yolo"}},
+        )
+        assert bad_mode.status_code == 400
+        assert "yolo" in bad_mode.json()["detail"] or "mode must be" in (
+            bad_mode.json()["detail"]
+        )
+
+    def test_a_blank_password_never_brakes(
+        self,
+        store_path: Path,
+        client: TestClient,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An empty password is no guess: it costs no decrypt, delay or brake.
+
+        The UI's form always sends the field, so a blank submit arrives as ""
+        rather than as an omission. Treating that as a wrong guess would let a
+        handful of stray clicks (or any local process, for free) trip the
+        global limiter and 429-lock every authenticated surface.
+        """
+        from connect.server import auth as auth_module
+        from connect.server import settings_routes
+
+        slept: list[float] = []
+        monkeypatch.setattr(settings_routes.time, "sleep", slept.append)
+
+        blank = {"password": "", "protected": {"mode": "restricted"}}  # nosec B105
+        for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
+            response = client.patch("/settings", json=blank)
+            assert response.status_code == 401  # never 429
+        assert slept == []  # no throttle burned either
+        reasons = [
+            e["reason"] for e in audit_entries(store_path) if e["kind"] == "auth_failed"
+        ]
+        assert "missing password" in reasons
+        assert "bad password" not in reasons
+
+        # and the real password still works immediately
+        flipped = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
+        )
+        assert flipped.status_code == 200
+
+    def test_the_patch_models_cover_the_whole_settings_shape(self) -> None:
+        """The API's shape tracks the persisted one, field for field.
+
+        The patch models mirror the dataclasses by hand, so a field added to
+        Settings/Protected would be enforced and MAC'd but unsettable over the
+        API — a 422 the operator cannot explain. If this fails, add the field
+        to the matching patch model (or freeze it deliberately, as the
+        whitelist is).
+        """
+        from dataclasses import fields
+
+        from connect.server.settings_routes import ProtectedPatch, SettingsPatch
+
+        assert set(SettingsPatch.model_fields) - {"password"} == {
+            f.name for f in fields(Settings)
+        }
+        assert set(ProtectedPatch.model_fields) == {f.name for f in fields(Protected)}
+
+    def test_failed_patch_changes_nothing(self, client: TestClient) -> None:
+        """A patch is atomic: an invalid protected half also drops the harness half."""
+        before = client.get("/settings").json()
+        assert before["harness"] != "claude_code_cli"
+        response = client.patch(
+            "/settings",
+            json={
+                "password": TEST_PASSWORD,
+                "protected": {"mode": "yolo"},
+                "harness": "claude_code_cli",
+            },
+        )
+        assert response.status_code == 400
+        assert client.get("/settings").json() == before
+
+    def test_unknown_patch_fields_are_rejected(self, client: TestClient) -> None:
+        """A typo'd field name is a 422, not a silently-dropped no-op."""
+        typoed_protected = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mdoe": "restricted"}},
+        )
+        assert typoed_protected.status_code == 422
+        typoed_top_level = client.patch("/settings", json={"harnes": "cursor"})
+        assert typoed_top_level.status_code == 422
+
+    def test_patch_over_tampered_file_merges_onto_defaults(
+        self,
+        store_path: Path,
+        client: TestClient,
+        settings_store: SettingsStore,
+        activity: ActivityLog,
+    ) -> None:
+        """A patch lands on the post-reset defaults, never the forged payload.
+
+        An unauthenticated harness-only patch must not launder a hand-edited
+        mode back to disk under a fresh valid MAC.
+        """
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
+        path = settings_store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["protected"]["mode"] = "unrestricted"  # forged without the key
+        path.write_text(json.dumps(payload))
+        response = client.patch("/settings", json={"harness": "claude_code_cli"})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["protected"]["mode"] == "restricted"  # reset, not merged
+        assert body["harness"] == "claude_code_cli"
+        assert "settings_tampered" in audit_kinds(store_path)
+
+    def test_unpersistable_patch_is_a_clear_error(
+        self, store_path: Path, client: TestClient, activity: ActivityLog
+    ) -> None:
+        """A disk-refused write is an audited 503, not an opaque 500."""
+        # a scoped context, NOT the shared monkeypatch fixture: undoing that
+        # one would also undo the client fixture's chdir to the keystore
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                SettingsStore,
+                "_save",
+                lambda self, settings: (_ for _ in ()).throw(OSError("disk full")),
+            )
+            response = client.patch("/settings", json={"harness": "claude_code_cli"})
+        assert response.status_code == 503
+        assert "persisted" in response.json()["detail"]
+        assert "settings_persist_failed" in audit_kinds(store_path)
+        # nothing changed on disk
+        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
 
 
 class TestMcpGuardrailTools:
@@ -1028,7 +1722,7 @@ class TestMcpGuardrailTools:
         settings_store: SettingsStore,
     ) -> dict[str, t.Callable]:
         """Return the registered tool functions keyed by name."""
-        from pearl_connect.server.mcp_tools import build_mcp
+        from connect.server.mcp_tools import build_mcp
 
         mcp = build_mcp(
             test_signer,
@@ -1052,13 +1746,12 @@ class TestMcpGuardrailTools:
     ) -> None:
         """The tool reflects the post-verification settings."""
         assert await tools["settings"]() == {
-            "mode": "unrestricted",
-            "whitelist": {},
+            "protected": {"mode": "unrestricted", "whitelist": {}},
             "harness": "claude_code_desktop",
         }
         # tampering is not visible through the tool — only the enforced defaults
         settings_store._path.write_text("garbage")  # pylint: disable=protected-access
-        assert (await tools["settings"]())["mode"] == "restricted"
+        assert (await tools["settings"]())["protected"]["mode"] == "restricted"
 
     async def test_wallet_info_reports_mode(self, tools: dict[str, t.Callable]) -> None:
         """wallet_info carries the mode for quick agent orientation."""
