@@ -29,8 +29,8 @@ their request-id digest is an opaque hash this gate cannot inspect).
 
 from eth_abi import decode as abi_decode
 
-from pearl_connect.config import AppConfig
-from pearl_connect.settings import MODE_RESTRICTED, SettingsStore
+from connect.config import AppConfig
+from connect.settings import MODE_RESTRICTED, SettingsStore
 
 # Safe v1.x execTransaction(address,uint256,bytes,uint8,uint256,uint256,
 #                           uint256,address,address,bytes)

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from pearl_connect.config import (
+from connect.config import (
     FUND_REQUIREMENTS_ENV,
     LOG_LEVEL_ENV,
     SAFES_ENV,

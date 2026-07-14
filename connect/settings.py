@@ -45,11 +45,11 @@ from pathlib import Path
 from eth_account.signers.local import LocalAccount
 from web3 import Web3
 
-from pearl_connect.activity import ActivityLog
+from connect.activity import ActivityLog
 
 logger = logging.getLogger("agent")
 
-SETTINGS_FILE = "pearl-connect.settings.json"
+SETTINGS_FILE = "connect.settings.json"
 SETTINGS_VERSION = 1
 
 # The MAC covers the version and the "protected" object of the canonical
@@ -73,7 +73,7 @@ HARNESS_CLAUDE_CODE_DESKTOP = "claude_code_desktop"
 HARNESSES = (HARNESS_CLAUDE_CODE_CLI, HARNESS_CLAUDE_CODE_DESKTOP)
 DEFAULT_HARNESS = HARNESS_CLAUDE_CODE_DESKTOP
 
-_MAC_KEY_INFO = b"pearl-connect settings hmac v1"
+_MAC_KEY_INFO = b"connect settings hmac v1"
 
 # Operator-provided additions to the default whitelist (chain -> addresses).
 # The MechMarketplace contracts are merged in by default_whitelist().

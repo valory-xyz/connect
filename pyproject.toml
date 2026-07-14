@@ -1,5 +1,5 @@
 [project]
-name = "pearl-connect"
+name = "connect"
 version = "0.1.0"
 description = "Pearl BYOA agent server: hosts an MCP + HTTP signing service so any agent harness session can act as an Olas Pearl agent without key access"
 readme = "README.md"
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-pearl-connect = "pearl_connect.__main__:main"
+connect = "connect.__main__:main"
 
 [dependency-groups]
 dev = [
@@ -32,7 +32,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["pearl_connect"]
+packages = ["connect"]
 
 [tool.black]
 force-exclude = '''packages/(valory/(connections|protocols)|open_aea)/'''
@@ -47,7 +47,7 @@ extend_skip_glob = [
     "packages/valory/protocols/*",
     "packages/open_aea/*",
 ]
-known_first_party = ["pearl_connect", "packages"]
+known_first_party = ["connect", "packages"]
 known_local_folder = ["tests"]
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 

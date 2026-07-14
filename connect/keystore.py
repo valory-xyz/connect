@@ -31,7 +31,7 @@ from pathlib import Path
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 
-from pearl_connect.config import KEYSTORE_FILE
+from connect.config import KEYSTORE_FILE
 
 
 class KeystoreError(Exception):

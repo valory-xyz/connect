@@ -29,9 +29,9 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from pearl_connect import wallet, workspace
-from pearl_connect.server.auth import require_local_origin
-from pearl_connect.settings import validate_harness
+from connect import wallet, workspace
+from connect.server.auth import require_local_origin
+from connect.settings import validate_harness
 
 logger = logging.getLogger("agent")
 

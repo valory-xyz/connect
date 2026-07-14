@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""web3.py client for the pearl-connect signer.
+"""web3.py client for the connect signer.
 
 Routes eth_sendTransaction through the local signing service (which fills
 nonce/gas, signs with the agent EOA and broadcasts); every other RPC method
@@ -39,7 +39,7 @@ from pathlib import Path
 
 from web3 import HTTPProvider, Web3
 
-MCP_SERVER_NAME = "pearl-connect"
+MCP_SERVER_NAME = "connect"
 SEND_ATTEMPTS = 3
 
 

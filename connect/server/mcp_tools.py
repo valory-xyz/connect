@@ -32,13 +32,13 @@ from hexbytes import HexBytes
 from mcp.server.fastmcp import FastMCP
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
-from pearl_connect import wallet
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig
-from pearl_connect.guard import Guard
-from pearl_connect.mech import DEFAULT_MAX_PAYMENT, DEFAULT_MECH_CHAIN, MechService
-from pearl_connect.settings import SettingsStore
-from pearl_connect.signer import Signer
+from connect import wallet
+from connect.activity import ActivityLog
+from connect.config import AppConfig
+from connect.guard import Guard
+from connect.mech import DEFAULT_MAX_PAYMENT, DEFAULT_MECH_CHAIN, MechService
+from connect.settings import SettingsStore
+from connect.signer import Signer
 
 RECEIPT_POLL_SECONDS = 2
 MAX_RECEIPT_TIMEOUT = 300
@@ -55,7 +55,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
 ) -> FastMCP:
     """Build mcp."""
     mcp = FastMCP(
-        name="pearl-connect",
+        name="connect",
         instructions=(
             "Signing service for this Pearl agent. The agent EOA and per-chain "
             "service safes are shown by wallet_info. Every on-chain action is an "

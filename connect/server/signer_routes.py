@@ -24,8 +24,8 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from pearl_connect import wallet
-from pearl_connect.signer import SignerError
+from connect import wallet
+from connect.signer import SignerError
 
 logger = logging.getLogger("agent")
 

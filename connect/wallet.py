@@ -21,8 +21,8 @@
 
 from web3 import Web3
 
-from pearl_connect.config import AppConfig, NATIVE_ASSET
-from pearl_connect.signer import Signer
+from connect.config import AppConfig, NATIVE_ASSET
+from connect.signer import Signer
 
 ERC20_ABI = [
     {

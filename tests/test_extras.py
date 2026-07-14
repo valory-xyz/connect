@@ -30,10 +30,10 @@ from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from web3 import Web3
 
-from pearl_connect import __main__ as main_module
-from pearl_connect import wallet, workspace
-from pearl_connect.activity import ActivityLog, MAX_LOG_BYTES
-from pearl_connect.config import (
+from connect import __main__ as main_module
+from connect import wallet, workspace
+from connect.activity import ActivityLog, MAX_LOG_BYTES
+from connect.config import (
     AppConfig,
     ChainConfig,
     FUND_REQUIREMENTS_ENV,
@@ -41,13 +41,13 @@ from pearl_connect.config import (
     STORE_PATH_ENV,
     load_config,
 )
-from pearl_connect.guard import Guard
-from pearl_connect.keystore import KeystoreError, load_account
-from pearl_connect.mech import MechService
-from pearl_connect.server.auth import AuthFailureLimiter, AuthMiddleware
-from pearl_connect.server.mcp_tools import build_mcp
-from pearl_connect.settings import SettingsStore
-from pearl_connect.signer import Signer, SignerError
+from connect.guard import Guard
+from connect.keystore import KeystoreError, load_account
+from connect.mech import MechService
+from connect.server.auth import AuthFailureLimiter, AuthMiddleware
+from connect.server.mcp_tools import build_mcp
+from connect.settings import SettingsStore
+from connect.signer import Signer, SignerError
 
 from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
 
@@ -567,7 +567,7 @@ class TestSignerExtras:
         self, monkeypatch: pytest.MonkeyPatch, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
         """Unknown-but-configured chains get a Web3 client, cached."""
-        from pearl_connect import signer as signer_module
+        from connect import signer as signer_module
 
         pool = test_signer._chains  # pylint: disable=protected-access
         pool._config.chains["otherchain"] = (  # pylint: disable=protected-access
@@ -658,7 +658,7 @@ class TestSignerExtras:
 
     def test_idempotency_cache_returns_cached_inside_run(self) -> None:
         """run() itself replays a completed key (guards the racing-caller path)."""
-        from pearl_connect.signer import _IdempotencyCache
+        from connect.signer import _IdempotencyCache
 
         cache = _IdempotencyCache()
         assert cache.run("k", lambda: "0xaaa") == "0xaaa"
@@ -666,7 +666,7 @@ class TestSignerExtras:
 
     def test_idempotency_cache_evicts_oldest(self) -> None:
         """The result cache is bounded; the oldest replays are dropped first."""
-        from pearl_connect.signer import _IdempotencyCache
+        from connect.signer import _IdempotencyCache
 
         cache = _IdempotencyCache(max_results=2)
         cache.run("a", lambda: "0xa")
@@ -969,7 +969,7 @@ class TestWorkspaceExtras:
         (store_path / ".mcp.json").write_text("{corrupt")
         assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
         config = json.loads((store_path / ".mcp.json").read_text())
-        assert "pearl-connect" in config["mcpServers"]
+        assert "connect" in config["mcpServers"]
 
     def test_stray_file_in_skill_assets_skipped(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, store_path: Path

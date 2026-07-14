@@ -1,6 +1,6 @@
 # Agent UI
 
-The server serves `pearl_connect/assets/ui/` at `/`. The `index.html` there is a
+The server serves `connect/assets/ui/` at `/`. The `index.html` there is a
 **stand-in** — a plain page that drives the endpoints below — and it keeps the
 agent usable until the real UI is ready.
 
@@ -10,12 +10,12 @@ first person who followed it.
 
 ## Integrating the real UI
 
-**Replace the contents of `pearl_connect/assets/ui/`** with the build, exactly as
+**Replace the contents of `connect/assets/ui/`** with the build, exactly as
 it is published (the layout Pearl's other agents use, e.g.
 [trader's `ui-build/polystrat`](https://github.com/valory-xyz/trader/tree/main/packages/valory/skills/trader_abci/ui-build/polystrat)):
 
 ```
-pearl_connect/assets/ui/
+connect/assets/ui/
 ├── index.html          <- required: what the server serves at /
 ├── assets/             <- JS/CSS the build references
 ├── images/
@@ -33,7 +33,7 @@ That is the whole integration — no code, packaging, or route changes:
     routing will 404 on refresh and on deep links — use hash routing. (A client
     route named `/settings` would in any case be answered by the API, which
     keeps precedence.)
-- **Packaging.** The PyInstaller spec bundles all of `pearl_connect/assets`, so
+- **Packaging.** The PyInstaller spec bundles all of `connect/assets`, so
   whatever lands here ships inside the binary.
 - **Endpoints.** The API routes are registered before the UI, which is a
   catch-all registered last, so the UI can never shadow them.
