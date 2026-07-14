@@ -26,9 +26,9 @@ from pathlib import Path
 
 import pytest
 
-from pearl_connect import workspace
-from pearl_connect.settings import HARNESSES
-from pearl_connect.workspace import Workspace
+from connect import workspace
+from connect.settings import HARNESSES
+from connect.workspace import Workspace
 
 
 def mcp_entry(store_path: Path) -> dict:

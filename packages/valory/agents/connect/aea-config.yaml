@@ -1,13 +1,12 @@
-agent_name: pearl_connect
+agent_name: connect
 author: valory
 version: 0.1.0
 license: Apache-2.0
-description: Pearl BYOA agent whose brain is an agent-harness session; the server
-  hosts an MCP + HTTP signing service so the session acts on-chain without key access.
+description: Connect agent whose brain is an agent-harness session
 aea_version: '>=2.0.0, <3.0.0'
 fingerprint:
-  README.md: bafybeieyfemszduzpuiiuqzyvu4yqom5aetznvgaxwgn3aswww26elxo7q
-  __init__.py: bafybeid7n7cmlkarkjrcqhnyqvzd6om5wsueleqweyskw6n3psec7idnpi
+  README.md: bafybeigxuuq5vgoe33jkzomfdriv2unlvqrdqkygyr3pusmjymksuhc4a4
+  __init__.py: bafybeiaxhzo47u7yvolses5owohcykc5fkzjn4hork6nouf5qkcv3zbsby
 fingerprint_ignore_patterns: []
 skills: []
 connections:

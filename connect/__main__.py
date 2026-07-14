@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Run the pearl-connect agent server.
+"""Run the connect agent server.
 
 Started by the Pearl middleware as: <binary> --password <password>.
 
@@ -33,15 +33,15 @@ from pathlib import Path
 
 import uvicorn
 
-from pearl_connect import workspace
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
-from pearl_connect.guard import Guard
-from pearl_connect.keystore import KeystoreError, load_account
-from pearl_connect.mech import MechService
-from pearl_connect.server.app import create_app
-from pearl_connect.settings import SETTINGS_FILE, SettingsStore, derive_mac_key
-from pearl_connect.signer import Signer
+from connect import workspace
+from connect.activity import ActivityLog
+from connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
+from connect.guard import Guard
+from connect.keystore import KeystoreError, load_account
+from connect.mech import MechService
+from connect.server.app import create_app
+from connect.settings import SETTINGS_FILE, SettingsStore, derive_mac_key
+from connect.signer import Signer
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [agent] %(message)s"
 
@@ -60,7 +60,7 @@ def setup_logging(level: str = "info") -> logging.Logger:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse args."""
-    parser = argparse.ArgumentParser(prog="pearl-connect")
+    parser = argparse.ArgumentParser(prog="connect")
     parser.add_argument("--password", required=True, help="keystore password")
     return parser.parse_args(argv)
 
@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     logger = setup_logging(config.log_level)
-    logger.info("pearl-connect starting")
+    logger.info("connect starting")
 
     try:
         account = load_account(args.password)
@@ -137,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("serving on http://%s:%s", BIND_HOST, AGENT_HTTP_PORT)
     server.run()  # handles SIGTERM/SIGINT itself
-    logger.info("pearl-connect stopped")
+    logger.info("connect stopped")
     return 0
 
 

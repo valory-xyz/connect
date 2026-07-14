@@ -17,6 +17,6 @@
 #
 # ------------------------------------------------------------------------------
 
-"""pearl-connect: Pearl BYOA agent server hosting an MCP + HTTP signing service."""
+"""connect: Pearl BYOA agent server hosting an MCP + HTTP signing service."""
 
 __version__ = "0.1.0"

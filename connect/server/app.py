@@ -28,22 +28,22 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig
-from pearl_connect.guard import Guard
-from pearl_connect.mech import MechService
-from pearl_connect.server import pearl_routes, settings_routes, signer_routes
-from pearl_connect.server.auth import (
+from connect.activity import ActivityLog
+from connect.config import AppConfig
+from connect.guard import Guard
+from connect.mech import MechService
+from connect.server import pearl_routes, settings_routes, signer_routes
+from connect.server.auth import (
     ALLOWED_HOSTS,
     AuthFailureLimiter,
     AuthMiddleware,
     RequireAuth,
     require_local_origin,
 )
-from pearl_connect.server.mcp_tools import build_mcp
-from pearl_connect.settings import SettingsStore
-from pearl_connect.signer import Signer
-from pearl_connect.workspace import UI_INDEX, Workspace, load_ui_bundle
+from connect.server.mcp_tools import build_mcp
+from connect.settings import SettingsStore
+from connect.signer import Signer
+from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
 
@@ -74,7 +74,7 @@ def create_app(  # pylint: disable=too-many-arguments
         async with mcp.session_manager.run():
             yield
 
-    app = FastAPI(title="pearl-connect", lifespan=lifespan)
+    app = FastAPI(title="connect", lifespan=lifespan)
     # DNS-rebinding defense: a rebound hostname reaches the socket with the
     # attacker's Host header — refuse anything that isn't a loopback name
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)

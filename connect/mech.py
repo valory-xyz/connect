@@ -33,10 +33,10 @@ import os
 import threading
 import typing as t
 
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig
-from pearl_connect.guard import Guard, GuardError
-from pearl_connect.signer import Signer, SignerError
+from connect.activity import ActivityLog
+from connect.config import AppConfig
+from connect.guard import Guard, GuardError
+from connect.signer import Signer, SignerError
 
 logger = logging.getLogger("agent")
 

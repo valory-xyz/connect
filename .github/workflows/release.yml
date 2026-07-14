@@ -57,11 +57,11 @@ jobs:
 
       - name: Rename to release asset (unix)
         if: runner.os != 'Windows'
-        run: mv dist/pearl-connect "dist/${{ matrix.asset }}"
+        run: mv dist/connect "dist/${{ matrix.asset }}"
 
       - name: Rename to release asset (windows)
         if: runner.os == 'Windows'
-        run: Move-Item dist/pearl-connect.exe "dist/${{ matrix.asset }}"
+        run: Move-Item dist/connect.exe "dist/${{ matrix.asset }}"
 
       - name: Smoke test (unix)
         if: runner.os != 'Windows'

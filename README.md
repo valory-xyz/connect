@@ -1,4 +1,4 @@
-# pearl-connect
+# connect
 
 Pearl Connect agent. When a user starts the BYOA agent in
 [Pearl](https://olas.network/pearl), the middleware runs this binary like any
@@ -8,13 +8,13 @@ other non-aea agent. It:
    using the `--password` argument — key material never leaves the process;
 2. populates the service's persistent workspace (`STORE_PATH`) with a
    `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
-   the agent session, and the bundled `pearl-connect` skill;
+   the agent session, and the bundled `connect` skill;
 3. serves on `127.0.0.1:8716`:
    - Pearl SDK contracts: `GET /healthcheck` and `GET /funds-status`.
      `is_healthy` turns true only once the workspace is populated — Pearl
      opens the session the moment it does, so health is a promise the server
      has to be able to keep
-   - the agent UI at `GET /`: the bundled build in `pearl_connect/assets/ui`,
+   - the agent UI at `GET /`: the bundled build in `connect/assets/ui`,
      read into memory at boot and served from there. It ships a stand-in page
      (settings, harness, open a session — everything it shows comes from
      `GET /settings`); see [docs/agent-ui.md](docs/agent-ui.md)
@@ -144,7 +144,7 @@ export CONNECTION_CONFIGS_CONFIG_STORE_PATH=/path/to/persistent_data
 export CONNECTION_CONFIGS_CONFIG_SAFE_CONTRACT_ADDRESSES='{"gnosis":"0x..."}'
 export CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS='{"gnosis":{"agent":{"0x0000000000000000000000000000000000000000":"1000000000000000000"}}}'
 # cwd must contain ethereum_private_key.txt (encrypted web3 keystore JSON)
-uv run python -m pearl_connect --password <password>
+uv run python -m connect --password <password>
 ```
 
 ## Olas packages
@@ -152,9 +152,9 @@ uv run python -m pearl_connect --password <password>
 `packages/` holds the [Olas SDK](https://stack.olas.network/olas-sdk/) package
 tree (mirroring `valory-xyz/olas-sdk-starter`):
 
-- `packages/valory/agents/pearl_connect` — the agent blueprint (metadata; the
+- `packages/valory/agents/connect` — the agent blueprint (metadata; the
   runtime is the released binary)
-- `packages/valory/services/pearl_connect` — the service package whose
+- `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
   `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL}`)

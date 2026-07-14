@@ -33,9 +33,9 @@ from eth_typing import Hash32
 from web3 import Web3
 from web3.types import TxParams
 
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig
-from pearl_connect.guard import Guard, GuardError
+from connect.activity import ActivityLog
+from connect.config import AppConfig
+from connect.guard import Guard, GuardError
 
 GAS_ESTIMATE_BUFFER = 1.2
 

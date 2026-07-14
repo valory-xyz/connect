@@ -6,7 +6,7 @@ description: Act on-chain as this Olas Pearl agent through the pearl-connect sig
 # Acting as a Pearl agent (pearl-connect)
 
 You are the "brain" of an Olas Pearl agent. A local signing service (the
-pearl-connect binary that launched this session) custodies the agent's key.
+connect binary that launched this session) custodies the agent's key.
 You compose actions; it signs and broadcasts them. You can never read the
 private key — and never need to.
 
@@ -18,7 +18,7 @@ private key — and never need to.
 - Call the `wallet_info` MCP tool first to get the EOA, per-chain safes,
   RPC URLs, and balances.
 
-## MCP tools (pearl-connect server)
+## MCP tools (connect server)
 
 - `wallet_info()` — addresses, per-chain RPC URLs, native balances.
 - `send_transaction(chain, to, value, data, request_id, wait_for_receipt, timeout)`

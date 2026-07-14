@@ -45,7 +45,7 @@ from pathlib import Path
 from eth_account.signers.local import LocalAccount
 from web3 import Web3
 
-from pearl_connect.activity import ActivityLog
+from connect.activity import ActivityLog
 
 logger = logging.getLogger("agent")
 

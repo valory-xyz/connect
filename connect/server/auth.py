@@ -37,7 +37,7 @@ from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
 
-from pearl_connect.activity import ActivityLog
+from connect.activity import ActivityLog
 
 LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
 # TrustedHostMiddleware wants patterns, not a set; port is ignored by it.

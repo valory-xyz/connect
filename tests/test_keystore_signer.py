@@ -27,9 +27,9 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from hexbytes import HexBytes
 
-from pearl_connect.activity import ActivityLog
-from pearl_connect.keystore import KeystoreError, load_account
-from pearl_connect.signer import Signer, SignerError
+from connect.activity import ActivityLog
+from connect.keystore import KeystoreError, load_account
+from connect.signer import Signer, SignerError
 
 from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
 

@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""web3.py client for the pearl-connect signer.
+"""web3.py client for the connect signer.
 
 Routes eth_sendTransaction through the local signing service (which fills
 nonce/gas, signs with the agent EOA and broadcasts); every other RPC method

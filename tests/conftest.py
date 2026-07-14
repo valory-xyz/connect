@@ -30,11 +30,11 @@ from eth_account.signers.local import LocalAccount
 from hexbytes import HexBytes
 from web3 import Web3
 
-from pearl_connect.activity import ACTIVITY_LOG_FILE, ActivityLog
-from pearl_connect.config import AppConfig, ChainConfig
-from pearl_connect.guard import Guard
-from pearl_connect.mech import MechService
-from pearl_connect.settings import (
+from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
+from connect.config import AppConfig, ChainConfig
+from connect.guard import Guard
+from connect.mech import MechService
+from connect.settings import (
     MODE_UNRESTRICTED,
     Protected,
     SETTINGS_FILE,
@@ -42,8 +42,8 @@ from pearl_connect.settings import (
     SettingsStore,
     derive_mac_key,
 )
-from pearl_connect.signer import Signer, _ChainState
-from pearl_connect.workspace import Workspace
+from connect.signer import Signer, _ChainState
+from connect.workspace import Workspace
 
 TEST_PASSWORD = "test-password"  # nosec B105
 
@@ -245,7 +245,7 @@ def make_app(
     guard: Guard, settings_store: SettingsStore, mech_service: MechService
 ) -> t.Callable:
     """Return an app factory threading the guard/settings/mech wiring."""
-    from pearl_connect.server.app import create_app
+    from connect.server.app import create_app
 
     def _make(
         signer: Signer,

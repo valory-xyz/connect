@@ -1,4 +1,4 @@
-# PyInstaller spec: one-file pearl-connect binary with bundled skill assets.
+# PyInstaller spec: one-file connect binary with bundled skill assets.
 # Build:  uv run pyinstaller packaging/pyinstaller.spec
 from pathlib import Path
 
@@ -40,9 +40,9 @@ for _pkg in _METADATA_PKGS:
         print(f"pyinstaller.spec: skipping metadata for {_pkg}: {_e}")
 
 a = Analysis(
-    [str(repo_root / "pearl_connect" / "__main__.py")],
+    [str(repo_root / "connect" / "__main__.py")],
     pathex=[str(repo_root)],
-    datas=[(str(repo_root / "pearl_connect" / "assets"), "assets")]
+    datas=[(str(repo_root / "connect" / "assets"), "assets")]
     # mech-client loads mechs.json, contract ABIs and templates at runtime;
     # safe-eth-py loads Safe contract ABIs the same way
     + collect_data_files("mech_client")
@@ -77,7 +77,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="pearl-connect",
+    name="connect",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

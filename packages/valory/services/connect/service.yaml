@@ -1,14 +1,13 @@
-name: pearl_connect
+name: connect
 author: valory
 version: 0.1.0
-description: Pearl BYOA service whose brain is an agent-harness session; the server
-  hosts an MCP + HTTP signing service so the session acts on-chain without key access.
+description: Connect service whose brain is an agent-harness session
 aea_version: '>=2.0.0, <3.0.0'
 license: Apache-2.0
 fingerprint:
-  README.md: bafybeiawhj3fqe7uq3m5gw3r7mpas7x4pk2pfwbvx6vsmale45ftau3p4y
+  README.md: bafybeidxuxfxjugoikbhjdziunxjd6kcnn4qukp7s3tzn6uoplxkki6dje
 fingerprint_ignore_patterns: []
-agent: valory/pearl_connect:0.1.0:bafybeihofho7jddmt53lkalq7gpqycpct3xl6belfmagmegdodchxlnqou
+agent: valory/connect:0.1.0:bafybeieuja63vl5hj3a3bsrx5nzqajhnjjr3zx5skc7ldvzrvfoxmtnpf4
 number_of_agents: 1
 deployment: {}
 ---

@@ -27,12 +27,12 @@ import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 
-from pearl_connect import wallet as wallet_module
-from pearl_connect import workspace
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig
-from pearl_connect.settings import HARNESSES, MODES
-from pearl_connect.signer import Signer
+from connect import wallet as wallet_module
+from connect import workspace
+from connect.activity import ActivityLog
+from connect.config import AppConfig
+from connect.settings import HARNESSES, MODES
+from connect.signer import Signer
 
 from tests.conftest import FakeW3
 

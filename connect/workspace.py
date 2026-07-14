@@ -41,8 +41,8 @@ import typing as t
 from pathlib import Path
 from urllib.parse import quote
 
-from pearl_connect.config import AGENT_HTTP_PORT, BIND_HOST
-from pearl_connect.settings import (
+from connect.config import AGENT_HTTP_PORT, BIND_HOST
+from connect.settings import (
     DEFAULT_HARNESS,
     HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CLAUDE_CODE_DESKTOP,
@@ -71,7 +71,7 @@ class LaunchError(Exception):
 def assets_dir() -> Path:
     """Bundled assets location — PyInstaller extracts to sys._MEIPASS."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-    for candidate in (base / "assets", base / "pearl_connect" / "assets"):
+    for candidate in (base / "assets", base / "connect" / "assets"):
         if candidate.exists():
             return candidate
     raise FileNotFoundError(f"bundled assets not found under {base}")
@@ -291,7 +291,7 @@ class Workspace:
         missing = [entry for entry in GITIGNORE_ENTRIES if entry not in existing]
         if not missing:
             return
-        lines = existing + ["# pearl-connect: never commit the signer token"] + missing
+        lines = existing + ["# connect: never commit the signer token"] + missing
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _write_claude_settings(self) -> None:

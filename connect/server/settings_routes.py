@@ -34,8 +34,8 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from pearl_connect.keystore import KeystoreError, load_account
-from pearl_connect.settings import SettingsPersistError
+from connect.keystore import KeystoreError, load_account
+from connect.settings import SettingsPersistError
 
 logger = logging.getLogger("agent")
 

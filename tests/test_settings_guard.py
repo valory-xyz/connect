@@ -33,19 +33,19 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 
-from pearl_connect import settings as settings_module
-from pearl_connect import workspace as workspace_module
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig, ChainConfig
-from pearl_connect.guard import EXEC_TRANSACTION_SELECTOR, Guard, GuardError
-from pearl_connect.mech import (
+from connect import settings as settings_module
+from connect import workspace as workspace_module
+from connect.activity import ActivityLog
+from connect.config import AppConfig, ChainConfig
+from connect.guard import EXEC_TRANSACTION_SELECTOR, Guard, GuardError
+from connect.mech import (
     MAX_DELIVERY_TIMEOUT,
     MechError,
     MechService,
     MechSigner,
 )
-from pearl_connect.server.settings_routes import WHITELIST_FROZEN
-from pearl_connect.settings import (
+from connect.server.settings_routes import WHITELIST_FROZEN
+from connect.settings import (
     MAC_FIELDS,
     MODE_RESTRICTED,
     MODE_UNRESTRICTED,
@@ -56,7 +56,7 @@ from pearl_connect.settings import (
     defaults,
     derive_mac_key,
 )
-from pearl_connect.signer import Signer, SignerError
+from connect.signer import Signer, SignerError
 
 from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
 
@@ -643,7 +643,7 @@ class TestSignerGuardIntegration:
 
         from web3 import Web3
 
-        from pearl_connect.signer import _ChainState
+        from connect.signer import _ChainState
 
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
@@ -1156,7 +1156,7 @@ class TestSettingsEndpoints:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Bad passwords burn a second and reveal nothing."""
-        from pearl_connect.server import settings_routes
+        from connect.server import settings_routes
 
         sleeps: list[float] = []
         monkeypatch.setattr(settings_routes.time, "sleep", sleeps.append)
@@ -1185,9 +1185,7 @@ class TestSettingsEndpoints:
         keystore = Account.encrypt(Account.create().key, TEST_PASSWORD)
         (other_dir / "ethereum_private_key.txt").write_text(json.dumps(keystore))
         monkeypatch.chdir(other_dir)
-        monkeypatch.setattr(
-            "pearl_connect.server.settings_routes.time.sleep", lambda _: None
-        )
+        monkeypatch.setattr("connect.server.settings_routes.time.sleep", lambda _: None)
         with TestClient(
             make_app(test_signer, app_config, activity),
             base_url="http://127.0.0.1:8716",
@@ -1398,7 +1396,7 @@ class TestSettingsEndpoints:
         No guess was made, so feeding the brake would let any local process
         429-lock every authenticated surface with free requests.
         """
-        from pearl_connect.server import auth as auth_module
+        from connect.server import auth as auth_module
 
         for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
             response = client.patch(
@@ -1493,8 +1491,8 @@ class TestSettingsEndpoints:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Probing is recorded and, past the threshold, answered with 429."""
-        from pearl_connect.server import auth as auth_module
-        from pearl_connect.server import settings_routes
+        from connect.server import auth as auth_module
+        from connect.server import settings_routes
 
         monkeypatch.setattr(settings_routes.time, "sleep", lambda _: None)
 
@@ -1555,7 +1553,7 @@ class TestSettingsEndpoints:
         they fed the limiter, a background tab could hold every authenticated
         surface at 429 indefinitely (including the settings UI).
         """
-        from pearl_connect.server import auth as auth_module
+        from connect.server import auth as auth_module
 
         headers = {"Origin": "https://evil.example"}
         for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
@@ -1597,8 +1595,8 @@ class TestSettingsEndpoints:
         handful of stray clicks (or any local process, for free) trip the
         global limiter and 429-lock every authenticated surface.
         """
-        from pearl_connect.server import auth as auth_module
-        from pearl_connect.server import settings_routes
+        from connect.server import auth as auth_module
+        from connect.server import settings_routes
 
         slept: list[float] = []
         monkeypatch.setattr(settings_routes.time, "sleep", slept.append)
@@ -1632,7 +1630,7 @@ class TestSettingsEndpoints:
         """
         from dataclasses import fields
 
-        from pearl_connect.server.settings_routes import ProtectedPatch, SettingsPatch
+        from connect.server.settings_routes import ProtectedPatch, SettingsPatch
 
         assert set(SettingsPatch.model_fields) - {"password"} == {
             f.name for f in fields(Settings)
@@ -1724,7 +1722,7 @@ class TestMcpGuardrailTools:
         settings_store: SettingsStore,
     ) -> dict[str, t.Callable]:
         """Return the registered tool functions keyed by name."""
-        from pearl_connect.server.mcp_tools import build_mcp
+        from connect.server.mcp_tools import build_mcp
 
         mcp = build_mcp(
             test_signer,

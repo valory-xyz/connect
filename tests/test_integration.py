@@ -34,12 +34,12 @@ import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 
-from pearl_connect.activity import ActivityLog
-from pearl_connect.config import AppConfig, ChainConfig
-from pearl_connect.guard import Guard
-from pearl_connect.mech import MechError, MechService
-from pearl_connect.server.app import create_app
-from pearl_connect.settings import (
+from connect.activity import ActivityLog
+from connect.config import AppConfig, ChainConfig
+from connect.guard import Guard
+from connect.mech import MechError, MechService
+from connect.server.app import create_app
+from connect.settings import (
     MODE_UNRESTRICTED,
     Protected,
     SETTINGS_FILE,
@@ -47,8 +47,8 @@ from pearl_connect.settings import (
     SettingsStore,
     derive_mac_key,
 )
-from pearl_connect.signer import Signer
-from pearl_connect.workspace import Workspace
+from connect.signer import Signer
+from connect.workspace import Workspace
 
 from tests.conftest import TEST_PASSWORD
 

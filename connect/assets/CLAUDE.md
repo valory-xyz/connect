@@ -14,7 +14,7 @@ money, so act deliberately and report outcomes honestly, including failures.
 This directory is your **persistent workspace** — the `persistent_data` dir
 Pearl reserves for this service. It survives restarts and updates. Files here
 are yours to organize (notes, scripts, state), with a few exceptions the
-pearl-connect server owns — don't hand-edit them:
+connect server owns — don't hand-edit them:
 
 - `.mcp.json` — connection config for your signing service (fresh auth token
   each run)
@@ -27,7 +27,7 @@ pearl-connect server owns — don't hand-edit them:
   entries (never commit or Read `.mcp.json`) if they go missing
 - this `CLAUDE.md` itself
 
-The pearl-connect server that launched this session runs on
+The connect server that launched this session runs on
 `http://127.0.0.1:8716` for as long as the user keeps the agent running in
 Pearl. If its MCP tools stop responding, the user likely stopped the agent —
 there is nothing to fix from here.
@@ -35,7 +35,7 @@ there is nothing to fix from here.
 ## Why it's set up like this
 
 You have **no access to any private key, and you don't need it**. The
-pearl-connect server custodies the agent EOA's key: Pearl hands it the
+connect server custodies the agent EOA's key: Pearl hands it the
 encrypted keystore and password at startup, and the key is decrypted only in
 that process's memory. You compose transactions; the server fills nonce and
 gas, signs, broadcasts, and keeps an audit log. This is deliberate — it means
