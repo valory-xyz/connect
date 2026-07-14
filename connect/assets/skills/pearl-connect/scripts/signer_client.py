@@ -39,7 +39,7 @@ from pathlib import Path
 
 from web3 import HTTPProvider, Web3
 
-MCP_SERVER_NAME = "connect"
+MCP_SERVER_NAME = "pearl-connect"
 SEND_ATTEMPTS = 3
 
 

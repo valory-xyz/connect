@@ -101,7 +101,7 @@ def store_fixture(
 ) -> SettingsStore:
     """Return a settings store with a fresh (never-written) file."""
     return SettingsStore(
-        store_path / "connect.settings.json", derive_mac_key(account), activity
+        store_path / "pearl-connect.settings.json", derive_mac_key(account), activity
     )
 
 
@@ -197,7 +197,7 @@ class TestSettingsStore:
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("a file where the store should be")
         store = SettingsStore(
-            blocker / "connect.settings.json", derive_mac_key(account), activity
+            blocker / "pearl-connect.settings.json", derive_mac_key(account), activity
         )
         assert store.load().protected.mode == MODE_RESTRICTED
 

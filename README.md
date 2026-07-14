@@ -65,7 +65,7 @@ The signer enforces one of two persistent modes:
 
 There is a single gate with no bypass: the MCP tools, the HTTP signing
 endpoints and the mech request flow all pass the same check. State persists in
-`connect.settings.json` at STORE_PATH; the security-critical fields
+`pearl-connect.settings.json` at STORE_PATH; the security-critical fields
 (mode, whitelist) are HMAC'd with a key derived from the agent private key
 and verified on every read — an edit by the agent (or anything else without
 the key) fails verification and resets them to the restricted defaults. The

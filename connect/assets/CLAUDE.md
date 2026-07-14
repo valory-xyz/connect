@@ -19,7 +19,7 @@ connect server owns — don't hand-edit them:
 - `.mcp.json` — connection config for your signing service (fresh auth token
   each run)
 - `.claude/skills/pearl-connect/` — your skill, kept up to date by the server
-- `connect.settings.json` — agent wallet's settings; the guardrail
+- `pearl-connect.settings.json` — agent wallet's settings; the guardrail
   fields (mode, whitelist) are integrity-checked — any hand-edit is detected
   and reset to safe defaults; the `harness` preference is stored alongside
   without integrity checks and survives such a reset

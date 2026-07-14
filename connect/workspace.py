@@ -50,7 +50,7 @@ from connect.settings import (
 
 logger = logging.getLogger("agent")
 
-MCP_SERVER_NAME = "connect"
+MCP_SERVER_NAME = "pearl-connect"
 MCP_CONFIG_FILE = ".mcp.json"
 # where a bundled agent-UI build is dropped in (see docs/agent-ui.md)
 UI_SUBDIR = "ui"

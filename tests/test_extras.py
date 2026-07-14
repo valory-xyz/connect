@@ -969,7 +969,7 @@ class TestWorkspaceExtras:
         (store_path / ".mcp.json").write_text("{corrupt")
         assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
         config = json.loads((store_path / ".mcp.json").read_text())
-        assert "connect" in config["mcpServers"]
+        assert "pearl-connect" in config["mcpServers"]
 
     def test_stray_file_in_skill_assets_skipped(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, store_path: Path

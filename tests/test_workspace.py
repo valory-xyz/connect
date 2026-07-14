@@ -33,7 +33,9 @@ from connect.workspace import Workspace
 
 def mcp_entry(store_path: Path) -> dict:
     """Mcp entry."""
-    return json.loads((store_path / ".mcp.json").read_text())["mcpServers"]["connect"]
+    return json.loads((store_path / ".mcp.json").read_text())["mcpServers"][
+        "pearl-connect"
+    ]
 
 
 def provisioned(store_path: Path, token: str = "tok") -> Workspace:  # nosec B107
@@ -62,7 +64,7 @@ def test_provisioning_preserves_other_mcp_servers(store_path: Path) -> None:
     provisioned(store_path, "tok-1")
     config = json.loads((store_path / ".mcp.json").read_text())
     assert "other" in config["mcpServers"]
-    assert "connect" in config["mcpServers"]
+    assert "pearl-connect" in config["mcpServers"]
 
 
 def test_a_second_run_rotates_the_token(store_path: Path) -> None:
