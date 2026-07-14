@@ -19,11 +19,13 @@
 
 """FastAPI application factory."""
 
+import logging
+import mimetypes
 import threading
 import typing as t
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from pearl_connect.activity import ActivityLog
@@ -41,7 +43,9 @@ from pearl_connect.server.auth import (
 from pearl_connect.server.mcp_tools import build_mcp
 from pearl_connect.settings import SettingsStore
 from pearl_connect.signer import Signer
-from pearl_connect.workspace import Workspace
+from pearl_connect.workspace import UI_INDEX, Workspace, load_ui_bundle
+
+logger = logging.getLogger("agent")
 
 
 def create_app(  # pylint: disable=too-many-arguments
@@ -64,7 +68,6 @@ def create_app(  # pylint: disable=too-many-arguments
         mech=mech,
         settings_store=settings_store,
     )
-    mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> t.AsyncIterator[None]:
@@ -94,5 +97,38 @@ def create_app(  # pylint: disable=too-many-arguments
         signer_routes.router,
         dependencies=[Depends(RequireAuth(token, activity, limiter))],
     )
-    app.mount("/mcp", AuthMiddleware(mcp_app, token, activity, limiter))
+    app.mount(
+        "/mcp",
+        AuthMiddleware(mcp.streamable_http_app(), token, activity, limiter),
+    )
+
+    # the agent UI last, so it can own / without shadowing an endpoint: routes
+    # match in registration order, and this catch-all would swallow anything
+    # registered below it. The bundle ships a stand-in page; a bundle with no
+    # UI at all still serves the API (see load_ui_bundle).
+    ui = load_ui_bundle()
+    if ui is not None:
+        logger.info("serving the agent UI: %d file(s), read at boot", len(ui))
+        # decided at boot, with the bytes: the module-level mimetypes.guess_type
+        # answers from HKEY_CLASSES_ROOT on Windows, so the type served for .js
+        # would be whatever the operator's machine says — and a box mapping it
+        # to text/plain has the browser refuse to execute the script. An
+        # instance is built from mimetypes' own table and reads no registry.
+        types = mimetypes.MimeTypes()
+
+        @app.get("/{asset_path:path}", include_in_schema=False)
+        def agent_ui(asset_path: str) -> Response:
+            """Serve the UI snapshot taken at boot.
+
+            Every file in the build is published as-is: the drop-in directory
+            is the contract, so a build that ships a sourcemap ships it here
+            too (see docs/agent-ui.md).
+            """
+            name = asset_path or UI_INDEX
+            body = ui.get(name)
+            if body is None:
+                raise HTTPException(status_code=404, detail="not found")
+            media_type, _ = types.guess_type(name)
+            return Response(body, media_type=media_type or "application/octet-stream")
+
     return app

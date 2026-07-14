@@ -1224,13 +1224,6 @@ class TestSettingsEndpoints:
         assert flipped.status_code == 200
         assert flipped.json()["harness"] == "claude_code_cli"
         assert client.get("/settings").json()["harness"] == "claude_code_cli"
-        # the UI reflects the choice; POST /session is what acts on it
-        page = client.get("/").text
-        assert 'value="claude_code_cli"' in page
-        # the button must exist *before* the inline script that binds it:
-        # getElementById returns null for an element the parser has not reached,
-        # so a button emitted after </script> throws and silently does nothing
-        assert 0 < page.index('id="open-session"') < page.index("<script>")
 
         bad = client.patch("/settings", json={"harness": "cursor"})
         assert bad.status_code == 400
@@ -1715,22 +1708,6 @@ class TestSettingsEndpoints:
         assert "settings_persist_failed" in audit_kinds(store_path)
         # nothing changed on disk
         assert client.get("/settings").json()["harness"] == "claude_code_desktop"
-
-    def test_index_shows_mode_and_whitelist(
-        self, client: TestClient, settings_store: SettingsStore
-    ) -> None:
-        """The agent UI renders the mode and the whitelist entries."""
-        settings_store.save(
-            Settings(
-                protected=Protected(
-                    mode=MODE_RESTRICTED, whitelist={"testchain": (WHITELISTED,)}
-                )
-            )
-        )
-        page = client.get("/").text
-        assert "restricted" in page
-        assert f"testchain:{WHITELISTED}" in page
-        assert "Guardrail settings" in page
 
 
 class TestMcpGuardrailTools:

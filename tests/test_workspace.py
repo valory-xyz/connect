@@ -169,6 +169,56 @@ def test_deep_links(store_path: Path) -> None:
     assert agent_workspace.deep_link("claude_code_cli").startswith("claude-cli://")
 
 
+def test_ui_build_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The UI turns on when a build is dropped in, and never breaks boot."""
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+    assert workspace.ui_build_dir() is None  # no ui dir: no UI was intended
+
+    # a directory with no index.html is a packaging failure, not a choice —
+    # answering None as quietly as for "no UI" would take the operator's only
+    # guardrail control surface off the air while health stayed green
+    (assets / "ui").mkdir()
+    with caplog.at_level("WARNING"):
+        assert workspace.ui_build_dir() is None
+    assert "has no index.html" in caplog.text
+
+    (assets / "ui" / "index.html").write_text("<!doctype html>")
+    assert workspace.ui_build_dir() == assets / "ui"
+
+    # a bundle missing altogether must not take the server down with it
+    def no_assets() -> Path:
+        raise FileNotFoundError("bundled assets not found")
+
+    monkeypatch.setattr(workspace, "assets_dir", no_assets)
+    assert workspace.ui_build_dir() is None
+
+
+def test_load_ui_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole build is read into memory, nested files and all."""
+    assets = tmp_path / "assets"
+    ui = assets / "ui"
+    (ui / "assets").mkdir(parents=True)
+    (ui / "index.html").write_text("<!doctype html>")
+    (ui / "assets" / "app.js").write_text("console.log('hi')")
+    monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+
+    bundle = workspace.load_ui_bundle()
+    assert bundle == {
+        "index.html": b"<!doctype html>",
+        "assets/app.js": b"console.log('hi')",
+    }
+
+    # no build, no bundle — and no crash: the API serves on its own
+    monkeypatch.setattr(workspace, "ui_build_dir", lambda: None)
+    assert workspace.load_ui_bundle() is None
+
+
 def test_deep_link_rejects_an_unknown_harness(store_path: Path) -> None:
     """A harness with no link raises, instead of quietly opening the desktop."""
     agent_workspace = Workspace(store_path, "tok")  # nosec B106

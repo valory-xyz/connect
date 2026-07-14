@@ -10,10 +10,14 @@ other non-aea agent. It:
    `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
    the agent session, and the bundled `pearl-connect` skill;
 3. serves on `127.0.0.1:8716`:
-   - Pearl SDK contracts: `GET /healthcheck`, `GET /funds-status`, `GET /`.
+   - Pearl SDK contracts: `GET /healthcheck` and `GET /funds-status`.
      `is_healthy` turns true only once the workspace is populated — Pearl
      opens the session the moment it does, so health is a promise the server
      has to be able to keep
+   - the agent UI at `GET /`: the bundled build in `pearl_connect/assets/ui`,
+     read into memory at boot and served from there. It ships a stand-in page
+     (settings, harness, open a session — everything it shows comes from
+     `GET /settings`); see [docs/agent-ui.md](docs/agent-ui.md)
    - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its

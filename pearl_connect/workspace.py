@@ -52,6 +52,9 @@ logger = logging.getLogger("agent")
 
 MCP_SERVER_NAME = "pearl-connect"
 MCP_CONFIG_FILE = ".mcp.json"
+# where a bundled agent-UI build is dropped in (see docs/agent-ui.md)
+UI_SUBDIR = "ui"
+UI_INDEX = "index.html"
 SKILLS_SUBDIR = Path(".claude") / "skills"
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harness itself reads .mcp.json; the model never needs to, and reading
@@ -77,6 +80,59 @@ def assets_dir() -> Path:
 def mcp_url() -> str:
     """Mcp url."""
     return f"http://{BIND_HOST}:{AGENT_HTTP_PORT}/mcp"
+
+
+def ui_build_dir() -> Path | None:
+    """Return the bundled agent UI, or None if no build has been dropped in.
+
+    The UI ships as a static build (index.html + its assets) under
+    assets/ui — see docs/agent-ui.md.
+
+    A directory with no index.html is not a decision anyone made. In a packaged
+    binary it is a packaging failure, and answering None for it as quietly as
+    for "no UI was intended" would take the operator's only guardrail control
+    surface off the air while the server went on reporting itself healthy.
+    """
+    try:
+        candidate = assets_dir() / UI_SUBDIR
+    except FileNotFoundError:  # no bundle at all (a source checkout under test)
+        return None
+    if not candidate.is_dir():
+        return None  # no UI: the API serves on its own, as designed
+    if (candidate / UI_INDEX).is_file():
+        return candidate
+    logger.warning(
+        "the agent UI directory %s has no %s — serving the API without a UI. "
+        "In a packaged build this is a packaging bug, not a configuration",
+        candidate,
+        UI_INDEX,
+    )
+    return None
+
+
+def load_ui_bundle() -> dict[str, bytes] | None:
+    """Read the agent UI into memory once, at boot, or None if there is none.
+
+    Serving the files from disk would re-read them on every request, and in the
+    packaged binary they live in PyInstaller's extraction directory — writable
+    by the same OS user the agent session runs as. That page is where the
+    operator types the keystore password: the one secret this whole design
+    keeps from the agent. A session that rewrote index.html between two visits
+    would harvest it, with no restart to notice.
+
+    Reading the bundle before any session exists is what makes the page the
+    operator sees the page we shipped. It does not make a compromised session
+    harmless — one that can write there can also replace the binary — but it
+    closes the cheapest version of that attack, the one needing no restart.
+    """
+    directory = ui_build_dir()
+    if directory is None:
+        return None
+    return {
+        path.relative_to(directory).as_posix(): path.read_bytes()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+    }
 
 
 def desktop_deep_link(store_path: Path) -> str:
