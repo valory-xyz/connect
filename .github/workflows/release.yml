@@ -33,14 +33,11 @@ jobs:
             asset: agent_runner_linux_x64
           - runner: ubuntu-24.04-arm
             asset: agent_runner_linux_arm64
-          # macos-13 is the last x64 macOS runner and is on GitHub's
-          # deprecation track — when it disappears, build x64 on arm64
-          # via arch -x86_64 or drop the asset if Pearl no longer needs it
-          - runner: macos-13
+          - runner: macos-15-large
             asset: agent_runner_macos_x64
-          - runner: macos-latest
+          - runner: macos-15
             asset: agent_runner_macos_arm64
-          - runner: windows-latest
+          - runner: windows-2025
             asset: agent_runner_windows_x64.exe
     runs-on: ${{ matrix.runner }}
     steps:
@@ -74,6 +71,7 @@ jobs:
 
       - name: Upload to release
         if: github.event_name == 'release'
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.event.release.tag_name }}
