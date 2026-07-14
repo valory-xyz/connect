@@ -24,7 +24,6 @@ import mimetypes
 import threading
 import typing as t
 from contextlib import asynccontextmanager
-from pathlib import PurePosixPath
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -48,42 +47,6 @@ from pearl_connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
 
-# What a static web build ships, typed here rather than by mimetypes: on
-# Windows mimetypes reads HKEY_CLASSES_ROOT, so the type served for .js is
-# whatever that machine's registry says. A box mapping it to text/plain would
-# have the browser refuse to execute the script — the UI would break for that
-# operator alone, on a machine we cannot reproduce. The bytes we serve are
-# fixed at boot; the type we serve them under should be just as fixed.
-UI_CONTENT_TYPES = {
-    ".html": "text/html; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
-    ".mjs": "text/javascript; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".json": "application/json",
-    ".map": "application/json",
-    ".wasm": "application/wasm",
-    ".svg": "image/svg+xml",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".ico": "image/x-icon",
-    ".woff": "font/woff",
-    ".woff2": "font/woff2",
-    ".ttf": "font/ttf",
-    ".txt": "text/plain; charset=utf-8",
-}
-
-
-def _media_type(name: str) -> str:
-    """Return the content type to serve a bundled UI file under."""
-    suffix = PurePosixPath(name).suffix.lower()
-    if suffix in UI_CONTENT_TYPES:
-        return UI_CONTENT_TYPES[suffix]
-    guessed, _ = mimetypes.guess_type(name)  # anything the build surprises us with
-    return guessed or "application/octet-stream"
-
 
 def create_app(  # pylint: disable=too-many-arguments
     signer: Signer,
@@ -105,7 +68,6 @@ def create_app(  # pylint: disable=too-many-arguments
         mech=mech,
         settings_store=settings_store,
     )
-    mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> t.AsyncIterator[None]:
@@ -135,7 +97,10 @@ def create_app(  # pylint: disable=too-many-arguments
         signer_routes.router,
         dependencies=[Depends(RequireAuth(token, activity, limiter))],
     )
-    app.mount("/mcp", AuthMiddleware(mcp_app, token, activity, limiter))
+    app.mount(
+        "/mcp",
+        AuthMiddleware(mcp.streamable_http_app(), token, activity, limiter),
+    )
 
     # the agent UI last, so it can own / without shadowing an endpoint: routes
     # match in registration order, and this catch-all would swallow anything
@@ -144,6 +109,12 @@ def create_app(  # pylint: disable=too-many-arguments
     ui = load_ui_bundle()
     if ui is not None:
         logger.info("serving the agent UI: %d file(s), read at boot", len(ui))
+        # decided at boot, with the bytes: the module-level mimetypes.guess_type
+        # answers from HKEY_CLASSES_ROOT on Windows, so the type served for .js
+        # would be whatever the operator's machine says — and a box mapping it
+        # to text/plain has the browser refuse to execute the script. An
+        # instance is built from mimetypes' own table and reads no registry.
+        types = mimetypes.MimeTypes()
 
         @app.get("/{asset_path:path}", include_in_schema=False)
         def agent_ui(asset_path: str) -> Response:
@@ -157,6 +128,7 @@ def create_app(  # pylint: disable=too-many-arguments
             body = ui.get(name)
             if body is None:
                 raise HTTPException(status_code=404, detail="not found")
-            return Response(body, media_type=_media_type(name))
+            media_type, _ = types.guess_type(name)
+            return Response(body, media_type=media_type or "application/octet-stream")
 
     return app

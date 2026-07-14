@@ -19,6 +19,7 @@
 
 """Test endpoints module."""
 
+import mimetypes
 import typing as t
 from pathlib import Path
 
@@ -125,12 +126,11 @@ class TestOpenEndpoints:
             assert "Pearl Connect" not in page.text
             asset = client.get("/assets/app.js")
             assert asset.status_code == 200
-            # the same type on every operator's machine: mimetypes would ask
-            # the Windows registry, and a box that answers text/plain for .js
-            # has the browser refuse to run the script — a UI that breaks for
-            # one operator, on a machine we cannot reproduce
-            assert asset.headers["content-type"] == "text/javascript; charset=utf-8"
-            assert client.get("/").headers["content-type"] == "text/html; charset=utf-8"
+            # a JavaScript type — the spelling moved from application/ to text/
+            # in 3.12, and both are executable; what matters is that it is one
+            # of them (see test_content_types_never_come_from_the_machine)
+            assert "javascript" in asset.headers["content-type"]
+            assert client.get("/").headers["content-type"].startswith("text/html")
             # a build can ship anything; what nothing types, we do not guess at
             binary = client.get("/assets/blob.q7x")
             assert binary.headers["content-type"] == "application/octet-stream"
@@ -139,6 +139,42 @@ class TestOpenEndpoints:
             # the API keeps precedence: the UI only sees what no route took
             assert client.get("/healthcheck").json() == {"is_healthy": True}
             assert client.get("/settings").status_code == 200
+
+    def test_content_types_never_come_from_the_machine(
+        self,
+        make_app: t.Callable,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A hostile mimetypes registry cannot reach what we serve.
+
+        On Windows, mimetypes.guess_type() answers from HKEY_CLASSES_ROOT, so
+        the type served for .js would be whatever that machine says. A box that
+        maps it to text/plain has the browser refuse to execute the script —
+        the UI breaks for that operator alone, on a machine we cannot
+        reproduce. This is what the private MimeTypes() buys.
+        """
+        assets = tmp_path / "assets"
+        ui = assets / "ui"
+        ui.mkdir(parents=True)
+        (ui / "index.html").write_text("<!doctype html>")
+        (ui / "app.js").write_text("console.log('hi')")
+        _complete_bundle(assets)
+        monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
+        # the registry, at its worst
+        monkeypatch.setattr(
+            mimetypes, "guess_type", lambda *_a, **_kw: ("text/plain", None)
+        )
+
+        with TestClient(
+            make_app(test_signer, app_config, activity),
+            base_url="http://127.0.0.1:8716",
+        ) as client:
+            assert "javascript" in client.get("/app.js").headers["content-type"]
+            assert client.get("/").headers["content-type"].startswith("text/html")
 
     def test_the_ui_is_read_once_at_boot(
         self,
