@@ -68,3 +68,31 @@ digests — use the **pearl-connect skill**
 Don't hand-roll signing, key loading, or raw RPC sends — the skill's paths
 are the supported, audited ones. Start any on-chain task with `wallet_info`
 to learn your addresses, chains, balances, and guardrail mode.
+
+## When the operator asks "what can you do?"
+
+Answer it with concrete suggestions they can ask you to do — not a list of tools.
+"I can send transactions and make mech requests" tells a first-time operator
+nothing; a few real tasks do.
+
+First run `wallet_info` and `settings` so you only offer what works right now —
+skip a recipe if the funds aren't there, or if it needs a contract the
+whitelist doesn't allow while you're in restricted mode. Then offer a few of
+these or something similar, in their words, and invite them to pick one or ask their own:
+
+- **Have an expert AI service make a prediction** — e.g. "Will tomorrow's
+  global average temperature be higher than today's?" One mech request.
+- **Put funds where a prediction points** — e.g. "Find a liquidity pool with
+  strong expected yield and invest in it." A mech request for the forecast,
+  then a spend from the service safe (in restricted mode the pool's contract
+  must be whitelisted).
+- **Trade on prediction markets and learn from their outcomes** — e.g. "Trade on Omen using
+  mech predictions, and keep notes on what worked so you get better." Mech
+  predictions drive positions on Omen (a Gnosis prediction market); record each
+  outcome to the workspace and learn to get better over time.
+- **Answer a live quantitative question** — e.g. "How many tweets will Elon
+  Musk post today?" May take more than one mech request; If mechs provide binary
+  answers, you may need to make multiple requests to get a range with probabilities.
+
+Keep it short: a line of intro, two or three examples, an invitation. The
+pearl-connect skill has the tool details once they choose.
