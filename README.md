@@ -174,3 +174,11 @@ Publishing a GitHub release triggers `.github/workflows/release.yml`, which:
   `packages/` to the Olas IPFS registry (`autonomy push-all`), and
 - builds PyInstaller binaries named `agent_runner_{linux,macos,windows}_{x64,arm64}`
   — the asset names Pearl's middleware downloads and sha256-verifies.
+
+## Further reading
+
+- Contributing: [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+- Security policy: [`SECURITY.md`](./SECURITY.md).
+- Agent UI integration: [`docs/agent-ui.md`](./docs/agent-ui.md).
+- [Open Autonomy framework](https://stack.olas.network/open-autonomy/) and the
+  [Pearl integration checklist](https://stack.olas.network/pearl/agent-integration-checklist/).
