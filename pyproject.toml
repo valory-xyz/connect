@@ -17,6 +17,9 @@ dependencies = [
 [project.scripts]
 connect = "connect.__main__:main"
 
+[project.urls]
+Repository = "https://github.com/valory-xyz/connect"
+
 [dependency-groups]
 dev = [
     "pytest==9.1.1",
