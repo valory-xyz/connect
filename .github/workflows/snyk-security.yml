@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
       - name: Export requirements for Snyk
         run: uv export --format requirements-txt --no-hashes --no-editable --no-emit-project > requirements.txt
       - name: Set up Snyk CLI to check for security issues
