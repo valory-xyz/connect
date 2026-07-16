@@ -39,18 +39,6 @@ from tests.conftest import FakeW3
 TOKEN = "unit-test-token"  # nosec B105
 
 
-def stand_in_page() -> str:
-    """Return the bundled stand-in page, read as the source artifact it is.
-
-    Not through GET /: that route serves whatever build sits in assets/ui, and
-    the documented integration is to replace it. Asserting the stand-in's own
-    markup through the server would mean that following our own instructions
-    turns the suite red.
-    """
-    path = workspace.assets_dir() / workspace.UI_SUBDIR / workspace.UI_INDEX
-    return path.read_text(encoding="utf-8")
-
-
 @pytest.fixture
 def client(
     test_signer: Signer,
@@ -226,55 +214,35 @@ class TestOpenEndpoints:
         assert client.get("/healthcheck").json() == {"is_healthy": True}
         assert client.get("/settings").status_code == 200
 
-    def test_the_stand_in_ui_matches_the_api_it_drives(
+    def test_the_bundled_ui_calls_the_api_by_the_names_it_answers(
         self, client: TestClient
     ) -> None:
-        """The page's contract with the server, pinned.
+        """The real UI's contract with the server, pinned against its bundle.
 
-        Nothing in the Python suite executes this page's JavaScript, and it is
-        the operator's only way to change the guardrail. So at least hold it to
-        the endpoints it calls, the fields its script reads, and — above all —
-        the literal values it sends: renaming any of them would otherwise break
-        the control surface with every test still green.
+        Nothing in the Python suite executes the UI's JavaScript, and that page
+        is the operator's only way to change the guardrail. So at least hold
+        the shipped bundle to the endpoint paths and settings values it embeds:
+        renaming either side would otherwise break the control surface with
+        every test still green.
         """
-        page = stand_in_page()
-        for endpoint in ('fetch("/settings")', 'fetch("/settings"', 'fetch("/session"'):
-            assert endpoint in page
-        # it waits for the workspace before offering a session, as the server
-        # 503s until then (and as docs/agent-ui.md tells the real UI to)
-        assert 'fetch("/healthcheck")' in page
-        # the inputs its script reads by name: renaming one silently breaks it
-        for field in ('name="mode"', 'name="password"', 'name="harness"'):
-            assert field in page
-        # the values it actually submits must be values the API accepts — this
-        # is the control surface, and a typo here is invisible to every other
-        # test in the suite
+        ui_dir = workspace.assets_dir() / workspace.UI_SUBDIR
+        bundle = "".join(
+            path.read_text(encoding="utf-8", errors="ignore")
+            for path in sorted((ui_dir / "assets").glob("*.js"))
+        )
+        # the endpoints the build drives, same-origin on this server's port
+        for needle in ("/settings", "/session", "127.0.0.1:8716"):
+            assert needle in bundle
+        # the mode values it submits must be values the API accepts — a typo
+        # here is invisible to every other test in the suite
         for mode in MODES:
-            assert f'name="mode" value="{mode}"' in page
+            assert f'"{mode}"' in bundle
         for harness in HARNESSES:
-            assert f'name="harness" value="{harness}"' in page
-        # and it must not offer to edit what the API refuses: a whitelist in a
-        # patch is a 422, so a whitelist input here would fail every save
-        assert 'name="whitelist"' not in page
+            assert f'"{harness}"' in bundle
         # the canonical shape it renders, exactly as GET /settings returns it
         served = client.get("/settings").json()
         assert set(served) == {"protected", "harness"}
         assert set(served["protected"]) == {"mode", "whitelist"}
-
-    def test_the_stand_in_offers_nothing_it_cannot_yet_do(self) -> None:
-        """Every control starts disabled, and its button is bindable.
-
-        A radio group nobody has touched reads .value as "", so a form left
-        live over a failed GET /settings would either send mode:"" — burning a
-        keystore decrypt to earn a 400 — or flip the guardrail from a page that
-        never read it. And an element emitted after the inline script is null
-        when the handler runs, so the button would look right and do nothing.
-        """
-        page = stand_in_page()
-        for control in ("settings-apply", "harness-apply", "open-session"):
-            button = page[page.index(f'id="{control}"') :]
-            assert "disabled" in button[: button.index(">")]
-        assert 0 < page.index('id="open-session"') < page.index("<script>")
 
     def test_api_survives_a_bundle_without_a_ui(
         self,

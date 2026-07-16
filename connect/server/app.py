@@ -104,8 +104,8 @@ def create_app(  # pylint: disable=too-many-arguments
 
     # the agent UI last, so it can own / without shadowing an endpoint: routes
     # match in registration order, and this catch-all would swallow anything
-    # registered below it. The bundle ships a stand-in page; a bundle with no
-    # UI at all still serves the API (see load_ui_bundle).
+    # registered below it. A bundle with no UI at all still serves the API
+    # (see load_ui_bundle).
     ui = load_ui_bundle()
     if ui is not None:
         logger.info("serving the agent UI: %d file(s), read at boot", len(ui))

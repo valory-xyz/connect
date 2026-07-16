@@ -1,17 +1,18 @@
 # Agent UI
 
-The server serves `connect/assets/ui/` at `/`. The `index.html` there is a
-**stand-in** — a plain page that drives the endpoints below — and it keeps the
-agent usable until the real UI is ready.
+The server serves `connect/assets/ui/` at `/`. What sits there is the
+**connect-ui build** from
+[agent-ui-monorepo](https://github.com/valory-xyz/agent-ui-monorepo), committed exactly as published.
 
-This document lives outside that directory on purpose: the integration is to
-*replace the directory*, and a contract stored inside it would be deleted by the
-first person who followed it.
+This document lives outside that directory on purpose: updating the UI means
+*replacing the directory*, and a contract stored inside it would be deleted by
+the first person who followed it.
 
-## Integrating the real UI
+## Updating the UI
 
-**Replace the contents of `connect/assets/ui/`** with the build, exactly as
-it is published (the layout Pearl's other agents use, e.g.
+**Replace the contents of `connect/assets/ui/`** with the new release's
+`connect-ui-build.zip`, exactly as it is published (the layout Pearl's other
+agents use, e.g.
 [trader's `ui-build/polystrat`](https://github.com/valory-xyz/trader/tree/main/packages/valory/skills/trader_abci/ui-build/polystrat)):
 
 ```
