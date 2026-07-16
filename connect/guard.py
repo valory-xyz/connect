@@ -28,7 +28,14 @@ enableModule, addOwnerWithThreshold, setGuard, or arbitrary code run against
 its own storage — and what they install goes on moving funds after this signer
 stops signing: on-chain, directly, forever. They would outlive a switch back to
 restricted mode, which is the one thing an operator flipping that switch is
-relying on. Unrestricted is meant to be a wider gate, not a one-way door.
+relying on. For the safe's own configuration, unrestricted is meant to be a
+wider gate, not a one-way door.
+
+That guarantee is scoped to the safe itself. State granted on *other*
+contracts while unrestricted — an ERC-20 allowance above all — persists until
+explicitly revoked, and an unlimited approve lets its spender drain the safe
+with no further signing. The floor cannot see allowances; revoking them is
+part of flipping the switch back, not a consequence of it.
 
 Everything else is the mode. In restricted mode the agent EOA may only have the
 safe CALL a whitelisted address via execTransaction; raw digest signing is
