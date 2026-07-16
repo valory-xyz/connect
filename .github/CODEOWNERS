@@ -1,0 +1,28 @@
+# CODEOWNERS — review routing for the connect repo
+#
+# Owners listed here are auto-requested as reviewers on matching paths.
+# Enforcement requires "Require review from Code Owners" in branch protection
+# (Settings -> Branches -> main); without that toggle this file is decorative.
+#
+# Precedence: last matching pattern wins.
+# Update this file as the maintainer team grows.
+
+# ── Default owner for the whole repo ──────────────────────────────────────────
+*                                @OjusWiZard
+
+# ── CI / infrastructure ───────────────────────────────────────────────────────
+/.github/                        @OjusWiZard
+/.github/CODEOWNERS              @OjusWiZard
+
+# ── Security policy ───────────────────────────────────────────────────────────
+/SECURITY.md                     @OjusWiZard
+
+# ── Python backend / agent server ─────────────────────────────────────────────
+/pyproject.toml                  @OjusWiZard
+/uv.lock                         @OjusWiZard
+/tox.ini                         @OjusWiZard
+/connect/                        @OjusWiZard
+/packaging/                      @OjusWiZard
+
+# ── Olas packages ─────────────────────────────────────────────────────────────
+/packages/                       @OjusWiZard
