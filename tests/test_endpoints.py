@@ -446,6 +446,51 @@ class TestAuth:
         assert response.json()["tx_hash"].startswith("0x")
         assert len(fake_w3.eth.sent) == 1
 
+    def test_safe_transaction(self, client: TestClient, fake_w3: FakeW3) -> None:
+        """The route names the inner call; the server composes the safe's tx."""
+        response = client.post(
+            "/safe-transaction",
+            json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": "0x10"},
+            headers=auth(),
+        )
+        assert response.status_code == 200
+        assert response.json()["tx_hash"].startswith("0x")
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_safe_transaction_without_a_safe_is_400(
+        self, client: TestClient, fake_w3: FakeW3
+    ) -> None:
+        """A chain we cannot spend from is the caller's problem, not a 500."""
+        response = client.post(
+            "/safe-transaction",
+            json={"chain": "mystery", "to": "0x" + "aa" * 20},
+            headers=auth(),
+        )
+        assert response.status_code == 400
+        assert not fake_w3.eth.sent
+
+    def test_safe_transaction_malformed_input_is_400_not_500(
+        self, client: TestClient, fake_w3: FakeW3
+    ) -> None:
+        """Compose-time errors map to 400, like the sibling /sign-and-send path.
+
+        The inner call is ABI-encoded before the send, so a bad target or an
+        oversized value must not leak out as an unhandled 500.
+        """
+        bad_target = client.post(
+            "/safe-transaction",
+            json={"chain": "testchain", "to": "0x1234"},
+            headers=auth(),
+        )
+        assert bad_target.status_code == 400
+        huge_value = client.post(
+            "/safe-transaction",
+            json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": 2**256},
+            headers=auth(),
+        )
+        assert huge_value.status_code == 400
+        assert not fake_w3.eth.sent
+
     def test_sign_and_send_unknown_chain_is_400(self, client: TestClient) -> None:
         """Test sign and send unknown chain is 400."""
         response = client.post(

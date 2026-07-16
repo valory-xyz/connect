@@ -17,9 +17,14 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Bearer-authed signing surface for skill scripts: /sign-and-send, /sign-message, /wallet."""
+"""Bearer-authed signing surface for skill scripts.
+
+Routes: /safe-transaction (act as the service safe), /sign-and-send (act as the
+EOA), /sign-message, /wallet.
+"""
 
 import logging
+import typing as t
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
@@ -57,13 +62,17 @@ class SignMessageRequest(BaseModel):
     digest: str = Field(description="0x-hex 32-byte digest, signed unprefixed")
 
 
-@router.post("/sign-and-send")
-def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
-    """Sign and send."""
+def _dispatch(method: t.Callable[..., str], body: SignAndSendRequest) -> dict:
+    """Run one signer method and map its input errors to a 400.
+
+    The address is passed positionally: `send` reads it as the EOA's outer
+    recipient, `send_via_safe` as the safe's call target — the one field whose
+    meaning the two endpoints deliberately keep distinct.
+    """
     try:
-        tx_hash = request.app.state.signer.send(
-            chain=body.chain,
-            to=body.to,
+        tx_hash = method(
+            body.chain,
+            body.to,
             value=body.value,
             data=body.data,
             request_id=body.request_id,
@@ -72,6 +81,22 @@ def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
     except (SignerError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"tx_hash": tx_hash}
+
+
+@router.post("/sign-and-send")
+def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
+    """Sign and send one transaction from the agent EOA."""
+    return _dispatch(request.app.state.signer.send, body)
+
+
+@router.post("/safe-transaction")
+def safe_transaction(body: SignAndSendRequest, request: Request) -> dict:
+    """Have the service safe make one call; the server composes the safe's tx.
+
+    The same body as /sign-and-send, read one level in: `to`, `value` and `data`
+    are the call the *safe* makes, and the value leaves the safe.
+    """
+    return _dispatch(request.app.state.signer.send_via_safe, body)
 
 
 @router.post("/sign-message")

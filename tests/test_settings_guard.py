@@ -28,6 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
@@ -37,13 +38,14 @@ from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig, ChainConfig
-from connect.guard import EXEC_TRANSACTION_SELECTOR, Guard, GuardError
+from connect.guard import Guard, GuardError
 from connect.mech import (
     MAX_DELIVERY_TIMEOUT,
     MechError,
     MechService,
     MechSigner,
 )
+from connect.safe import EXEC_TRANSACTION_SELECTOR, EXEC_TRANSACTION_TYPES
 from connect.server.settings_routes import WHITELIST_FROZEN
 from connect.settings import (
     MAC_FIELDS,
@@ -551,11 +553,81 @@ class TestGuard:
         with pytest.raises(GuardError, match="no service safe"):
             guard.check_transaction("nosafe", SAFE, 1, "0x")
 
-    def test_restricted_allows_native_sweep(self, store: SettingsStore) -> None:
-        """A plain EOA -> safe transfer is always allowed."""
+    def test_restricted_refuses_a_bare_transfer_to_the_safe(
+        self, store: SettingsStore
+    ) -> None:
+        """Even an EOA -> safe transfer is not a shape restricted mode allows.
+
+        Funding the safe is the operator's job, through Pearl. A permission the
+        agent never needed is one the gate should not carry.
+        """
         guard = make_guard(store, MODE_RESTRICTED)
-        guard.check_transaction("testchain", SAFE, 10**18, "0x")
-        guard.check_transaction("testchain", SAFE.upper().replace("0X", "0x"), 0, "")
+        with pytest.raises(GuardError, match="must be execTransaction"):
+            guard.check_transaction("testchain", SAFE, 10**18, "0x")
+
+    def test_the_floor_holds_in_every_mode(self, store: SettingsStore) -> None:
+        """Delegatecall and safe-self-calls are refused even when unrestricted.
+
+        Both change what the safe *is* — its modules, owners, guard — and what
+        they install keeps moving funds after this signer stops signing. An
+        unrestricted session could otherwise leave a door open that survives
+        the operator switching back, which would make the switch a lie.
+        """
+        for mode in (MODE_RESTRICTED, MODE_UNRESTRICTED):
+            guard = make_guard(store, mode, {"testchain": (WHITELISTED.lower(),)})
+            delegatecall = exec_transaction_calldata(WHITELISTED, operation=1)
+            with pytest.raises(GuardError, match="may not delegatecall"):
+                guard.check_transaction("testchain", SAFE, 0, delegatecall)
+            # enableModule/addOwnerWithThreshold/setGuard are all self-calls
+            self_call = exec_transaction_calldata(SAFE, data=b"\x61\x0b\x59\x25")
+            with pytest.raises(GuardError, match="may not call itself"):
+                guard.check_transaction("testchain", SAFE, 0, self_call)
+
+    def test_the_floor_holds_where_no_safe_is_configured(
+        self, store: SettingsStore
+    ) -> None:
+        """A chain with no configured safe is not a bypass around the floor.
+
+        The floor protects any safe the agent reaches, not only the one we
+        configured. If the EOA owns a Safe on a chain we left unconfigured, an
+        execTransaction to it is still refused delegatecall and self-admin —
+        otherwise unrestricted mode would have a door the docstring denies.
+        """
+        guard = make_guard(store, MODE_UNRESTRICTED)  # "nosafe" has safe_address=None
+        other_safe = "0x" + "dd" * 20
+        delegatecall = exec_transaction_calldata(WHITELISTED, operation=1)
+        with pytest.raises(GuardError, match="may not delegatecall"):
+            guard.check_transaction("nosafe", other_safe, 0, delegatecall)
+        self_call = exec_transaction_calldata(other_safe)  # inner to == outer to
+        with pytest.raises(GuardError, match="may not call itself"):
+            guard.check_transaction("nosafe", other_safe, 0, self_call)
+
+    def test_unrestricted_still_signs_everything_else(
+        self, store: SettingsStore
+    ) -> None:
+        """The floor narrows unrestricted mode; it does not replace it."""
+        guard = make_guard(store, MODE_UNRESTRICTED)
+        # an arbitrary EOA call to an address no whitelist ever saw
+        guard.check_transaction("testchain", WHITELISTED, 10**18, "0xdeadbeef")
+        # and the safe calling a non-whitelisted address
+        guard.check_transaction(
+            "testchain", SAFE, 0, exec_transaction_calldata(OTHER, value=10**18)
+        )
+
+    def test_the_floor_passes_a_plain_exec_transaction_to_any_target(
+        self, store: SettingsStore
+    ) -> None:
+        """Widening the floor to every execTransaction must not over-block.
+
+        An execTransaction to some third-party address — a CALL whose inner
+        target is not that address — is a legitimate unrestricted-mode action.
+        The floor only refuses delegatecall and self-calls; this must still pass,
+        or a later tightening could silently break every safe-to-safe call.
+        """
+        guard = make_guard(store, MODE_UNRESTRICTED)
+        third_party = "0x" + "99" * 20
+        legit = exec_transaction_calldata(WHITELISTED, value=10**18)  # inner != outer
+        guard.check_transaction("testchain", third_party, 0, legit)
 
     def test_restricted_allows_whitelisted_call(self, store: SettingsStore) -> None:
         """Allow an execTransaction CALL to a whitelisted address."""
@@ -570,8 +642,9 @@ class TestGuard:
         [
             (exec_transaction_calldata(OTHER), "not in the testchain whitelist"),
             (
+                # refused by the floor now, not by the mode
                 exec_transaction_calldata(WHITELISTED, operation=1),
-                "only CALL operations",
+                "may not delegatecall",
             ),
             ("0xdeadbeef", "must be execTransaction"),
             ("0x" + EXEC_TRANSACTION_SELECTOR + "ff", "could not decode"),
@@ -672,13 +745,145 @@ class TestSignerGuardIntegration:
         assert "blocked" in audit_kinds(store_path)
         assert not fake_w3.eth.sent
 
-    def test_sweep_passes_the_gate(
+    def test_the_server_composes_what_the_agent_no_longer_has_to(  # pylint: disable=too-many-arguments
+        self,
+        restricted_signer: Signer,
+        fake_w3: FakeW3,
+        settings_store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """send_via_safe wraps the inner call, and the wrapper passes the gate.
+
+        The agent names only the call it wants the safe to make. What reaches
+        the chain is an execTransaction to the safe carrying it — composed
+        here, and judged by the same guard as if the agent had hand-rolled it.
+        """
+        settings_store.save(
+            Settings(
+                protected=Protected(
+                    mode=MODE_RESTRICTED,
+                    whitelist={"testchain": (WHITELISTED.lower(),)},
+                )
+            )
+        )
+        sent: dict = {}
+        original = restricted_signer.send
+        monkeypatch.setattr(
+            restricted_signer,
+            "send",
+            lambda chain, to, **kw: (
+                sent.update({"chain": chain, "to": to, **kw}),
+                original(chain, to, **kw),
+            )[1],
+        )
+        tx_hash = restricted_signer.send_via_safe(
+            "testchain", WHITELISTED, value=10**18, data="0xabcd"
+        )
+
+        assert tx_hash.startswith("0x")
+        assert fake_w3.eth.sent  # it really was broadcast
+        assert sent["to"].lower() == SAFE.lower()  # the outer call goes to the safe
+        assert sent["value"] == 0  # ...carrying nothing: the safe pays
+        # and the inner call is the one the agent actually asked for
+        calldata = sent["data"].removeprefix("0x")
+        assert calldata.startswith(EXEC_TRANSACTION_SELECTOR)
+        inner = abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
+        assert inner[0].lower() == WHITELISTED.lower()  # to
+        assert inner[1] == 10**18  # value, out of the safe
+        assert inner[2] == b"\xab\xcd"  # data
+        assert inner[3] == 0  # a CALL, never a delegatecall
+
+    def test_the_composer_is_not_a_way_around_the_gate(
         self, restricted_signer: Signer, fake_w3: FakeW3
     ) -> None:
-        """EOA -> safe sweep broadcasts even in restricted mode."""
-        tx_hash = restricted_signer.send("testchain", SAFE, value=5)
-        assert tx_hash.startswith("0x")
-        assert fake_w3.eth.sent
+        """A composed call to a non-whitelisted address is refused like any other.
+
+        The composer is a caller of the gate, not a second gate. If it could
+        reach targets the whitelist never saw, it would be the bypass this
+        design exists to not have.
+        """
+        with pytest.raises(SignerError, match="not in the testchain whitelist"):
+            restricted_signer.send_via_safe("testchain", OTHER, value=1)
+        assert not fake_w3.eth.sent
+
+    def test_the_composer_cannot_open_the_safe_to_itself(
+        self, restricted_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """The floor holds even though the server wrote the calldata.
+
+        `to` is still the agent's to choose, so it can name the safe — and
+        enableModule would outlive the guardrail. The floor is in the gate for
+        exactly this reason, not in the composer.
+        """
+        with pytest.raises(SignerError, match="may not call itself"):
+            restricted_signer.send_via_safe("testchain", SAFE, data="0x610b5925")
+        assert not fake_w3.eth.sent
+
+    def test_send_via_safe_needs_a_safe(
+        self,
+        account: LocalAccount,
+        activity: ActivityLog,
+        store_path: Path,
+        settings_store: SettingsStore,
+    ) -> None:
+        """A chain with no service safe has nothing to spend from."""
+        config = AppConfig(
+            chains={"safeless": ChainConfig(rpc_url="http://127.0.0.1:9")},
+            store_path=store_path,
+        )
+        signer = Signer(
+            account=account,
+            config=config,
+            activity=activity,
+            guard=Guard(settings_store, config),
+        )
+        with pytest.raises(SignerError, match="no service safe is configured"):
+            signer.send_via_safe("safeless", WHITELISTED, value=1)
+
+    def test_a_malformed_inner_call_is_a_clean_error_not_a_crash(
+        self, restricted_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Bad compose input fails as a SignerError (a 400), not an eth_abi 500.
+
+        The calldata is composed before the send, outside send()'s error
+        handling, so the compose has to map its own input errors — a malformed
+        target or an oversized value — the way the EOA path already does.
+        """
+        with pytest.raises(SignerError, match="cannot compose"):
+            restricted_signer.send_via_safe("testchain", "0x1234", value=1)
+        with pytest.raises(SignerError, match="cannot compose"):
+            restricted_signer.send_via_safe("testchain", WHITELISTED, value=2**256)
+        assert not fake_w3.eth.sent
+
+    def test_the_safe_path_has_its_own_idempotency_namespace(
+        self,
+        restricted_signer: Signer,
+        settings_store: SettingsStore,
+        fake_w3: FakeW3,
+    ) -> None:
+        """One request_id on the EOA path and the safe path is two actions.
+
+        The two endpoints share a body model, so a client generating one id per
+        logical action could reuse it across them; the shared cache must not
+        then hand back the first path's tx_hash for the other's call.
+        """
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}))
+        )
+        eoa = restricted_signer.send(
+            "testchain", WHITELISTED, value=1, request_id="dup"
+        )
+        via_safe = restricted_signer.send_via_safe(
+            "testchain", WHITELISTED, value=1, request_id="dup"
+        )
+        assert eoa != via_safe
+        assert len(fake_w3.eth.sent) == 2  # no cross-path collision
+        # ...but a real retry on the safe path with the same id is still deduped
+        again = restricted_signer.send_via_safe(
+            "testchain", WHITELISTED, value=1, request_id="dup"
+        )
+        assert again == via_safe
+        assert len(fake_w3.eth.sent) == 2
 
     def test_blocked_sign_digest_is_audited(
         self, store_path: Path, restricted_signer: Signer, activity: ActivityLog

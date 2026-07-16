@@ -455,6 +455,92 @@ class TestMcpTools:
         assert result["tx_hash"].startswith("0x")
         assert len(fake_w3.eth.sent) == 1
 
+    async def test_safe_transaction_spends_from_the_safe(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """The tool names the inner call; the server wraps it and broadcasts."""
+        result = await tools["safe_transaction"](
+            "testchain", "0x" + "aa" * 20, value=10**18
+        )
+        assert result["tx_hash"].startswith("0x")
+        assert len(fake_w3.eth.sent) == 1
+
+    async def test_safe_transaction_settles_like_any_other_send(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """Receipt when it mines, 'pending' when it does not."""
+        fake_w3.eth.receipt = {
+            "status": 1,
+            "blockNumber": 7,
+            "gasUsed": 21000,
+            "logs": [],
+        }
+        mined = await tools["safe_transaction"](
+            "testchain", "0x" + "aa" * 20, wait_for_receipt=True, timeout=5
+        )
+        assert mined["receipt"]["status"] == 1
+
+        fake_w3.eth.receipt = None
+        pending = await tools["safe_transaction"](
+            "testchain", "0x" + "aa" * 20, wait_for_receipt=True, timeout=0
+        )
+        assert pending["status"] == "pending"
+
+    async def test_a_reverted_tx_is_not_reported_as_success(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """status==0 surfaces as top-level 'reverted', not a success-shaped dict."""
+        fake_w3.eth.receipt = {
+            "status": 0,
+            "blockNumber": 7,
+            "gasUsed": 21000,
+            "logs": [],
+        }
+        result = await tools["safe_transaction"](
+            "testchain", "0x" + "aa" * 20, wait_for_receipt=True, timeout=5
+        )
+        assert result["status"] == "reverted"
+        assert result["tx_hash"].startswith("0x")
+
+    async def test_a_post_broadcast_receipt_error_keeps_the_hash(
+        self,
+        tools: dict[str, t.Callable],
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A receipt-read hiccup after broadcast is 'pending', never a lost hash.
+
+        The tx is already on-chain; reporting failure would invite a resend that
+        double-spends. It comes back pending, with the hash and the error.
+        """
+
+        def boom(*_a: object, **_kw: object) -> dict:
+            raise ConnectionError("rpc dropped")
+
+        monkeypatch.setattr(fake_w3.eth, "wait_for_transaction_receipt", boom)
+        result = await tools["safe_transaction"](
+            "testchain", "0x" + "aa" * 20, wait_for_receipt=True, timeout=5
+        )
+        assert fake_w3.eth.sent  # the premise: it really was broadcast first
+        assert result["status"] == "pending"
+        assert result["tx_hash"].startswith("0x")
+        assert "rpc dropped" in result["receipt_error"]
+
+    async def test_safe_transaction_rejects_a_negative_value(
+        self, tools: dict[str, t.Callable]
+    ) -> None:
+        """A negative value is the caller's mistake, caught before the chain."""
+        with pytest.raises(ValueError, match="non-negative"):
+            await tools["safe_transaction"]("testchain", "0x" + "aa" * 20, value=-1)
+
+    async def test_safe_transaction_malformed_target_is_a_clean_error(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """A bad compose input fails as an error, not a broadcast — at the tool too."""
+        with pytest.raises(SignerError, match="cannot compose"):
+            await tools["safe_transaction"]("testchain", "0x1234")
+        assert not fake_w3.eth.sent
+
     async def test_send_transaction_wait_mined(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
@@ -503,7 +589,12 @@ class TestMcpTools:
     async def test_transaction_status(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
-        """transaction_status reports pending then mined."""
+        """transaction_status reports pending, then mined, then reverted.
+
+        It speaks the same top-level status the send tools do, so a tx polled
+        here after a pending send is read the same way — a revert is not a
+        success-shaped dict a caller reads past.
+        """
         tx_hash = "0x" + "11" * 32
         pending = await tools["transaction_status"]("testchain", tx_hash)
         assert pending["status"] == "pending"
@@ -513,8 +604,12 @@ class TestMcpTools:
             "gasUsed": 21000,
             "logs": [],
         }
-        result = await tools["transaction_status"]("testchain", tx_hash)
-        assert result["receipt"]["block_number"] == 7
+        mined = await tools["transaction_status"]("testchain", tx_hash)
+        assert mined["status"] == "mined"
+        assert mined["receipt"]["block_number"] == 7
+        fake_w3.eth.receipt = {**fake_w3.eth.receipt, "status": 0}
+        reverted = await tools["transaction_status"]("testchain", tx_hash)
+        assert reverted["status"] == "reverted"
 
     async def test_transaction_status_rejects_malformed_hash(
         self, tools: dict[str, t.Callable]

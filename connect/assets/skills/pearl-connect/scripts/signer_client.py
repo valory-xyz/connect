@@ -95,12 +95,17 @@ class SignerClient:
             _raise_with_detail(e)
 
     def send_transaction(self, tx: dict, request_id: str | None = None) -> str:
-        """Send transaction; client-side timeouts retry with the same request_id.
+        """Have the service safe make this call; retries stay idempotent.
 
-        The signer may have broadcast before a timeout hit: replaying the same
-        request_id returns the original tx_hash instead of double-spending. If
-        all attempts fail, the raised error names the request_id so a manual
-        retry can stay idempotent too.
+        `tx` is the call the *safe* makes — to, value, data. The safe is the
+        `msg.sender` the contract sees, and any value carried leaves the safe.
+        The server composes the safe's transaction: nothing here knows what an
+        execTransaction is, and nothing here needs the safe's address.
+
+        The signer may have broadcast before a client-side timeout hit, so
+        replaying the same request_id returns the original tx_hash instead of
+        spending twice. If every attempt fails, the raised error names the
+        request_id so a manual retry can stay idempotent too.
         """
         request_id = request_id or str(uuid.uuid4())
         payload = {
@@ -110,12 +115,14 @@ class SignerClient:
             "data": tx.get("data", "0x"),
             "request_id": request_id,
         }
-        if tx.get("gas"):
-            payload["gas"] = _to_int(tx["gas"])
+        # tx["gas"], if the caller set it, was estimated against this inner call;
+        # the server wraps it in an execTransaction whose gas is larger (safe
+        # dispatch, signature check, nonce write). Forwarding the inner estimate
+        # would under-fund the outer tx and revert, so the server re-estimates.
         last_error: Exception | None = None
         for _ in range(SEND_ATTEMPTS):
             try:
-                return self._post("/sign-and-send", payload)["tx_hash"]
+                return self._post("/safe-transaction", payload)["tx_hash"]
             # OSError covers timeouts, URLError and connection resets;
             # HTTPException covers RemoteDisconnected on the response path
             # (urllib does not wrap those). HTTP-status errors become
@@ -145,7 +152,12 @@ class SignerClient:
 
 
 class SignerProvider(HTTPProvider):
-    """HTTPProvider that diverts eth_sendTransaction to the signer service."""
+    """HTTPProvider that diverts eth_sendTransaction through the service safe.
+
+    Reads (balances, gas, receipts) go straight to the chain. A send does not:
+    it becomes a call made *by the safe*, so the safe is the `msg.sender` the
+    contract sees, and any value carried leaves the safe rather than the EOA.
+    """
 
     def __init__(self, rpc_url: str, signer: SignerClient) -> None:
         """Initialize."""
