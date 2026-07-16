@@ -23,6 +23,7 @@ import json
 import stat
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -158,11 +159,15 @@ def test_provisioning_ships_token_hygiene(store_path: Path) -> None:
 
 
 def test_deep_links(store_path: Path) -> None:
-    """Deep links, and the one the configured harness resolves to."""
-    assert workspace.desktop_deep_link(store_path).startswith(
-        "claude://code/new?folder="
-    )
-    assert workspace.cli_deep_link(store_path).startswith("claude-cli://open?cwd=")
+    """Deep links carry the working dir and a pre-filled opening prompt."""
+    desktop = workspace.desktop_deep_link(store_path)
+    cli = workspace.cli_deep_link(store_path)
+    assert desktop.startswith("claude://code/new?folder=")
+    assert cli.startswith("claude-cli://open?cwd=")
+    # both pre-fill the same opening question, url-encoded, so a fresh session
+    # opens on "what can you do?" and the agent answers with its recipe tour
+    for url in (desktop, cli):
+        assert parse_qs(urlparse(url).query)["q"] == [workspace.FIRST_PROMPT]
     # the harness resolves to exactly one link — the other is never a fallback
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     assert agent_workspace.deep_link().startswith("claude://")

@@ -135,14 +135,21 @@ def load_ui_bundle() -> dict[str, bytes] | None:
     }
 
 
+# Pre-filled into the prompt box of a freshly opened session. A deep link only
+# fills the box — the operator reads it and presses Enter — so this reads as the
+# operator's own opening question, not something we sent. CLAUDE.md tells the
+# agent how to answer it: with a short, concrete tour of what it can be asked.
+FIRST_PROMPT = "hi, what can you do?"
+
+
 def desktop_deep_link(store_path: Path) -> str:
-    """Claude Code desktop-app deep link."""
-    return f"claude://code/new?folder={quote(str(store_path))}"
+    """Claude Code desktop-app deep link, opening prompt pre-filled."""
+    return f"claude://code/new?folder={quote(str(store_path))}&q={quote(FIRST_PROMPT)}"
 
 
 def cli_deep_link(store_path: Path) -> str:
-    """Claude Code CLI deep link."""
-    return f"claude-cli://open?cwd={quote(str(store_path))}"
+    """Claude Code CLI deep link, opening prompt pre-filled."""
+    return f"claude-cli://open?cwd={quote(str(store_path))}&q={quote(FIRST_PROMPT)}"
 
 
 # The one place a harness gets a way to be opened. settings.HARNESSES says
