@@ -175,12 +175,25 @@ class FakeEth:
         return HexBytes(Web3.keccak(bytes(raw)))
 
 
+class FakeMiddlewareOnion:
+    """Records middleware injections (the signer adds the PoA middleware)."""
+
+    def __init__(self) -> None:
+        """Initialize."""
+        self.injected: list = []
+
+    def inject(self, middleware: object, layer: int = 0) -> None:
+        """Record an injection."""
+        self.injected.append((middleware, layer))
+
+
 class FakeW3:
     """Minimal Web3 stand-in for signer tests."""
 
     def __init__(self) -> None:
         """Initialize."""
         self.eth = FakeEth()
+        self.middleware_onion = FakeMiddlewareOnion()
 
     def to_wei(self, value: float, unit: str) -> int:
         """Convert gwei to wei."""

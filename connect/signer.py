@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from eth_account.signers.local import LocalAccount
 from eth_typing import Hash32
 from web3 import Web3
+from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 from web3.types import TxParams
 
 from connect import safe as safe_module
@@ -75,6 +76,10 @@ class _ChainPool:
         w3 = Web3(
             Web3.HTTPProvider(chain_config.rpc_url, request_kwargs={"timeout": 30})
         )
+        # PoA chains (Polygon above all) pad extraData past 32 bytes, which
+        # web3's default block formatter refuses — making every send there
+        # fail at fee estimation. The middleware is a no-op on non-PoA chains.
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         state = _ChainState(w3=w3, lock=threading.Lock(), chain_id=w3.eth.chain_id)
         with self._lock:
             # a racing builder may have won; one state per chain must survive
