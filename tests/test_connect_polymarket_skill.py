@@ -495,6 +495,9 @@ class _FakeRelayer:
 
 
 def _sweep_mocks(monkeypatch, *, pusd, ctf_balance, recorded, indexed):
+    # Bypass the open-orders guard here (it needs the CLOB SDK); it has its
+    # own tests in test_connect_polymarket_sdk.py.
+    monkeypatch.setattr(funds, "_abort_if_open_orders", lambda cs, dw: None)
     monkeypatch.setattr(funds, "dw_or_exit", lambda cs: DW_ADDR)
     monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, tok, dw: pusd)
     monkeypatch.setattr(pm, "erc1155_balance_of", lambda w3, ctf, dw, tid: ctf_balance)

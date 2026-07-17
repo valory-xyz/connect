@@ -188,12 +188,13 @@ def cmd_limit(  # pylint: disable=too-many-arguments
 ) -> None:
     """Resting limit order (GTC, or GTD with --expires-in seconds).
 
-    BUY funds must already sit in the DW when the order matches. The bought
-    token is NOT recorded to the DW-holdings hint here: a resting order fills
-    asynchronously, and you only learn of a fill by polling positions — by
-    which point the data-API indexer already reflects it, so the sweep's
-    indexer lookup covers it. (Eagerly recording every limit order would
-    leave lingering hints for orders that never fill.)
+    BUY funds must already sit in the DW when the order matches. A BUY token
+    is recorded to the DW-holdings hint on placement: a resting order can
+    fill before the data-API indexer reflects it, and a sweep run for any
+    reason in that window would otherwise omit the just-filled position while
+    still reporting success. The hint is dropped once the position is swept;
+    an order that never fills leaves a harmless zero-balance hint that sweep
+    simply skips.
     """
     order_side = BUY if side == "buy" else SELL
     ot = _order_type(order_type)
@@ -213,7 +214,10 @@ def cmd_limit(  # pylint: disable=too-many-arguments
                 expiration=expiration,
             )
         )
-        return client.post_order(order, ot)
+        resp = client.post_order(order, ot)
+        if order_side == BUY:
+            pm.record_dw_token_best_effort(cs, int(token_id))
+        return resp
 
     _run_client(cs, op)
 

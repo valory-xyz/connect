@@ -29,8 +29,10 @@ USDC.e in safe --wrap--> pUSD in safe --top-up--> DW --buy--> position in DW
    next buy spends.
 3. `trade.py buy/sell/limit` — trade on the CLOB, funded by the DW.
 4. `funds.py sweep` — **always, after trading**: returns the DW's pUSD *and*
-   bought positions to the safe. Selling happens before sweeping (the shares
-   must be in the DW when a sell matches).
+   bought positions to the safe. Cancel any resting limit orders first —
+   sweep refuses while orders are open (their collateral/shares must stay in
+   the DW to settle), unless you pass `--force`. Selling happens before
+   sweeping (the shares must be in the DW when a sell matches).
 5. `redeem.py all` — after market resolution, the safe redeems its winning
    positions for pUSD.
 

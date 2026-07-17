@@ -29,7 +29,9 @@ Usage:
     python funds.py balances                       # safe / DW / EOA balances
     python funds.py wrap [--amount 25.0]           # safe: USDC.e → pUSD (default: all)
     python funds.py top-up --amount 10.0           # safe → DW pUSD for a trade
-    python funds.py sweep [--token-ids ID ...]     # DW → safe: pUSD + positions
+    python funds.py sweep [--token-ids ID ...] [--force]
+                                                   # DW → safe: pUSD + positions
+                                                   # (blocked while orders rest)
     python funds.py return-position --token-id ID [--shares N]
                                                    # safe → DW: stage a swept
                                                    # position for selling
@@ -127,21 +129,52 @@ def _dw_position_token_ids(dw: str) -> list:
     return ids
 
 
-def cmd_sweep(cs: pm.ConnectSigner, token_ids: list) -> None:
+def _abort_if_open_orders(cs: pm.ConnectSigner, dw: str) -> None:
+    """Refuse to sweep while resting CLOB orders back the DW's assets.
+
+    A live GTC/GTD buy reserves pUSD collateral and a live sell reserves
+    outcome shares; sweeping those out would leave the order live but
+    unsettleable. Bypass with --force only when you know none rest here.
+    """
+    from remote_signer import make_clob_client  # SDK import only needed here
+
+    try:
+        open_orders = make_clob_client(cs, dw).get_open_orders()
+    except Exception as e:  # noqa: BLE001 - can't verify → don't sweep blind
+        raise SystemExit(
+            f"could not verify open CLOB orders before sweeping ({e}); cancel "
+            "any resting orders (trade.py cancel) or re-run with --force if you "
+            "are certain none rest against the DW"
+        ) from e
+    if open_orders:
+        ids = ", ".join(str(o.get("id", "?")) for o in open_orders[:5])
+        raise SystemExit(
+            f"{len(open_orders)} open CLOB order(s) rest against the DW ({ids}) "
+            "— sweeping could strand their collateral or shares and leave them "
+            "unsettleable. Cancel them (trade.py cancel --id ...) first, or "
+            "re-run with --force if they are safe to move."
+        )
+
+
+def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> None:
     """Sweep the DW's pUSD AND positions back to the safe ("whatever's there").
 
     The safe is the canonical store of persistent assets — bought positions
     must not linger in the transient DW, or redemption (which acts on the
     safe) never sees them.
 
-    Position discovery, when --token-ids is not given, is the UNION of two
-    sources: the tokens this skill recorded at buy time (`dw_open_tokens`,
-    which is immediate) and the data-API's view (which can lag right after a
-    buy). Relying on the indexer alone would silently drop a just-bought
-    position from the sweep. If both come back empty the DW is reported empty
-    but with a warning to pass --token-ids if a buy just happened.
+    Refuses to run while any resting CLOB order is open (its collateral or
+    shares must stay in the DW to settle); cancel those first, or pass
+    --force. Position discovery, when --token-ids is not given, is the UNION
+    of two sources: the tokens this skill recorded at buy time
+    (`dw_open_tokens`, immediate) and the data-API's view (which can lag right
+    after a buy). Relying on the indexer alone would silently drop a
+    just-bought position. If both come back empty the DW is reported empty
+    with a warning to pass --token-ids if a buy just happened.
     """
     dw = dw_or_exit(cs)
+    if not force:
+        _abort_if_open_orders(cs, dw)
     safe = cs.safe_address
     calls = []
     pusd_balance = pm.erc20_balance_of(cs.w3, pm.PUSD, dw)
@@ -261,6 +294,11 @@ def main() -> None:
     top_up.add_argument("--amount", type=float, required=True, help="pUSD to send")
     sweep = sub.add_parser("sweep")
     sweep.add_argument("--token-ids", type=int, nargs="*", default=None)
+    sweep.add_argument(
+        "--force",
+        action="store_true",
+        help="sweep even with open CLOB orders resting against the DW",
+    )
     ret = sub.add_parser("return-position")
     ret.add_argument("--token-id", type=int, required=True)
     ret.add_argument("--shares", type=float, default=None, help="default: all")
@@ -273,7 +311,7 @@ def main() -> None:
     elif args.command == "top-up":
         cmd_top_up(cs, args.amount)
     elif args.command == "sweep":
-        cmd_sweep(cs, args.token_ids)
+        cmd_sweep(cs, args.token_ids, args.force)
     elif args.command == "return-position":
         cmd_return_position(cs, args.token_id, args.shares)
 

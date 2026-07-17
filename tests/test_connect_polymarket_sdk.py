@@ -46,6 +46,7 @@ _SCRIPTS = (
 )
 sys.path.insert(0, str(_SCRIPTS))
 
+import funds  # noqa: E402
 import remote_signer  # noqa: E402
 import trade  # noqa: E402
 from py_clob_client_v2.exceptions import PolyApiException  # noqa: E402
@@ -160,3 +161,122 @@ def test_clear_cached_creds_removes_and_persists(monkeypatch) -> None:
     remote_signer.clear_cached_creds(object())
     assert "clob_creds" not in saved
     assert saved.get("k") == 1
+
+
+# --- trade.cmd_limit: BUY records the token, SELL does not ----------------------
+
+
+class _OrderClient:
+    """A CLOB client whose order calls succeed with a dummy response."""
+
+    def create_order(self, args):
+        """Return an opaque order object."""
+        return "order"
+
+    def post_order(self, order, order_type):
+        """Return a dummy live-order response."""
+        return {"status": "live"}
+
+
+def test_limit_buy_records_token(monkeypatch, capsys) -> None:
+    """A limit BUY records the token to the DW-holdings hint (finding 1)."""
+    recorded = []
+    monkeypatch.setattr(trade, "dw_or_exit", lambda cs: "0xdw")
+    monkeypatch.setattr(trade, "make_clob_client", lambda cs, dw: _OrderClient())
+    monkeypatch.setattr(trade, "clear_cached_creds", lambda cs: None)
+    monkeypatch.setattr(
+        trade.pm, "record_dw_token_best_effort", lambda cs, tid: recorded.append(tid)
+    )
+    trade.cmd_limit(object(), "12345", "buy", 0.5, 10.0, "gtc", None)
+    assert recorded == [12345]
+
+
+def test_limit_sell_does_not_record(monkeypatch, capsys) -> None:
+    """A limit SELL records nothing (no new token enters the DW)."""
+    recorded = []
+    monkeypatch.setattr(trade, "dw_or_exit", lambda cs: "0xdw")
+    monkeypatch.setattr(trade, "make_clob_client", lambda cs, dw: _OrderClient())
+    monkeypatch.setattr(trade, "clear_cached_creds", lambda cs: None)
+    monkeypatch.setattr(
+        trade.pm, "record_dw_token_best_effort", lambda cs, tid: recorded.append(tid)
+    )
+    trade.cmd_limit(object(), "12345", "sell", 0.5, 10.0, "gtc", None)
+    assert recorded == []
+
+
+# --- funds sweep: refuse while resting orders back the DW (finding 2) -----------
+
+
+class _OrdersClient:
+    """A CLOB client returning a fixed open-order list (or raising)."""
+
+    def __init__(self, orders=None, boom=False):
+        """Configure the fixed open orders, or a failure to fetch them."""
+        self._orders = orders or []
+        self._boom = boom
+
+    def get_open_orders(self):
+        """Return the configured open orders, or raise if boom is set."""
+        if self._boom:
+            raise RuntimeError("clob down")
+        return self._orders
+
+
+def test_abort_if_open_orders_blocks(monkeypatch) -> None:
+    """An open order blocks the sweep with a cancel-first message."""
+    monkeypatch.setattr(
+        remote_signer, "make_clob_client", lambda cs, dw: _OrdersClient([{"id": "0xa"}])
+    )
+    with pytest.raises(SystemExit) as exc:
+        funds._abort_if_open_orders(object(), "0xdw")
+    assert "open CLOB order" in str(exc.value)
+
+
+def test_abort_if_open_orders_allows_when_none(monkeypatch) -> None:
+    """No open orders → the guard passes without raising."""
+    monkeypatch.setattr(
+        remote_signer, "make_clob_client", lambda cs, dw: _OrdersClient([])
+    )
+    funds._abort_if_open_orders(object(), "0xdw")
+
+
+def test_abort_if_open_orders_blocks_when_unverifiable(monkeypatch) -> None:
+    """A failure to check open orders blocks — don't sweep blind."""
+    monkeypatch.setattr(
+        remote_signer, "make_clob_client", lambda cs, dw: _OrdersClient(boom=True)
+    )
+    with pytest.raises(SystemExit) as exc:
+        funds._abort_if_open_orders(object(), "0xdw")
+    assert "could not verify" in str(exc.value)
+
+
+class _EmptyDwCS:
+    """A connect-signer stand-in whose DW reads as empty."""
+
+    safe_address = "0x" + "5a" * 20
+    w3 = object()
+
+
+def _mock_empty_dw(monkeypatch) -> list:
+    """Make cmd_sweep see an empty DW; return a list tracking guard calls."""
+    called = []
+    monkeypatch.setattr(funds, "dw_or_exit", lambda cs: "0xdw")
+    monkeypatch.setattr(funds, "_abort_if_open_orders", lambda cs, dw: called.append(1))
+    monkeypatch.setattr(funds.pm, "erc20_balance_of", lambda w3, token, owner: 0)
+    monkeypatch.setattr(funds.pm, "dw_open_tokens", lambda cs: [])
+    monkeypatch.setattr(funds, "_dw_position_token_ids", lambda dw: [])
+    return called
+
+
+def test_cmd_sweep_checks_orders_by_default(monkeypatch, capsys) -> None:
+    """Without --force, the open-orders guard runs."""
+    called = _mock_empty_dw(monkeypatch)
+    funds.cmd_sweep(_EmptyDwCS(), None, force=False)
+    assert called == [1]
+
+
+def test_cmd_sweep_force_skips_order_check(monkeypatch, capsys) -> None:
+    """--force bypasses the open-orders guard."""
+    called = _mock_empty_dw(monkeypatch)
+    funds.cmd_sweep(_EmptyDwCS(), None, force=True)
+    assert called == []
