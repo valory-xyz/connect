@@ -1,0 +1,162 @@
+# -*- coding: utf-8 -*-
+# ------------------------------------------------------------------------------
+#
+#   Copyright 2026 Valory AG
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# ------------------------------------------------------------------------------
+
+"""Tests for the skill's SDK-dependent glue (trade.py, remote_signer.py).
+
+These import ``py_clob_client_v2``, which is NOT a repo dependency (the agent
+pip-installs it into its own venv). So the whole module SKIPS when the SDK is
+absent — e.g. in the repo's CI — and runs where it is installed (the agent
+env, or a dev venv with the SDK). It covers the two branches the live e2e did
+not: the auth-failure creds-refresh retry, and the Account-shim routing.
+"""
+
+# mypy: ignore-errors
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("py_clob_client_v2")
+
+_SCRIPTS = (
+    Path(__file__).resolve().parent.parent
+    / "connect"
+    / "assets"
+    / "skills"
+    / "connect-polymarket"
+    / "scripts"
+)
+sys.path.insert(0, str(_SCRIPTS))
+
+import remote_signer  # noqa: E402
+import trade  # noqa: E402
+from py_clob_client_v2.exceptions import PolyApiException  # noqa: E402
+
+# --- trade._auth_failed ---------------------------------------------------------
+
+
+def test_auth_failed_on_401_status() -> None:
+    """A 401 status is treated as an auth failure (status-code path)."""
+    err = PolyApiException(error_msg="nope")
+    err.status_code = 401
+    assert trade._auth_failed(err) is True
+
+
+def test_auth_failed_on_message() -> None:
+    """An 'unauthorized' message is treated as an auth failure (message path)."""
+    assert trade._auth_failed(PolyApiException(error_msg="unauthorized")) is True
+
+
+def test_auth_failed_false_on_other() -> None:
+    """A non-auth rejection is not treated as an auth failure."""
+    assert trade._auth_failed(PolyApiException(error_msg="bad order")) is False
+
+
+# --- trade._run_client: refresh creds once on auth failure ----------------------
+
+
+class _FakeClient:
+    """A placeholder CLOB client (behaviour supplied by the op closure)."""
+
+
+def test_run_client_refreshes_creds_then_succeeds(monkeypatch, capsys) -> None:
+    """An auth failure clears cached creds, rebuilds the client, and retries."""
+    built = []
+    cleared = []
+    monkeypatch.setattr(trade, "dw_or_exit", lambda cs: "0xdw")
+    monkeypatch.setattr(
+        trade, "make_clob_client", lambda cs, dw: built.append(1) or _FakeClient()
+    )
+    monkeypatch.setattr(trade, "clear_cached_creds", lambda cs: cleared.append(1))
+
+    state = {"attempt": 0}
+
+    def op(client, dw):
+        state["attempt"] += 1
+        if state["attempt"] == 1:
+            raise PolyApiException(error_msg="unauthorized")
+        return {"ok": True}
+
+    trade._run_client(object(), op)
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert cleared == [1]  # creds cleared once
+    assert len(built) == 2  # client built twice (initial + rebuild)
+
+
+def test_run_client_non_auth_error_exits(monkeypatch) -> None:
+    """A non-auth rejection is not retried; it prints and exits 1."""
+    monkeypatch.setattr(trade, "dw_or_exit", lambda cs: "0xdw")
+    monkeypatch.setattr(trade, "make_clob_client", lambda cs, dw: _FakeClient())
+    monkeypatch.setattr(trade, "clear_cached_creds", lambda cs: None)
+
+    def op(client, dw):
+        raise PolyApiException(error_msg="bad order")
+
+    with pytest.raises(SystemExit):
+        trade._run_client(object(), op)
+
+
+# --- remote_signer._AccountShim: sentinel routes to connect, real key delegates --
+
+
+def test_account_shim_routes_sentinel_to_connect_signer() -> None:
+    """A RemoteSigner sentinel signs via connect, not eth_account."""
+
+    class _CS:
+        agent_eoa = "0x" + "9e" * 20
+
+        def sign_digest(self, digest):
+            return "0x" + "ab" * 65
+
+    signer = remote_signer.RemoteSigner(_CS())
+    signed = remote_signer._AccountShim._sign_hash(b"\x11" * 32, private_key=signer)
+    assert signed.signature.hex().endswith("ab" * 65)
+
+
+def test_account_shim_delegates_real_key(monkeypatch) -> None:
+    """A real (non-sentinel) key falls through to eth_account unchanged."""
+    called = {}
+    monkeypatch.setattr(
+        remote_signer._RealAccount,
+        "_sign_hash",
+        staticmethod(
+            lambda digest, private_key=None: called.setdefault("k", private_key)
+        ),
+    )
+    remote_signer._AccountShim._sign_hash(b"\x11" * 32, private_key=b"\x02" * 32)
+    assert called["k"] == b"\x02" * 32
+
+
+# --- remote_signer.clear_cached_creds -------------------------------------------
+
+
+def test_clear_cached_creds_removes_and_persists(monkeypatch) -> None:
+    """Cached creds are dropped and the trimmed state is written back."""
+    saved = {}
+    monkeypatch.setattr(
+        remote_signer, "load_state", lambda cs: {"clob_creds": {"api_key": "x"}, "k": 1}
+    )
+    monkeypatch.setattr(
+        remote_signer, "save_state", lambda cs, state: saved.update(state)
+    )
+    remote_signer.clear_cached_creds(object())
+    assert "clob_creds" not in saved
+    assert saved.get("k") == 1
