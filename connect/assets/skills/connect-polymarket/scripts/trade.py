@@ -127,7 +127,9 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
                 )
         except SystemExit:
             raise
-        except Exception:  # noqa: BLE001 - empty book etc.: let the CLOB answer
+        # advisory preflight (empty book etc.): on any error, fall through and
+        # let the CLOB itself validate the order.
+        except Exception:  # noqa: BLE001 # nosec B110
             pass
         order = client.create_market_order(
             MarketOrderArgs(
