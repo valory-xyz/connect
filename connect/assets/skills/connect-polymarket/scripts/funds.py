@@ -190,7 +190,9 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
         indexed = _dw_position_token_ids(dw)
         candidate_ids = list(dict.fromkeys([*recorded, *indexed]))
         discovery = f"{len(recorded)} recorded + {len(indexed)} indexed"
+    pending_buy_ids = set(pm.dw_pending_buy_tokens(cs))
     swept_tokens = {}
+    unresolved_buy_ids = []
     for token_id in candidate_ids:
         balance = pm.erc1155_balance_of(cs.w3, pm.CTF, dw, token_id)
         if balance > 0:
@@ -203,8 +205,18 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
                     ),
                 }
             )
+        elif token_id in pending_buy_ids:
+            unresolved_buy_ids.append(token_id)
+    unresolved_buy_ids.extend(pending_buy_ids - set(candidate_ids))
     warning = None
-    if not token_ids and not candidate_ids:
+    if unresolved_buy_ids:
+        warning = (
+            "unresolved buy intent(s) remain for token(s) "
+            f"{', '.join(str(t) for t in sorted(unresolved_buy_ids))}; no position "
+            "is visible on-chain yet, so re-run sweep after settlement/indexing "
+            "before treating the DW as fully recovered"
+        )
+    elif not token_ids and not candidate_ids:
         warning = (
             "no positions discovered (recorded state and indexer both empty); "
             "if a buy just happened the indexer may lag — re-run with "
@@ -223,20 +235,21 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
     # Confirm on-chain, not just the relayer's self-reported state.
     receipt = cs.wait_receipt(tx_hash) if tx_hash else {"status": None}
     confirmed = ok and receipt.get("status") == 1
-    if confirmed:
+    if confirmed and swept_tokens:
         # These tokens have left the DW — drop them from the holdings hint.
         pm.forget_dw_tokens(cs, [int(t) for t in swept_tokens])
-    pm.print_json(
-        {
-            "swept": confirmed,
-            "pusd": pm.units_to_usd(pusd_balance),
-            "positions": swept_tokens,
-            "discovery": discovery,
-            "relayer_state": state,
-            "onchain_status": receipt.get("status"),
-            "tx_hash": tx_hash,
-        }
-    )
+    result = {
+        "swept": confirmed,
+        "pusd": pm.units_to_usd(pusd_balance),
+        "positions": swept_tokens,
+        "discovery": discovery,
+        "relayer_state": state,
+        "onchain_status": receipt.get("status"),
+        "tx_hash": tx_hash,
+    }
+    if warning:
+        result["warning"] = warning
+    pm.print_json(result)
     if not confirmed:
         raise SystemExit(
             "sweep not confirmed on-chain — funds remain in the DW; "

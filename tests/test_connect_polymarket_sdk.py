@@ -175,7 +175,103 @@ class _OrderClient:
 
     def post_order(self, order, order_type):
         """Return a dummy live-order response."""
-        return {"status": "live"}
+        return {"success": True, "status": "live"}
+
+
+class _AmbiguousOrderClient:
+    """A CLOB client that loses the response after a possible acceptance."""
+
+    def post_order(self, order, order_type):
+        """Raise without an HTTP status, leaving submission outcome unknown."""
+        raise PolyApiException(error_msg="Request exception!")
+
+
+def test_buy_hint_survives_ambiguous_submission(monkeypatch) -> None:
+    """A lost response must leave a hint that a later sweep can inspect."""
+    recorded = []
+    confirmed = []
+    rejected = []
+    monkeypatch.setattr(
+        trade.pm, "record_dw_buy_intent", lambda cs, tid: recorded.append(tid)
+    )
+    monkeypatch.setattr(
+        trade.pm, "confirm_dw_buy_intent", lambda cs, tid: confirmed.append(tid)
+    )
+    monkeypatch.setattr(
+        trade.pm, "reject_dw_buy_intent", lambda cs, tid: rejected.append(tid)
+    )
+
+    with pytest.raises(PolyApiException):
+        trade._post_buy_with_recovery_hint(
+            _AmbiguousOrderClient(), object(), "12345", "order", "FOK"
+        )
+
+    assert recorded == [12345]
+    assert confirmed == []
+    assert rejected == []
+
+
+def test_buy_hint_is_cleared_on_definitive_rejection(monkeypatch) -> None:
+    """A success-false response is definitive and must not leave stale intent."""
+    recorded = []
+    rejected = []
+    monkeypatch.setattr(
+        trade.pm, "record_dw_buy_intent", lambda cs, tid: recorded.append(tid)
+    )
+    monkeypatch.setattr(
+        trade.pm, "reject_dw_buy_intent", lambda cs, tid: rejected.append(tid)
+    )
+    client = _OrderClient()
+    monkeypatch.setattr(
+        client,
+        "post_order",
+        lambda order, order_type: {"success": False, "errorMsg": "not filled"},
+    )
+
+    with pytest.raises(SystemExit, match="not filled"):
+        trade._post_buy_with_recovery_hint(client, object(), "12345", "order", "FOK")
+
+    assert recorded == [12345]
+    assert rejected == [12345]
+
+
+def test_buy_hint_is_confirmed_on_accepted_response(monkeypatch) -> None:
+    """An accepted response resolves pending state but keeps the sweep hint."""
+    recorded = []
+    confirmed = []
+    monkeypatch.setattr(
+        trade.pm, "record_dw_buy_intent", lambda cs, tid: recorded.append(tid)
+    )
+    monkeypatch.setattr(
+        trade.pm, "confirm_dw_buy_intent", lambda cs, tid: confirmed.append(tid)
+    )
+
+    response = trade._post_buy_with_recovery_hint(
+        _OrderClient(), object(), "12345", "order", "FOK"
+    )
+
+    assert response["success"] is True
+    assert recorded == [12345]
+    assert confirmed == [12345]
+
+
+def test_buy_confirmation_state_failure_does_not_mask_acceptance(
+    monkeypatch, capsys
+) -> None:
+    """Post-success bookkeeping failure keeps pending state and only warns."""
+    monkeypatch.setattr(trade.pm, "record_dw_buy_intent", lambda cs, tid: None)
+
+    def fail_confirmation(cs, token_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(trade.pm, "confirm_dw_buy_intent", fail_confirmation)
+
+    response = trade._post_buy_with_recovery_hint(
+        _OrderClient(), object(), "12345", "order", "FOK"
+    )
+
+    assert response["success"] is True
+    assert "action itself succeeded" in capsys.readouterr().err
 
 
 def test_limit_buy_records_token(monkeypatch, capsys) -> None:
@@ -185,8 +281,9 @@ def test_limit_buy_records_token(monkeypatch, capsys) -> None:
     monkeypatch.setattr(trade, "make_clob_client", lambda cs, dw: _OrderClient())
     monkeypatch.setattr(trade, "clear_cached_creds", lambda cs: None)
     monkeypatch.setattr(
-        trade.pm, "record_dw_token_best_effort", lambda cs, tid: recorded.append(tid)
+        trade.pm, "record_dw_buy_intent", lambda cs, tid: recorded.append(tid)
     )
+    monkeypatch.setattr(trade.pm, "confirm_dw_buy_intent", lambda cs, tid: None)
     trade.cmd_limit(object(), "12345", "buy", 0.5, 10.0, "gtc", None)
     assert recorded == [12345]
 
@@ -198,7 +295,7 @@ def test_limit_sell_does_not_record(monkeypatch, capsys) -> None:
     monkeypatch.setattr(trade, "make_clob_client", lambda cs, dw: _OrderClient())
     monkeypatch.setattr(trade, "clear_cached_creds", lambda cs: None)
     monkeypatch.setattr(
-        trade.pm, "record_dw_token_best_effort", lambda cs, tid: recorded.append(tid)
+        trade.pm, "record_dw_buy_intent", lambda cs, tid: recorded.append(tid)
     )
     trade.cmd_limit(object(), "12345", "sell", 0.5, 10.0, "gtc", None)
     assert recorded == []
@@ -264,6 +361,7 @@ def _mock_empty_dw(monkeypatch) -> list:
     monkeypatch.setattr(funds, "_abort_if_open_orders", lambda cs, dw: called.append(1))
     monkeypatch.setattr(funds.pm, "erc20_balance_of", lambda w3, token, owner: 0)
     monkeypatch.setattr(funds.pm, "dw_open_tokens", lambda cs: [])
+    monkeypatch.setattr(funds.pm, "dw_pending_buy_tokens", lambda cs: [])
     monkeypatch.setattr(funds, "_dw_position_token_ids", lambda dw: [])
     return called
 

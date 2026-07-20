@@ -42,13 +42,38 @@ import argparse
 
 import pm_common as pm
 
+POSITIONS_PAGE_LIMIT = 500
+POSITIONS_MAX_OFFSET = 10_000
+
 
 def _redeemable(cs: pm.ConnectSigner) -> list:
-    positions = pm.http_get_json(
-        f"{pm.DATA_API}/positions",
-        params={"user": cs.safe_address, "redeemable": "true", "sizeThreshold": 0},
-    )
-    return positions or []
+    """Return every redeemable safe position, across all data-API pages."""
+    positions = []
+    offset = 0
+    while True:
+        page = (
+            pm.http_get_json(
+                f"{pm.DATA_API}/positions",
+                params={
+                    "user": cs.safe_address,
+                    "redeemable": "true",
+                    "sizeThreshold": 0,
+                    "limit": POSITIONS_PAGE_LIMIT,
+                    "offset": offset,
+                },
+            )
+            or []
+        )
+        positions.extend(page)
+        if len(page) < POSITIONS_PAGE_LIMIT:
+            return positions
+        next_offset = offset + POSITIONS_PAGE_LIMIT
+        if next_offset > POSITIONS_MAX_OFFSET:
+            raise SystemExit(
+                "redeemable-position pagination limit reached; refusing to "
+                "claim all positions were discovered"
+            )
+        offset = next_offset
 
 
 def _ensure_adapter_approvals(cs: pm.ConnectSigner) -> list:

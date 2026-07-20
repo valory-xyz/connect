@@ -38,6 +38,7 @@ shares ("--shares").
 """
 
 import argparse
+import sys
 import time
 
 import pm_common as pm
@@ -86,6 +87,44 @@ def _run_client(cs: pm.ConnectSigner, op) -> None:
             pm.print_json({"error": str(getattr(e2, "error_msg", "") or e2)})
             raise SystemExit(1) from e2
     pm.print_json(result)
+
+
+def _post_buy_with_recovery_hint(client, cs, token_id: str, order, order_type):
+    """Post a buy while preserving enough state to recover an unknown outcome.
+
+    Persist the token before submission: the CLOB may accept and fill the order
+    even if its response is lost. A later sweep can then check the DW's
+    on-chain balance directly instead of depending on the lagging data API.
+
+    A 4xx or ``success: false`` response is a definitive rejection, so remove
+    the hint. Transport errors and server-side failures remain ambiguous and
+    deliberately retain it; a harmless zero-balance hint is safer than an
+    undiscoverable filled position.
+    """
+    token_id_int = int(token_id)
+    # This happens before funds may move, so a state-write failure must abort
+    # the submission rather than proceed without the recovery hint.
+    pm.record_dw_buy_intent(cs, token_id_int)
+    try:
+        response = client.post_order(order, order_type)
+    except PolyApiException as e:
+        status_code = getattr(e, "status_code", None)
+        if status_code is not None and 400 <= status_code < 500:
+            pm.reject_dw_buy_intent(cs, token_id_int)
+        raise
+    if isinstance(response, dict) and response.get("success") is False:
+        pm.reject_dw_buy_intent(cs, token_id_int)
+        detail = response.get("errorMsg") or "CLOB rejected the buy"
+        raise SystemExit(str(detail))
+    try:
+        pm.confirm_dw_buy_intent(cs, token_id_int)
+    except Exception as e:  # noqa: BLE001 - post succeeded; retain pending marker
+        print(
+            f"WARNING: could not mark buy {token_id_int} confirmed ({e}); "
+            "the action itself succeeded and its recovery hint remains pending",
+            file=sys.stderr,
+        )
+    return response
 
 
 def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) -> None:
@@ -140,13 +179,7 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
                 user_usdc_balance=balance,
             )
         )
-        resp = client.post_order(order, ot)
-        # The DW may now hold this outcome — record it so a later sweep won't
-        # miss it even if the data-API indexer lags (see funds.py cmd_sweep).
-        # Best-effort: the order already filled, so a state-write hiccup must
-        # not make this command look failed.
-        pm.record_dw_token_best_effort(cs, int(token_id))
-        return resp
+        return _post_buy_with_recovery_hint(client, cs, token_id, order, ot)
 
     _run_client(cs, op)
 
@@ -214,10 +247,9 @@ def cmd_limit(  # pylint: disable=too-many-arguments
                 expiration=expiration,
             )
         )
-        resp = client.post_order(order, ot)
         if order_side == BUY:
-            pm.record_dw_token_best_effort(cs, int(token_id))
-        return resp
+            return _post_buy_with_recovery_hint(client, cs, token_id, order, ot)
+        return client.post_order(order, ot)
 
     _run_client(cs, op)
 

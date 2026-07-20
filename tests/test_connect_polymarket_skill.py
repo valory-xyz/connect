@@ -467,6 +467,23 @@ def test_dw_token_hint_round_trip(tmp_path) -> None:
     assert pm.dw_open_tokens(cs) == [9]
 
 
+def test_dw_buy_intent_lifecycle(tmp_path) -> None:
+    """Buy intent is atomic, then either confirmed or fully rejected."""
+    cs = _cs_with_workspace(tmp_path)
+    pm.record_dw_buy_intent(cs, 5)
+    assert pm.dw_open_tokens(cs) == [5]
+    assert pm.dw_pending_buy_tokens(cs) == [5]
+
+    pm.confirm_dw_buy_intent(cs, 5)
+    assert pm.dw_open_tokens(cs) == [5]
+    assert pm.dw_pending_buy_tokens(cs) == []
+
+    pm.record_dw_buy_intent(cs, 9)
+    pm.reject_dw_buy_intent(cs, 9)
+    assert pm.dw_open_tokens(cs) == [5]
+    assert pm.dw_pending_buy_tokens(cs) == []
+
+
 # --- funds.cmd_sweep: state-union discovery + on-chain confirm (C1/A1) -----------
 
 
@@ -502,6 +519,7 @@ def _sweep_mocks(monkeypatch, *, pusd, ctf_balance, recorded, indexed):
     monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, tok, dw: pusd)
     monkeypatch.setattr(pm, "erc1155_balance_of", lambda w3, ctf, dw, tid: ctf_balance)
     monkeypatch.setattr(pm, "dw_open_tokens", lambda cs: recorded)
+    monkeypatch.setattr(pm, "dw_pending_buy_tokens", lambda cs: [])
     monkeypatch.setattr(funds, "_dw_position_token_ids", lambda dw: indexed)
     monkeypatch.setattr(pm, "dw_nonce", lambda w3, dw: 1)
     monkeypatch.setattr(funds, "RelayerProxyClient", _FakeRelayer)
@@ -537,6 +555,20 @@ def test_sweep_raises_when_not_confirmed_onchain(monkeypatch) -> None:
         funds.cmd_sweep(_SweepCS({"status": 0, "tx_hash": "0xhash"}), None)
 
 
+def test_sweep_warns_when_ambiguous_buy_has_not_settled(monkeypatch, capsys) -> None:
+    """Moving residual pUSD must disclose a still-unresolved buy intent."""
+    _sweep_mocks(monkeypatch, pusd=1_000_000, ctf_balance=0, recorded=[7], indexed=[])
+    monkeypatch.setattr(pm, "dw_pending_buy_tokens", lambda cs: [7])
+    _FakeRelayer.result = (True, "STATE_MINED", "0xhash")
+
+    funds.cmd_sweep(_SweepCS({"status": 1, "tx_hash": "0xhash"}), None)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["swept"] is True
+    assert "unresolved buy" in out["warning"]
+    assert "7" in out["warning"]
+
+
 # --- redeem.cmd_all: attempt all, fail loud if any failed (I1) -------------------
 
 
@@ -565,6 +597,43 @@ def test_redeem_all_success(monkeypatch, capsys) -> None:
     monkeypatch.setattr(redeem, "_redeem_one", lambda cs, cid, idx, nr: {"status": 1})
     redeem.cmd_all(object())
     assert json.loads(capsys.readouterr().out)["failed"] == 0
+
+
+def test_redeemable_fetches_every_page(monkeypatch) -> None:
+    """Redeemable discovery continues until the API returns a short page."""
+    monkeypatch.setattr(redeem, "POSITIONS_PAGE_LIMIT", 2)
+    seen = []
+
+    def fake_get(url, params=None):
+        seen.append(dict(params))
+        return {
+            0: [{"conditionId": "0x1"}, {"conditionId": "0x2"}],
+            2: [{"conditionId": "0x3"}],
+        }[params["offset"]]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    assert [p["conditionId"] for p in redeem._redeemable(_SweepCS({}))] == [
+        "0x1",
+        "0x2",
+        "0x3",
+    ]
+    assert [params["offset"] for params in seen] == [0, 2]
+    assert all(params["limit"] == 2 for params in seen)
+
+
+def test_redeemable_fails_at_api_offset_ceiling(monkeypatch) -> None:
+    """A full final addressable page must not be mistaken for completion."""
+    monkeypatch.setattr(redeem, "POSITIONS_PAGE_LIMIT", 2)
+    monkeypatch.setattr(redeem, "POSITIONS_MAX_OFFSET", 2)
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: [{"conditionId": "0x1"}, {"conditionId": "0x2"}],
+    )
+
+    with pytest.raises(SystemExit, match="pagination limit"):
+        redeem._redeemable(_SweepCS({}))
 
 
 # --- markets.cmd_market: events-index fallback ----------------------------------

@@ -281,6 +281,12 @@ def dw_open_tokens(cs: ConnectSigner) -> list:
     return [int(t) for t in raw]
 
 
+def dw_pending_buy_tokens(cs: ConnectSigner) -> list:
+    """Token ids whose buy submission outcome is still ambiguous."""
+    raw = load_state(cs).get("dw_pending_buy_tokens") or []
+    return [int(t) for t in raw]
+
+
 def record_dw_token(cs: ConnectSigner, token_id: int) -> None:
     """Note that the DW may now hold `token_id` (idempotent)."""
     state = load_state(cs)
@@ -289,6 +295,41 @@ def record_dw_token(cs: ConnectSigner, token_id: int) -> None:
         tokens.add(int(token_id))
         state["dw_open_tokens"] = sorted(tokens)
         save_state(cs, state)
+
+
+def record_dw_buy_intent(cs: ConnectSigner, token_id: int) -> None:
+    """Atomically persist a pre-submission holdings hint and pending marker."""
+    state = load_state(cs)
+    token_id = int(token_id)
+    tokens = {int(t) for t in state.get("dw_open_tokens") or []}
+    pending = {int(t) for t in state.get("dw_pending_buy_tokens") or []}
+    tokens.add(token_id)
+    pending.add(token_id)
+    state["dw_open_tokens"] = sorted(tokens)
+    state["dw_pending_buy_tokens"] = sorted(pending)
+    save_state(cs, state)
+
+
+def confirm_dw_buy_intent(cs: ConnectSigner, token_id: int) -> None:
+    """Mark a buy response accepted while retaining its holdings hint."""
+    state = load_state(cs)
+    pending = {int(t) for t in state.get("dw_pending_buy_tokens") or []}
+    pending.discard(int(token_id))
+    state["dw_pending_buy_tokens"] = sorted(pending)
+    save_state(cs, state)
+
+
+def reject_dw_buy_intent(cs: ConnectSigner, token_id: int) -> None:
+    """Remove both markers after a definitive buy rejection."""
+    state = load_state(cs)
+    token_id = int(token_id)
+    tokens = {int(t) for t in state.get("dw_open_tokens") or []}
+    pending = {int(t) for t in state.get("dw_pending_buy_tokens") or []}
+    tokens.discard(token_id)
+    pending.discard(token_id)
+    state["dw_open_tokens"] = sorted(tokens)
+    state["dw_pending_buy_tokens"] = sorted(pending)
+    save_state(cs, state)
 
 
 def record_dw_token_best_effort(cs: ConnectSigner, token_id: int) -> bool:
@@ -315,10 +356,11 @@ def record_dw_token_best_effort(cs: ConnectSigner, token_id: int) -> bool:
 def forget_dw_tokens(cs: ConnectSigner, token_ids: list) -> None:
     """Drop `token_ids` from the DW-holdings hint (after they leave the DW)."""
     state = load_state(cs)
-    remaining = {int(t) for t in state.get("dw_open_tokens") or []} - {
-        int(t) for t in token_ids
-    }
+    forgotten = {int(t) for t in token_ids}
+    remaining = {int(t) for t in state.get("dw_open_tokens") or []} - forgotten
+    pending = {int(t) for t in state.get("dw_pending_buy_tokens") or []} - forgotten
     state["dw_open_tokens"] = sorted(remaining)
+    state["dw_pending_buy_tokens"] = sorted(pending)
     save_state(cs, state)
 
 
