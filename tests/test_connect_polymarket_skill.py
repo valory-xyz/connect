@@ -651,6 +651,66 @@ def test_sweep_warns_after_sweeping_visible_pending_token(
     assert "7" in out["warning"]
 
 
+def test_sweep_reports_confirmed_result_when_hint_cleanup_fails(
+    monkeypatch, capsys
+) -> None:
+    """A post-confirmation state-write failure cannot hide the on-chain result."""
+    _sweep_mocks(
+        monkeypatch,
+        pusd=0,
+        ctf_balance=500,
+        recorded=[7],
+        indexed=[],
+        pending=[7],
+    )
+
+    def fail_cleanup(cs, token_ids):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pm, "forget_dw_tokens", fail_cleanup)
+    _FakeRelayer.result = (True, "STATE_MINED", "0xhash")
+
+    funds.cmd_sweep(_SweepCS({"status": 1, "tx_hash": "0xhash"}), None)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["swept"] is True
+    assert out["tx_hash"] == "0xhash"
+    assert out["onchain_status"] == 1
+    assert "state bookkeeping" in out["warning"]
+
+
+def test_sweep_falls_back_when_pending_state_reload_fails(monkeypatch, capsys) -> None:
+    """A post-confirmation state-read failure uses the pre-sweep snapshot."""
+    _sweep_mocks(
+        monkeypatch,
+        pusd=0,
+        ctf_balance=500,
+        recorded=[7],
+        indexed=[],
+        pending=[7],
+    )
+    reads = iter(([7], SystemExit("corrupt state")))
+
+    def read_pending(cs):
+        result = next(reads)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(pm, "dw_pending_buy_tokens", read_pending)
+    monkeypatch.setattr(pm, "forget_dw_tokens", lambda cs, token_ids: None)
+    _FakeRelayer.result = (True, "STATE_MINED", "0xhash")
+
+    funds.cmd_sweep(_SweepCS({"status": 1, "tx_hash": "0xhash"}), None)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["swept"] is True
+    assert out["tx_hash"] == "0xhash"
+    assert out["onchain_status"] == 1
+    assert "unresolved buy" in out["warning"]
+    assert "pre-sweep pending state" in out["warning"]
+
+
 def test_sweep_raises_when_not_confirmed_onchain(monkeypatch) -> None:
     """Relayer 'mined' but a status-0 receipt must fail loud (funds not moved)."""
     _sweep_mocks(monkeypatch, pusd=1_000_000, ctf_balance=0, recorded=[], indexed=[])
@@ -743,6 +803,17 @@ def test_redeemable_fails_at_api_offset_ceiling(monkeypatch) -> None:
     )
 
     with pytest.raises(SystemExit, match="pagination limit"):
+        redeem._redeemable(_SweepCS({}))
+
+
+@pytest.mark.parametrize("payload", [None, {"positions": []}])
+def test_redeemable_rejects_non_list_page(monkeypatch, payload) -> None:
+    """A malformed later page cannot masquerade as pagination completion."""
+    monkeypatch.setattr(redeem, "POSITIONS_PAGE_LIMIT", 1)
+    pages = iter(([{"conditionId": "0x1"}], payload))
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: next(pages))
+
+    with pytest.raises(SystemExit, match="expected a list"):
         redeem._redeemable(_SweepCS({}))
 
 

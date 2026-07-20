@@ -51,19 +51,22 @@ def _redeemable(cs: pm.ConnectSigner) -> list:
     positions = []
     offset = 0
     while True:
-        page = (
-            pm.http_get_json(
-                f"{pm.DATA_API}/positions",
-                params={
-                    "user": cs.safe_address,
-                    "redeemable": "true",
-                    "sizeThreshold": 0,
-                    "limit": POSITIONS_PAGE_LIMIT,
-                    "offset": offset,
-                },
-            )
-            or []
+        page = pm.http_get_json(
+            f"{pm.DATA_API}/positions",
+            params={
+                "user": cs.safe_address,
+                "redeemable": "true",
+                "sizeThreshold": 0,
+                "limit": POSITIONS_PAGE_LIMIT,
+                "offset": offset,
+            },
         )
+        if not isinstance(page, list):
+            raise SystemExit(
+                "redeemable-position API returned malformed data at offset "
+                f"{offset}: expected a list, got {type(page).__name__}; refusing "
+                "to claim all positions were discovered"
+            )
         positions.extend(page)
         if len(page) < POSITIONS_PAGE_LIMIT:
             return positions

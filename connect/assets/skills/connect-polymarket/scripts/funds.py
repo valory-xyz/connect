@@ -281,10 +281,25 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
     # Confirm on-chain, not just the relayer's self-reported state.
     receipt = cs.wait_receipt(tx_hash) if tx_hash else {"status": None}
     confirmed = ok and receipt.get("status") == 1
+    state_warnings = []
     if confirmed and swept_tokens:
         # These tokens have left the DW — drop them from the holdings hint.
-        pm.forget_dw_tokens(cs, [int(t) for t in swept_tokens])
-    remaining_pending_ids = set(pm.dw_pending_buy_tokens(cs))
+        try:
+            pm.forget_dw_tokens(cs, [int(t) for t in swept_tokens])
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            state_warnings.append(
+                "sweep confirmed on-chain, but state bookkeeping failed while "
+                f"dropping swept holdings hints ({e}); the on-chain result is "
+                "authoritative"
+            )
+    try:
+        remaining_pending_ids = set(pm.dw_pending_buy_tokens(cs))
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        remaining_pending_ids = pending_buy_ids
+        state_warnings.append(
+            f"could not reload pending-buy state after sweep ({e}); using the "
+            "pre-sweep pending state for the recovery warning"
+        )
     warning = (
         _pending_buy_warning(
             remaining_pending_ids,
@@ -294,6 +309,8 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
         )
         or empty_discovery_warning
     )
+    if state_warnings:
+        warning = " ".join(filter(None, [warning, *state_warnings]))
     result = {
         "swept": confirmed,
         "pusd": pm.units_to_usd(pusd_balance),
