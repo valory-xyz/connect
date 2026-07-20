@@ -186,6 +186,20 @@ class _AmbiguousOrderClient:
         raise PolyApiException(error_msg="Request exception!")
 
 
+class _HttpErrorOrderClient:
+    """A CLOB client that returns an HTTP error with an ambiguous outcome."""
+
+    def __init__(self, status_code):
+        """Store the HTTP status to raise from post_order."""
+        self.status_code = status_code
+
+    def post_order(self, order, order_type):
+        """Raise a CLOB API exception carrying the configured status."""
+        err = PolyApiException(error_msg="response lost")
+        err.status_code = self.status_code
+        raise err
+
+
 def test_buy_hint_survives_ambiguous_submission(monkeypatch) -> None:
     """A lost response must leave a hint that a later sweep can inspect."""
     recorded = []
@@ -204,6 +218,31 @@ def test_buy_hint_survives_ambiguous_submission(monkeypatch) -> None:
     with pytest.raises(PolyApiException):
         trade._post_buy_with_recovery_hint(
             _AmbiguousOrderClient(), object(), "12345", "order", "FOK"
+        )
+
+    assert recorded == [12345]
+    assert confirmed == []
+    assert rejected == []
+
+
+def test_buy_hint_survives_http_408(monkeypatch) -> None:
+    """A timeout response is ambiguous and must retain its recovery marker."""
+    recorded = []
+    confirmed = []
+    rejected = []
+    monkeypatch.setattr(
+        trade.pm, "record_dw_buy_intent", lambda cs, tid: recorded.append(tid)
+    )
+    monkeypatch.setattr(
+        trade.pm, "confirm_dw_buy_intent", lambda cs, tid: confirmed.append(tid)
+    )
+    monkeypatch.setattr(
+        trade.pm, "reject_dw_buy_intent", lambda cs, tid: rejected.append(tid)
+    )
+
+    with pytest.raises(PolyApiException):
+        trade._post_buy_with_recovery_hint(
+            _HttpErrorOrderClient(408), object(), "12345", "order", "FOK"
         )
 
     assert recorded == [12345]

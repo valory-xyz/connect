@@ -166,11 +166,12 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
     Refuses to run while any resting CLOB order is open (its collateral or
     shares must stay in the DW to settle); cancel those first, or pass
     --force. Position discovery, when --token-ids is not given, is the UNION
-    of two sources: the tokens this skill recorded at buy time
-    (`dw_open_tokens`, immediate) and the data-API's view (which can lag right
-    after a buy). Relying on the indexer alone would silently drop a
-    just-bought position. If both come back empty the DW is reported empty
-    with a warning to pass --token-ids if a buy just happened.
+    of three sources: the tokens this skill recorded at buy time
+    (`dw_open_tokens`, immediate), unresolved buy submissions, and the
+    data-API's view (which can lag right after a buy). Relying on the indexer
+    alone would silently drop a just-bought position. If all come back empty
+    the DW is reported empty with a warning to pass --token-ids if a buy just
+    happened.
     """
     dw = dw_or_exit(cs)
     if not force:
@@ -182,15 +183,20 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
         calls.append(
             {"target": pm.PUSD, "data": pm.encode_erc20_transfer(safe, pusd_balance)}
         )
+    pending_buy_ids = set(pm.dw_pending_buy_tokens(cs))
     if token_ids:
         candidate_ids = list(dict.fromkeys(int(t) for t in token_ids))
         discovery = "explicit --token-ids"
     else:
         recorded = pm.dw_open_tokens(cs)
         indexed = _dw_position_token_ids(dw)
-        candidate_ids = list(dict.fromkeys([*recorded, *indexed]))
-        discovery = f"{len(recorded)} recorded + {len(indexed)} indexed"
-    pending_buy_ids = set(pm.dw_pending_buy_tokens(cs))
+        candidate_ids = list(
+            dict.fromkeys([*recorded, *sorted(pending_buy_ids), *indexed])
+        )
+        discovery = (
+            f"{len(recorded)} recorded + {len(pending_buy_ids)} pending + "
+            f"{len(indexed)} indexed"
+        )
     swept_tokens = {}
     unresolved_buy_ids = []
     for token_id in candidate_ids:

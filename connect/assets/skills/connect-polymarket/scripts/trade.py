@@ -96,22 +96,16 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order, order_type):
     even if its response is lost. A later sweep can then check the DW's
     on-chain balance directly instead of depending on the lagging data API.
 
-    A 4xx or ``success: false`` response is a definitive rejection, so remove
-    the hint. Transport errors and server-side failures remain ambiguous and
-    deliberately retain it; a harmless zero-balance hint is safer than an
-    undiscoverable filled position.
+    Only a structured ``success: false`` response is treated as a definitive
+    rejection. HTTP exceptions remain ambiguous: a timeout, rate limit, or
+    intermediary response may arrive after the request reached the CLOB. A
+    harmless zero-balance hint is safer than an undiscoverable filled position.
     """
     token_id_int = int(token_id)
     # This happens before funds may move, so a state-write failure must abort
     # the submission rather than proceed without the recovery hint.
     pm.record_dw_buy_intent(cs, token_id_int)
-    try:
-        response = client.post_order(order, order_type)
-    except PolyApiException as e:
-        status_code = getattr(e, "status_code", None)
-        if status_code is not None and 400 <= status_code < 500:
-            pm.reject_dw_buy_intent(cs, token_id_int)
-        raise
+    response = client.post_order(order, order_type)
     if isinstance(response, dict) and response.get("success") is False:
         pm.reject_dw_buy_intent(cs, token_id_int)
         detail = response.get("errorMsg") or "CLOB rejected the buy"

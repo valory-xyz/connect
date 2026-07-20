@@ -468,7 +468,7 @@ def test_dw_token_hint_round_trip(tmp_path) -> None:
 
 
 def test_dw_buy_intent_lifecycle(tmp_path) -> None:
-    """Buy intent is atomic, then either confirmed or fully rejected."""
+    """A confirmed buy clears its pending intent but retains its hint."""
     cs = _cs_with_workspace(tmp_path)
     pm.record_dw_buy_intent(cs, 5)
     assert pm.dw_open_tokens(cs) == [5]
@@ -478,10 +478,62 @@ def test_dw_buy_intent_lifecycle(tmp_path) -> None:
     assert pm.dw_open_tokens(cs) == [5]
     assert pm.dw_pending_buy_tokens(cs) == []
 
-    pm.record_dw_buy_intent(cs, 9)
-    pm.reject_dw_buy_intent(cs, 9)
+
+def test_ambiguous_then_accepted_repeat_keeps_pending_intent(tmp_path) -> None:
+    """Accepting repeat B must not erase ambiguous submission A."""
+    cs = _cs_with_workspace(tmp_path)
+    pm.record_dw_buy_intent(cs, 5)
+    pm.record_dw_buy_intent(cs, 5)
+    pm.confirm_dw_buy_intent(cs, 5)
+
+    assert pm.dw_open_tokens(cs) == [5]
+    assert pm.dw_pending_buy_tokens(cs) == [5]
+    assert pm.load_state(cs)["dw_pending_buy_counts"] == {"5": 1}
+
+
+def test_legacy_pending_token_migrates_to_reference_count(tmp_path) -> None:
+    """The token-set state written by older versions remains recoverable."""
+    cs = _cs_with_workspace(tmp_path)
+    pm.save_state(cs, {"dw_open_tokens": [5], "dw_pending_buy_tokens": [5]})
+
+    pm.record_dw_buy_intent(cs, 5)
+
+    state = pm.load_state(cs)
+    assert state["dw_pending_buy_counts"] == {"5": 2}
+    assert "dw_pending_buy_tokens" not in state
+
+
+def test_ambiguous_then_rejected_repeat_keeps_pending_intent(tmp_path) -> None:
+    """Rejecting repeat B must not erase ambiguous submission A."""
+    cs = _cs_with_workspace(tmp_path)
+    pm.record_dw_buy_intent(cs, 5)
+    pm.record_dw_buy_intent(cs, 5)
+    pm.reject_dw_buy_intent(cs, 5)
+
+    assert pm.dw_open_tokens(cs) == [5]
+    assert pm.dw_pending_buy_tokens(cs) == [5]
+    assert pm.load_state(cs)["dw_pending_buy_counts"] == {"5": 1}
+
+
+def test_existing_hint_survives_rejected_repeat_buy(tmp_path) -> None:
+    """A rejected repeat cannot delete a pre-existing holdings hint."""
+    cs = _cs_with_workspace(tmp_path)
+    pm.record_dw_token(cs, 5)
+    pm.record_dw_buy_intent(cs, 5)
+    pm.reject_dw_buy_intent(cs, 5)
+
     assert pm.dw_open_tokens(cs) == [5]
     assert pm.dw_pending_buy_tokens(cs) == []
+
+
+def test_forget_dw_token_preserves_pending_intent(tmp_path) -> None:
+    """Sweeping one fill must not erase another unresolved submission."""
+    cs = _cs_with_workspace(tmp_path)
+    pm.record_dw_buy_intent(cs, 5)
+    pm.forget_dw_tokens(cs, [5])
+
+    assert pm.dw_open_tokens(cs) == []
+    assert pm.dw_pending_buy_tokens(cs) == [5]
 
 
 # --- funds.cmd_sweep: state-union discovery + on-chain confirm (C1/A1) -----------
@@ -511,7 +563,7 @@ class _FakeRelayer:
         return _FakeRelayer.result
 
 
-def _sweep_mocks(monkeypatch, *, pusd, ctf_balance, recorded, indexed):
+def _sweep_mocks(monkeypatch, *, pusd, ctf_balance, recorded, indexed, pending=()):
     # Bypass the open-orders guard here (it needs the CLOB SDK); it has its
     # own tests in test_connect_polymarket_sdk.py.
     monkeypatch.setattr(funds, "_abort_if_open_orders", lambda cs, dw: None)
@@ -519,7 +571,7 @@ def _sweep_mocks(monkeypatch, *, pusd, ctf_balance, recorded, indexed):
     monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, tok, dw: pusd)
     monkeypatch.setattr(pm, "erc1155_balance_of", lambda w3, ctf, dw, tid: ctf_balance)
     monkeypatch.setattr(pm, "dw_open_tokens", lambda cs: recorded)
-    monkeypatch.setattr(pm, "dw_pending_buy_tokens", lambda cs: [])
+    monkeypatch.setattr(pm, "dw_pending_buy_tokens", lambda cs: list(pending))
     monkeypatch.setattr(funds, "_dw_position_token_ids", lambda dw: indexed)
     monkeypatch.setattr(pm, "dw_nonce", lambda w3, dw: 1)
     monkeypatch.setattr(funds, "RelayerProxyClient", _FakeRelayer)
@@ -547,6 +599,28 @@ def test_sweep_confirms_and_forgets(monkeypatch, capsys) -> None:
     assert forgotten == [7]
 
 
+def test_sweep_checks_pending_token_without_holdings_hint(monkeypatch, capsys) -> None:
+    """A pending-only token remains an on-chain sweep candidate."""
+    forgotten = []
+    _sweep_mocks(
+        monkeypatch,
+        pusd=0,
+        ctf_balance=500,
+        recorded=[],
+        indexed=[],
+        pending=[7],
+    )
+    monkeypatch.setattr(pm, "forget_dw_tokens", lambda cs, ids: forgotten.extend(ids))
+    _FakeRelayer.result = (True, "STATE_MINED", "0xhash")
+
+    funds.cmd_sweep(_SweepCS({"status": 1, "tx_hash": "0xhash"}), None)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["swept"] is True
+    assert out["positions"] == {"7": 500}
+    assert forgotten == [7]
+
+
 def test_sweep_raises_when_not_confirmed_onchain(monkeypatch) -> None:
     """Relayer 'mined' but a status-0 receipt must fail loud (funds not moved)."""
     _sweep_mocks(monkeypatch, pusd=1_000_000, ctf_balance=0, recorded=[], indexed=[])
@@ -557,8 +631,14 @@ def test_sweep_raises_when_not_confirmed_onchain(monkeypatch) -> None:
 
 def test_sweep_warns_when_ambiguous_buy_has_not_settled(monkeypatch, capsys) -> None:
     """Moving residual pUSD must disclose a still-unresolved buy intent."""
-    _sweep_mocks(monkeypatch, pusd=1_000_000, ctf_balance=0, recorded=[7], indexed=[])
-    monkeypatch.setattr(pm, "dw_pending_buy_tokens", lambda cs: [7])
+    _sweep_mocks(
+        monkeypatch,
+        pusd=1_000_000,
+        ctf_balance=0,
+        recorded=[7],
+        indexed=[],
+        pending=[7],
+    )
     _FakeRelayer.result = (True, "STATE_MINED", "0xhash")
 
     funds.cmd_sweep(_SweepCS({"status": 1, "tx_hash": "0xhash"}), None)
