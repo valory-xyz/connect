@@ -621,6 +621,36 @@ def test_sweep_checks_pending_token_without_holdings_hint(monkeypatch, capsys) -
     assert forgotten == [7]
 
 
+def test_sweep_warns_after_sweeping_visible_pending_token(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """A swept balance cannot suppress another unresolved buy submission."""
+    cs = _SweepCS({"status": 1, "tx_hash": "0xhash"})
+    cs.workspace = tmp_path
+    pm.save_state(
+        cs,
+        {"dw_open_tokens": [7], "dw_pending_buy_counts": {"7": 1}},
+    )
+    monkeypatch.setattr(funds, "_abort_if_open_orders", lambda signer, dw: None)
+    monkeypatch.setattr(funds, "dw_or_exit", lambda signer: DW_ADDR)
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, tok, dw: 0)
+    monkeypatch.setattr(pm, "erc1155_balance_of", lambda w3, ctf, dw, tid: 500)
+    monkeypatch.setattr(funds, "_dw_position_token_ids", lambda dw: [])
+    monkeypatch.setattr(pm, "dw_nonce", lambda w3, dw: 1)
+    monkeypatch.setattr(funds, "RelayerProxyClient", _FakeRelayer)
+    _FakeRelayer.result = (True, "STATE_MINED", "0xhash")
+
+    funds.cmd_sweep(cs, None)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["swept"] is True
+    assert out["positions"] == {"7": 500}
+    assert pm.dw_pending_buy_tokens(cs) == [7]
+    assert "unresolved buy" in out["warning"]
+    assert "was swept" in out["warning"]
+    assert "7" in out["warning"]
+
+
 def test_sweep_raises_when_not_confirmed_onchain(monkeypatch) -> None:
     """Relayer 'mined' but a status-0 receipt must fail loud (funds not moved)."""
     _sweep_mocks(monkeypatch, pusd=1_000_000, ctf_balance=0, recorded=[], indexed=[])

@@ -156,6 +156,44 @@ def _abort_if_open_orders(cs: pm.ConnectSigner, dw: str) -> None:
         )
 
 
+def _pending_buy_warning(
+    pending_ids: set,
+    checked_ids: set,
+    visible_ids: set,
+    sweep_confirmed: bool,
+) -> str | None:
+    """Describe every unresolved buy, including tokens with swept balances."""
+    if not pending_ids:
+        return None
+    visible_ids = pending_ids & visible_ids
+    hidden_ids = (pending_ids & checked_ids) - visible_ids
+    unchecked_ids = pending_ids - checked_ids
+    details = []
+    if visible_ids:
+        action = "was swept" if sweep_confirmed else "is still visible"
+        details.append(
+            f"a balance {action} for token(s) "
+            f"{', '.join(str(t) for t in sorted(visible_ids))}, but pending "
+            "submission state remains and additional balance may settle later"
+        )
+    if hidden_ids:
+        details.append(
+            "no position is visible on-chain yet for token(s) "
+            f"{', '.join(str(t) for t in sorted(hidden_ids))}"
+        )
+    if unchecked_ids:
+        details.append(
+            "the explicit token filter did not check token(s) "
+            f"{', '.join(str(t) for t in sorted(unchecked_ids))}"
+        )
+    return (
+        "unresolved buy intent(s) remain for token(s) "
+        f"{', '.join(str(t) for t in sorted(pending_ids))}; "
+        f"{'; '.join(details)}. Re-run sweep after settlement/indexing before "
+        "treating the DW as fully recovered"
+    )
+
+
 def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> None:
     """Sweep the DW's pUSD AND positions back to the safe ("whatever's there").
 
@@ -198,11 +236,14 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
             f"{len(indexed)} indexed"
         )
     swept_tokens = {}
-    unresolved_buy_ids = []
+    visible_pending_ids = set()
+    checked_pending_ids = pending_buy_ids & set(candidate_ids)
     for token_id in candidate_ids:
         balance = pm.erc1155_balance_of(cs.w3, pm.CTF, dw, token_id)
         if balance > 0:
             swept_tokens[str(token_id)] = balance
+            if token_id in pending_buy_ids:
+                visible_pending_ids.add(token_id)
             calls.append(
                 {
                     "target": pm.CTF,
@@ -211,23 +252,22 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
                     ),
                 }
             )
-        elif token_id in pending_buy_ids:
-            unresolved_buy_ids.append(token_id)
-    unresolved_buy_ids.extend(pending_buy_ids - set(candidate_ids))
-    warning = None
-    if unresolved_buy_ids:
-        warning = (
-            "unresolved buy intent(s) remain for token(s) "
-            f"{', '.join(str(t) for t in sorted(unresolved_buy_ids))}; no position "
-            "is visible on-chain yet, so re-run sweep after settlement/indexing "
-            "before treating the DW as fully recovered"
-        )
-    elif not token_ids and not candidate_ids:
-        warning = (
+    empty_discovery_warning = None
+    if not token_ids and not candidate_ids:
+        empty_discovery_warning = (
             "no positions discovered (recorded state and indexer both empty); "
             "if a buy just happened the indexer may lag — re-run with "
             "--token-ids <id> to be certain nothing is left in the DW"
         )
+    warning = (
+        _pending_buy_warning(
+            pending_buy_ids,
+            checked_pending_ids,
+            visible_pending_ids,
+            sweep_confirmed=False,
+        )
+        or empty_discovery_warning
+    )
     if not calls:
         result = {"swept": False, "note": "DepositWallet is empty (pUSD and positions)"}
         if warning:
@@ -244,6 +284,16 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
     if confirmed and swept_tokens:
         # These tokens have left the DW — drop them from the holdings hint.
         pm.forget_dw_tokens(cs, [int(t) for t in swept_tokens])
+    remaining_pending_ids = set(pm.dw_pending_buy_tokens(cs))
+    warning = (
+        _pending_buy_warning(
+            remaining_pending_ids,
+            checked_pending_ids,
+            visible_pending_ids,
+            sweep_confirmed=confirmed,
+        )
+        or empty_discovery_warning
+    )
     result = {
         "swept": confirmed,
         "pusd": pm.units_to_usd(pusd_balance),
