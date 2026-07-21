@@ -49,6 +49,7 @@ from connect.safe import (
     APPROVE_SELECTOR,
     EXEC_TRANSACTION_SELECTOR,
     EXEC_TRANSACTION_TYPES,
+    decode_approve,
 )
 from connect.server.settings_routes import WHITELIST_FROZEN
 from connect.settings import (
@@ -61,6 +62,7 @@ from connect.settings import (
     default_whitelist,
     defaults,
     derive_mac_key,
+    token_approve_targets,
 )
 from connect.signer import Signer, SignerError
 
@@ -525,6 +527,34 @@ class TestDefaults:
         )
         assert default_whitelist() == {}
         assert defaults().protected.mode == MODE_RESTRICTED
+
+    def test_token_approve_targets_maps_tokens_to_trackers(self) -> None:
+        """Each configured payment token maps to its mech balance tracker."""
+        usdc = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+        usdc_tracker = "0x5c50ebc17d002a4484585c8fbf62f51953493c0b"
+        polygon = token_approve_targets("polygon")
+        assert polygon[usdc] == usdc_tracker
+        assert len(polygon) == 2  # USDC and OLAS
+        # gnosis has an OLAS tracker but no USDC one: only the funded token maps
+        olas = "0xce11e14225575945b8e6dc0d4f2dd4c570f79d9f"
+        gnosis = token_approve_targets("gnosis")
+        assert olas in gnosis
+        assert usdc not in gnosis
+
+    def test_token_approve_targets_unknown_chain_is_empty(self) -> None:
+        """A chain mech-client does not know yields no targets."""
+        assert token_approve_targets("testchain") == {}
+
+    def test_token_approve_targets_broken_mech_client_is_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken mech-client fails closed rather than taking the guard down."""
+        monkeypatch.setattr("mech_client.utils.constants.CHAIN_NAME_TO_ID", None)
+        assert token_approve_targets("polygon") == {}
+
+    def test_decode_approve_returns_none_on_undecodable(self) -> None:
+        """The approve selector with unparseable args decodes to no spender."""
+        assert decode_approve("0x" + APPROVE_SELECTOR + "ff") is None
 
 
 def make_guard(
