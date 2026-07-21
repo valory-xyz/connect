@@ -78,7 +78,7 @@ def assets_dir() -> Path:
 
 
 def mcp_url() -> str:
-    """The MCP endpoint URL for .mcp.json.
+    """Return the MCP endpoint URL for .mcp.json.
 
     Keep the trailing slash. The server serves MCP at /mcp/, and the agent-UI
     route answers GET on /mcp, so a POST to /mcp (no slash) returns 405 and the
