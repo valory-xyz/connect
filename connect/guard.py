@@ -53,8 +53,9 @@ from connect.safe import (
     EXEC_TRANSACTION_TYPES,
     OPERATION_CALL,
     ZERO_ADDRESS,
+    decode_approve,
 )
-from connect.settings import MODE_RESTRICTED, SettingsStore
+from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
 
 
 class GuardError(Exception):
@@ -66,6 +67,7 @@ class _SafeExec:
     """The execTransaction fields this gate has an opinion about."""
 
     to: str
+    data: str
     operation: int
     gas_price: int
     gas_token: str
@@ -87,6 +89,7 @@ class _SafeExec:
             raise GuardError(f"could not decode execTransaction calldata: {e}") from e
         return cls(
             to=str(decoded[0]),
+            data="0x" + decoded[2].hex(),
             operation=decoded[3],
             gas_price=decoded[6],
             gas_token=str(decoded[7]),
@@ -203,6 +206,18 @@ class Guard:
                 "(gasPrice=0, gasToken=0x0, refundReceiver=0x0) — a gas refund "
                 "would pay out of the safe outside the whitelist"
             )
+        tracker = token_approve_targets(chain).get(exec_call.to.lower())
+        if tracker is not None:
+            # a mech payment token: the safe may only approve it for the tracker,
+            # never transfer or anything else (an address-level whitelist entry
+            # would allow those; a token-paid mech needs just this approve)
+            spender = decode_approve(exec_call.data)
+            if spender is None or spender.lower() != tracker:
+                raise GuardError(
+                    f"restricted mode: on the payment token {exec_call.to} only "
+                    f"approve(spender={tracker}) is allowed"
+                )
+            return
         whitelist = self._store.load().protected.whitelist
         if exec_call.to.lower() not in whitelist.get(chain, ()):
             # the whitelist is not editable through the API yet, so pointing at

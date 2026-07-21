@@ -192,8 +192,9 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     only via the off-chain flow (unrestricted mode). Payment token contracts
     are NOT whitelisted either: the whitelist is address-level, so allowing a
     token contract would allow arbitrary `transfer`s of the safe's balance,
-    not just the `approve` a token-paid mech needs. Operators can whitelist
-    those explicitly when they want token-paid mechs in restricted mode.
+    not just the `approve` a token-paid mech needs. Token-paid mechs are
+    handled by token_approve_targets() instead, which the guard restricts to
+    `approve(spender=tracker)`.
 
     Importing the address (rather than hardcoding a copy) keeps a single
     source of truth for fresh installs and resets. Existing installs keep
@@ -220,6 +221,43 @@ def _mech_system_addresses() -> dict[str, list[str]]:
         # every guarded decision loads settings, and a tampered/missing file
         # loads defaults. Fail closed to an empty whitelist instead.
         logger.warning("could not load mech marketplace addresses: %s", e)
+        return {}
+
+
+def token_approve_targets(chain: str) -> dict[str, str]:
+    """Payment token -> its mech balance tracker for one chain, from mech-client.
+
+    In restricted mode the safe may `approve` these tokens, but only with the
+    tracker as spender (the guard enforces that). A token is included only when
+    both it and its tracker are configured for the chain. Fail closed to empty
+    if mech-client cannot be read.
+    """
+    # pylint: disable=import-outside-toplevel
+    try:
+        from mech_client.infrastructure.config import (
+            CHAIN_TO_PRICE_TOKEN_OLAS,
+            CHAIN_TO_PRICE_TOKEN_USDC,
+            CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS,
+            CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC,
+        )
+        from mech_client.utils.constants import CHAIN_NAME_TO_ID
+
+        chain_id = CHAIN_NAME_TO_ID.get(chain.lower())
+        if chain_id is None:
+            return {}
+        zero_address = "0x" + "00" * 20
+        result: dict[str, str] = {}
+        for tokens, trackers in (
+            (CHAIN_TO_PRICE_TOKEN_USDC, CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC),
+            (CHAIN_TO_PRICE_TOKEN_OLAS, CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS),
+        ):
+            token = (tokens.get(chain_id) or "").lower()
+            tracker = (trackers.get(chain_id) or "").lower()
+            if token and tracker and zero_address not in (token, tracker):
+                result[token] = tracker
+        return result
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.warning("could not load mech token payment addresses: %s", e)
         return {}
 
 
