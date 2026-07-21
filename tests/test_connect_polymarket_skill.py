@@ -563,6 +563,50 @@ class _FakeRelayer:
         return _FakeRelayer.result
 
 
+def test_dw_position_token_ids_fetches_every_page(monkeypatch) -> None:
+    """Every indexed DW-position page contributes sweep candidates."""
+    monkeypatch.setattr(funds, "POSITIONS_PAGE_LIMIT", 2, raising=False)
+    seen = []
+
+    def fake_get(url, params=None):
+        seen.append(dict(params))
+        return {
+            0: [{"asset": "11"}, {"asset": "12"}],
+            2: [{"asset": "13"}],
+        }[params.get("offset", 0)]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    assert funds._dw_position_token_ids(DW_ADDR) == [11, 12, 13]
+    assert [params["offset"] for params in seen] == [0, 2]
+    assert all(params["limit"] == 2 for params in seen)
+
+
+@pytest.mark.parametrize("payload", [None, {"positions": []}])
+def test_dw_position_token_ids_rejects_non_list_page(monkeypatch, payload) -> None:
+    """Malformed indexed-position pages cannot masquerade as completion."""
+    monkeypatch.setattr(funds, "POSITIONS_PAGE_LIMIT", 1, raising=False)
+    pages = iter(([{"asset": "11"}], payload))
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: next(pages))
+
+    with pytest.raises(SystemExit, match="expected a list"):
+        funds._dw_position_token_ids(DW_ADDR)
+
+
+def test_dw_position_token_ids_fails_at_api_offset_ceiling(monkeypatch) -> None:
+    """A full final addressable page cannot be mistaken for completion."""
+    monkeypatch.setattr(funds, "POSITIONS_PAGE_LIMIT", 2, raising=False)
+    monkeypatch.setattr(funds, "POSITIONS_MAX_OFFSET", 2, raising=False)
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: [{"asset": "11"}, {"asset": "12"}],
+    )
+
+    with pytest.raises(SystemExit, match="pagination limit"):
+        funds._dw_position_token_ids(DW_ADDR)
+
+
 def _sweep_mocks(monkeypatch, *, pusd, ctf_balance, recorded, indexed, pending=()):
     # Bypass the open-orders guard here (it needs the CLOB SDK); it has its
     # own tests in test_connect_polymarket_sdk.py.

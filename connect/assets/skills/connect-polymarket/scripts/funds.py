@@ -43,6 +43,9 @@ import pm_common as pm
 from deposit_wallet import _resolve_dw, dw_or_exit
 from relayer_proxy import RelayerProxyClient
 
+POSITIONS_PAGE_LIMIT = 500
+POSITIONS_MAX_OFFSET = 10_000
+
 
 def cmd_balances(cs: pm.ConnectSigner) -> None:
     """Report pUSD / USDC.e / POL for the safe, the DW and the agent EOA."""
@@ -117,16 +120,38 @@ def cmd_top_up(cs: pm.ConnectSigner, amount: float) -> None:
 
 
 def _dw_position_token_ids(dw: str) -> list:
-    """Outcome-token ids the DW currently holds, from the data API."""
-    positions = pm.http_get_json(
-        f"{pm.DATA_API}/positions", params={"user": dw, "sizeThreshold": 0}
-    )
+    """Outcome-token ids the DW currently holds, across all data-API pages."""
     ids = []
-    for position in positions or []:
-        asset = position.get("asset")
-        if asset:
-            ids.append(int(asset))
-    return ids
+    offset = 0
+    while True:
+        positions = pm.http_get_json(
+            f"{pm.DATA_API}/positions",
+            params={
+                "user": dw,
+                "sizeThreshold": 0,
+                "limit": POSITIONS_PAGE_LIMIT,
+                "offset": offset,
+            },
+        )
+        if not isinstance(positions, list):
+            raise SystemExit(
+                "DW-position API returned malformed data at offset "
+                f"{offset}: expected a list, got {type(positions).__name__}; "
+                "refusing to claim all positions were discovered"
+            )
+        for position in positions:
+            asset = position.get("asset")
+            if asset:
+                ids.append(int(asset))
+        if len(positions) < POSITIONS_PAGE_LIMIT:
+            return ids
+        next_offset = offset + POSITIONS_PAGE_LIMIT
+        if next_offset > POSITIONS_MAX_OFFSET:
+            raise SystemExit(
+                "DW-position pagination limit reached; refusing to claim all "
+                "positions were discovered"
+            )
+        offset = next_offset
 
 
 def _abort_if_open_orders(cs: pm.ConnectSigner, dw: str) -> None:

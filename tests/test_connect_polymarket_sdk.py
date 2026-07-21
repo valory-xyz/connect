@@ -115,6 +115,32 @@ def test_run_client_non_auth_error_exits(monkeypatch) -> None:
         trade._run_client(object(), op)
 
 
+def test_disabled_auth_retry_does_not_resubmit_operation(monkeypatch, capsys) -> None:
+    """Order placement surfaces an auth-looking error after one submission."""
+    attempts = []
+    built = []
+    cleared = []
+    monkeypatch.setattr(trade, "dw_or_exit", lambda cs: "0xdw")
+    monkeypatch.setattr(
+        trade, "make_clob_client", lambda cs, dw: built.append(1) or _FakeClient()
+    )
+    monkeypatch.setattr(trade, "clear_cached_creds", lambda cs: cleared.append(1))
+
+    def op(client, dw):
+        attempts.append(client)
+        raise PolyApiException(error_msg="unauthorized")
+
+    with pytest.raises(SystemExit):
+        trade._run_client(object(), op, retry_auth=False)
+
+    assert len(attempts) == 1
+    assert len(built) == 1
+    assert cleared == [1]
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"] == "unauthorized"
+    assert "reconcile before retrying" in output["warning"]
+
+
 # --- remote_signer._AccountShim: sentinel routes to connect, real key delegates --
 
 
@@ -200,6 +226,14 @@ class _HttpErrorOrderClient:
         raise err
 
 
+class _AuthMessageOrderClient:
+    """A CLOB client raising an auth-looking error without an HTTP status."""
+
+    def post_order(self, order, order_type):
+        """Raise a message-only error whose submission outcome is ambiguous."""
+        raise PolyApiException(error_msg="unauthorized")
+
+
 def test_buy_hint_survives_ambiguous_submission(monkeypatch) -> None:
     """A lost response must leave a hint that a later sweep can inspect."""
     recorded = []
@@ -247,6 +281,42 @@ def test_buy_hint_survives_http_408(monkeypatch) -> None:
 
     assert recorded == [12345]
     assert confirmed == []
+    assert rejected == []
+
+
+def test_buy_hint_is_cleared_on_clean_http_401(monkeypatch) -> None:
+    """A positive authentication rejection resolves its unsubmitted intent."""
+    recorded = []
+    rejected = []
+    monkeypatch.setattr(
+        trade.pm, "record_dw_buy_intent", lambda cs, tid: recorded.append(tid)
+    )
+    monkeypatch.setattr(
+        trade.pm, "reject_dw_buy_intent", lambda cs, tid: rejected.append(tid)
+    )
+
+    with pytest.raises(PolyApiException):
+        trade._post_buy_with_recovery_hint(
+            _HttpErrorOrderClient(401), object(), "12345", "order", "FOK"
+        )
+
+    assert recorded == [12345]
+    assert rejected == [12345]
+
+
+def test_buy_hint_survives_message_only_auth_error(monkeypatch) -> None:
+    """An auth-looking message without status remains an ambiguous submission."""
+    rejected = []
+    monkeypatch.setattr(trade.pm, "record_dw_buy_intent", lambda cs, tid: None)
+    monkeypatch.setattr(
+        trade.pm, "reject_dw_buy_intent", lambda cs, tid: rejected.append(tid)
+    )
+
+    with pytest.raises(PolyApiException):
+        trade._post_buy_with_recovery_hint(
+            _AuthMessageOrderClient(), object(), "12345", "order", "FOK"
+        )
+
     assert rejected == []
 
 
@@ -338,6 +408,52 @@ def test_limit_sell_does_not_record(monkeypatch, capsys) -> None:
     )
     trade.cmd_limit(object(), "12345", "sell", 0.5, 10.0, "gtc", None)
     assert recorded == []
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda: trade.cmd_buy(object(), "12345", 1.0, "fok"),
+        lambda: trade.cmd_sell(object(), "12345", 1.0, "fak"),
+        lambda: trade.cmd_limit(object(), "12345", "buy", 0.5, 10.0, "gtc", None),
+        lambda: trade.cmd_limit(object(), "12345", "sell", 0.5, 10.0, "gtc", None),
+    ],
+)
+def test_order_placement_disables_whole_operation_auth_retry(
+    monkeypatch, invoke
+) -> None:
+    """No order-placement command may rebuild and resubmit a fresh order."""
+    retry_modes = []
+    monkeypatch.setattr(
+        trade,
+        "_run_client",
+        lambda cs, op, retry_auth=True: retry_modes.append(retry_auth),
+    )
+
+    invoke()
+
+    assert retry_modes == [False]
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda: trade.cmd_order(object(), "0xorder"),
+        lambda: trade.cmd_cancel(object(), "0xorder"),
+    ],
+)
+def test_existing_order_operations_keep_auth_retry(monkeypatch, invoke) -> None:
+    """Reads and ID-based cancellation retain their retry-safe behavior."""
+    retry_modes = []
+    monkeypatch.setattr(
+        trade,
+        "_run_client",
+        lambda cs, op, retry_auth=True: retry_modes.append(retry_auth),
+    )
+
+    invoke()
+
+    assert retry_modes == [True]
 
 
 # --- funds sweep: refuse while resting orders back the DW (finding 2) -----------

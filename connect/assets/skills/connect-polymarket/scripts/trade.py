@@ -63,13 +63,19 @@ def _auth_failed(e: PolyApiException) -> bool:
     return code == 401 or "unauthorized" in msg or "apikey" in msg or "api key" in msg
 
 
-def _run_client(cs: pm.ConnectSigner, op) -> None:
+def _definitive_auth_rejection(e: PolyApiException) -> bool:
+    """Whether the response proves authentication failed before submission."""
+    return getattr(e, "status_code", None) == 401
+
+
+def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
     """Build a DW-funded CLOB client, run op(client, dw), print the result.
 
-    On an auth-class failure the cached creds are cleared and the client is
-    rebuilt once (re-deriving fresh creds), so a server-side key rotation
-    self-heals instead of failing every order. Other rejections print the
-    API's error body and exit 1.
+    Replay-safe operations may rebuild the client and retry once after an
+    auth-class failure. Order placement disables that retry: rerunning its
+    closure would construct a newly signed order and risk duplicate execution.
+    Cached credentials are still cleared so an explicit operator retry starts
+    with freshly derived credentials.
     """
     dw = dw_or_exit(cs)
     client = make_clob_client(cs, dw)
@@ -80,6 +86,17 @@ def _run_client(cs: pm.ConnectSigner, op) -> None:
             pm.print_json({"error": str(getattr(e, "error_msg", "") or e)})
             raise SystemExit(1) from e
         clear_cached_creds(cs)
+        if not retry_auth:
+            error = {
+                "error": str(getattr(e, "error_msg", "") or e),
+                "retry": "not attempted automatically: operation is not replay-safe",
+            }
+            if not _definitive_auth_rejection(e):
+                error["warning"] = (
+                    "submission outcome may be ambiguous; reconcile before retrying"
+                )
+            pm.print_json(error)
+            raise SystemExit(1) from e
         client = make_clob_client(cs, dw)  # re-derives creds
         try:
             result = op(client, dw)
@@ -96,16 +113,22 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order, order_type):
     even if its response is lost. A later sweep can then check the DW's
     on-chain balance directly instead of depending on the lagging data API.
 
-    Only a structured ``success: false`` response is treated as a definitive
-    rejection. HTTP exceptions remain ambiguous: a timeout, rate limit, or
-    intermediary response may arrive after the request reached the CLOB. A
-    harmless zero-balance hint is safer than an undiscoverable filled position.
+    A structured ``success: false`` response or status-code 401 authentication
+    rejection proves that no order was submitted. Other HTTP exceptions remain
+    ambiguous: a timeout, rate limit, intermediary response, or message-only
+    auth error may arrive after the request reached the CLOB. A harmless
+    zero-balance hint is safer than an undiscoverable filled position.
     """
     token_id_int = int(token_id)
     # This happens before funds may move, so a state-write failure must abort
     # the submission rather than proceed without the recovery hint.
     pm.record_dw_buy_intent(cs, token_id_int)
-    response = client.post_order(order, order_type)
+    try:
+        response = client.post_order(order, order_type)
+    except PolyApiException as e:
+        if _definitive_auth_rejection(e):
+            pm.reject_dw_buy_intent(cs, token_id_int)
+        raise
     if isinstance(response, dict) and response.get("success") is False:
         pm.reject_dw_buy_intent(cs, token_id_int)
         detail = response.get("errorMsg") or "CLOB rejected the buy"
@@ -175,7 +198,7 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
         )
         return _post_buy_with_recovery_hint(client, cs, token_id, order, ot)
 
-    _run_client(cs, op)
+    _run_client(cs, op, retry_auth=False)
 
 
 def cmd_sell(
@@ -201,7 +224,7 @@ def cmd_sell(
         )
         return client.post_order(order, ot)
 
-    _run_client(cs, op)
+    _run_client(cs, op, retry_auth=False)
 
 
 def cmd_limit(  # pylint: disable=too-many-arguments
@@ -245,7 +268,7 @@ def cmd_limit(  # pylint: disable=too-many-arguments
             return _post_buy_with_recovery_hint(client, cs, token_id, order, ot)
         return client.post_order(order, ot)
 
-    _run_client(cs, op)
+    _run_client(cs, op, retry_auth=False)
 
 
 def cmd_order(cs: pm.ConnectSigner, order_id: str) -> None:
