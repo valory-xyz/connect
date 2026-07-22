@@ -13,14 +13,18 @@ private key — and never need to.
 ## Wallet model
 
 - **Agent EOA** — one address across all chains; the signer holds its key.
-- **Service safe(s)** — one Gnosis Safe per configured chain, owned by the
-  agent EOA with threshold 1. Working funds live in the safe.
-- Call the `wallet_info` MCP tool first to get the EOA, per-chain safes,
-  RPC URLs, and balances.
+- **Service safe** — a Gnosis Safe owned by the EOA (threshold 1) on each
+  chain you were deployed to, usually one. Working funds live there; the
+  EOA pays gas.
+- Call `wallet_info` first: **act only on `actionable_chains`** — usually a
+  single chain. The launcher configures an RPC for every chain it supports,
+  so the rest are listed with no safe or no gas. That is the normal shape,
+  not something to fix; `not_actionable_because` says which state each is in.
 
 ## MCP tools (connect server)
 
-- `wallet_info()` — addresses, per-chain RPC URLs, native balances.
+- `wallet_info()` — addresses, guardrail mode, `actionable_chains`, and per
+  chain its safe, balances and `not_actionable_because`.
 - `safe_transaction(chain, target, value, data, request_id, wait_for_receipt, timeout)`
   — **the normal way to act on-chain.** Describes the call the *safe* makes —
   an approval, a swap, a stake, a claim, a transfer, anything. Most carry no

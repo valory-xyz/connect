@@ -67,7 +67,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
 
     @mcp.tool()
     async def wallet_info() -> dict:
-        """Agent EOA, per-chain service safes, RPC URLs, balances and guard mode."""
+        """Agent EOA, guard mode, and per-chain safes and balances.
+
+        Act only on `actionable_chains` (safe + gas, usually one); the rest
+        give a `not_actionable_because`.
+        """
 
         def _run() -> dict:
             overview = wallet.wallet_overview(config, signer)
