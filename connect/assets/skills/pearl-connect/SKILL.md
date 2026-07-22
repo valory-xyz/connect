@@ -44,8 +44,8 @@ private key — and never need to.
   in restricted mode.
 - `mech_tools(chain, priority_mech, limit, offset)` — discover live mechs
   (most deliveries first; paginate with limit/offset, `total` tells you
-  when to stop) and, given a `priority_mech`, its payment type and tool
-  names.
+  when to stop) and, given a `priority_mech`, its payment type, tool names
+  and `offchain_capable`. `chain` defaults to a chain that has a safe.
 - `mech_request(prompt, tool, chain, legacy_on_chain, priority_mech, auto_deposit, timeout, max_payment)` —
   send a request to an Olas mech (an on-chain-paid AI service) and wait for its delivery.
   See "Mech requests" below.
@@ -65,9 +65,8 @@ On top of that floor, the signer runs in one of two user-controlled modes
 - **unrestricted** — anything else you ask for is signed.
 - **restricted** (default) — the safe may only CALL a **whitelisted** address
   (any value, any calldata). Raw digest signing (`sign_message`) is disabled
-  entirely, which also disables off-chain mech requests — use
-  `mech_request(..., legacy_on_chain=true)`. A `send_transaction` from the EOA
-  can reach nothing but the safe.
+  entirely, which also disables off-chain mech requests — send them on-chain
+  instead. A `send_transaction` from the EOA can reach nothing but the safe.
 
 Every blocked request fails with the violated rule. You cannot lift the
 restrictions; the user changes the mode in the agent UI with their keystore
@@ -79,13 +78,27 @@ whitelist itself cannot be edited yet.
 [Mechs](https://olas.network/services/ai-mechs) are on-chain-paid AI services.
 `mech_request` drives the whole flow through the signer: metadata to IPFS,
 payment via the service safe, request, and delivery watching. Start with
-`mech_tools()` to pick a mech and a tool it serves.
+`mech_tools()` to pick a mech, then call it again with that `priority_mech`
+to see the tools it serves and whether it can be reached off-chain.
+
+Two things decide which flow you can use, and both are worth checking before
+composing a prompt:
+
+- **Payment asset.** A mech's `mech_type` names what it charges in (native,
+  USDC, OLAS). A mech pricing in an asset the safe does not hold cannot be
+  paid, and `auto_deposit` will fail rather than convert anything.
+- **`offchain_capable`.** The off-chain flow needs an endpoint published in
+  the mech's service metadata, and few mechs publish one; those that do not
+  serve on-chain requests only.
+  When it is `false`, `offchain_note` says why and what to do — a mech with no
+  endpoint must go on-chain, an unreadable fetch is worth retrying first. An
+  off-chain request to such a mech is refused up front, not part-way through.
 
 - `legacy_on_chain=false` (default): off-chain request — no transaction; it
   raw-signs a request digest and spends prepaid balance held by the mech
-  BalanceTracker. Requires unrestricted mode. With `auto_deposit=true` (the
-  default) an insufficient prepaid balance is topped up from the safe once
-  and the request retried.
+  BalanceTracker. Requires unrestricted mode **and** an `offchain_capable`
+  mech. With `auto_deposit=true` (the default) an insufficient prepaid
+  balance is topped up from the safe once and the request retried.
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
   via the service safe. Works in restricted mode out of the box (the
   marketplace contract ships in the default whitelist).

@@ -27,6 +27,7 @@ import json
 import os
 import secrets
 import time
+import typing as t
 from pathlib import Path
 
 import httpx
@@ -441,25 +442,111 @@ def test_wallet_reports_only_actionable_chains_on_fork(
     _set_balance(rpc_url, account.address, 10 * 10**18)
 
 
-def _pick_live_mech(mech_service: MechService) -> tuple[str, str] | None:
-    """Find a native-payment mech (and a tool name) via the mech_tools surface.
+def _iter_gnosis_mechs(
+    mech_service: MechService, limit: int | None = None
+) -> t.Iterator[tuple[str, dict]]:
+    """Yield (address, mech_tools report) for live gnosis mechs.
 
-    Exercises MechService.tools() against the live subgraph + fork. A missing
-    tool list degrades to a default tool name: mech-client's tool validation
-    is best-effort and no delivery can happen on a fork anyway.
+    Exercises MechService.tools() against the live subgraph + fork. Mechs that
+    post-date the fork snapshot revert on the info call; that is expected here
+    and skipped rather than failed.
     """
     listing = mech_service.tools(chain="gnosis")
     assert listing["mechs"], "subgraph returned no live mechs"
-    for entry in listing["mechs"]:
+    entries = listing["mechs"] if limit is None else listing["mechs"][:limit]
+    for entry in entries:
         try:
-            # some mechs may post-date the fork snapshot -> calls revert
             info = mech_service.tools(chain="gnosis", priority_mech=entry["address"])
         except Exception:  # pylint: disable=broad-except # nosec B112
             continue
+        yield str(entry["address"]), info
+
+
+def _pick_live_mech(mech_service: MechService) -> tuple[str, str] | None:
+    """Find a native-payment mech (and a tool name) via the mech_tools surface.
+
+    A missing tool list degrades to a default tool name: mech-client's tool
+    validation is best-effort and no delivery can happen on a fork anyway.
+    """
+    for address, info in _iter_gnosis_mechs(mech_service):
         if info["payment_type"] == "NATIVE":
             tools = info.get("tools") or ["prediction-online"]
-            return str(entry["address"]), str(tools[0])
+            return address, str(tools[0])
     return None
+
+
+def _pick_offchain_incapable_mech(
+    mech_service: MechService,
+) -> tuple[tuple[str, dict] | None, int]:
+    """Find a live mech the off-chain flow cannot reach, and how many were read.
+
+    Reachability is decided by the `url` field of the mech's published service
+    metadata, which is real network state no fixture can stand in for — hence
+    reading it here, from the live subgraph and the live gateway.
+
+    The count comes back so the caller can tell "none of the mechs I read was
+    unreachable" from "I could not read any mech" — those look identical from
+    a bare None, and only the first says anything about reachability.
+    """
+    read = 0
+    # bounded: each unreadable mech costs a full gateway timeout
+    for address, info in _iter_gnosis_mechs(mech_service, limit=6):
+        read += 1
+        assert isinstance(info["offchain_capable"], bool), info
+        if not info["offchain_capable"]:
+            assert info["offchain_note"], info
+            return (address, info), read
+    return None, read
+
+
+def test_offchain_preflight_refuses_an_unreachable_mech_on_fork(
+    rpc_url: str,
+    funded_signer: Signer,
+    fork_config: AppConfig,
+    fork_store: SettingsStore,
+    store_path: Path,
+    account: LocalAccount,
+) -> None:
+    """An off-chain request to a mech with no endpoint is refused before paying.
+
+    This is the reported failure, against real metadata: mech-client would
+    discover the missing endpoint deep in its send path and report it as a
+    metadata problem, which reads like a slow gateway. The pre-flight has to
+    decide it up front, in unrestricted mode where nothing else would stop it,
+    and leave the safe untouched.
+    """
+    _set_balance(rpc_url, account.address, 10 * 10**18)
+    safe_address = _deploy_safe(rpc_url, funded_signer, account)
+    _set_balance(rpc_url, safe_address, 10 * 10**18)
+    fork_config.chains["gnosis"].safe_address = safe_address
+    fork_store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+
+    activity = ActivityLog(store_path)
+    guard = Guard(fork_store, fork_config)
+    assert guard.mode() == MODE_UNRESTRICTED  # the guardrail is not what refuses here
+    mech_service = MechService(funded_signer, fork_config, activity, guard)
+
+    picked, read = _pick_offchain_incapable_mech(mech_service)
+    if picked is None:
+        # say what was actually established: reading nothing proves nothing
+        pytest.skip(f"all {read} gnosis mech(s) read published an off-chain endpoint")
+    assert picked is not None  # mypy: pytest.skip's NoReturn isn't visible
+    mech_address, info = picked
+
+    w3 = funded_signer.w3("gnosis")
+    eoa = Web3.to_checksum_address(funded_signer.address)
+    nonce_before = w3.eth.get_transaction_count(eoa)
+    with pytest.raises(MechError, match="cannot serve off-chain requests"):
+        mech_service.request(
+            "integration preflight",
+            (info.get("tools") or ["prediction-online"])[0],
+            chain="gnosis",
+            priority_mech=mech_address,
+            timeout=30,
+            max_payment=10**18,
+        )
+    # refused before payment: nothing was broadcast, so no nonce was consumed
+    assert w3.eth.get_transaction_count(eoa) == nonce_before
 
 
 def test_mech_request_on_fork_restricted_mode(
@@ -489,7 +576,7 @@ def test_mech_request_on_fork_restricted_mode(
     mech_service = MechService(funded_signer, fork_config, activity, guard)
 
     # off-chain requests are cleanly refused in restricted mode
-    with pytest.raises(MechError, match="legacy_on_chain"):
+    with pytest.raises(MechError, match="retry it on-chain"):
         mech_service.request("test", "test", chain="gnosis")
 
     picked = _pick_live_mech(mech_service)

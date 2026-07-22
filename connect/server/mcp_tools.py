@@ -36,7 +36,7 @@ from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.mech import DEFAULT_MAX_PAYMENT, DEFAULT_MECH_CHAIN, MechService
+from connect.mech import DEFAULT_MAX_PAYMENT, MechService
 from connect.settings import SettingsStore
 from connect.signer import Signer
 
@@ -193,7 +193,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     async def mech_request(  # pylint: disable=too-many-arguments
         prompt: str,
         tool: str,
-        chain: str = DEFAULT_MECH_CHAIN,
+        chain: str | None = None,
         *,
         legacy_on_chain: bool = False,
         priority_mech: str | None = None,
@@ -204,13 +204,16 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
         """Send a request to an Olas mech (AI service) and wait for its delivery.
 
         By default the request goes off-chain (prepaid balance, no transaction;
-        needs unrestricted mode). With legacy_on_chain=true it is sent on-chain
+        needs unrestricted mode) — but only mechs whose operator published an
+        endpoint can serve it, and few do, so check `offchain_capable` with
+        mech_tools first. With legacy_on_chain=true it is sent on-chain
         through the mech marketplace via the service safe — this works in
         restricted mode because the mech contracts are whitelisted by default.
-        auto_deposit tops up the prepaid balance from the safe when the mech
-        answers 402 (insufficient balance) and retries once. A request is
-        refused if the mech's per-request price exceeds max_payment (wei,
-        default 0.1 of the native unit) — raise it explicitly to accept a
+        chain defaults to a configured chain that has a service safe, since the
+        safe is what pays. auto_deposit tops up the prepaid balance from the
+        safe when the mech answers 402 (insufficient balance) and retries once.
+        A request is refused if the mech's per-request price exceeds max_payment
+        (wei, default 0.1 of the native unit) — raise it explicitly to accept a
         more expensive mech.
         """
         # mech-client manages its own event loops (asyncio.run + sync gql):
@@ -229,7 +232,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
 
     @mcp.tool()
     async def mech_tools(
-        chain: str = DEFAULT_MECH_CHAIN,
+        chain: str | None = None,
         priority_mech: str | None = None,
         limit: int = 20,
         offset: int = 0,
@@ -240,7 +243,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
         deliveries first; `total` reports how many exist — page with
         limit/offset). With priority_mech: that mech's payment type, service
         id and available tool names — pass one as mech_request's `tool`
-        argument (limit/offset are ignored then).
+        argument (limit/offset are ignored then) — plus `offchain_capable`,
+        which says whether the default off-chain flow can reach it at all; when
+        it is false, `offchain_note` gives the reason and mech_request needs
+        legacy_on_chain=true. chain defaults to a configured chain with a safe.
         """
         # same as mech_request: the sync gql subgraph client refuses to run
         # on an already-running loop
