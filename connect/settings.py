@@ -46,6 +46,7 @@ from eth_account.signers.local import LocalAccount
 from web3 import Web3
 
 from connect.activity import ActivityLog
+from connect.safe import ZERO_ADDRESS
 
 logger = logging.getLogger("agent")
 
@@ -185,9 +186,10 @@ class Settings:
 def _mech_system_addresses() -> dict[str, list[str]]:
     """Collect the MechMarketplace contract per chain from the pinned mech-client.
 
-    The marketplace is the only contract the service safe CALLs in the
-    restricted-mode mech flow (`request`/`requestBatch`; native payment rides
-    as the inner value). Balance trackers are deliberately NOT whitelisted —
+    The marketplace is the only contract the safe CALLs to *submit* a mech
+    request (`request`/`requestBatch`; native payment rides as the inner
+    value); token-paid mechs additionally `approve` the payment token, see
+    token_approve_targets(). Balance trackers are deliberately NOT whitelisted —
     the safe only calls them for prepaid deposits, which our surface reaches
     only via the off-chain flow (unrestricted mode). Payment token contracts
     are NOT whitelisted either: the whitelist is address-level, so allowing a
@@ -208,12 +210,11 @@ def _mech_system_addresses() -> dict[str, list[str]]:
         from mech_client.infrastructure.config.constants import MECH_CONFIGS
         from mech_client.utils.constants import CHAIN_NAME_TO_ID
 
-        zero_address = "0x" + "00" * 20
         mechs = json.loads(Path(MECH_CONFIGS).read_text(encoding="utf-8"))
         result: dict[str, list[str]] = {}
         for chain in CHAIN_NAME_TO_ID:
             marketplace = mechs.get(chain, {}).get("mech_marketplace_contract", "")
-            if marketplace and marketplace.lower() != zero_address:
+            if marketplace and marketplace.lower() != ZERO_ADDRESS:
                 result[chain] = [marketplace.lower()]
         return result
     except Exception as e:  # pylint: disable=broad-exception-caught
@@ -245,7 +246,6 @@ def token_approve_targets(chain: str) -> dict[str, str]:
         chain_id = CHAIN_NAME_TO_ID.get(chain.lower())
         if chain_id is None:
             return {}
-        zero_address = "0x" + "00" * 20
         result: dict[str, str] = {}
         for tokens, trackers in (
             (CHAIN_TO_PRICE_TOKEN_USDC, CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC),
@@ -253,7 +253,7 @@ def token_approve_targets(chain: str) -> dict[str, str]:
         ):
             token = (tokens.get(chain_id) or "").lower()
             tracker = (trackers.get(chain_id) or "").lower()
-            if token and tracker and zero_address not in (token, tracker):
+            if token and tracker and ZERO_ADDRESS not in (token, tracker):
                 result[token] = tracker
         return result
     except Exception as e:  # pylint: disable=broad-exception-caught
