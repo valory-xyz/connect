@@ -429,10 +429,14 @@ class TestMcpTools:
     async def test_wallet_info(
         self, tools: dict[str, t.Callable], test_signer: Signer
     ) -> None:
-        """wallet_info reports the agent EOA and balances."""
+        """wallet_info reports the agent EOA, balances and what is actionable."""
         info = await tools["wallet_info"]()
         assert info["agent_eoa"] == test_signer.address
-        assert info["balances"]["testchain"]["agent_eoa"] == "12345"
+        assert info["chains"]["testchain"]["balances"]["agent_eoa"] == "12345"
+        # the verdict is stated, not left to be inferred from the other keys
+        assert info["actionable_chains"] == ["testchain"]
+        assert info["chains"]["testchain"]["actionable"] is True
+        assert "not_actionable_because" not in info["chains"]["testchain"]
 
     async def test_send_transaction_request_id_idempotency(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
@@ -883,12 +887,45 @@ class TestWalletExtras:
         test_signer: Signer,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Per-chain RPC failures land in the balances as errors."""
+        """A chain whose RPC failed is reported unusable, not merely balance-less.
+
+        Nothing established that the chain is usable, and an optimistic guess
+        is what sends an agent off to plan work it cannot carry out.
+        """
         monkeypatch.setattr(
             test_signer, "w3", lambda chain: (_ for _ in ()).throw(RuntimeError("down"))
         )
         overview = wallet.wallet_overview(app_config, test_signer)
-        assert overview["balances"]["testchain"] == {"error": "down"}
+        entry = overview["chains"]["testchain"]
+        assert entry["balances"] == {"error": "down"}
+        assert entry["actionable"] is False
+        assert "down" in entry["not_actionable_because"]
+        assert overview["actionable_chains"] == []
+
+    def test_overview_separates_undeployed_from_unfunded_chains(
+        self, app_config: AppConfig, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """The two unusable cases are named apart; they need different remedies.
+
+        A chain with no safe was never deployed to. A chain with a safe but no
+        gas in the EOA is deployed and merely needs funding — telling an
+        operator the wrong one sends them to fix the wrong thing. The missing
+        safe is reported as such even though this chain's RPC is unreachable,
+        because that fact comes from configuration, not from the network.
+        """
+        app_config.chains["nosafe"] = ChainConfig(rpc_url="http://127.0.0.1:9")
+        overview = wallet.wallet_overview(app_config, test_signer)
+        assert overview["chains"]["nosafe"]["safe"] is None
+        assert (
+            "no service safe" in overview["chains"]["nosafe"]["not_actionable_because"]
+        )
+        assert overview["actionable_chains"] == ["testchain"]  # the deployed one
+
+        # deployed, but the EOA cannot pay gas there
+        fake_w3.eth.balance = 0
+        overview = wallet.wallet_overview(app_config, test_signer)
+        assert "no gas" in overview["chains"]["testchain"]["not_actionable_because"]
+        assert overview["actionable_chains"] == []
 
 
 class TestPearlRoutesExtras:

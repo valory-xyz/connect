@@ -32,6 +32,7 @@ from pathlib import Path
 import httpx
 import pytest
 from eth_account.signers.local import LocalAccount
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from web3 import Web3
 
@@ -146,7 +147,7 @@ def _fork_app(
     store: SettingsStore,
     store_path: Path,
     token: str,
-) -> object:
+) -> FastAPI:
     activity = ActivityLog(store_path)
     guard = Guard(store, config)
     return create_app(
@@ -388,6 +389,56 @@ def _deploy_safe(rpc_url: str, signer: Signer, account: LocalAccount) -> str:
     )
     _wait_mined(signer, tx_sent.tx_hash.hex())
     return str(tx_sent.contract_address)
+
+
+def test_wallet_reports_only_actionable_chains_on_fork(
+    rpc_url: str,
+    funded_signer: Signer,
+    fork_config: AppConfig,
+    fork_store: SettingsStore,
+    store_path: Path,
+    account: LocalAccount,
+) -> None:
+    """GET /wallet names the chains that can be acted on, against a real chain.
+
+    The reported bug was an agent treating every configured chain as its own
+    to work. A unit test can assert the verdict over fakes; only a real chain
+    proves the balances behind it are read correctly — so this deploys a safe,
+    adds a second configured chain that was never deployed to, and then
+    removes the EOA's gas to check the deployed chain drops out as well.
+    """
+    _set_balance(rpc_url, account.address, 10 * 10**18)
+    safe_address = _deploy_safe(rpc_url, funded_signer, account)
+    fork_config.chains["gnosis"].safe_address = safe_address
+    # the shape that made an agent believe it had work to do elsewhere
+    fork_config.chains["undeployed"] = ChainConfig(rpc_url=rpc_url)
+
+    token = secrets.token_urlsafe(16)
+    app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
+    headers = {"Authorization": f"Bearer {token}"}
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        body = client.get("/wallet", headers=headers).json()
+
+        assert body["actionable_chains"] == ["gnosis"]
+        gnosis = body["chains"]["gnosis"]
+        assert gnosis["safe"] == safe_address
+        assert gnosis["actionable"] is True
+        assert "not_actionable_because" not in gnosis
+        assert int(gnosis["balances"]["agent_eoa"]) > 0
+        undeployed = body["chains"]["undeployed"]
+        assert undeployed["safe"] is None
+        assert (
+            undeployed["not_actionable_because"] == "not deployed here: no service safe"
+        )
+
+        # a deployed chain whose EOA cannot pay gas is not actionable either
+        _set_balance(rpc_url, account.address, 0)
+        drained = client.get("/wallet", headers=headers).json()
+        assert drained["actionable_chains"] == []
+        assert "no gas" in drained["chains"]["gnosis"]["not_actionable_because"]
+
+    # leave the fork funded: its state persists across runs
+    _set_balance(rpc_url, account.address, 10 * 10**18)
 
 
 def _pick_live_mech(mech_service: MechService) -> tuple[str, str] | None:
