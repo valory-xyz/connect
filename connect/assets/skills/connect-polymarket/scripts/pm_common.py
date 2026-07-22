@@ -287,25 +287,21 @@ def dw_pending_buy_tokens(cs: ConnectSigner) -> list:
 
 
 def _dw_pending_buy_counts(state: dict) -> dict:
-    """Return positive pending-intent counts, migrating the legacy token set."""
-    raw_counts = state.get("dw_pending_buy_counts")
-    if raw_counts is not None:
-        return {
-            int(token_id): int(count)
-            for token_id, count in raw_counts.items()
-            if int(count) > 0
-        }
-    return {int(token_id): 1 for token_id in state.get("dw_pending_buy_tokens") or []}
+    """Return positive pending-intent counts."""
+    return {
+        int(token_id): int(count)
+        for token_id, count in (state.get("dw_pending_buy_counts") or {}).items()
+        if int(count) > 0
+    }
 
 
 def _store_dw_pending_buy_counts(state: dict, counts: dict) -> None:
-    """Store normalized counts and remove the superseded token-set field."""
+    """Store normalized pending-intent counts."""
     state["dw_pending_buy_counts"] = {
         str(token_id): counts[token_id]
         for token_id in sorted(counts)
         if counts[token_id] > 0
     }
-    state.pop("dw_pending_buy_tokens", None)
 
 
 def record_dw_token(cs: ConnectSigner, token_id: int) -> None:
@@ -331,8 +327,15 @@ def record_dw_buy_intent(cs: ConnectSigner, token_id: int) -> None:
     save_state(cs, state)
 
 
-def confirm_dw_buy_intent(cs: ConnectSigner, token_id: int) -> None:
-    """Resolve one accepted buy while retaining its shared holdings hint."""
+def resolve_dw_buy_intent(cs: ConnectSigner, token_id: int) -> None:
+    """Resolve one buy submission by dropping a single pending marker.
+
+    Accepted and rejected submissions do exactly the same bookkeeping. The
+    `dw_open_tokens` hint is deliberately left alone in both cases: a pending
+    count reaching zero does not prove this submission owns the hint, since
+    earlier buys and `funds.py cmd_return_position` write the same key, and
+    dropping a shared hint could hide a real position from the sweep.
+    """
     state = load_state(cs)
     token_id = int(token_id)
     pending = _dw_pending_buy_counts(state)
@@ -342,15 +345,10 @@ def confirm_dw_buy_intent(cs: ConnectSigner, token_id: int) -> None:
     save_state(cs, state)
 
 
-def reject_dw_buy_intent(cs: ConnectSigner, token_id: int) -> None:
-    """Resolve one rejected buy without clobbering a shared holdings hint."""
-    state = load_state(cs)
-    token_id = int(token_id)
-    pending = _dw_pending_buy_counts(state)
-    if token_id in pending:
-        pending[token_id] -= 1
-    _store_dw_pending_buy_counts(state, pending)
-    save_state(cs, state)
+# Aliases so the call sites still read intentionally (accepted vs rejected),
+# even though the resolution is identical.
+confirm_dw_buy_intent = resolve_dw_buy_intent
+reject_dw_buy_intent = resolve_dw_buy_intent
 
 
 def record_dw_token_best_effort(cs: ConnectSigner, token_id: int) -> bool:
@@ -602,6 +600,42 @@ def http_get_json(url: str, params: dict | None = None) -> t.Any:
     response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
     response.raise_for_status()
     return response.json()
+
+
+def fetch_all_positions(
+    params: dict, *, label: str, page_limit: int, max_offset: int
+) -> list:
+    """Fetch every ``/positions`` page for `params`, or fail loudly.
+
+    The data API pages, so a single unpaginated read silently drops
+    everything past the first page. Two things are refused rather than
+    mistaken for "that is all there is": a non-list payload, and a full
+    final addressable page (the offset ceiling). `label` names the caller in
+    those errors so the operator knows which discovery was incomplete.
+    """
+    results: list = []
+    offset = 0
+    while True:
+        page = http_get_json(
+            f"{DATA_API}/positions",
+            params={**params, "limit": page_limit, "offset": offset},
+        )
+        if not isinstance(page, list):
+            raise SystemExit(
+                f"{label} API returned malformed data at offset {offset}: "
+                f"expected a list, got {type(page).__name__}; refusing to "
+                "claim all positions were discovered"
+            )
+        results.extend(page)
+        if len(page) < page_limit:
+            return results
+        next_offset = offset + page_limit
+        if next_offset > max_offset:
+            raise SystemExit(
+                f"{label} pagination limit reached; refusing to claim all "
+                "positions were discovered"
+            )
+        offset = next_offset
 
 
 def print_json(payload: t.Any) -> None:

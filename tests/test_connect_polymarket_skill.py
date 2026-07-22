@@ -59,6 +59,7 @@ import deposit_wallet  # noqa: E402
 import funds  # noqa: E402
 import markets  # noqa: E402
 import pm_common as pm  # noqa: E402
+import positions  # noqa: E402
 import redeem  # noqa: E402
 import relayer_proxy  # noqa: E402
 
@@ -491,16 +492,10 @@ def test_ambiguous_then_accepted_repeat_keeps_pending_intent(tmp_path) -> None:
     assert pm.load_state(cs)["dw_pending_buy_counts"] == {"5": 1}
 
 
-def test_legacy_pending_token_migrates_to_reference_count(tmp_path) -> None:
-    """The token-set state written by older versions remains recoverable."""
-    cs = _cs_with_workspace(tmp_path)
-    pm.save_state(cs, {"dw_open_tokens": [5], "dw_pending_buy_tokens": [5]})
-
-    pm.record_dw_buy_intent(cs, 5)
-
-    state = pm.load_state(cs)
-    assert state["dw_pending_buy_counts"] == {"5": 2}
-    assert "dw_pending_buy_tokens" not in state
+def test_buy_intent_confirm_and_reject_share_one_implementation() -> None:
+    """confirm_/reject_ are aliases: the resolution bookkeeping is identical."""
+    assert pm.confirm_dw_buy_intent is pm.resolve_dw_buy_intent
+    assert pm.reject_dw_buy_intent is pm.resolve_dw_buy_intent
 
 
 def test_ambiguous_then_rejected_repeat_keeps_pending_intent(tmp_path) -> None:
@@ -848,6 +843,38 @@ def test_redeemable_fails_at_api_offset_ceiling(monkeypatch) -> None:
 
     with pytest.raises(SystemExit, match="pagination limit"):
         redeem._redeemable(_SweepCS({}))
+
+
+def test_positions_command_fetches_every_page(monkeypatch, capsys) -> None:
+    """Portfolio reporting pages through instead of showing only page one."""
+    monkeypatch.setattr(positions, "POSITIONS_PAGE_LIMIT", 2)
+    seen = []
+
+    def fake_get(url, params=None):
+        seen.append(dict(params))
+        return {
+            0: [{"asset": "11"}, {"asset": "12"}],
+            2: [{"asset": "13"}],
+        }[params["offset"]]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    positions.cmd_positions(_SweepCS({}), "safe", False)
+
+    reported = json.loads(capsys.readouterr().out)
+    assert [p["token_id"] for p in reported] == ["11", "12", "13"]
+    assert [params["offset"] for params in seen] == [0, 2]
+
+
+@pytest.mark.parametrize("payload", [None, {"positions": []}])
+def test_positions_command_rejects_non_list_page(monkeypatch, payload) -> None:
+    """A malformed portfolio page must not read as an empty portfolio."""
+    monkeypatch.setattr(positions, "POSITIONS_PAGE_LIMIT", 1)
+    pages = iter(([{"asset": "11"}], payload))
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: next(pages))
+
+    with pytest.raises(SystemExit, match="expected a list"):
+        positions.cmd_positions(_SweepCS({}), "safe", False)
 
 
 @pytest.mark.parametrize("payload", [None, {"positions": []}])

@@ -33,6 +33,9 @@ import argparse
 import pm_common as pm
 from deposit_wallet import dw_or_exit
 
+POSITIONS_PAGE_LIMIT = 500
+POSITIONS_MAX_OFFSET = 10_000
+
 
 def _wallet_address(cs: pm.ConnectSigner, wallet: str) -> str:
     if wallet == "safe":
@@ -62,11 +65,16 @@ def _slim(position: dict) -> dict:
 
 
 def cmd_positions(cs: pm.ConnectSigner, wallet: str, redeemable: bool) -> None:
-    """Open (or redeemable) positions held by a wallet."""
+    """Open (or redeemable) positions held by a wallet, across all pages."""
     params: dict = {"user": _wallet_address(cs, wallet), "sizeThreshold": 0}
     if redeemable:
         params["redeemable"] = "true"
-    positions = pm.http_get_json(f"{pm.DATA_API}/positions", params=params) or []
+    positions = pm.fetch_all_positions(
+        params,
+        label="position",
+        page_limit=POSITIONS_PAGE_LIMIT,
+        max_offset=POSITIONS_MAX_OFFSET,
+    )
     pm.print_json([_slim(p) for p in positions])
 
 
