@@ -1196,7 +1196,7 @@ class TestMech:
     ) -> None:
         """A mech that never published metadata cannot be reached off-chain."""
         patched_mech.metadata = None
-        with pytest.raises(MechError, match="could not be read"):
+        with pytest.raises(MechError, match="metadata unreadable"):
             mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
         assert not patched_mech.calls
 
@@ -1451,13 +1451,13 @@ class TestMech:
         )
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert "tools" not in info
-        assert "could not be read" in info["tools_note"]
+        assert "unreadable" in info["tools_note"]
         assert info["offchain_capable"] is False
-        assert info["offchain_note"].endswith("send to this mech on-chain")
+        assert info["offchain_note"].endswith("send on-chain")
         # the cause travels with the verdict, and the verdict does not claim
         # a transient timeout is permanent
         assert "TimeoutError: slow" in info["offchain_note"]
-        assert "cannot tell which" in info["offchain_note"]
+        assert "may be transient" in info["offchain_note"]
 
     def test_unreadable_metadata_verdict_never_claims_permanence(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -1474,9 +1474,9 @@ class TestMech:
         note = mech_service.tools(chain="testchain", priority_mech=OTHER)[
             "offchain_note"
         ]
-        assert "nothing usable" in note  # stands in for the absent cause
-        assert "cannot tell which" in note
-        assert "never" not in note
+        assert "no cause reported" in note  # stands in for the absent cause
+        # hedged, not asserted: "may be" is what keeps this honest
+        assert "may be transient or never published" in note
 
     def test_tools_separates_no_metadata_from_no_tools_published(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -1485,7 +1485,7 @@ class TestMech:
         patched_mech.metadata = {"url": "https://mech.example/offchain"}
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert "tools" not in info
-        assert "lists no usable tools" in info["tools_note"]
+        assert "lists no tools" in info["tools_note"]
         assert info["offchain_capable"] is True  # the endpoint is still there
 
     @pytest.mark.parametrize("published", [5, "abc", {"a": 1}, None])
@@ -1505,7 +1505,7 @@ class TestMech:
         patched_mech.metadata = {"tools": published, "url": "https://m.example"}
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert "tools" not in info
-        assert "lists no usable tools" in info["tools_note"]
+        assert "lists no tools" in info["tools_note"]
 
     def test_tools_survives_metadata_that_is_not_a_document(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService

@@ -89,19 +89,13 @@ def _offchain_blocker(read: MetadataRead) -> str | None:
     listed mechs publish tools and no ``url``, and serve on-chain requests fine.
     """
     if read.document is None:
-        cause = read.error or "the gateway returned nothing usable"
-        return (
-            f"this mech's service metadata could not be read ({cause}), so its "
-            "off-chain endpoint cannot be discovered; the publish may be "
-            "permanently absent or the gateway merely slow — this cannot tell "
-            "which"
-        )
+        cause = read.error or "no cause reported"
+        # "may be" is load-bearing: nothing here distinguishes a mech that
+        # never published from a gateway that was briefly slow.
+        return f"metadata unreadable ({cause}); may be transient or never published"
     url = read.document.get("url")
     if not isinstance(url, str) or not url.strip():
-        return (
-            "this mech's operator published no 'url' in its metadata, so it "
-            "serves on-chain requests only"
-        )
+        return "no 'url' in metadata; serves on-chain requests only"
     return None
 
 
@@ -291,20 +285,14 @@ class MechService:
         if tool_names:
             info["tools"] = tool_names
         elif read.document is None:
-            info["tools_note"] = (
-                "tool metadata could not be read; mech_request validates tools "
-                "best-effort, so a known tool name can still be used on-chain"
-            )
+            # the two causes stay distinct: one may clear on retry, one will not
+            info["tools_note"] = "tool metadata unreadable; a known tool still works"
         else:
-            info["tools_note"] = (
-                "this mech's metadata lists no usable tools; mech_request "
-                "validates tools best-effort, so a known tool name can still "
-                "be used on-chain"
-            )
+            info["tools_note"] = "metadata lists no tools; a known tool still works"
         blocker = _offchain_blocker(read)
         info["offchain_capable"] = blocker is None
         if blocker is not None:
-            info["offchain_note"] = f"{blocker} — send to this mech on-chain"
+            info["offchain_note"] = f"{blocker}; send on-chain"
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:
