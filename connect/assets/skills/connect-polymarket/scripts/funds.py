@@ -121,37 +121,13 @@ def cmd_top_up(cs: pm.ConnectSigner, amount: float) -> None:
 
 def _dw_position_token_ids(dw: str) -> list:
     """Outcome-token ids the DW currently holds, across all data-API pages."""
-    ids = []
-    offset = 0
-    while True:
-        positions = pm.http_get_json(
-            f"{pm.DATA_API}/positions",
-            params={
-                "user": dw,
-                "sizeThreshold": 0,
-                "limit": POSITIONS_PAGE_LIMIT,
-                "offset": offset,
-            },
-        )
-        if not isinstance(positions, list):
-            raise SystemExit(
-                "DW-position API returned malformed data at offset "
-                f"{offset}: expected a list, got {type(positions).__name__}; "
-                "refusing to claim all positions were discovered"
-            )
-        for position in positions:
-            asset = position.get("asset")
-            if asset:
-                ids.append(int(asset))
-        if len(positions) < POSITIONS_PAGE_LIMIT:
-            return ids
-        next_offset = offset + POSITIONS_PAGE_LIMIT
-        if next_offset > POSITIONS_MAX_OFFSET:
-            raise SystemExit(
-                "DW-position pagination limit reached; refusing to claim all "
-                "positions were discovered"
-            )
-        offset = next_offset
+    positions = pm.fetch_all_positions(
+        {"user": dw, "sizeThreshold": 0},
+        label="DW-position",
+        page_limit=POSITIONS_PAGE_LIMIT,
+        max_offset=POSITIONS_MAX_OFFSET,
+    )
+    return [int(p["asset"]) for p in positions if p.get("asset")]
 
 
 def _abort_if_open_orders(cs: pm.ConnectSigner, dw: str) -> None:
