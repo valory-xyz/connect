@@ -61,9 +61,8 @@ On top of that floor, the signer runs in one of two user-controlled modes
 - **unrestricted** — anything else you ask for is signed.
 - **restricted** (default) — the safe may only CALL a **whitelisted** address
   (any value, any calldata). Raw digest signing (`sign_message`) is disabled
-  entirely, which also disables off-chain mech requests — use
-  `mech_request(..., legacy_on_chain=true)`. A `send_transaction` from the EOA
-  can reach nothing but the safe.
+  entirely, which also disables off-chain mech requests — send them on-chain
+  instead. A `send_transaction` from the EOA can reach nothing but the safe.
 
 Every blocked request fails with the violated rule. You cannot lift the
 restrictions; the user changes the mode in the agent UI with their keystore
@@ -87,9 +86,9 @@ composing a prompt:
 - **`offchain_capable`.** The off-chain flow needs an endpoint published in
   the mech's service metadata, and few mechs publish one; those that do not
   serve on-chain requests only.
-  When it is `false`, `offchain_note` says why, and `mech_request` must be
-  called with `legacy_on_chain=true`. An off-chain request to such a mech is
-  refused up front rather than part-way through.
+  When it is `false`, `offchain_note` says why and what to do — a mech with no
+  endpoint must go on-chain, an unreadable fetch is worth retrying first. An
+  off-chain request to such a mech is refused up front, not part-way through.
 
 - `legacy_on_chain=false` (default): off-chain request — no transaction; it
   raw-signs a request digest and spends prepaid balance held by the mech

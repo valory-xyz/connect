@@ -40,6 +40,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard, GuardError
 from connect.mech import (
+    DEFAULT_MECH_CHAIN,
     MAX_DELIVERY_TIMEOUT,
     MechError,
     MechService,
@@ -1220,6 +1221,33 @@ class TestMech:
         with pytest.raises(MechError, match="no configured chain has a service safe"):
             mech_service.request("q", "t", legacy_on_chain=True, priority_mech=OTHER)
 
+    def test_listing_still_works_with_no_safe_anywhere(
+        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discovery is a subgraph query, so it must not demand a safe.
+
+        Only paying needs one. Refusing to list left an agent on a deployment
+        with no safe configured unable to see mechs it could previously browse.
+        """
+        import mech_client.infrastructure.subgraph.queries as queries
+
+        asked: list[str] = []
+
+        def record(chain: str) -> list:
+            asked.append(chain)
+            return []
+
+        monkeypatch.setattr(queries, "query_mm_mechs_info", record)
+        # pylint: disable=protected-access
+        chains = mech_service._config.chains
+        chains["testchain"].safe_address = None
+        assert DEFAULT_MECH_CHAIN not in chains  # the default is not configured
+        assert mech_service.tools()["mechs"] == []
+        # fell back to a chain this deployment actually configured: the default
+        # would raise "unknown chain" and answer nothing
+        assert asked == ["testchain"]
+        assert not mech_service._services  # and built no paying service
+
     def test_default_chain_prefers_gnosis_over_alphabetical_order(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
@@ -1453,11 +1481,30 @@ class TestMech:
         assert "tools" not in info
         assert "unreadable" in info["tools_note"]
         assert info["offchain_capable"] is False
-        assert info["offchain_note"].endswith("send on-chain")
         # the cause travels with the verdict, and the verdict does not claim
         # a transient timeout is permanent
         assert "TimeoutError: slow" in info["offchain_note"]
         assert "may be transient" in info["offchain_note"]
+        # an unreadable fetch may clear on its own, so paying for gas is the
+        # second move, not the first
+        assert "retry before paying" in info["offchain_note"]
+
+    def test_the_two_blockers_advise_differently(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A mech with no endpoint goes on-chain; an unreadable fetch retries.
+
+        Sending the unreadable case on-chain spends real gas to avoid a retry
+        that may well have worked, so the two must not share one imperative.
+        """
+        patched_mech.metadata = {"tools": ["prediction-online"]}  # readable, no url
+        published = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert "on-chain requests only" in published["offchain_note"]
+        assert "retry" not in published["offchain_note"]
+
+        patched_mech.metadata = None  # unreadable
+        unreadable = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert "retry before paying" in unreadable["offchain_note"]
 
     def test_unreadable_metadata_verdict_never_claims_permanence(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -1506,6 +1553,22 @@ class TestMech:
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert "tools" not in info
         assert "lists no tools" in info["tools_note"]
+
+    def test_tools_drops_entries_that_are_not_names(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A list of the right type can still hold entries of the wrong one.
+
+        Stringifying them invents the same plausible-but-unservable names the
+        non-list case was fixed for, so the untrusted-document rule has to
+        apply to the contents too, not just the container.
+        """
+        patched_mech.metadata = {
+            "tools": ["real-tool", {"name": "x"}, 5, "", "  ", None],
+            "url": "https://m.example",
+        }
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert info["tools"] == ["real-tool"]
 
     def test_tools_survives_metadata_that_is_not_a_document(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService

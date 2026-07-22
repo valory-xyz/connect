@@ -84,18 +84,22 @@ def _offchain_blocker(read: MetadataRead) -> str | None:
 
     The off-chain flow resolves the mech's endpoint from the ``url`` field of
     the service metadata, so a document we cannot read and a document without
-    a ``url`` both rule the flow out entirely. They are reported separately
-    because only the second describes a mech that is otherwise healthy — most
-    listed mechs publish tools and no ``url``, and serve on-chain requests fine.
+    a ``url`` both rule the flow out entirely — but they earn different advice,
+    which is why each reason carries its own. A mech that published no ``url``
+    never will serve off-chain; a fetch that failed may simply succeed next
+    time, and sending that one on-chain spends gas to avoid a retry.
     """
     if read.document is None:
         cause = read.error or "no cause reported"
         # "may be" is load-bearing: nothing here distinguishes a mech that
         # never published from a gateway that was briefly slow.
-        return f"metadata unreadable ({cause}); may be transient or never published"
+        return (
+            f"metadata unreadable ({cause}); may be transient or never "
+            "published — retry before paying to send this on-chain"
+        )
     url = read.document.get("url")
     if not isinstance(url, str) or not url.strip():
-        return "no 'url' in metadata; serves on-chain requests only"
+        return "no 'url' in metadata; this mech serves on-chain requests only"
     return None
 
 
@@ -149,13 +153,18 @@ class MechService:
         self._lock = threading.Lock()
         self._services: dict[str, MarketplaceService] = {}
 
-    def _resolve_chain(self, chain: str | None) -> str:
+    def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
 
         A fixed default strands an agent whose safe lives on another chain: it
         discovers the mismatch only when a request fails, having already been
         shown a listing of mechs it could never pay. An explicit chain is still
         honoured without a safe, because discovery alone needs none.
+
+        `needs_safe=False` is discovery, which only queries the subgraph: with
+        no safe anywhere it falls back to the default chain rather than
+        refusing, since a listing was answerable before this method existed
+        and is still answerable now.
         """
         if chain is not None:
             return chain.lower()
@@ -168,6 +177,14 @@ class MechService:
             return DEFAULT_MECH_CHAIN
         if funded:
             return funded[0]
+        if not needs_safe:
+            # a configured chain, not merely the default one: falling back to
+            # a chain this deployment never configured swaps "no safe" for
+            # "unknown chain" and still answers nothing
+            if DEFAULT_MECH_CHAIN in self._config.chains:
+                return DEFAULT_MECH_CHAIN
+            if self._config.chains:
+                return sorted(self._config.chains)[0]
         raise MechError(
             "no configured chain has a service safe, and mech requests are "
             f"paid by the safe (configured chains: {sorted(self._config.chains)})"
@@ -177,9 +194,11 @@ class MechService:
     def _service_metadata(service: MarketplaceService, service_id: int) -> MetadataRead:
         """Read the mech's published service metadata, keeping any failure cause.
 
-        One fetch answers both questions asked of that document — the tool
-        names and the off-chain URL — where mech-client refetches it per
-        question, and every miss costs a full gateway timeout.
+        One fetch answers both questions a report asks of that document — the
+        tool names and the off-chain URL — where mech-client refetches it per
+        question, and every miss costs a full gateway timeout. The request
+        path still pays twice: the pre-flight reads it here, then
+        ``send_request`` resolves the URL from it again inside mech-client.
 
         mech-client swallows the common transport failures itself and hands
         back a bare ``None``, so a miss here usually arrives with no cause at
@@ -257,7 +276,7 @@ class MechService:
         resolved here and the caller would otherwise have no way to tell which
         chain the answer came from.
         """
-        chain = self._resolve_chain(chain)
+        chain = self._resolve_chain(chain, needs_safe=priority_mech is not None)
         if priority_mech is None:
             self._config.chain(chain)
             return self._list_mechs(chain, limit=limit, offset=offset)
@@ -274,13 +293,16 @@ class MechService:
             "max_delivery_rate": str(max_delivery_rate),
         }
         read = self._service_metadata(service, service_id)
-        # The document is published by the mech operator, so its shape is not
-        # ours to assume: a `tools` that is not a list must not be iterated.
-        # A bare string would otherwise yield one "tool" per character —
-        # plausible-looking names that no mech serves.
+        # The document is published by the mech operator, so neither its shape
+        # nor its contents are ours to assume. A `tools` that is not a list
+        # must not be iterated (a bare string yields one "tool" per character),
+        # and an entry that is not a name must not be stringified into one:
+        # both invent plausible-looking tools that no mech serves.
         raw_tools = (read.document or {}).get("tools")
         tool_names = (
-            [str(name) for name in raw_tools] if isinstance(raw_tools, list) else []
+            [n for n in raw_tools if isinstance(n, str) and n.strip()]
+            if isinstance(raw_tools, list)
+            else []
         )
         if tool_names:
             info["tools"] = tool_names
@@ -292,7 +314,7 @@ class MechService:
         blocker = _offchain_blocker(read)
         info["offchain_capable"] = blocker is None
         if blocker is not None:
-            info["offchain_note"] = f"{blocker}; send on-chain"
+            info["offchain_note"] = blocker
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:
@@ -392,7 +414,7 @@ class MechService:
                 self._blocked(chain, tool, "offchain-unreachable", blocker)
                 raise MechError(
                     f"mech {priority_mech} (service {service_id}) cannot serve "
-                    f"off-chain requests: {blocker}; retry it on-chain"
+                    f"off-chain requests: {blocker}"
                 )
         try:
             result = asyncio.run(
