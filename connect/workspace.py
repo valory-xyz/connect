@@ -351,7 +351,9 @@ class Workspace:
             target = target_root / skill_dir.name
             if target.exists():
                 shutil.rmtree(target)
-            shutil.copytree(skill_dir, target)
+            shutil.copytree(
+                skill_dir, target, ignore=shutil.ignore_patterns("__pycache__")
+            )
 
 
 def _open_url(url: str) -> bool:
