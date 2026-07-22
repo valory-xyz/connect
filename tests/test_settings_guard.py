@@ -45,7 +45,12 @@ from connect.mech import (
     MechService,
     MechSigner,
 )
-from connect.safe import EXEC_TRANSACTION_SELECTOR, EXEC_TRANSACTION_TYPES
+from connect.safe import (
+    APPROVE_SELECTOR,
+    EXEC_TRANSACTION_SELECTOR,
+    EXEC_TRANSACTION_TYPES,
+    decode_approve,
+)
 from connect.server.settings_routes import WHITELIST_FROZEN
 from connect.settings import (
     MAC_FIELDS,
@@ -57,6 +62,7 @@ from connect.settings import (
     default_whitelist,
     defaults,
     derive_mac_key,
+    token_approve_targets,
 )
 from connect.signer import Signer, SignerError
 
@@ -65,8 +71,17 @@ from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
 OTHER = "0x" + "bb" * 20
+PAYMENT_TOKEN = "0x" + "cc" * 20
+TRACKER = "0x" + "ee" * 20
 
 GNOSIS_MARKETPLACE = "0x735faab1c4ec41128c367afb5c3bac73509f70bb"
+
+
+def approve_data(spender: str, amount: int = 10**6) -> bytes:
+    """Encode ERC-20 approve(spender, amount) calldata."""
+    return bytes.fromhex(APPROVE_SELECTOR) + abi_encode(
+        ["address", "uint256"], [spender, amount]
+    )
 
 
 def exec_transaction_calldata(  # pylint: disable=too-many-arguments
@@ -513,6 +528,34 @@ class TestDefaults:
         assert default_whitelist() == {}
         assert defaults().protected.mode == MODE_RESTRICTED
 
+    def test_token_approve_targets_maps_tokens_to_trackers(self) -> None:
+        """Each configured payment token maps to its mech balance tracker."""
+        usdc = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+        usdc_tracker = "0x5c50ebc17d002a4484585c8fbf62f51953493c0b"
+        polygon = token_approve_targets("polygon")
+        assert polygon[usdc] == usdc_tracker
+        assert len(polygon) == 2  # USDC and OLAS
+        # gnosis has an OLAS tracker but no USDC one: only the funded token maps
+        olas = "0xce11e14225575945b8e6dc0d4f2dd4c570f79d9f"
+        gnosis = token_approve_targets("gnosis")
+        assert olas in gnosis
+        assert usdc not in gnosis
+
+    def test_token_approve_targets_unknown_chain_is_empty(self) -> None:
+        """A chain mech-client does not know yields no targets."""
+        assert token_approve_targets("testchain") == {}
+
+    def test_token_approve_targets_broken_mech_client_is_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken mech-client fails closed rather than taking the guard down."""
+        monkeypatch.setattr("mech_client.utils.constants.CHAIN_NAME_TO_ID", None)
+        assert token_approve_targets("polygon") == {}
+
+    def test_decode_approve_returns_none_on_undecodable(self) -> None:
+        """The approve selector with unparseable args decodes to no spender."""
+        assert decode_approve("0x" + APPROVE_SELECTOR + "ff") is None
+
 
 def make_guard(
     store: SettingsStore, mode: str, whitelist: dict[str, tuple[str, ...]] | None = None
@@ -697,6 +740,59 @@ class TestGuard:
         guard.check_transaction(
             "testchain", SAFE, 0, "0x" + calldata.removeprefix("0x").upper()
         )
+
+    def test_restricted_allows_token_approve_to_tracker(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A payment token may be approved, but only for its mech tracker."""
+        monkeypatch.setattr(
+            "connect.guard.token_approve_targets",
+            lambda chain: {PAYMENT_TOKEN.lower(): TRACKER.lower()},
+        )
+        guard = make_guard(
+            store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
+        )
+        calldata = exec_transaction_calldata(PAYMENT_TOKEN, data=approve_data(TRACKER))
+        guard.check_transaction("testchain", SAFE, 0, calldata)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            approve_data(OTHER),  # approve, but to a spender that is not the tracker
+            bytes.fromhex("a9059cbb") + b"\x00" * 64,  # transfer, not approve
+        ],
+    )
+    def test_restricted_denies_non_tracker_token_calls(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch, data: bytes
+    ) -> None:
+        """On a payment token, only approve(spender=tracker) is allowed."""
+        monkeypatch.setattr(
+            "connect.guard.token_approve_targets",
+            lambda chain: {PAYMENT_TOKEN.lower(): TRACKER.lower()},
+        )
+        guard = make_guard(
+            store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
+        )
+        calldata = exec_transaction_calldata(PAYMENT_TOKEN, data=data)
+        with pytest.raises(GuardError, match="payment token"):
+            guard.check_transaction("testchain", SAFE, 0, calldata)
+
+    def test_restricted_token_rule_does_not_leak_to_other_targets(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An address absent from the token map still goes through the whitelist."""
+        monkeypatch.setattr(
+            "connect.guard.token_approve_targets",
+            lambda chain: {PAYMENT_TOKEN.lower(): TRACKER.lower()},
+        )
+        guard = make_guard(
+            store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
+        )
+        # OTHER is not the payment token, so its approve is judged by the
+        # whitelist (which does not contain OTHER), not the token rule
+        calldata = exec_transaction_calldata(OTHER, data=approve_data(TRACKER))
+        with pytest.raises(GuardError, match="not in the testchain whitelist"):
+            guard.check_transaction("testchain", SAFE, 0, calldata)
 
 
 class TestSignerGuardIntegration:
