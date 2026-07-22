@@ -1246,6 +1246,12 @@ class TestMech:
         # fell back to a chain this deployment actually configured: the default
         # would raise "unknown chain" and answer nothing
         assert asked == ["testchain"]
+
+        # with the default configured — still unfunded — discovery prefers it
+        # over the alphabetically first chain
+        chains[DEFAULT_MECH_CHAIN] = ChainConfig(rpc_url="http://127.0.0.1:9")
+        assert mech_service.tools()["mechs"] == []
+        assert asked == ["testchain", DEFAULT_MECH_CHAIN]
         assert not mech_service._services  # and built no paying service
 
     def test_default_chain_prefers_gnosis_over_alphabetical_order(
