@@ -33,6 +33,8 @@ import os
 import threading
 import typing as t
 
+from mech_client.services.marketplace_service import MarketplaceService
+
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
@@ -54,6 +56,53 @@ DEFAULT_MAX_PAYMENT = 10**17
 
 class MechError(Exception):
     """A mech request failure with an agent-facing message."""
+
+
+class PricedMech(t.NamedTuple):
+    """The mech a request will pay, with the price the cap must bind."""
+
+    mech: str
+    service_id: int
+    rate_wei: int
+
+
+class MetadataRead(t.NamedTuple):
+    """A service-metadata read: the document, or why it could not be read.
+
+    The reason travels with the result because the two failure modes it
+    separates need opposite responses — a gateway that timed out may well
+    answer on the next call, while a mech that never published metadata never
+    will — and nothing downstream can tell them apart from a bare ``None``.
+    """
+
+    document: dict | None
+    error: str | None
+
+
+def _offchain_blocker(read: MetadataRead) -> str | None:
+    """Why this mech cannot serve an off-chain request, or None if it can.
+
+    The off-chain flow resolves the mech's endpoint from the ``url`` field of
+    the service metadata, so a document we cannot read and a document without
+    a ``url`` both rule the flow out entirely. They are reported separately
+    because only the second describes a mech that is otherwise healthy — most
+    listed mechs publish tools and no ``url``, and serve on-chain requests fine.
+    """
+    if read.document is None:
+        cause = read.error or "the gateway returned nothing usable"
+        return (
+            f"this mech's service metadata could not be read ({cause}), so its "
+            "off-chain endpoint cannot be discovered; the publish may be "
+            "permanently absent or the gateway merely slow — this cannot tell "
+            "which"
+        )
+    url = read.document.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return (
+            "this mech's operator published no 'url' in its metadata, so it "
+            "serves on-chain requests only"
+        )
+    return None
 
 
 class MechSigner:
@@ -104,13 +153,63 @@ class MechService:
         self._activity = activity
         self._guard = guard
         self._lock = threading.Lock()
-        self._services: dict[str, t.Any] = {}
+        self._services: dict[str, MarketplaceService] = {}
 
-    def _service(self, chain: str) -> t.Any:
+    def _resolve_chain(self, chain: str | None) -> str:
+        """Resolve the chain: an explicit one wins, else one that has a safe.
+
+        A fixed default strands an agent whose safe lives on another chain: it
+        discovers the mismatch only when a request fails, having already been
+        shown a listing of mechs it could never pay. An explicit chain is still
+        honoured without a safe, because discovery alone needs none.
+        """
+        if chain is not None:
+            return chain.lower()
+        funded = sorted(
+            name
+            for name, chain_config in self._config.chains.items()
+            if chain_config.safe_address is not None
+        )
+        if DEFAULT_MECH_CHAIN in funded:
+            return DEFAULT_MECH_CHAIN
+        if funded:
+            return funded[0]
+        raise MechError(
+            "no configured chain has a service safe, and mech requests are "
+            f"paid by the safe (configured chains: {sorted(self._config.chains)})"
+        )
+
+    @staticmethod
+    def _service_metadata(service: MarketplaceService, service_id: int) -> MetadataRead:
+        """Read the mech's published service metadata, keeping any failure cause.
+
+        One fetch answers both questions asked of that document — the tool
+        names and the off-chain URL — where mech-client refetches it per
+        question, and every miss costs a full gateway timeout.
+
+        mech-client swallows the common transport failures itself and hands
+        back a bare ``None``, so a miss here usually arrives with no cause at
+        all. Log every miss rather than only the ones that reach the `except`,
+        otherwise the frequent case leaves no trace in this service's log.
+        """
+        try:
+            metadata = service.tool_manager.fetch_tools_metadata(service_id)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning("metadata fetch failed for service %s: %s", service_id, e)
+            return MetadataRead(None, f"{type(e).__name__}: {e}")
+        if isinstance(metadata, dict):
+            return MetadataRead(metadata, None)
+        logger.warning(
+            "metadata for service %s is unusable: expected a document, got %s",
+            service_id,
+            type(metadata).__name__,
+        )
+        return MetadataRead(None, None)
+
+    def _service(self, chain: str) -> MarketplaceService:
         """Lazily build the MarketplaceService for a configured chain."""
         # pylint: disable=import-outside-toplevel
         from eth_typing import URI
-        from mech_client.services.marketplace_service import MarketplaceService
         from safe_eth.eth import EthereumClient
 
         chain = chain.lower()
@@ -147,44 +246,65 @@ class MechService:
     def tools(
         self,
         *,
-        chain: str = DEFAULT_MECH_CHAIN,
+        chain: str | None = None,
         priority_mech: str | None = None,
         limit: int = DEFAULT_MECH_PAGE_SIZE,
         offset: int = 0,
     ) -> dict:
-        """Discover live mechs (paginated), or the tool list of one mech.
+        """Discover live mechs (paginated), or one mech's tools and reachability.
 
-        The tool list comes from the mech's on-chain metadata via the IPFS
-        gateway, which can be slow — a failed fetch degrades to a note instead
-        of an error, mirroring mech-client's own best-effort tool validation.
+        Both the tool list and the off-chain endpoint come from the same
+        service metadata document, so a single mech report answers whether the
+        mech can be reached off-chain (`offchain_capable`) and with which
+        tools. An unreadable document degrades to notes rather than an error:
+        the mech remains usable on-chain, which is what the notes say.
+
+        Every report names the `chain` it describes, since an omitted one is
+        resolved here and the caller would otherwise have no way to tell which
+        chain the answer came from.
         """
+        chain = self._resolve_chain(chain)
         if priority_mech is None:
-            self._config.chain(chain.lower())
-            return self._list_mechs(chain.lower(), limit=limit, offset=offset)
+            self._config.chain(chain)
+            return self._list_mechs(chain, limit=limit, offset=offset)
         service = self._service(chain)
         # no public single-mech info API in mech-client yet; the protected
         # helper is the same one send_request() uses internally
         fetch_info = service._fetch_mech_info  # pylint: disable=protected-access
         payment_type, service_id, max_delivery_rate = fetch_info(priority_mech)
         info: dict = {
+            "chain": chain,
             "mech": priority_mech,
             "payment_type": payment_type.name,
             "service_id": service_id,
             "max_delivery_rate": str(max_delivery_rate),
         }
-        try:
-            tools_info = service.tool_manager.get_tools(service_id)
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            tools_info = None
-            logger.warning("tool metadata fetch failed for %s: %s", priority_mech, e)
-        if tools_info and tools_info.tools:
-            info["tools"] = [t.tool_name for t in tools_info.tools]
+        read = self._service_metadata(service, service_id)
+        # The document is published by the mech operator, so its shape is not
+        # ours to assume: a `tools` that is not a list must not be iterated.
+        # A bare string would otherwise yield one "tool" per character —
+        # plausible-looking names that no mech serves.
+        raw_tools = (read.document or {}).get("tools")
+        tool_names = (
+            [str(name) for name in raw_tools] if isinstance(raw_tools, list) else []
+        )
+        if tool_names:
+            info["tools"] = tool_names
+        elif read.document is None:
+            info["tools_note"] = (
+                "tool metadata could not be read; mech_request validates tools "
+                "best-effort, so a known tool name can still be used on-chain"
+            )
         else:
             info["tools_note"] = (
-                "tool metadata is unavailable (IPFS gateway slow or none "
-                "published); mech_request validates tools best-effort, so a "
-                "known tool name can still be used"
+                "this mech's metadata lists no usable tools; mech_request "
+                "validates tools best-effort, so a known tool name can still "
+                "be used on-chain"
             )
+        blocker = _offchain_blocker(read)
+        info["offchain_capable"] = blocker is None
+        if blocker is not None:
+            info["offchain_note"] = f"{blocker} — send to this mech on-chain"
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:
@@ -215,13 +335,15 @@ class MechService:
         except Exception as e:
             raise MechError(f"could not list mechs for '{chain}': {e}") from e
         return {
+            "chain": chain,
             "mechs": page,
             "total": len(mechs),
             "offset": offset,
             "limit": limit,
             "note": (
                 "call mech_tools with priority_mech=<address> for a mech's "
-                "payment type and tool list; page with limit/offset"
+                "payment type, tool list and whether it can be reached "
+                "off-chain; page with limit/offset"
             ),
         }
 
@@ -230,7 +352,7 @@ class MechService:
         prompt: str,
         tool: str,
         *,
-        chain: str = DEFAULT_MECH_CHAIN,
+        chain: str | None = None,
         legacy_on_chain: bool = False,
         priority_mech: str | None = None,
         auto_deposit: bool = True,
@@ -242,26 +364,48 @@ class MechService:
         ``legacy_on_chain=False`` (default) uses the off-chain prepaid flow;
         ``True`` sends the request on-chain through the marketplace. The
         mech's per-request price must not exceed ``max_payment`` (wei).
+
+        Each refusal below is audited before it raises: the activity log is
+        what an operator reconstructs an incident from, and a request blocked
+        by policy must not look identical there to one never attempted.
         """
         timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
+        chain = self._resolve_chain(chain)
         if not legacy_on_chain:
             # Same rule the signer enforces, surfaced before any work happens
             # (the off-chain flow raw-signs the request-id digest).
             try:
                 self._guard.check_sign_digest()
             except GuardError as e:
+                self._blocked(chain, tool, "restricted-mode", str(e))
                 raise MechError(
-                    f"off-chain mech requests are restricted: {e}; retry with "
-                    "legacy_on_chain=true to send the request on-chain"
+                    f"off-chain mech requests are restricted: {e}; retry it on-chain"
                 ) from e
         service = self._service(chain)
-        priority_mech, rate = self._priced_mech(service, chain, priority_mech)
+        priority_mech, service_id, rate = self._priced_mech(
+            service, chain, priority_mech
+        )
         if rate > max_payment:
+            self._blocked(
+                chain, tool, "over-max-payment", f"{rate} wei > {max_payment} wei"
+            )
             raise MechError(
                 f"mech {priority_mech} charges {rate} wei per request, above "
                 f"max_payment={max_payment}; pass a higher max_payment to "
                 "accept that price"
             )
+        if not legacy_on_chain:
+            # mech-client discovers the endpoint mid-flow and fails there with
+            # a message about metadata, which reads as a transient gateway
+            # problem. Most listed mechs publish no endpoint at all, so decide
+            # it here, before any payment, and name the flow that does work.
+            blocker = _offchain_blocker(self._service_metadata(service, service_id))
+            if blocker is not None:
+                self._blocked(chain, tool, "offchain-unreachable", blocker)
+                raise MechError(
+                    f"mech {priority_mech} (service {service_id}) cannot serve "
+                    f"off-chain requests: {blocker}; retry it on-chain"
+                )
         try:
             result = asyncio.run(
                 service.send_request(
@@ -286,16 +430,33 @@ class MechService:
             tool=tool,
             offchain=not legacy_on_chain,
         )
-        return dict(result)
+        return {"chain": chain, **dict(result)}
+
+    def _blocked(self, chain: str, tool: str, reason: str, detail: str) -> None:
+        """Audit a request refused by policy, before raising it to the caller."""
+        self._activity.record(
+            "mech_request_blocked",
+            chain=chain,
+            tool=tool,
+            reason=reason,
+            detail=detail,
+        )
 
     def _priced_mech(
-        self, service: t.Any, chain: str, priority_mech: str | None
-    ) -> tuple[str, int]:
-        """Resolve the target mech and its per-request price (wei).
+        self, service: MarketplaceService, chain: str, priority_mech: str | None
+    ) -> PricedMech:
+        """Resolve the target mech, its service id and per-request price (wei).
 
         Without an explicit mech, the most active listed mech is used: the
         price cap must bind the mech that is actually paid, so the selection
-        happens here instead of inside mech-client's send path.
+        happens here instead of inside mech-client's send path. The service id
+        comes back with it because every later check — reachability, metadata
+        — is keyed by service rather than by mech address.
+
+        Named rather than a bare tuple because two of the three fields are
+        ints of wholly different kinds: transposing a service id and a wei
+        price would corrupt the `max_payment` cap silently, and no type
+        checker would object.
         """
         if priority_mech is None:
             listing = self._list_mechs(chain, limit=1, offset=0)
@@ -304,7 +465,11 @@ class MechService:
             priority_mech = str(listing["mechs"][0]["address"])
         fetch_info = service._fetch_mech_info  # pylint: disable=protected-access
         try:
-            _, _, max_delivery_rate = fetch_info(priority_mech)
+            _, service_id, max_delivery_rate = fetch_info(priority_mech)
         except Exception as e:
             raise MechError(f"could not price mech {priority_mech}: {e}") from e
-        return priority_mech, int(max_delivery_rate)
+        return PricedMech(
+            mech=priority_mech,
+            service_id=int(service_id),
+            rate_wei=int(max_delivery_rate),
+        )
