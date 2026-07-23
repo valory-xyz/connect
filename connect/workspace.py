@@ -52,6 +52,15 @@ logger = logging.getLogger("agent")
 
 MCP_SERVER_NAME = "pearl-connect"
 MCP_CONFIG_FILE = ".mcp.json"
+# Per-server tool budget, in ms. Our slowest tool (mech_request) waits on a
+# third party for up to mech.MAX_DELIVERY_TIMEOUT, and three separate harness
+# limits would otherwise abort the call long before that: the per-call wall
+# clock, the 60s first-byte timer an HTTP MCP server gets, and its 5-minute
+# idle window. This one field raises all three, for our server alone — a mech
+# request already paid for on-chain must not be abandoned mid-flight. The
+# margin over MAX_DELIVERY_TIMEOUT covers the deposit and receipt waits around
+# the wait itself; test_workspace holds the two in step.
+MCP_TOOL_TIMEOUT_MS = 1_200_000
 # where a bundled agent-UI build is dropped in (see docs/agent-ui.md)
 UI_SUBDIR = "ui"
 UI_INDEX = "index.html"
@@ -286,6 +295,7 @@ class Workspace:
             "type": "http",
             "url": mcp_url(),
             "headers": {"Authorization": f"Bearer {self._token}"},
+            "timeout": MCP_TOOL_TIMEOUT_MS,
         }
         tmp = path.with_suffix(".json.tmp")
         tmp.unlink(missing_ok=True)  # a stale tmp may have looser permissions

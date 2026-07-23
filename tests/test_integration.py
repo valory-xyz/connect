@@ -23,22 +23,26 @@ The RPC comes from the GNOSIS_TESTNET_RPC env var (CI) or, for local runs,
 from the sibling olas-operate-middleware checkout's .env file.
 """
 
+import contextlib
 import json
 import os
 import secrets
+import sys
+import threading
 import time
 import typing as t
 from pathlib import Path
 
 import httpx
 import pytest
+import uvicorn
 from eth_account.signers.local import LocalAccount
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from web3 import Web3
 
 from connect.activity import ActivityLog
-from connect.config import AppConfig, ChainConfig
+from connect.config import AGENT_HTTP_PORT, AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechError, MechService
 from connect.server.app import create_app
@@ -56,19 +60,20 @@ from connect.workspace import Workspace
 from tests.conftest import TEST_PASSWORD
 
 RPC_ENV = "GNOSIS_TESTNET_RPC"
+POLYGON_RPC_ENV = "POLYGON_TESTNET_RPC"
 MIDDLEWARE_ENV_FILE = (
     Path(__file__).parent.parent.parent / "olas-operate-middleware" / ".env"
 )
 
 
-def _resolve_rpc() -> str | None:
-    """GNOSIS_TESTNET_RPC from the env, else from the middleware repo's .env."""
-    if os.environ.get(RPC_ENV):
-        return os.environ[RPC_ENV]
+def _resolve_rpc(name: str = RPC_ENV) -> str | None:
+    """A testnet RPC from the env, else from the middleware repo's .env."""
+    if os.environ.get(name):
+        return os.environ[name]
     try:
         for line in MIDDLEWARE_ENV_FILE.read_text(encoding="utf-8").splitlines():
             key, _, value = line.partition("=")
-            if key.strip() == RPC_ENV and value.strip():
+            if key.strip() == name and value.strip():
                 return value.strip()
     except OSError:
         pass
@@ -76,6 +81,7 @@ def _resolve_rpc() -> str | None:
 
 
 RPC_URL = _resolve_rpc()
+POLYGON_RPC_URL = _resolve_rpc(POLYGON_RPC_ENV)
 
 pytestmark = [
     pytest.mark.integration,
@@ -161,6 +167,134 @@ def _fork_app(
         mech=MechService(signer, config, activity, guard),
         workspace=Workspace(store_path, token),
     )
+
+
+_SKILLS = Path(__file__).resolve().parent.parent / "connect" / "assets" / "skills"
+_PEARL_SCRIPTS = _SKILLS / "pearl-connect" / "scripts"
+_POLYMARKET_SCRIPTS = _SKILLS / "connect-polymarket" / "scripts"
+
+
+@contextlib.contextmanager
+def _serving(app: FastAPI) -> t.Iterator[str]:
+    """Serve the app on a real loopback socket, yielding its base URL.
+
+    signer_client talks HTTP through urllib, so TestClient's in-process ASGI
+    transport never exercises it — and URL handling is exactly where it broke.
+    Port 0 keeps this off the agent's own 8716 if one is running locally.
+    """
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 30
+    while not server.started:
+        if time.time() > deadline:  # pragma: no cover - startup failure
+            raise AssertionError("uvicorn did not start within 30s")
+        time.sleep(0.05)
+    try:
+        yield f"http://127.0.0.1:{server.servers[0].sockets[0].getsockname()[1]}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=30)
+
+
+def test_signer_client_reaches_the_server_that_provisioned_it(
+    rpc_url: str,
+    funded_signer: Signer,
+    fork_config: AppConfig,
+    fork_store: SettingsStore,
+    store_path: Path,
+    account: LocalAccount,
+) -> None:
+    """The bundled client, the real .mcp.json and a live server, end to end.
+
+    Two field bugs lived in this seam and unit tests missed both, because each
+    side was only ever tested against a fixture of the other: the workspace
+    writes a URL ending in "/mcp/" that the client must strip, and the client
+    must read the /wallet shape the server actually serves.
+    """
+    sys.path.insert(0, str(_PEARL_SCRIPTS))
+    import signer_client  # pylint: disable=import-outside-toplevel
+
+    _set_balance(rpc_url, account.address, 10 * 10**18)
+    safe_address = _deploy_safe(rpc_url, funded_signer, account)
+    fork_config.chains["gnosis"].safe_address = safe_address
+
+    token = secrets.token_urlsafe(16)
+    provisioned = Workspace(store_path, token)
+    assert provisioned.ensure() is True, provisioned.reason
+
+    # the file the server really wrote, parsed by the real client
+    base_url, parsed_token, root = signer_client.load_mcp_config_dir(store_path)
+    assert parsed_token == token
+    assert root == store_path.resolve()
+    assert base_url == f"http://127.0.0.1:{AGENT_HTTP_PORT}"
+
+    app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
+    with _serving(app) as served_url:
+        client = signer_client.SignerClient(served_url, parsed_token, "gnosis")
+        gnosis = client.chain_info("gnosis")
+        assert gnosis["rpc"] == rpc_url
+        assert gnosis["safe"] == safe_address
+        assert gnosis["actionable"] is True
+        # the misleading error the field report chased: a chain that is simply
+        # absent must be named as absent, not blamed on operator configuration
+        with pytest.raises(signer_client.SignerRequestError) as excinfo:
+            client.chain_info("polygon")
+        assert "not configured" in str(excinfo.value)
+        assert "gnosis" in str(excinfo.value)
+
+
+@pytest.mark.skipif(
+    not POLYGON_RPC_URL, reason=f"{POLYGON_RPC_ENV} not set and .env not usable"
+)
+def test_polymarket_token_constants_are_the_tokens_they_claim() -> None:
+    """Resolve the skill's hardcoded Polygon tokens against the real chain.
+
+    These decide which balance the operator is shown; a wrong address reports
+    someone else's token, or zero, and a funded safe then looks empty. Symbol
+    alone cannot police them — native USDC and bridged USDC.e BOTH report
+    "USDC" on-chain, which is exactly how a funded safe gets read as holding
+    none — so each is pinned by address here.
+    """
+    assert POLYGON_RPC_URL is not None
+    w3 = Web3(Web3.HTTPProvider(POLYGON_RPC_URL, request_kwargs={"timeout": 45}))
+    try:
+        chain_id = w3.eth.chain_id
+    except Exception as e:  # pylint: disable=broad-except
+        # a configured-but-dead endpoint (an expired fork answers 400) is a
+        # missing tool, not a failing assertion about the constants
+        pytest.skip(f"{POLYGON_RPC_ENV} is unreachable: {e}")
+    if chain_id != 137:  # pragma: no cover - misconfigured endpoint
+        pytest.skip(f"{POLYGON_RPC_ENV} is not Polygon (chain {chain_id})")
+
+    sys.path.insert(0, str(_POLYMARKET_SCRIPTS))
+    # tox.ini excludes connect-polymarket from mypy (it needs py_clob_client_v2
+    # and a runtime sys.path insert), so this import is unresolvable by design
+    import pm_common  # type: ignore[import-not-found] # pylint: disable=import-outside-toplevel
+
+    abi = [
+        {
+            "name": n,
+            "type": "function",
+            "stateMutability": "view",
+            "inputs": [],
+            "outputs": [{"name": "", "type": t}],
+        }
+        for n, t in (("symbol", "string"), ("decimals", "uint8"))
+    ]
+    for address, symbol in (
+        (pm_common.USDC, "USDC"),
+        (pm_common.USDC_E, "USDC"),
+        (pm_common.PUSD, "pUSD"),
+    ):
+        token = w3.eth.contract(address=address, abi=abi)
+        assert token.functions.symbol().call() == symbol, address
+        # every amount in the skill is converted with PUSD_DECIMALS
+        assert token.functions.decimals().call() == pm_common.PUSD_DECIMALS, address
+    # the two USDCs are distinct contracts despite sharing a symbol
+    assert pm_common.USDC != pm_common.USDC_E
 
 
 def _wait_mined(signer: Signer, tx_hash: str, timeout: float = 120) -> dict:
@@ -598,3 +732,21 @@ def test_mech_request_on_fork_restricted_mode(
     assert result["request_ids"], result
     receipt = _wait_mined(funded_signer, result["tx_hash"])
     assert receipt["status"] == 1
+
+    # No mech serves a fork, so this is the timed-out case for real: the paid
+    # request must come back pollable rather than stranded, and a poll that
+    # finds nothing must say so without consuming the id.
+    assert result["pending_request_ids"], result
+    pending_id = result["pending_request_ids"][0]
+
+    # The block the resumed watch will scan from, taken from a REAL receipt.
+    # Asserting only "not delivered" cannot catch a wrong window: on a fork
+    # nothing ever delivers, so scanning the right blocks and scanning the
+    # wrong ones give the same answer. This value differs between the two.
+    pending = mech_service._pending[pending_id]  # pylint: disable=protected-access
+    assert pending.from_block == receipt["blockNumber"]
+
+    polled = mech_service.result(pending_id, timeout=5)
+    assert polled["delivered"] is False
+    assert polled["mech"] == mech_address
+    assert mech_service.result(pending_id, timeout=5)["delivered"] is False

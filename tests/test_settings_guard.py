@@ -33,6 +33,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from web3.datastructures import AttributeDict
 
 from connect import settings as settings_module
 from connect import workspace as workspace_module
@@ -45,6 +46,7 @@ from connect.mech import (
     MechError,
     MechService,
     MechSigner,
+    PendingDelivery,
 )
 from connect.safe import (
     APPROVE_SELECTOR,
@@ -1026,7 +1028,14 @@ class FakeMarketplaceService:
     def __init__(self) -> None:
         """Initialize."""
         self.calls: list[dict] = []
-        self.result: dict = {"tx_hash": "0x" + "11" * 32, "request_ids": ["ab"]}
+        # the healthy case: the mech answered before the wait ran out, so
+        # nothing is left pending (tests for the timeout path drop the
+        # delivery_results entry to leave that id unanswered)
+        self.result: dict = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["ab"],
+            "delivery_results": {"ab": {"answer": "42"}},
+        }
         self.raises: Exception | None = None
         self.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**16)
         # A mech that publishes both a tool list and an off-chain endpoint —
@@ -1126,6 +1135,155 @@ class TestMech:
             priority_mech=OTHER,
         )
         assert len(patched_mech.calls) == 2
+
+    def test_delivered_request_leaves_nothing_pending(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """An answered request must not be offered for polling."""
+        result = mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert "pending_request_ids" not in result
+        with pytest.raises(MechError, match="nothing is awaiting delivery"):
+            mech_service.result("ab")
+
+    def test_undelivered_request_is_reported_and_pollable(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A timed-out wait hands back the id, and the poll resumes the watch.
+
+        The request was paid for; the answer must stay reachable rather than
+        being stranded by the wait giving up first.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "delivery_results": {},
+            # AttributeDict, not a dict literal: that is what web3 really
+            # hands back, and it is NOT a dict subclass — stubbing a plain
+            # dict hid a bug that left from_block None on every live request
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+        result = mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        # normalized: the two flows disagree about the 0x prefix, and the id
+        # the caller is handed has to be the one mech_result accepts
+        assert result["pending_request_ids"] == ["ab"]
+
+        watched: dict = {}
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            watched.update(pending=pending, key=key, timeout=timeout)
+            return {"ab": {"answer": "42"}}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        delivery = mech_service.result("0xAB")
+        assert delivery["delivered"] is True
+        assert delivery["result"] == {"answer": "42"}
+        assert delivery["mech"] == OTHER
+        # the request's own block, not the chain head: an older request is
+        # invisible to a scan that starts near the tip
+        assert watched["pending"].from_block == 4321
+        assert watched["pending"].offchain is False
+        # delivered once, so it stops being pending
+        with pytest.raises(MechError, match="nothing is awaiting delivery"):
+            mech_service.result("ab")
+
+    def test_poll_reports_a_delivery_that_has_not_arrived(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Still-waiting is a report, not an error — and stays pollable."""
+        patched_mech.result = {
+            "tx_hash": None,
+            "request_ids": ["ab"],
+            "delivery_results": {},
+        }
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        delivery = mech_service.result("ab")
+        assert delivery["delivered"] is False
+        assert "may still answer" in delivery["note"]
+        # a miss must not consume the id
+        assert mech_service.result("ab")["delivered"] is False
+
+    def test_poll_clamps_its_timeout_and_reports_watcher_failure(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A watcher blow-up becomes a MechError; the timeout stays bounded."""
+        patched_mech.result = {"request_ids": ["ab"], "delivery_results": {}}
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        seen: dict = {}
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            seen["timeout"] = timeout
+            raise RuntimeError("subgraph down")
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        with pytest.raises(MechError, match="could not read delivery"):
+            mech_service.result("ab", timeout=10_000)
+        assert seen["timeout"] == MAX_DELIVERY_TIMEOUT
+
+    @pytest.mark.parametrize("offchain", [True, False])
+    def test_watch_picks_the_flow_the_request_was_sent_through(
+        self, monkeypatch: pytest.MonkeyPatch, offchain: bool
+    ) -> None:
+        """Off-chain polls the mech's endpoint; on-chain scans from its block."""
+        import mech_client.domain.delivery as delivery_module
+
+        seen: dict = {}
+
+        class _Watcher:
+            def __init__(self, *args: object) -> None:
+                seen["args"] = args
+
+            async def watch(self, request_ids: list, **kwargs: object) -> dict:
+                seen["request_ids"] = request_ids
+                seen.update(kwargs)
+                return {"ab": "delivered"}
+
+        monkeypatch.setattr(delivery_module, "OffchainDeliveryWatcher", _Watcher)
+        monkeypatch.setattr(delivery_module, "OnchainDeliveryWatcher", _Watcher)
+        service = SimpleNamespace(
+            tool_manager=SimpleNamespace(
+                get_offchain_url=lambda service_id: "https://mech.example/offchain"
+            ),
+            ledger_api=object(),
+            _get_marketplace_contract=lambda: "contract",
+        )
+        pending = PendingDelivery("testchain", OTHER, 42, offchain, 99)
+        out = asyncio.run(MechService._watch(service, pending, "ab", 5.0))
+        assert out == {"ab": "delivered"}
+        assert seen["request_ids"] == ["ab"]
+        if offchain:
+            assert seen["args"] == ("https://mech.example/offchain", 5.0)
+            assert "from_block" not in seen
+        else:
+            assert seen["args"] == ("contract", service.ledger_api, 5.0)
+            assert seen["from_block"] == 99
 
     def test_delivered_request_survives_an_unwritable_audit_log(
         self,
@@ -2450,3 +2608,20 @@ class TestMcpGuardrailTools:
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
         assert result == {"chain": "testchain", **fake.result}
+
+    async def test_mech_result_tool_polls_off_the_event_loop(
+        self,
+        tools: dict[str, t.Callable],
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The poll also calls asyncio.run, so it needs the same worker thread."""
+        calls: list[dict] = []
+
+        def fake_result(request_id: str, **kwargs: object) -> dict:
+            calls.append({"request_id": request_id, **kwargs})
+            return {"delivered": True}
+
+        monkeypatch.setattr(mech_service, "result", fake_result)
+        assert await tools["mech_result"]("ab", timeout=5) == {"delivered": True}
+        assert calls[0] == {"request_id": "ab", "timeout": 5}

@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from connect import workspace
+from connect.mech import MAX_DELIVERY_TIMEOUT
 from connect.settings import HARNESSES
 from connect.workspace import Workspace
 
@@ -55,6 +56,21 @@ def test_provisioning_writes_mcp_config_0600(store_path: Path) -> None:
     entry = mcp_entry(store_path)
     assert entry["url"] == "http://127.0.0.1:8716/mcp/"
     assert entry["headers"]["Authorization"] == "Bearer tok-1"
+
+
+def test_mcp_entry_grants_a_tool_budget_covering_the_longest_wait(
+    store_path: Path,
+) -> None:
+    """The harness must not abandon a mech request the agent already paid for.
+
+    An HTTP MCP server otherwise gets a 60s first-byte timer and a 5-minute
+    idle window, both shorter than a mech delivery wait. The per-server
+    timeout raises all of them, so it has to cover the longest wait the
+    server itself permits.
+    """
+    provisioned(store_path)
+    assert mcp_entry(store_path)["timeout"] == workspace.MCP_TOOL_TIMEOUT_MS
+    assert workspace.MCP_TOOL_TIMEOUT_MS >= MAX_DELIVERY_TIMEOUT * 1000
 
 
 def test_provisioning_preserves_other_mcp_servers(store_path: Path) -> None:
