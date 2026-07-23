@@ -36,7 +36,7 @@ from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.mech import DEFAULT_MAX_PAYMENT, MechService
+from connect.mech import DEFAULT_MAX_PAYMENT, DEFAULT_RESULT_TIMEOUT, MechService
 from connect.settings import SettingsStore
 from connect.signer import Signer
 
@@ -44,7 +44,7 @@ RECEIPT_POLL_SECONDS = 2
 MAX_RECEIPT_TIMEOUT = 300
 
 
-def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
+def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-locals
     signer: Signer,
     config: AppConfig,
     activity: ActivityLog,
@@ -69,8 +69,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     async def wallet_info() -> dict:
         """Agent EOA, guard mode, and per-chain safes and balances.
 
-        Act only on `actionable_chains` (safe + gas, usually one); the rest
-        give a `not_actionable_because`.
+        Act only on `actionable_chains`; the rest say `not_actionable_because`.
         """
 
         def _run() -> dict:
@@ -93,16 +92,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     ) -> dict:
         """Make the service safe call `target` — the normal way to act on-chain.
 
-        The safe is the agent's on-chain identity: approvals, swaps, stakes,
-        claims and transfers are all calls it makes. `target`, `value` and
-        `data` are that call — most carry no value at all; any they do carry
-        leaves the safe, not the EOA. The server composes the safe's transaction
-        around it. Prefer this over send_transaction, whose `to` is the EOA's
-        own outer recipient — a different account with different funds.
-
-        Returns {tx_hash}; with wait_for_receipt, also a top-level `status`
-        (mined / reverted / pending) and the receipt. Retrying with the same
-        request_id returns the original tx_hash rather than acting twice.
+        `target`/`value`/`data` are the call the safe makes; any value carried
+        leaves the safe, not the EOA. Returns {tx_hash}, plus a top-level
+        `status` (mined / reverted / pending) and the receipt when
+        wait_for_receipt. Reusing a request_id replays the original tx_hash
+        instead of spending twice.
         """
         return await _dispatch(
             signer.send_via_safe,
@@ -129,14 +123,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     ) -> dict:
         """Sign and broadcast a transaction from the agent EOA — the rarer path.
 
-        `to` is the EOA's own outer recipient, not a call the safe makes; the
-        EOA's funds are for gas. For spending or acting on-chain, use
-        safe_transaction instead. In restricted mode this can reach nothing but
-        the safe.
-
-        Returns {tx_hash}; with wait_for_receipt, also a top-level `status`
-        (mined / reverted / pending) and the receipt. Retrying with the same
-        request_id returns the original tx_hash instead of a duplicate.
+        `to` is the EOA's own recipient, not a call the safe makes, and the
+        EOA's funds are for gas: to spend or act on-chain use safe_transaction.
+        In restricted mode this reaches nothing but the safe. Returns and
+        request_id semantics are safe_transaction's.
         """
         return await _dispatch(
             signer.send,
@@ -154,10 +144,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     async def transaction_status(chain: str, tx_hash: str) -> dict:
         """Settlement of a transaction: mined / reverted / pending.
 
-        The same top-level `status` the send tools return, so a tx polled here
-        after a send is read the same way — a revert is not mistaken for success.
-        A malformed hash or a failing RPC raises instead of reporting "pending":
-        a hash that can never resolve must not be polled forever.
+        A malformed hash or a failing RPC raises rather than reporting
+        "pending": a hash that can never resolve must not be polled forever.
         """
         try:
             valid = len(bytes.fromhex(tx_hash.removeprefix("0x"))) == 32
@@ -203,18 +191,12 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     ) -> dict:
         """Send a request to an Olas mech (AI service) and wait for its delivery.
 
-        By default the request goes off-chain (prepaid balance, no transaction;
-        needs unrestricted mode) — but only mechs whose operator published an
-        endpoint can serve it, and few do, so check `offchain_capable` with
-        mech_tools first. With legacy_on_chain=true it is sent on-chain
-        through the mech marketplace via the service safe — this works in
-        restricted mode because the mech contracts are whitelisted by default.
-        chain defaults to a configured chain that has a service safe, since the
-        safe is what pays. auto_deposit tops up the prepaid balance from the
-        safe when the mech answers 402 (insufficient balance) and retries once.
-        A request is refused if the mech's per-request price exceeds max_payment
-        (wei, default 0.1 of the native unit) — raise it explicitly to accept a
-        more expensive mech.
+        The safe pays, so `chain` defaults to a configured chain that has one.
+        Off-chain by default: few mechs can serve that, so check
+        `offchain_capable` with mech_tools first; legacy_on_chain=true goes
+        through the marketplace instead and works in restricted mode.
+        Refused before paying if the mech's price exceeds max_payment (wei).
+        On timeout the ids come back as `pending_request_ids` for mech_result.
         """
         # mech-client manages its own event loops (asyncio.run + sync gql):
         # it must run in a worker thread, never on the server loop
@@ -231,6 +213,18 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
         )
 
     @mcp.tool()
+    async def mech_result(
+        request_id: str, timeout: float = DEFAULT_RESULT_TIMEOUT
+    ) -> dict:
+        """Check whether a mech has since answered a request whose wait timed out.
+
+        Poll the ids from `pending_request_ids`. Already paid for, so this
+        resumes the watch and never resends. Returns {delivered, result}; a
+        restart of this server clears what can be polled.
+        """
+        return await asyncio.to_thread(mech.result, request_id, timeout=timeout)
+
+    @mcp.tool()
     async def mech_tools(
         chain: str | None = None,
         priority_mech: str | None = None,
@@ -239,14 +233,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     ) -> dict:
         """Discover Olas mechs and the tools they serve, for use with mech_request.
 
-        Without priority_mech: a page of live marketplace mechs (most
-        deliveries first; `total` reports how many exist — page with
-        limit/offset). With priority_mech: that mech's payment type, service
-        id and available tool names — pass one as mech_request's `tool`
-        argument (limit/offset are ignored then) — plus `offchain_capable`,
-        which says whether the default off-chain flow can reach it at all; when
-        it is false, `offchain_note` gives the reason and mech_request needs
-        legacy_on_chain=true. chain defaults to a configured chain with a safe.
+        Without priority_mech: a page of live mechs, most deliveries first
+        (`total` says how many exist). With it: that mech's payment type,
+        service id, tool names for mech_request's `tool`, and
+        `offchain_capable` — false means only legacy_on_chain=true reaches it,
+        and `offchain_note` says why.
         """
         # same as mech_request: the sync gql subgraph client refuses to run
         # on an already-running loop
@@ -262,8 +253,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments
     async def settings() -> dict:
         """Read the enforced settings in their canonical shape.
 
-        The "protected" object is the guardrail state. Read-only: changes
-        go through the operator's agent UI, never through this MCP surface.
+        "protected" is the guardrail state. Read-only: changes go through the
+        operator's agent UI, never this surface.
         """
         return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 

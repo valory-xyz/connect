@@ -33,7 +33,7 @@ other non-aea agent. It:
      `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `safe_transaction`, `send_transaction`, `transaction_status`,
-     `sign_message`, `mech_tools`, `mech_request`, `settings`.
+     `sign_message`, `mech_tools`, `mech_request`, `mech_result`, `settings`.
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)

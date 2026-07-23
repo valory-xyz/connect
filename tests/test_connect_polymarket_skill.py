@@ -34,12 +34,16 @@ covered by the live e2e, not here).
 
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from eth_abi import decode as abi_decode
 from eth_utils import to_checksum_address
 from web3.exceptions import ContractLogicError, TimeExhausted
+
+from connect import workspace
+from connect.config import AGENT_HTTP_PORT, BIND_HOST
 
 # The skill ships as bundled assets, not an installed package; put its scripts
 # dir on the path so we can import the modules under test. pm_common locates
@@ -62,6 +66,7 @@ import pm_common as pm  # noqa: E402
 import positions  # noqa: E402
 import redeem  # noqa: E402
 import relayer_proxy  # noqa: E402
+import signer_client  # noqa: E402  (on sys.path via pm_common's sibling import)
 
 ADDR_A = to_checksum_address("0x" + "11" * 20)
 ADDR_B = to_checksum_address("0x" + "22" * 20)
@@ -962,3 +967,353 @@ def test_deploy_fatal_when_owner_never_reads(monkeypatch, tmp_path) -> None:
     with pytest.raises(SystemExit):
         deposit_wallet._deploy(cs, _DeployProxy())
     assert pm.load_state(cs) == {}
+
+
+# --- .mcp.json base URL: the trailing slash that 404'd a whole live run ----------
+
+
+def _write_mcp_config(directory: Path, url: str) -> None:
+    (directory / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    signer_client.MCP_SERVER_NAME: {
+                        "url": url,
+                        "headers": {"Authorization": "Bearer t0ken"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8716/mcp",
+        "http://127.0.0.1:8716/mcp/",
+        "http://127.0.0.1:8716/mcp///",
+    ],
+)
+def test_mcp_base_url_drops_the_suffix_however_it_is_slashed(tmp_path, url) -> None:
+    """A trailing slash must not defeat the /mcp strip — it 404s every request."""
+    _write_mcp_config(tmp_path, url)
+    base_url, token, root = signer_client.load_mcp_config_dir(tmp_path)
+    assert base_url == "http://127.0.0.1:8716"
+    assert token == "t0ken"  # nosec B105
+    assert root == tmp_path.resolve()
+
+
+def test_base_url_handles_the_url_the_server_actually_writes(tmp_path) -> None:
+    """Producer and consumer in one test — the gap that broke every live run.
+
+    ``workspace.mcp_url`` ends in a slash on purpose (a POST to /mcp without
+    it hits the agent-UI route and 405s), so the reader must cope with it
+    rather than the writer dropping it.
+    """
+    _write_mcp_config(tmp_path, workspace.mcp_url())
+    base_url, _, _ = signer_client.load_mcp_config_dir(tmp_path)
+    assert base_url == f"http://{BIND_HOST}:{AGENT_HTTP_PORT}"
+    assert not base_url.rstrip("/").endswith("/mcp")
+
+
+# --- /wallet shape: one reader, and errors that are sure of their cause ----------
+
+
+def _cs_with_info(info: dict):
+    """Build a ConnectSigner with the /wallet response already cached."""
+    cs = pm.ConnectSigner.__new__(pm.ConnectSigner)
+    cs._info = info
+    cs._w3 = None
+    cs.chain = pm.CHAIN
+    return cs
+
+
+def _wallet_payload(**entry) -> dict:
+    """Build the connect server's /wallet shape, one entry for Polygon."""
+    return {
+        "agent_eoa": ADDR_A,
+        "actionable_chains": [pm.CHAIN] if entry.get("safe") else [],
+        "chains": {pm.CHAIN: entry},
+    }
+
+
+def test_safe_address_reads_the_nested_chain_entry() -> None:
+    """The safe comes from chains[polygon].safe, not a flat safes map."""
+    cs = _cs_with_info(_wallet_payload(safe=SAFE_ADDR, rpc="https://rpc.example"))
+    assert cs.safe_address == SAFE_ADDR
+
+
+def test_w3_reads_the_rpc_from_the_nested_chain_entry() -> None:
+    """The RPC comes from chains[polygon].rpc, not a flat rpcs map."""
+    cs = _cs_with_info(_wallet_payload(safe=SAFE_ADDR, rpc="https://rpc.example"))
+    assert cs.w3.provider.endpoint_uri == "https://rpc.example"
+
+
+def test_deployed_chain_without_a_safe_blames_deployment_not_the_rpc() -> None:
+    """A configured chain missing only its safe says so, precisely."""
+    cs = _cs_with_info(_wallet_payload(safe=None, rpc="https://rpc.example"))
+    with pytest.raises(pm.ConnectError, match="no service safe"):
+        _ = cs.safe_address
+
+
+def test_unconfigured_chain_names_the_chains_that_are() -> None:
+    """An absent chain is reported as absent, and lists what is configured."""
+    cs = _cs_with_info(
+        {"agent_eoa": ADDR_A, "chains": {"gnosis": {"rpc": "https://g"}}}
+    )
+    with pytest.raises(pm.ConnectError) as excinfo:
+        _ = cs.safe_address
+    assert "not configured" in str(excinfo.value)
+    assert "gnosis" in str(excinfo.value)
+
+
+def test_chain_info_defaults_to_the_client_s_own_chain() -> None:
+    """Called with no argument it reads self.chain, not a hardcoded default."""
+    cs = _cs_with_info(_wallet_payload(safe=SAFE_ADDR, rpc="https://rpc.example"))
+    assert cs.chain_info()["rpc"] == "https://rpc.example"
+
+
+def test_unconfigured_chain_on_an_empty_deployment_says_none() -> None:
+    """A server reporting no chains at all still gives a usable message."""
+    cs = _cs_with_info({"agent_eoa": ADDR_A, "chains": {}})
+    with pytest.raises(pm.ConnectError, match="configured: none"):
+        _ = cs.safe_address
+
+
+def test_unrecognised_wallet_payload_is_not_reported_as_missing_config() -> None:
+    """The pre-#34 flat shape must read as client/server drift, not bad config.
+
+    This is the exact failure the live QA run chased: a parsing fault that
+    named operator configuration as the cause and sent the agent hunting a
+    Polygon setup problem that did not exist.
+    """
+    cs = _cs_with_info({"agent_eoa": ADDR_A, "safes": {}, "rpcs": {}})
+    with pytest.raises(pm.ConnectError) as excinfo:
+        _ = cs.safe_address
+    assert "out of step" in str(excinfo.value)
+    assert "not configured" not in str(excinfo.value)
+
+
+# --- balances: the USDC that was there all along -------------------------
+
+
+class _BalancesW3:
+    class eth:  # noqa: D106 - test double
+        @staticmethod
+        def get_balance(address):
+            return 2 * 10**18
+
+    @staticmethod
+    def from_wei(value, unit):
+        return value / 10**18
+
+
+class _BalancesCS:
+    safe_address = SAFE_ADDR
+    agent_eoa = ADDR_A
+    w3 = _BalancesW3()
+
+
+def _only_usdc(w3, token, owner):
+    """Report a safe holding USDC and nothing else the onramp accepts."""
+    return 5_000_000 if token == pm.USDC else 0
+
+
+def test_balances_report_usdc(monkeypatch, capsys) -> None:
+    """USDC appears; omitting it read as "no USDC" and blocked a run."""
+    monkeypatch.setattr(funds, "_resolve_dw", lambda cs: None)
+    monkeypatch.setattr(pm, "erc20_balance_of", _only_usdc)
+    funds.cmd_balances(_BalancesCS())
+    safe = json.loads(capsys.readouterr().out)["safe"]
+    assert safe["usdc"] == 5.0
+    assert safe["usdc_e"] == 0.0
+    assert safe["pusd"] == 0.0
+
+
+def test_wrap_refusal_names_the_usdc_it_cannot_use(monkeypatch) -> None:
+    """Name what the safe does hold, and why the onramp cannot use it."""
+    monkeypatch.setattr(pm, "erc20_balance_of", _only_usdc)
+    with pytest.raises(SystemExit) as excinfo:
+        funds.cmd_wrap(_BalancesCS(), None)
+    assert "5.0 USDC" in str(excinfo.value)
+    assert "USDC.e" in str(excinfo.value)
+
+
+def test_wrap_refusal_survives_an_rpc_failure_while_building_its_hint(
+    monkeypatch,
+) -> None:
+    """A flaky RPC must not replace the real refusal with its own traceback.
+
+    Only the hint's read is allowed to fail quietly: the USDC.e read is the
+    actual operation, and its failure has to propagate.
+    """
+
+    def _hint_read_fails(w3, token, owner):
+        if token == pm.USDC:
+            raise ConnectionError("RPC unavailable")
+        return 0
+
+    monkeypatch.setattr(pm, "erc20_balance_of", _hint_read_fails)
+    with pytest.raises(SystemExit) as excinfo:
+        funds.cmd_wrap(_BalancesCS(), None)
+    assert "nothing to wrap" in str(excinfo.value)
+    assert "does hold" not in str(excinfo.value)
+
+
+def test_wrap_propagates_a_failure_of_the_read_it_actually_needs(
+    monkeypatch,
+) -> None:
+    """The USDC.e read is the operation, not a hint — it must not be swallowed."""
+
+    def _boom(w3, token, owner):
+        raise ConnectionError("RPC unavailable")
+
+    monkeypatch.setattr(pm, "erc20_balance_of", _boom)
+    with pytest.raises(ConnectionError):
+        funds.cmd_wrap(_BalancesCS(), None)
+
+
+def test_wrap_refusal_stays_quiet_when_there_is_no_usdc(monkeypatch) -> None:
+    """An empty safe gets no misleading "but you do hold" clause."""
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 0)
+    with pytest.raises(SystemExit) as excinfo:
+        funds.cmd_wrap(_BalancesCS(), None)
+    # "USDC.e" is in the base message either way — what must be absent is the
+    # hint clause, which would name a balance the safe does not have
+    assert "does hold" not in str(excinfo.value)
+
+
+# --- markets list: "resolves within N" ------------------------------------------
+
+NOW = datetime(2026, 7, 23, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_ends_within_bounds_start_now_and_span_the_window() -> None:
+    """The window runs from now (never re-admitting ended markets) to now+N."""
+    assert markets._ends_within_params(*markets._ends_within_bounds("48h", NOW)) == {
+        "end_date_min": "2026-07-23T12:00:00Z",
+        "end_date_max": "2026-07-25T12:00:00Z",
+    }
+
+
+@pytest.mark.parametrize("window", ["7d", "2w", "1h"])
+def test_ends_within_accepts_hours_days_weeks(window) -> None:
+    """Each supported unit parses and yields an ordered pair of bounds."""
+    start, end = markets._ends_within_bounds(window, NOW)
+    assert end > start
+
+
+@pytest.mark.parametrize("window", ["0h", "0d", "00w"])
+def test_ends_within_rejects_an_empty_window(window) -> None:
+    """A zero-length window matches nothing; that must not read as "none"."""
+    with pytest.raises(SystemExit, match="positive window"):
+        markets._ends_within_bounds(window)
+
+
+@pytest.mark.parametrize("window", ["7", "3mo", "", "-1d", "d7", "48 h"])
+def test_ends_within_rejects_what_it_cannot_parse(window) -> None:
+    """An unparseable window fails loudly rather than silently not filtering."""
+    with pytest.raises(SystemExit, match="ends-within"):
+        markets._ends_within_bounds(window)
+
+
+@pytest.mark.parametrize(
+    ("end_date", "inside"),
+    [
+        ("2026-07-24T12:00:00Z", True),
+        ("2026-07-23T12:00:00Z", True),  # the lower bound itself
+        ("2026-07-25T12:00:00Z", True),  # the upper bound itself
+        ("2026-07-26T12:00:00Z", False),  # after the window
+        ("2026-07-22T12:00:00Z", False),  # already ended
+        ("2026-07-24T12:00:00.500Z", True),  # fractional seconds
+        ("2026-07-24T12:00:00+00:00", True),  # explicit offset
+        ("not-a-date", False),
+        (None, False),
+    ],
+)
+def test_ends_in_window_judges_each_market_by_its_own_end_date(
+    end_date, inside
+) -> None:
+    """The local check must handle every endDate shape Gamma may return."""
+    start, end = markets._ends_within_bounds("48h", NOW)
+    assert markets._ends_in_window({"endDate": end_date}, start, end) is inside
+
+
+def test_cmd_list_sends_the_end_date_bounds(monkeypatch, capsys) -> None:
+    """--ends-within reaches Gamma as query params."""
+    seen: dict = {}
+
+    def fake_get(url, params=None):
+        seen.update(params or {})
+        return []
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    markets.cmd_list(5, None, None, "48h")
+    capsys.readouterr()
+    assert "end_date_min" in seen
+    assert "end_date_max" in seen
+
+
+def test_cmd_list_drops_markets_gamma_should_have_filtered(monkeypatch, capsys) -> None:
+    """The window holds even if Gamma ignored the parameters entirely.
+
+    Gamma drops query parameters it does not recognise, so a server that never
+    applied the filter returns a full unfiltered page. Reporting those as
+    "resolves within N" would be a silent, invisible lie.
+    """
+    far_future = (datetime.now(timezone.utc) + timedelta(days=400)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    soon = (datetime.now(timezone.utc) + timedelta(hours=5)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: [
+            {"question": "resolves soon", "endDate": soon},
+            {"question": "resolves next year", "endDate": far_future},
+            {"question": "no end date at all"},
+        ],
+    )
+    markets.cmd_list(10, None, None, "48h")
+    out = json.loads(capsys.readouterr().out)
+    assert [m["question"] for m in out] == ["resolves soon"]
+
+
+def test_main_wires_ends_within_through_the_parser(monkeypatch, capsys) -> None:
+    """The CLI is the only way this runs in production, so parse it for real.
+
+    cmd_list is tested directly above; that would not notice the flag being
+    renamed or never forwarded, which would silently filter nothing.
+    """
+    seen: dict = {}
+
+    def fake_get(url, params=None):
+        seen.update(params or {})
+        return []
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    monkeypatch.setattr(
+        sys, "argv", ["markets.py", "list", "--limit", "3", "--ends-within", "48h"]
+    )
+    markets.main()
+    capsys.readouterr()
+    assert "end_date_min" in seen
+    assert "end_date_max" in seen
+
+
+def test_cmd_list_without_the_flag_sends_no_bounds(monkeypatch, capsys) -> None:
+    """The filter is opt-in — an unfiltered list keeps its previous query."""
+    seen: dict = {}
+
+    def fake_get(url, params=None):
+        seen.update(params or {})
+        return []
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    markets.cmd_list(5, None, None)
+    capsys.readouterr()
+    assert "end_date_min" not in seen

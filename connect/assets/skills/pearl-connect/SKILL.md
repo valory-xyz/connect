@@ -23,35 +23,23 @@ private key — and never need to.
 
 ## MCP tools (connect server)
 
-- `wallet_info()` — addresses, guardrail mode, `actionable_chains`, and per
-  chain its safe, balances and `not_actionable_because`.
-- `safe_transaction(chain, target, value, data, request_id, wait_for_receipt, timeout)`
-  — **the normal way to act on-chain.** Describes the call the *safe* makes —
-  an approval, a swap, a stake, a claim, a transfer, anything. Most carry no
-  `value`; any they do carry leaves the safe, where the working funds are. The
-  server wraps the call in the safe's own transaction, so you never compose one
-  and never need the safe's address. Returns `{tx_hash}` (plus `receipt` if you
-  asked to wait and it mined in time).
-- `send_transaction(chain, to, value, data, request_id, wait_for_receipt, timeout)`
-  — the same call, made by the **EOA**, whose funds are for gas fees. Rarely what you
-  want; in restricted mode it can reach nothing but the safe.
-- For either: when retrying a send whose outcome you are unsure about, reuse
-  the same `request_id` and you get the original `tx_hash` back instead of
-  spending twice.
-- `transaction_status(chain, tx_hash)` — receipt once mined.
-- `sign_message(digest)` — sign a raw 32-byte digest (0x-hex), **unprefixed**
-  (plain ecrecover semantics; used by off-chain mech requests). Unavailable
-  in restricted mode.
-- `mech_tools(chain, priority_mech, limit, offset)` — discover live mechs
-  (most deliveries first; paginate with limit/offset, `total` tells you
-  when to stop) and, given a `priority_mech`, its payment type, tool names
-  and `offchain_capable`. `chain` defaults to a chain that has a safe.
-- `mech_request(prompt, tool, chain, legacy_on_chain, priority_mech, auto_deposit, timeout, max_payment)` —
-  send a request to an Olas mech (an on-chain-paid AI service) and wait for its delivery.
-  See "Mech requests" below.
-- `settings()` — the enforced settings in their canonical shape:
-  `{"protected": {"mode", "whitelist"}, "harness"}`. The protected object is
-  the guardrail state (read-only here; see "Guardrail modes" below).
+Each tool's own description carries its parameters and returns. What those
+cannot tell you is which to reach for:
+
+- `wallet_info` — start every on-chain task here.
+- `safe_transaction` — **the normal way to act on-chain.** It describes the
+  call the *safe* makes: an approval, a swap, a stake, a claim, a transfer,
+  anything. You never compose the safe's own transaction, and never need its
+  address.
+- `send_transaction` — the same call made by the **EOA**, whose funds are for
+  gas. Rarely what you want.
+- For either: if you are unsure whether a send landed, retry with the same
+  `request_id` rather than issuing a new one.
+- `transaction_status` — settle a hash you already hold.
+- `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
+- `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
+- `settings` — `{"protected": {"mode", "whitelist"}, "harness"}`; the
+  protected object is the guardrail state, read-only here.
 
 ## Guardrail modes
 
@@ -81,6 +69,9 @@ payment via the service safe, request, and delivery watching. Start with
 `mech_tools()` to pick a mech, then call it again with that `priority_mech`
 to see the tools it serves and whether it can be reached off-chain.
 
+`chain` is optional throughout: it defaults to a configured chain, preferring
+one with a safe.
+
 Two things decide which flow you can use, and both are worth checking before
 composing a prompt:
 
@@ -88,22 +79,25 @@ composing a prompt:
   USDC, OLAS). A mech pricing in an asset the safe does not hold cannot be
   paid, and `auto_deposit` will fail rather than convert anything.
 - **`offchain_capable`.** The off-chain flow needs an endpoint published in
-  the mech's service metadata, and few mechs publish one; those that do not
-  serve on-chain requests only.
-  When it is `false`, `offchain_note` says why and what to do — a mech with no
-  endpoint must go on-chain, an unreadable fetch is worth retrying first. An
-  off-chain request to such a mech is refused up front, not part-way through.
+  the mech's service metadata, and few mechs publish one; the rest serve
+  on-chain requests only. When it is `false`, `offchain_note` says why — a
+  mech with no endpoint must go on-chain, an unreadable fetch is worth
+  retrying first. Such a request is refused up front, not part-way through.
 
-- `legacy_on_chain=false` (default): off-chain request — no transaction; it
-  raw-signs a request digest and spends prepaid balance held by the mech
-  BalanceTracker. Requires unrestricted mode **and** an `offchain_capable`
-  mech. With `auto_deposit=true` (the default) an insufficient prepaid
-  balance is topped up from the safe once and the request retried.
+- `legacy_on_chain=false` (default): no transaction; it raw-signs a request
+  digest and spends prepaid balance held by the mech BalanceTracker, so it
+  needs unrestricted mode. With `auto_deposit=true` (the default) an
+  insufficient balance is topped up from the safe once and the request
+  retried.
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
   via the service safe. Works in restricted mode out of the box (the
   marketplace contract ships in the default whitelist).
-- `timeout` (seconds, default 300) bounds the wait for the mech's answer; on
-  timeout you still get the `tx_hash`/`request_ids` and can check later.
+- `timeout` (seconds, default 300, max 900) bounds each phase of the wait —
+  the marketplace naming a delivering mech, then reading that mech's logs —
+  so the call itself can take up to twice it. A timeout does not lose the
+  request — it is paid for, and the ids come back as `pending_request_ids`.
+  Poll them with `mech_result(request_id)`, which resumes the watch and never
+  resends.
 - `max_payment` (wei, default 10^17 = 0.1 of the native unit) caps what one
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with

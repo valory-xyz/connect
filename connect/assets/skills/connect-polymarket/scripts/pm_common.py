@@ -64,6 +64,10 @@ CHAIN_ID = 137
 # --- Polymarket contracts (Polygon mainnet, CLOB v2) ---------------------------
 PUSD = to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
 USDC_E = to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+# Circle's USDC. The onramp does NOT accept it, but a safe funded
+# through Pearl routinely holds it, so every balance read must show it —
+# omitting it reads as "no USDC" and looks like a funding blocker.
+USDC = to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
 COLLATERAL_ONRAMP = to_checksum_address("0x93070a847efEf7F70739046A929D47a521F5B8ee")
 CTF = to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 CTF_EXCHANGE = to_checksum_address("0xE111180000d2663C0091e4f400237545B87B996B")
@@ -150,12 +154,12 @@ class ConnectSigner(signer_client.SignerClient):
     @property
     def safe_address(self) -> str:
         """The service safe on Polygon — the treasury every flow returns to."""
-        safe = self.wallet_info().get("safes", {}).get(CHAIN)
+        safe = self.chain_info(CHAIN).get("safe")
         if not safe:
             raise ConnectError(
-                f"no service safe configured on '{CHAIN}' — Polymarket flows "
-                "need the safe as the recoverable treasury; ask the operator "
-                "to configure the Polygon chain"
+                f"the agent has no service safe on '{CHAIN}' — Polymarket "
+                "flows need the safe as the recoverable treasury; ask the "
+                "operator to deploy the service on Polygon"
             )
         return to_checksum_address(safe)
 
@@ -163,11 +167,11 @@ class ConnectSigner(signer_client.SignerClient):
     def w3(self) -> Web3:
         """web3 on the configured Polygon RPC (reads only; sends go via signer)."""
         if self._w3 is None:
-            rpc = self.wallet_info().get("rpcs", {}).get(CHAIN)
+            rpc = self.chain_info(CHAIN).get("rpc")
             if not rpc:
                 raise ConnectError(
-                    f"no RPC configured for '{CHAIN}' — ask the operator to "
-                    "configure the Polygon chain"
+                    f"the signer reports '{CHAIN}' with no RPC URL; ask the "
+                    "operator to configure the Polygon chain"
                 )
             self._w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 60}))
             self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)

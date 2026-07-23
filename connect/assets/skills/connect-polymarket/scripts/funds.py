@@ -48,7 +48,7 @@ POSITIONS_MAX_OFFSET = 10_000
 
 
 def cmd_balances(cs: pm.ConnectSigner) -> None:
-    """Report pUSD / USDC.e / POL for the safe, the DW and the agent EOA."""
+    """Report pUSD / USDC.e / USDC / POL for the safe, DW and agent EOA."""
     w3 = cs.w3
     dw = _resolve_dw(cs)
     wallets = {"safe": cs.safe_address, "agent_eoa": cs.agent_eoa}
@@ -60,9 +60,28 @@ def cmd_balances(cs: pm.ConnectSigner) -> None:
             "address": address,
             "pusd": pm.units_to_usd(pm.erc20_balance_of(w3, pm.PUSD, address)),
             "usdc_e": pm.units_to_usd(pm.erc20_balance_of(w3, pm.USDC_E, address)),
+            "usdc": pm.units_to_usd(pm.erc20_balance_of(w3, pm.USDC, address)),
             "pol": float(w3.from_wei(w3.eth.get_balance(address), "ether")),
         }
     pm.print_json(report)
+
+
+def _usdc_hint(cs: pm.ConnectSigner, safe: str) -> str:
+    """Name the USDC the onramp just refused to see, if there is any.
+
+    "Nothing to wrap" against a safe holding USDC is true but reads as
+    unfunded; the balance and the reason it cannot be wrapped belong together.
+    """
+    try:
+        native = pm.erc20_balance_of(cs.w3, pm.USDC, safe)
+    except Exception:  # noqa: BLE001 - a hint must never replace the refusal
+        return ""
+    if native <= 0:
+        return ""
+    return (
+        f" (the safe does hold {pm.units_to_usd(native)} USDC, which "
+        "the onramp does not accept — it must be swapped to USDC.e first)"
+    )
 
 
 def cmd_wrap(cs: pm.ConnectSigner, amount: float | None) -> None:
@@ -71,14 +90,15 @@ def cmd_wrap(cs: pm.ConnectSigner, amount: float | None) -> None:
     Two sequential safe calls — approve, then wrap (the onramp pulls via
     transferFrom and mints pUSD back to the safe). NOT a multisend: connect's
     guardrail floor refuses delegatecall in every mode. The onramp accepts
-    USDC.e only; native USDC must be swapped to USDC.e first.
+    USDC.e only; USDC must be swapped to USDC.e first.
     """
     safe = cs.safe_address
     balance = pm.erc20_balance_of(cs.w3, pm.USDC_E, safe)
     units = pm.usd_to_units(amount) if amount is not None else balance
     if units <= 0 or units > balance:
         raise SystemExit(
-            f"safe USDC.e balance is {pm.units_to_usd(balance)}; nothing to wrap"
+            f"safe USDC.e balance is {pm.units_to_usd(balance)}; nothing to "
+            f"wrap{_usdc_hint(cs, safe)}"
             if balance <= 0
             else f"requested {amount} exceeds safe USDC.e balance {pm.units_to_usd(balance)}"
         )
