@@ -15,7 +15,7 @@ jobs:
     container:
       image: valory/open-autonomy-user:0.21.26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify hashes and push packages
         run: |
           export AUTHOR=$(grep 'service/' packages/packages.json | awk -F/ '{print $2}' | head -1)
@@ -41,7 +41,7 @@ jobs:
             asset: agent_runner_windows_x64.exe
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v7
         with:
