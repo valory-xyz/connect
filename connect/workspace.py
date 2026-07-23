@@ -78,8 +78,13 @@ def assets_dir() -> Path:
 
 
 def mcp_url() -> str:
-    """Mcp url."""
-    return f"http://{BIND_HOST}:{AGENT_HTTP_PORT}/mcp"
+    """Return the MCP endpoint URL for .mcp.json.
+
+    Keep the trailing slash. The server serves MCP at /mcp/, and the agent-UI
+    route answers GET on /mcp, so a POST to /mcp (no slash) returns 405 and the
+    connection fails. /mcp/ reaches the MCP server directly.
+    """
+    return f"http://{BIND_HOST}:{AGENT_HTTP_PORT}/mcp/"
 
 
 def ui_build_dir() -> Path | None:
@@ -346,7 +351,9 @@ class Workspace:
             target = target_root / skill_dir.name
             if target.exists():
                 shutil.rmtree(target)
-            shutil.copytree(skill_dir, target)
+            shutil.copytree(
+                skill_dir, target, ignore=shutil.ignore_patterns("__pycache__")
+            )
 
 
 def _open_url(url: str) -> bool:

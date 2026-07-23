@@ -53,7 +53,7 @@ def test_provisioning_writes_mcp_config_0600(store_path: Path) -> None:
     if sys.platform != "win32":  # Windows does not enforce POSIX mode bits
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
     entry = mcp_entry(store_path)
-    assert entry["url"] == "http://127.0.0.1:8716/mcp"
+    assert entry["url"] == "http://127.0.0.1:8716/mcp/"
     assert entry["headers"]["Authorization"] == "Bearer tok-1"
 
 

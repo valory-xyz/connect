@@ -134,8 +134,10 @@ class SignerClient:
             f"retry with request_id='{request_id}' to avoid double-spending"
         ) from last_error
 
-    def sign_digest(self, digest: str) -> str:
-        """Sign a raw 32-byte digest (0x-hex), unprefixed."""
+    def sign_digest(self, digest: str | bytes) -> str:
+        """Sign a raw 32-byte digest (0x-hex or bytes), unprefixed."""
+        if isinstance(digest, bytes):
+            digest = "0x" + digest.hex()
         return self._post("/sign-message", {"digest": digest})["signature"]
 
     def wallet_info(self) -> dict:
@@ -172,8 +174,12 @@ class SignerProvider(HTTPProvider):
         return super().make_request(method, params)
 
 
-def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
-    """Find .mcp.json (cwd upwards) and return (server_base_url, token)."""
+def load_mcp_config_dir(start: Path | None = None) -> tuple[str, str, Path]:
+    """Find .mcp.json (cwd upwards); return (base_url, token, containing_dir).
+
+    The containing directory is the agent workspace — sibling skills that
+    keep their own state files there use it to locate that root.
+    """
     directory = (start or Path.cwd()).resolve()
     for candidate in (directory, *directory.parents):
         path = candidate / ".mcp.json"
@@ -183,8 +189,14 @@ def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
             ]
             base_url = entry["url"].removesuffix("/mcp")
             token = entry["headers"]["Authorization"].removeprefix("Bearer ")
-            return base_url, token
+            return base_url, token, candidate
     raise FileNotFoundError(".mcp.json not found in cwd or parents")
+
+
+def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
+    """Find .mcp.json (cwd upwards) and return (server_base_url, token)."""
+    base_url, token, _ = load_mcp_config_dir(start)
+    return base_url, token
 
 
 def connect(chain: str) -> tuple[Web3, SignerClient]:

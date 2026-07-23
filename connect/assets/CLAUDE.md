@@ -70,7 +70,8 @@ digests — use the **pearl-connect skill**
 
 Don't hand-roll signing, key loading, or raw RPC sends — the skill's paths
 are the supported, audited ones. Start any on-chain task with `wallet_info`
-to learn your addresses, chains, balances, and guardrail mode.
+for your addresses, balances, guardrail mode, and `actionable_chains` — the
+chains you can actually act on, usually one. Ignore the rest.
 
 ## When the operator asks "what can you do?"
 
@@ -79,8 +80,9 @@ Answer it with concrete suggestions they can ask you to do — not a list of too
 nothing; a few real tasks do.
 
 First run `wallet_info` and `settings` so you only offer what works right now —
-skip a recipe if the funds aren't there, or if it needs a contract the
-whitelist doesn't allow while you're in restricted mode. Then offer a few of
+skip a recipe if the funds aren't there, if it needs a chain outside
+`actionable_chains`, or if it needs a contract the whitelist doesn't allow
+while you're in restricted mode. Then offer a few of
 these or something similar, in their words, and invite them to pick one or ask their own:
 
 - **Have an expert AI service make a prediction** — e.g. "Will tomorrow's
