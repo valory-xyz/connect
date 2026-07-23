@@ -57,7 +57,7 @@ Run them from anywhere in the workspace (they locate `.mcp.json` upwards).
 |---|---|
 | `deposit_wallet.py status\|ensure` | Deploy the DW via the relayer proxy and grant its trading approvals (idempotent one-time setup) |
 | `funds.py balances\|wrap\|top-up\|sweep\|return-position` | Treasury flows between safe and DW; `return-position` stages an already-swept position back in the DW for selling |
-| `markets.py list\|market\|book\|price` | Market discovery and prices (public, any mode) |
+| `markets.py list\|market\|book\|price` | Market discovery and prices (public, any mode); `list --ends-within 48h\|7d\|2w` filters by resolution date |
 | `trade.py buy\|sell\|limit\|order\|cancel` | CLOB orders (POLY_1271, DW-funded); market orders take `--order-type fok\|fak`, limit orders `gtc\|gtd --expires-in` |
 | `positions.py positions\|trades` | Portfolio reads (public, any mode) |
 | `redeem.py list\|approve\|redeem\|all` | Redeem resolved positions from the safe |
@@ -82,6 +82,13 @@ if [ ! -x "$VENV/bin/python" ]; then
   "$VENV/bin/pip" install -q "py-clob-client-v2==1.0.2" "web3>=7.15,<8" requests
 fi
 PY="$VENV/bin/python"   # run every script below with "$PY", not plain python
+# Point TLS at certifi's CA bundle, on every run — not only at creation. A
+# pyenv/source-built Python often carries no trust store, and every Polymarket
+# HTTPS call then dies with CERTIFICATE_VERIFY_FAILED, which reads as a venue
+# outage rather than a local gap.
+SSL_CERT_FILE="$("$PY" -c 'import certifi; print(certifi.where())')"
+export SSL_CERT_FILE
+export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
 ```
 
 A typical first session (once the venv is set up as above):
@@ -112,6 +119,20 @@ A typical first session (once the venv is set up as above):
 - **Relayer proxy reachable.** DW operations go through Valory's predict-api
   proxy (Polymarket's DW relayer needs a Builder key that can't ship in a
   desktop app). Override with `POLYMARKET_RELAYER_PROXY_URL` if instructed.
+- **Network reachable.** Some ISPs block Polymarket at the DNS level, which
+  looks nothing like the venue's 403 — connections hang or fail TLS, and
+  every host resolves to one address the ISP owns. Check before blaming the
+  venue or the code:
+
+  ```bash
+  "$PY" -c "import socket
+  for h in ('clob.polymarket.com','gamma-api.polymarket.com','data-api.polymarket.com'):
+      print(h, socket.gethostbyname(h))"
+  ```
+
+  Three distinct addresses is healthy; one address for all three means the
+  network is intercepting the lookup. Report that to the operator — it is
+  theirs to fix, and nothing here can route around it.
 - **Geoblocking.** Polymarket rejects order placement from the US, UK and
   ~30 other jurisdictions by IP (close-only). A `403`/geoblock error on
   order posting is the venue's policy, not a bug — report it to the operator
@@ -133,7 +154,8 @@ A typical first session (once the venv is set up as above):
   balance equals the bet, a $1 bet shrinks below the minimum and is
   rejected — `trade.py buy` preflights this with the SDK's exact per-market
   sizing and tells you the precise top-up. Resting limit orders reserve the
-  same per-market fee on top of `price × size`.
+  same per-market fee on top of `price × size`. In short: **never buy with
+  the DW's full balance** — leave the fee room above the bet.
 - pUSD has **no unwrap**: the onramp is wrap-only. The exit back to USDC is
   a DEX swap (Uniswap v3 pUSD/USDC pools) or selling positions and
   withdrawing pUSD as-is.

@@ -32,6 +32,7 @@ import logging
 import os
 import threading
 import typing as t
+from collections.abc import Mapping
 
 from mech_client.services.marketplace_service import MarketplaceService
 
@@ -44,7 +45,16 @@ logger = logging.getLogger("agent")
 
 DEFAULT_MECH_CHAIN = "gnosis"
 DEFAULT_DELIVERY_TIMEOUT = 300.0
-MAX_DELIVERY_TIMEOUT = 3600.0  # a tool call must not pin its worker forever
+# A tool call must not pin its worker forever, and waiting longer than the mech
+# itself was given cannot help: mech-client writes responseTimeout=300 into the
+# request, so past that the mech is out of time by the request's own terms.
+# 900s matches mech-client's own delivery-watcher default and leaves room past
+# responseTimeout for settlement and log indexing.
+MAX_DELIVERY_TIMEOUT = 900.0
+# mech_result resumes a wait rather than starting one, so it polls briefly by
+# default: the caller decides when to give up, and a long block here buys
+# nothing a second call would not.
+DEFAULT_RESULT_TIMEOUT = 30.0
 DEFAULT_MECH_PAGE_SIZE = 20
 MAX_MECH_PAGE_SIZE = 100
 # A mech prices its own requests (max_delivery_rate) and the guardrail only
@@ -64,6 +74,27 @@ class PricedMech(t.NamedTuple):
     mech: str
     service_id: int
     rate_wei: int
+
+
+class PendingDelivery(t.NamedTuple):
+    """Where to resume looking for a request whose delivery had not arrived.
+
+    `from_block` is the request's own transaction block: the on-chain watcher
+    otherwise scans from the head minus a hundred blocks, which finds nothing
+    for a request that has been waiting a while — exactly the case this exists
+    to serve.
+    """
+
+    chain: str
+    mech: str
+    service_id: int
+    offchain: bool
+    from_block: int | None
+
+
+def _request_key(request_id: object) -> str:
+    """Normalize a request id: the two flows disagree about the 0x prefix."""
+    return str(request_id).lower().removeprefix("0x")
 
 
 class MetadataRead(t.NamedTuple):
@@ -152,6 +183,9 @@ class MechService:
         self._guard = guard
         self._lock = threading.Lock()
         self._services: dict[str, MarketplaceService] = {}
+        # requests that returned without a delivery, keyed by request id, so
+        # mech_result can resume the watch a paid-for request deserves
+        self._pending: dict[str, PendingDelivery] = {}
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
@@ -439,8 +473,123 @@ class MechService:
             chain=chain,
             tool=tool,
             offchain=not legacy_on_chain,
+            request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
-        return {"chain": chain, **dict(result)}
+        return self._with_pending(
+            dict(result),
+            chain=chain,
+            mech=priority_mech,
+            service_id=service_id,
+            offchain=not legacy_on_chain,
+        )
+
+    def _with_pending(
+        self,
+        result: dict,
+        *,
+        chain: str,
+        mech: str,
+        service_id: int,
+        offchain: bool,
+    ) -> dict:
+        """Record every request id the mech has not answered, and report them.
+
+        A timed-out wait is not a failed request: it was paid for and the mech
+        may still answer. Remembering where to look is what lets mech_result
+        pick it up instead of the answer being stranded.
+        """
+        delivered = {
+            _request_key(rid): answer
+            for rid, answer in (result.get("delivery_results") or {}).items()
+        }
+        ids = [_request_key(rid) for rid in result.get("request_ids") or []]
+        receipt = result.get("receipt")
+        block = receipt.get("blockNumber") if isinstance(receipt, Mapping) else None
+        pending = PendingDelivery(
+            chain=chain,
+            mech=mech,
+            service_id=service_id,
+            offchain=offchain,
+            from_block=block,
+        )
+        waiting = [key for key in ids if key not in delivered]
+        with self._lock:
+            for key in waiting:
+                self._pending[key] = pending
+        # Re-key the ids mech-client returned: the on-chain flow 0x-prefixes
+        # request_ids but not the delivery_results keys, so a caller handed
+        # both raw sees one id spelled two ways and cannot match them up.
+        payload = {"chain": chain, **result}
+        if "request_ids" in result:
+            payload["request_ids"] = ids
+        if "delivery_results" in result:
+            payload["delivery_results"] = delivered
+        if waiting:
+            payload["pending_request_ids"] = waiting
+        return payload
+
+    def result(
+        self, request_id: str, *, timeout: float = DEFAULT_RESULT_TIMEOUT
+    ) -> dict:
+        """Resume watching for one request's delivery, without paying again.
+
+        Only ids this service is still waiting on can be polled: the watchers
+        need the flow, the chain and the request's own block to look in the
+        right place, and none of that survives a restart.
+        """
+        timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
+        key = _request_key(request_id)
+        with self._lock:
+            pending = self._pending.get(key)
+        if pending is None:
+            raise MechError(
+                f"nothing is awaiting delivery for request {key}; mech_result "
+                "polls the ids mech_request reported as pending, and a restart "
+                "of this service clears them"
+            )
+        service = self._service(pending.chain)
+        try:
+            delivered = asyncio.run(self._watch(service, pending, key, timeout))
+        except Exception as e:
+            raise MechError(f"could not read delivery for request {key}: {e}") from e
+        data = {_request_key(k): v for k, v in (delivered or {}).items()}
+        report = {
+            "request_id": key,
+            "chain": pending.chain,
+            "mech": pending.mech,
+            "delivered": key in data,
+        }
+        if key not in data:
+            report["note"] = (
+                "no delivery yet — the mech may still answer, or may never; "
+                "poll again or treat the payment as spent"
+            )
+            return report
+        with self._lock:
+            self._pending.pop(key, None)
+        self._activity.record("mech_result", chain=pending.chain, request_id=key)
+        return {**report, "result": data[key]}
+
+    @staticmethod
+    async def _watch(
+        service: MarketplaceService,
+        pending: PendingDelivery,
+        key: str,
+        timeout: float,
+    ) -> dict:
+        """Run the watcher for the flow this request was sent through."""
+        # pylint: disable=import-outside-toplevel, protected-access
+        from mech_client.domain.delivery import (
+            OffchainDeliveryWatcher,
+            OnchainDeliveryWatcher,
+        )
+
+        if pending.offchain:
+            url = service.tool_manager.get_offchain_url(pending.service_id)
+            return await OffchainDeliveryWatcher(url, timeout).watch([key])
+        contract = service._get_marketplace_contract()
+        watcher = OnchainDeliveryWatcher(contract, service.ledger_api, timeout)
+        return await watcher.watch([key], from_block=pending.from_block)
 
     def _blocked(self, chain: str, tool: str, reason: str, detail: str) -> None:
         """Audit a request refused by policy, before raising it to the caller."""

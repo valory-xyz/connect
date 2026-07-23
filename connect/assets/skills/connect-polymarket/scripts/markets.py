@@ -21,6 +21,7 @@
 
 Usage:
     python markets.py list [--limit 20] [--query "bitcoin"] [--tag politics]
+                           [--ends-within 48h]
     python markets.py market --slug will-x-happen        # or --condition-id 0x...
     python markets.py book  --token-id 123...            # CLOB order book
     python markets.py price --token-id 123... --side buy # best price
@@ -28,8 +29,13 @@ Usage:
 
 import argparse
 import json
+import re
+from datetime import datetime, timedelta, timezone
 
 import pm_common as pm
+
+_DURATION = re.compile(r"^(\d+)([hdw])$")
+_DURATION_UNITS = {"h": "hours", "d": "days", "w": "weeks"}
 
 
 def _json_field(market: dict, key: str):
@@ -61,22 +67,78 @@ def _slim(market: dict) -> dict:
     }
 
 
-def cmd_list(limit: int, query: str | None, tag: str | None) -> None:
-    """Active markets by volume; --query filters question text client-side."""
+def _ends_within_bounds(
+    window: str, now: datetime | None = None
+) -> tuple[datetime, datetime]:
+    """Return the (start, end) a `48h` / `7d` / `2w` window covers from now.
+
+    The lower bound is now, so a market that already ended cannot come back.
+    """
+    match = _DURATION.match(window.strip().lower())
+    if not match:
+        raise SystemExit(
+            f"--ends-within must be <number><h|d|w> (e.g. 48h, 7d, 2w), got '{window}'"
+        )
+    amount, unit = match.groups()
+    if int(amount) <= 0:
+        raise SystemExit(f"--ends-within must be a positive window, got '{window}'")
+    start = now or datetime.now(timezone.utc)
+    return start, start + timedelta(**{_DURATION_UNITS[unit]: int(amount)})
+
+
+def _ends_within_params(start: datetime, end: datetime) -> dict:
+    """Gamma's server-side end-date filter for the window."""
+    return {
+        "end_date_min": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_date_max": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _ends_in_window(market: dict, start: datetime, end: datetime) -> bool:
+    """Whether this market's own endDate really falls inside the window.
+
+    Gamma ignores query parameters it does not recognise, so the server-side
+    filter alone cannot be trusted to have been applied — the caller would get
+    a full unfiltered page with no sign that "resolves within N" was dropped.
+    Re-checking each market's own endDate makes the answer right either way; a
+    market whose endDate is missing or unparseable is excluded rather than
+    assumed to qualify.
+    """
+    raw = market.get("endDate")
+    if not isinstance(raw, str):
+        return False
+    try:
+        when = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return start <= when <= end
+
+
+def cmd_list(
+    limit: int, query: str | None, tag: str | None, ends_within: str | None = None
+) -> None:
+    """Active markets by volume; --query and --ends-within also filter locally."""
+    bounds = _ends_within_bounds(ends_within) if ends_within else None
     params: dict = {
         "active": "true",
         "closed": "false",
         "order": "volumeNum",
         "ascending": "false",
-        # over-fetch when filtering client-side so a narrow query still fills
-        "limit": limit if not query else max(limit * 10, 100),
+        # over-fetch when filtering client-side so a narrow filter still fills
+        "limit": limit if not (query or bounds) else max(limit * 10, 100),
     }
     if tag:
         params["tag_slug"] = tag
+    if bounds:
+        params.update(_ends_within_params(*bounds))
     markets = pm.http_get_json(f"{pm.GAMMA_API}/markets", params=params) or []
     if query:
         needle = query.lower()
         markets = [m for m in markets if needle in (m.get("question") or "").lower()]
+    if bounds:
+        markets = [m for m in markets if _ends_in_window(m, *bounds)]
     pm.print_json([_slim(m) for m in markets[:limit]])
 
 
@@ -129,6 +191,11 @@ def main() -> None:
     lst.add_argument("--limit", type=int, default=20)
     lst.add_argument("--query", default=None)
     lst.add_argument("--tag", default=None)
+    lst.add_argument(
+        "--ends-within",
+        default=None,
+        help="only markets resolving within this window, e.g. 48h, 7d, 2w",
+    )
     market = sub.add_parser("market")
     market.add_argument("--slug", default=None)
     market.add_argument("--condition-id", default=None)
@@ -139,7 +206,7 @@ def main() -> None:
     price.add_argument("--side", choices=["buy", "sell"], default="buy")
     args = parser.parse_args()
     if args.command == "list":
-        cmd_list(args.limit, args.query, args.tag)
+        cmd_list(args.limit, args.query, args.tag, args.ends_within)
     elif args.command == "market":
         cmd_market(args.slug, args.condition_id)
     elif args.command == "book":

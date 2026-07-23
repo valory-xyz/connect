@@ -47,26 +47,17 @@ spend passes through one authenticated, logged choke point. The bearer token
 in `.mcp.json` is what authorizes *this* session to use the signer; never
 paste it into anything outside this workspace.
 
-## The guardrail
-
-The signer enforces a user-controlled guardrail (`restricted` by default): it
-may refuse to sign, and every refusal names the exact rule it violated. You
-cannot lift the restrictions yourself — when a task needs more than the
-guardrail allows, tell the user what was blocked and why. The pearl-connect
-skill documents the modes and how to respond to a block.
-
 ## How to act on-chain: the pearl-connect skill
 
 For **any** on-chain action — checking balances, sending transactions,
 acting through the service safe, making mech requests, signing mech-request
 digests — use the **pearl-connect skill**
-(`.claude/skills/pearl-connect/SKILL.md`). It documents:
-
-- the MCP tools (`wallet_info`, `safe_transaction`, `send_transaction`,
-  `transaction_status`, `sign_message`, `mech_tools`, `mech_request`,
-  `settings`);
-- `scripts/signer_client.py` for web3.py code run by spawned scripts;
-- what the guardrail allows, and the two things no mode ever allows.
+(`.claude/skills/pearl-connect/SKILL.md`). It documents which tool to reach
+for, `scripts/signer_client.py` for web3.py code run by spawned scripts, and
+the guardrail: a user-controlled restriction (`restricted` by default) that
+may refuse to sign, always naming the rule it violated. You cannot lift it
+yourself — when a task needs more than it allows, tell the user what was
+blocked and why.
 
 Don't hand-roll signing, key loading, or raw RPC sends — the skill's paths
 are the supported, audited ones. Start any on-chain task with `wallet_info`
