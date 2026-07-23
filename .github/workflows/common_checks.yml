@@ -22,7 +22,7 @@ jobs:
         python-version: ["3.12"]
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
@@ -47,7 +47,7 @@ jobs:
       image: valory/open-autonomy-user:0.21.26
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify packages.json matches package contents
         run: |
           export AUTHOR=$(grep 'service/' packages/packages.json | awk -F/ '{print $2}' | head -1)
@@ -74,7 +74,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
@@ -94,7 +94,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -131,7 +131,7 @@ jobs:
       GNOSIS_TESTNET_RPC: ${{ secrets.GNOSIS_TESTNET_RPC }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
