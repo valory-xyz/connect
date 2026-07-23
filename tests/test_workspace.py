@@ -70,7 +70,11 @@ def test_mcp_entry_grants_a_tool_budget_covering_the_longest_wait(
     """
     provisioned(store_path)
     assert mcp_entry(store_path)["timeout"] == workspace.MCP_TOOL_TIMEOUT_MS
-    assert workspace.MCP_TOOL_TIMEOUT_MS >= MAX_DELIVERY_TIMEOUT * 1000
+    # TWICE the delivery timeout: mech-client's on-chain watcher spends it
+    # once waiting for the marketplace to name a delivering mech, then
+    # restarts its clock to scan that mech's logs. Asserting a single pass
+    # held while the budget still fell short of the real worst case.
+    assert workspace.MCP_TOOL_TIMEOUT_MS >= 2 * MAX_DELIVERY_TIMEOUT * 1000
 
 
 def test_provisioning_preserves_other_mcp_servers(store_path: Path) -> None:

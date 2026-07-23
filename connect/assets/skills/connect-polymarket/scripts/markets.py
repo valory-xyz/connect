@@ -80,6 +80,8 @@ def _ends_within_bounds(
             f"--ends-within must be <number><h|d|w> (e.g. 48h, 7d, 2w), got '{window}'"
         )
     amount, unit = match.groups()
+    if int(amount) <= 0:
+        raise SystemExit(f"--ends-within must be a positive window, got '{window}'")
     start = now or datetime.now(timezone.utc)
     return start, start + timedelta(**{_DURATION_UNITS[unit]: int(amount)})
 

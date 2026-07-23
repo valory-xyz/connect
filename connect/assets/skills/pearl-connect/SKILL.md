@@ -69,6 +69,9 @@ payment via the service safe, request, and delivery watching. Start with
 `mech_tools()` to pick a mech, then call it again with that `priority_mech`
 to see the tools it serves and whether it can be reached off-chain.
 
+`chain` is optional throughout: it defaults to a configured chain, preferring
+one with a safe.
+
 Two things decide which flow you can use, and both are worth checking before
 composing a prompt:
 
@@ -89,10 +92,12 @@ composing a prompt:
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
   via the service safe. Works in restricted mode out of the box (the
   marketplace contract ships in the default whitelist).
-- `timeout` (seconds, default 300, max 900) bounds the wait for the mech's
-  answer. A timeout does not lose the request — it is paid for, and the ids
-  come back as `pending_request_ids`. Poll them with `mech_result(request_id)`,
-  which resumes the watch and never resends.
+- `timeout` (seconds, default 300, max 900) bounds each phase of the wait —
+  the marketplace naming a delivering mech, then reading that mech's logs —
+  so the call itself can take up to twice it. A timeout does not lose the
+  request — it is paid for, and the ids come back as `pending_request_ids`.
+  Poll them with `mech_result(request_id)`, which resumes the watch and never
+  resends.
 - `max_payment` (wei, default 10^17 = 0.1 of the native unit) caps what one
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with

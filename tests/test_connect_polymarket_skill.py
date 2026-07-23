@@ -1205,6 +1205,13 @@ def test_ends_within_accepts_hours_days_weeks(window) -> None:
     assert end > start
 
 
+@pytest.mark.parametrize("window", ["0h", "0d", "00w"])
+def test_ends_within_rejects_an_empty_window(window) -> None:
+    """A zero-length window matches nothing; that must not read as "none"."""
+    with pytest.raises(SystemExit, match="positive window"):
+        markets._ends_within_bounds(window)
+
+
 @pytest.mark.parametrize("window", ["7", "3mo", "", "-1d", "d7", "48 h"])
 def test_ends_within_rejects_what_it_cannot_parse(window) -> None:
     """An unparseable window fails loudly rather than silently not filtering."""

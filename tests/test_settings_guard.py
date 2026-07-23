@@ -1195,6 +1195,34 @@ class TestMech:
         with pytest.raises(MechError, match="nothing is awaiting delivery"):
             mech_service.result("ab")
 
+    def test_every_id_in_one_response_is_spelled_the_same_way(
+        self,
+        store_path: Path,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """One id must not appear 0x-prefixed in one key and bare in another.
+
+        mech-client 0x-prefixes on-chain request_ids but not the
+        delivery_results keys, so a caller handed both raw cannot tell that
+        they name the same request. The audit record carries them too: if the
+        harness abandons the call, the log is the only place naming what was
+        paid for.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB", "0xCD"],
+            "delivery_results": {"ab": {"answer": "42"}},
+        }
+        result = mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert result["request_ids"] == ["ab", "cd"]
+        assert list(result["delivery_results"]) == ["ab"]
+        assert result["pending_request_ids"] == ["cd"]
+        recorded = [e for e in audit_entries(store_path) if e["kind"] == "mech_request"]
+        assert recorded[-1]["request_ids"] == ["ab", "cd"]
+
     def test_poll_reports_a_delivery_that_has_not_arrived(
         self,
         mech_service: MechService,

@@ -473,6 +473,7 @@ class MechService:
             chain=chain,
             tool=tool,
             offchain=not legacy_on_chain,
+            request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
         return self._with_pending(
             dict(result),
@@ -498,8 +499,10 @@ class MechService:
         pick it up instead of the answer being stranded.
         """
         delivered = {
-            _request_key(rid) for rid in (result.get("delivery_results") or {})
+            _request_key(rid): answer
+            for rid, answer in (result.get("delivery_results") or {}).items()
         }
+        ids = [_request_key(rid) for rid in result.get("request_ids") or []]
         receipt = result.get("receipt")
         block = receipt.get("blockNumber") if isinstance(receipt, Mapping) else None
         pending = PendingDelivery(
@@ -509,19 +512,21 @@ class MechService:
             offchain=offchain,
             from_block=block,
         )
-        waiting = [
-            key
-            for key in (_request_key(rid) for rid in result.get("request_ids") or [])
-            if key not in delivered
-        ]
+        waiting = [key for key in ids if key not in delivered]
         with self._lock:
             for key in waiting:
                 self._pending[key] = pending
-        return {
-            "chain": chain,
-            **result,
-            **({"pending_request_ids": waiting} if waiting else {}),
-        }
+        # Re-key the ids mech-client returned: the on-chain flow 0x-prefixes
+        # request_ids but not the delivery_results keys, so a caller handed
+        # both raw sees one id spelled two ways and cannot match them up.
+        payload = {"chain": chain, **result}
+        if "request_ids" in result:
+            payload["request_ids"] = ids
+        if "delivery_results" in result:
+            payload["delivery_results"] = delivered
+        if waiting:
+            payload["pending_request_ids"] = waiting
+        return payload
 
     def result(
         self, request_id: str, *, timeout: float = DEFAULT_RESULT_TIMEOUT
