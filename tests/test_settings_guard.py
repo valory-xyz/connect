@@ -33,6 +33,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from web3.datastructures import AttributeDict
 
 from connect import settings as settings_module
 from connect import workspace as workspace_module
@@ -40,12 +41,19 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard, GuardError
 from connect.mech import (
+    DEFAULT_MECH_CHAIN,
     MAX_DELIVERY_TIMEOUT,
     MechError,
     MechService,
     MechSigner,
+    PendingDelivery,
 )
-from connect.safe import EXEC_TRANSACTION_SELECTOR, EXEC_TRANSACTION_TYPES
+from connect.safe import (
+    APPROVE_SELECTOR,
+    EXEC_TRANSACTION_SELECTOR,
+    EXEC_TRANSACTION_TYPES,
+    decode_approve,
+)
 from connect.server.settings_routes import WHITELIST_FROZEN
 from connect.settings import (
     MAC_FIELDS,
@@ -57,6 +65,7 @@ from connect.settings import (
     default_whitelist,
     defaults,
     derive_mac_key,
+    token_approve_targets,
 )
 from connect.signer import Signer, SignerError
 
@@ -65,8 +74,17 @@ from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
 OTHER = "0x" + "bb" * 20
+PAYMENT_TOKEN = "0x" + "cc" * 20
+TRACKER = "0x" + "ee" * 20
 
 GNOSIS_MARKETPLACE = "0x735faab1c4ec41128c367afb5c3bac73509f70bb"
+
+
+def approve_data(spender: str, amount: int = 10**6) -> bytes:
+    """Encode ERC-20 approve(spender, amount) calldata."""
+    return bytes.fromhex(APPROVE_SELECTOR) + abi_encode(
+        ["address", "uint256"], [spender, amount]
+    )
 
 
 def exec_transaction_calldata(  # pylint: disable=too-many-arguments
@@ -513,6 +531,34 @@ class TestDefaults:
         assert default_whitelist() == {}
         assert defaults().protected.mode == MODE_RESTRICTED
 
+    def test_token_approve_targets_maps_tokens_to_trackers(self) -> None:
+        """Each configured payment token maps to its mech balance tracker."""
+        usdc = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+        usdc_tracker = "0x5c50ebc17d002a4484585c8fbf62f51953493c0b"
+        polygon = token_approve_targets("polygon")
+        assert polygon[usdc] == usdc_tracker
+        assert len(polygon) == 2  # USDC and OLAS
+        # gnosis has an OLAS tracker but no USDC one: only the funded token maps
+        olas = "0xce11e14225575945b8e6dc0d4f2dd4c570f79d9f"
+        gnosis = token_approve_targets("gnosis")
+        assert olas in gnosis
+        assert usdc not in gnosis
+
+    def test_token_approve_targets_unknown_chain_is_empty(self) -> None:
+        """A chain mech-client does not know yields no targets."""
+        assert token_approve_targets("testchain") == {}
+
+    def test_token_approve_targets_broken_mech_client_is_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken mech-client fails closed rather than taking the guard down."""
+        monkeypatch.setattr("mech_client.utils.constants.CHAIN_NAME_TO_ID", None)
+        assert token_approve_targets("polygon") == {}
+
+    def test_decode_approve_returns_none_on_undecodable(self) -> None:
+        """The approve selector with unparseable args decodes to no spender."""
+        assert decode_approve("0x" + APPROVE_SELECTOR + "ff") is None
+
 
 def make_guard(
     store: SettingsStore, mode: str, whitelist: dict[str, tuple[str, ...]] | None = None
@@ -697,6 +743,59 @@ class TestGuard:
         guard.check_transaction(
             "testchain", SAFE, 0, "0x" + calldata.removeprefix("0x").upper()
         )
+
+    def test_restricted_allows_token_approve_to_tracker(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A payment token may be approved, but only for its mech tracker."""
+        monkeypatch.setattr(
+            "connect.guard.token_approve_targets",
+            lambda chain: {PAYMENT_TOKEN.lower(): TRACKER.lower()},
+        )
+        guard = make_guard(
+            store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
+        )
+        calldata = exec_transaction_calldata(PAYMENT_TOKEN, data=approve_data(TRACKER))
+        guard.check_transaction("testchain", SAFE, 0, calldata)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            approve_data(OTHER),  # approve, but to a spender that is not the tracker
+            bytes.fromhex("a9059cbb") + b"\x00" * 64,  # transfer, not approve
+        ],
+    )
+    def test_restricted_denies_non_tracker_token_calls(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch, data: bytes
+    ) -> None:
+        """On a payment token, only approve(spender=tracker) is allowed."""
+        monkeypatch.setattr(
+            "connect.guard.token_approve_targets",
+            lambda chain: {PAYMENT_TOKEN.lower(): TRACKER.lower()},
+        )
+        guard = make_guard(
+            store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
+        )
+        calldata = exec_transaction_calldata(PAYMENT_TOKEN, data=data)
+        with pytest.raises(GuardError, match="payment token"):
+            guard.check_transaction("testchain", SAFE, 0, calldata)
+
+    def test_restricted_token_rule_does_not_leak_to_other_targets(
+        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An address absent from the token map still goes through the whitelist."""
+        monkeypatch.setattr(
+            "connect.guard.token_approve_targets",
+            lambda chain: {PAYMENT_TOKEN.lower(): TRACKER.lower()},
+        )
+        guard = make_guard(
+            store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
+        )
+        # OTHER is not the payment token, so its approve is judged by the
+        # whitelist (which does not contain OTHER), not the token rule
+        calldata = exec_transaction_calldata(OTHER, data=approve_data(TRACKER))
+        with pytest.raises(GuardError, match="not in the testchain whitelist"):
+            guard.check_transaction("testchain", SAFE, 0, calldata)
 
 
 class TestSignerGuardIntegration:
@@ -929,13 +1028,24 @@ class FakeMarketplaceService:
     def __init__(self) -> None:
         """Initialize."""
         self.calls: list[dict] = []
-        self.result: dict = {"tx_hash": "0x" + "11" * 32, "request_ids": ["ab"]}
+        # the healthy case: the mech answered before the wait ran out, so
+        # nothing is left pending (tests for the timeout path drop the
+        # delivery_results entry to leave that id unanswered)
+        self.result: dict = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["ab"],
+            "delivery_results": {"ab": {"answer": "42"}},
+        }
         self.raises: Exception | None = None
         self.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**16)
+        # A mech that publishes both a tool list and an off-chain endpoint —
+        # the rare healthy case; tests that need a blocker override `metadata`.
+        self.metadata: dict | None = {
+            "tools": ["prediction-online"],
+            "url": "https://mech.example/offchain",
+        }
         self.tool_manager = SimpleNamespace(
-            get_tools=lambda service_id: SimpleNamespace(
-                tools=[SimpleNamespace(tool_name="prediction-online")]
-            )
+            fetch_tools_metadata=lambda service_id: self.metadata
         )
 
     def _fetch_mech_info(self, mech: str) -> tuple:
@@ -974,12 +1084,17 @@ class TestMech:
     def patched_mech_fixture(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> FakeMarketplaceService:
-        """Route MechService._service construction to the fake."""
-        import mech_client.services.marketplace_service as ms
+        """Route MechService._service construction to the fake.
+
+        Patched on `connect.mech`, the name that module actually calls —
+        patching mech-client's own module would miss the import-time binding.
+        """
         import safe_eth.eth as se
 
+        from connect import mech as mech_module
+
         fake = FakeMarketplaceService()
-        monkeypatch.setattr(ms, "MarketplaceService", lambda **kwargs: fake)
+        monkeypatch.setattr(mech_module, "MarketplaceService", lambda **kwargs: fake)
         monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
         return fake
 
@@ -1000,7 +1115,9 @@ class TestMech:
             auto_deposit=False,
             timeout=42,
         )
-        assert result == patched_mech.result
+        # the resolved chain travels with the result, so a caller that omitted
+        # it can still tell which chain was paid
+        assert result == {"chain": "testchain", **patched_mech.result}
         call = patched_mech.calls[0]
         assert call["prompts"] == ("what is the answer",)
         assert call["tools"] == ("prediction",)
@@ -1018,6 +1135,183 @@ class TestMech:
             priority_mech=OTHER,
         )
         assert len(patched_mech.calls) == 2
+
+    def test_delivered_request_leaves_nothing_pending(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """An answered request must not be offered for polling."""
+        result = mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert "pending_request_ids" not in result
+        with pytest.raises(MechError, match="nothing is awaiting delivery"):
+            mech_service.result("ab")
+
+    def test_undelivered_request_is_reported_and_pollable(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A timed-out wait hands back the id, and the poll resumes the watch.
+
+        The request was paid for; the answer must stay reachable rather than
+        being stranded by the wait giving up first.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "delivery_results": {},
+            # AttributeDict, not a dict literal: that is what web3 really
+            # hands back, and it is NOT a dict subclass — stubbing a plain
+            # dict hid a bug that left from_block None on every live request
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+        result = mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        # normalized: the two flows disagree about the 0x prefix, and the id
+        # the caller is handed has to be the one mech_result accepts
+        assert result["pending_request_ids"] == ["ab"]
+
+        watched: dict = {}
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            watched.update(pending=pending, key=key, timeout=timeout)
+            return {"ab": {"answer": "42"}}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        delivery = mech_service.result("0xAB")
+        assert delivery["delivered"] is True
+        assert delivery["result"] == {"answer": "42"}
+        assert delivery["mech"] == OTHER
+        # the request's own block, not the chain head: an older request is
+        # invisible to a scan that starts near the tip
+        assert watched["pending"].from_block == 4321
+        assert watched["pending"].offchain is False
+        # delivered once, so it stops being pending
+        with pytest.raises(MechError, match="nothing is awaiting delivery"):
+            mech_service.result("ab")
+
+    def test_every_id_in_one_response_is_spelled_the_same_way(
+        self,
+        store_path: Path,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """One id must not appear 0x-prefixed in one key and bare in another.
+
+        mech-client 0x-prefixes on-chain request_ids but not the
+        delivery_results keys, so a caller handed both raw cannot tell that
+        they name the same request. The audit record carries them too: if the
+        harness abandons the call, the log is the only place naming what was
+        paid for.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB", "0xCD"],
+            "delivery_results": {"ab": {"answer": "42"}},
+        }
+        result = mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert result["request_ids"] == ["ab", "cd"]
+        assert list(result["delivery_results"]) == ["ab"]
+        assert result["pending_request_ids"] == ["cd"]
+        recorded = [e for e in audit_entries(store_path) if e["kind"] == "mech_request"]
+        assert recorded[-1]["request_ids"] == ["ab", "cd"]
+
+    def test_poll_reports_a_delivery_that_has_not_arrived(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Still-waiting is a report, not an error — and stays pollable."""
+        patched_mech.result = {
+            "tx_hash": None,
+            "request_ids": ["ab"],
+            "delivery_results": {},
+        }
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        delivery = mech_service.result("ab")
+        assert delivery["delivered"] is False
+        assert "may still answer" in delivery["note"]
+        # a miss must not consume the id
+        assert mech_service.result("ab")["delivered"] is False
+
+    def test_poll_clamps_its_timeout_and_reports_watcher_failure(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A watcher blow-up becomes a MechError; the timeout stays bounded."""
+        patched_mech.result = {"request_ids": ["ab"], "delivery_results": {}}
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        seen: dict = {}
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            seen["timeout"] = timeout
+            raise RuntimeError("subgraph down")
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        with pytest.raises(MechError, match="could not read delivery"):
+            mech_service.result("ab", timeout=10_000)
+        assert seen["timeout"] == MAX_DELIVERY_TIMEOUT
+
+    @pytest.mark.parametrize("offchain", [True, False])
+    def test_watch_picks_the_flow_the_request_was_sent_through(
+        self, monkeypatch: pytest.MonkeyPatch, offchain: bool
+    ) -> None:
+        """Off-chain polls the mech's endpoint; on-chain scans from its block."""
+        import mech_client.domain.delivery as delivery_module
+
+        seen: dict = {}
+
+        class _Watcher:
+            def __init__(self, *args: object) -> None:
+                seen["args"] = args
+
+            async def watch(self, request_ids: list, **kwargs: object) -> dict:
+                seen["request_ids"] = request_ids
+                seen.update(kwargs)
+                return {"ab": "delivered"}
+
+        monkeypatch.setattr(delivery_module, "OffchainDeliveryWatcher", _Watcher)
+        monkeypatch.setattr(delivery_module, "OnchainDeliveryWatcher", _Watcher)
+        service = SimpleNamespace(
+            tool_manager=SimpleNamespace(
+                get_offchain_url=lambda service_id: "https://mech.example/offchain"
+            ),
+            ledger_api=object(),
+            _get_marketplace_contract=lambda: "contract",
+        )
+        pending = PendingDelivery("testchain", OTHER, 42, offchain, 99)
+        out = asyncio.run(MechService._watch(service, pending, "ab", 5.0))
+        assert out == {"ab": "delivered"}
+        assert seen["request_ids"] == ["ab"]
+        if offchain:
+            assert seen["args"] == ("https://mech.example/offchain", 5.0)
+            assert "from_block" not in seen
+        else:
+            assert seen["args"] == ("contract", service.ledger_api, 5.0)
+            assert seen["from_block"] == 99
 
     def test_delivered_request_survives_an_unwritable_audit_log(
         self,
@@ -1042,7 +1336,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
         )
-        assert result == patched_mech.result
+        assert result == {"chain": "testchain", **patched_mech.result}
 
     def test_request_offchain_denied_in_restricted(
         self,
@@ -1050,13 +1344,122 @@ class TestMech:
         settings_store: SettingsStore,
         patched_mech: FakeMarketplaceService,
     ) -> None:
-        """The off-chain preflight names the escape hatch."""
+        """The off-chain preflight points at the route that still works."""
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
         )
-        with pytest.raises(MechError, match="legacy_on_chain=true"):
+        with pytest.raises(MechError, match="retry it on-chain"):
             mech_service.request("q", "tool", chain="testchain")
         assert not patched_mech.calls
+
+    def test_request_refuses_an_unreachable_offchain_mech(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """An off-chain request to a mech with no endpoint fails before paying.
+
+        mech-client would discover this mid-flow and report it as a metadata
+        problem, which reads as a slow gateway; the operator needs to know the
+        mech is simply on-chain-only, before any deposit happens.
+        """
+        patched_mech.metadata = {"tools": ["prediction-online"]}
+        with pytest.raises(MechError, match="cannot serve off-chain requests"):
+            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        assert not patched_mech.calls
+        # the same mech is fine on-chain, which is what the error recommends
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert len(patched_mech.calls) == 1
+
+    def test_request_allows_a_mech_that_published_an_endpoint(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """The pre-flight passes a healthy mech straight through to the flow."""
+        mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        assert patched_mech.calls[0]["use_offchain"] is True
+
+    def test_unreadable_metadata_blocks_the_offchain_flow(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A mech that never published metadata cannot be reached off-chain."""
+        patched_mech.metadata = None
+        with pytest.raises(MechError, match="metadata unreadable"):
+            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        assert not patched_mech.calls
+
+    def test_chain_defaults_to_one_holding_a_safe(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Omitting `chain` picks a chain the safe can actually pay from.
+
+        A fixed default strands an agent deployed elsewhere: it would list
+        mechs it can never pay and only learn that from a failed request.
+        """
+        # pylint: disable=protected-access
+        # function-scoped fixtures: this dict is rebuilt per test, so mutating
+        # it here cannot leak. Widening their scope would break that.
+        chains = mech_service._config.chains
+        assert "gnosis" not in chains  # the preferred default is not configured
+        mech_service.request("q", "t", legacy_on_chain=True, priority_mech=OTHER)
+        assert patched_mech.calls  # resolved to testchain, the only funded chain
+
+        chains["testchain"].safe_address = None
+        with pytest.raises(MechError, match="no configured chain has a service safe"):
+            mech_service.request("q", "t", legacy_on_chain=True, priority_mech=OTHER)
+
+    def test_listing_still_works_with_no_safe_anywhere(
+        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discovery is a subgraph query, so it must not demand a safe.
+
+        Only paying needs one. Refusing to list left an agent on a deployment
+        with no safe configured unable to see mechs it could previously browse.
+        """
+        import mech_client.infrastructure.subgraph.queries as queries
+
+        asked: list[str] = []
+
+        def record(chain: str) -> list:
+            asked.append(chain)
+            return []
+
+        monkeypatch.setattr(queries, "query_mm_mechs_info", record)
+        # pylint: disable=protected-access
+        chains = mech_service._config.chains
+        chains["testchain"].safe_address = None
+        assert DEFAULT_MECH_CHAIN not in chains  # the default is not configured
+        assert mech_service.tools()["mechs"] == []
+        # fell back to a chain this deployment actually configured: the default
+        # would raise "unknown chain" and answer nothing
+        assert asked == ["testchain"]
+
+        # with the default configured — still unfunded — discovery prefers it
+        # over the alphabetically first chain
+        chains[DEFAULT_MECH_CHAIN] = ChainConfig(rpc_url="http://127.0.0.1:9")
+        assert mech_service.tools()["mechs"] == []
+        assert asked == ["testchain", DEFAULT_MECH_CHAIN]
+        assert not mech_service._services  # and built no paying service
+
+    def test_default_chain_prefers_gnosis_over_alphabetical_order(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A funded `gnosis` wins over an alphabetically earlier funded chain.
+
+        The preference must apply to *funded* chains only. Checking membership
+        in the configured chains instead would resolve to a `gnosis` with no
+        safe and fail later with an unrelated "no service safe" message.
+        """
+        # pylint: disable=protected-access
+        chains = mech_service._config.chains
+        chains["arbitrum"] = ChainConfig(
+            rpc_url="http://127.0.0.1:9", safe_address=SAFE
+        )
+        chains["gnosis"] = ChainConfig(rpc_url="http://127.0.0.1:9", safe_address=SAFE)
+        assert mech_service._resolve_chain(None) == "gnosis"
+
+        # gnosis configured but unfunded -> fall through to the funded chains
+        chains["gnosis"].safe_address = None
+        assert mech_service._resolve_chain(None) == "arbitrum"
 
     def test_request_wraps_mech_client_errors(
         self,
@@ -1076,6 +1479,69 @@ class TestMech:
                 priority_mech=OTHER,
             )
         assert "mech_request_failed" in audit_kinds(store_path)
+
+    def test_policy_refusals_are_audited_before_they_raise(
+        self,
+        store_path: Path,
+        mech_service: MechService,
+        settings_store: SettingsStore,
+        patched_mech: FakeMarketplaceService,
+        activity: ActivityLog,
+    ) -> None:
+        """Each pre-flight refusal leaves a trail naming which rule fired.
+
+        The activity log is what an operator reconstructs an incident from. A
+        request blocked by policy must not look there like one that was never
+        attempted, and the three rules must be distinguishable from each other.
+        """
+        # 1. price cap
+        patched_mech.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**18)
+        with pytest.raises(MechError, match="max_payment"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        # 2. mech unreachable off-chain
+        patched_mech.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**16)
+        patched_mech.metadata = {"tools": ["prediction-online"]}
+        with pytest.raises(MechError, match="cannot serve off-chain requests"):
+            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        # 3. restricted mode
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
+        with pytest.raises(MechError, match="restricted"):
+            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+
+        blocked = [
+            entry
+            for entry in audit_entries(store_path)
+            if entry["kind"] == "mech_request_blocked"
+        ]
+        assert [entry["reason"] for entry in blocked] == [
+            "over-max-payment",
+            "offchain-unreachable",
+            "restricted-mode",
+        ]
+        assert all(entry["chain"] == "testchain" for entry in blocked)
+        assert not patched_mech.calls  # nothing was ever sent
+
+    def test_price_cap_binds_the_offchain_flow_too(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """The cap is checked for the default flow, before any metadata read.
+
+        Ordering matters: an over-priced mech is disqualified on price alone,
+        so the pre-flight's network fetch is never reached.
+        """
+        patched_mech.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**18)
+        patched_mech.tool_manager = SimpleNamespace(
+            fetch_tools_metadata=lambda service_id: pytest.fail(
+                "priced out already; the metadata fetch should not be reached"
+            )
+        )
+        with pytest.raises(MechError, match="max_payment"):
+            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        assert not patched_mech.calls
 
     def test_request_passes_signer_errors_through(
         self,
@@ -1185,17 +1651,160 @@ class TestMech:
         assert info["payment_type"] == "NATIVE"
         assert info["service_id"] == 42
         assert info["tools"] == ["prediction-online"]
+        # this mech published an endpoint, so nothing bars the default flow
+        assert info["offchain_capable"] is True
+        assert "offchain_note" not in info
 
     def test_tools_degrade_without_metadata(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
-        """A slow/absent IPFS gateway yields a note, not an error."""
+        """An unreadable metadata document yields notes, not an error.
+
+        The mech stays usable on-chain, so the report must not read as a
+        total failure — but it must also stop claiming, as it once did, that
+        the off-chain flow will go through with a known tool name.
+        """
         patched_mech.tool_manager = SimpleNamespace(
-            get_tools=lambda service_id: (_ for _ in ()).throw(TimeoutError("slow"))
+            fetch_tools_metadata=lambda service_id: (_ for _ in ()).throw(
+                TimeoutError("slow")
+            )
         )
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert "tools" not in info
-        assert "unavailable" in info["tools_note"]
+        assert "unreadable" in info["tools_note"]
+        assert info["offchain_capable"] is False
+        # the cause travels with the verdict, and the verdict does not claim
+        # a transient timeout is permanent
+        assert "TimeoutError: slow" in info["offchain_note"]
+        assert "may be transient" in info["offchain_note"]
+        # an unreadable fetch may clear on its own, so paying for gas is the
+        # second move, not the first
+        assert "retry before paying" in info["offchain_note"]
+
+    def test_the_two_blockers_advise_differently(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A mech with no endpoint goes on-chain; an unreadable fetch retries.
+
+        Sending the unreadable case on-chain spends real gas to avoid a retry
+        that may well have worked, so the two must not share one imperative.
+        """
+        patched_mech.metadata = {"tools": ["prediction-online"]}  # readable, no url
+        published = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert "on-chain requests only" in published["offchain_note"]
+        assert "retry" not in published["offchain_note"]
+
+        patched_mech.metadata = None  # unreadable
+        unreadable = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert "retry before paying" in unreadable["offchain_note"]
+
+    def test_unreadable_metadata_verdict_never_claims_permanence(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A miss with no cause must not be reported as a permanent one.
+
+        mech-client swallows the common transport failures and returns a bare
+        None, so nothing here knows whether the mech never published metadata
+        or the gateway simply timed out. An earlier version asserted the
+        former outright, which sends an operator on-chain for good over what
+        may be a blip.
+        """
+        patched_mech.metadata = None
+        note = mech_service.tools(chain="testchain", priority_mech=OTHER)[
+            "offchain_note"
+        ]
+        assert "no cause reported" in note  # stands in for the absent cause
+        # hedged, not asserted: "may be" is what keeps this honest
+        assert "may be transient or never published" in note
+
+    def test_tools_separates_no_metadata_from_no_tools_published(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Readable metadata listing no tools is not "metadata unavailable"."""
+        patched_mech.metadata = {"url": "https://mech.example/offchain"}
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert "tools" not in info
+        assert "lists no tools" in info["tools_note"]
+        assert info["offchain_capable"] is True  # the endpoint is still there
+
+    @pytest.mark.parametrize("published", [5, "abc", {"a": 1}, None])
+    def test_tools_refuses_to_iterate_a_malformed_tools_field(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        published: object,
+    ) -> None:
+        """A non-list `tools` degrades to a note instead of being iterated.
+
+        The document comes from the mech operator, so its shape is untrusted.
+        A bare string is the dangerous one: iterating it yields one "tool" per
+        character — plausible names that no mech serves, which an agent would
+        then pass straight to mech_request.
+        """
+        patched_mech.metadata = {"tools": published, "url": "https://m.example"}
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert "tools" not in info
+        assert "lists no tools" in info["tools_note"]
+
+    def test_tools_drops_entries_that_are_not_names(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A list of the right type can still hold entries of the wrong one.
+
+        Stringifying them invents the same plausible-but-unservable names the
+        non-list case was fixed for, so the untrusted-document rule has to
+        apply to the contents too, not just the container.
+        """
+        patched_mech.metadata = {
+            "tools": ["real-tool", {"name": "x"}, 5, "", "  ", None],
+            "url": "https://m.example",
+        }
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert info["tools"] == ["real-tool"]
+
+    def test_tools_survives_metadata_that_is_not_a_document(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A non-dict payload degrades like an unreadable one, not a crash."""
+        patched_mech.metadata = ["not", "a", "document"]  # type: ignore[assignment]
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert "tools" not in info
+        assert info["offchain_capable"] is False
+
+    @pytest.mark.parametrize("url", ["   ", "", 1, ["https://m.example"], None])
+    def test_a_url_that_is_not_a_usable_string_blocks_the_offchain_flow(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        url: object,
+    ) -> None:
+        """Only a non-empty string endpoint counts as reachable.
+
+        A truthy non-string once passed this check and the pre-flight, then
+        failed inside mech-client's `.strip()` mid-flow — the exact confusing
+        failure the pre-flight exists to replace.
+        """
+        patched_mech.metadata = {"tools": ["prediction-online"], "url": url}
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert info["offchain_capable"] is False
+        with pytest.raises(MechError, match="cannot serve off-chain requests"):
+            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        assert not patched_mech.calls
+
+    def test_tools_report_a_mech_that_published_no_endpoint(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Readable metadata without a `url` is still off-chain-unusable.
+
+        This is the common case — most listed mechs publish tools and no
+        endpoint — and the one an earlier version reported as fully healthy.
+        """
+        patched_mech.metadata = {"tools": ["prediction-online"]}
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert info["tools"] == ["prediction-online"]  # healthy in every other way
+        assert "tools_note" not in info
+        assert info["offchain_capable"] is False
+        assert "no 'url'" in info["offchain_note"]
 
     def test_service_requires_safe_and_known_chain(
         self, mech_service: MechService
@@ -2016,13 +2625,31 @@ class TestMcpGuardrailTools:
         push the whole mech flow to a worker thread. Awaiting the tool under
         pytest's loop reproduces the server condition end to end.
         """
-        import mech_client.services.marketplace_service as ms
         import safe_eth.eth as se
 
+        from connect import mech as mech_module
+
         fake = FakeMarketplaceService()
-        monkeypatch.setattr(ms, "MarketplaceService", lambda **kwargs: fake)
+        monkeypatch.setattr(mech_module, "MarketplaceService", lambda **kwargs: fake)
         monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
         result = await tools["mech_request"](
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
-        assert result == fake.result
+        assert result == {"chain": "testchain", **fake.result}
+
+    async def test_mech_result_tool_polls_off_the_event_loop(
+        self,
+        tools: dict[str, t.Callable],
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The poll also calls asyncio.run, so it needs the same worker thread."""
+        calls: list[dict] = []
+
+        def fake_result(request_id: str, **kwargs: object) -> dict:
+            calls.append({"request_id": request_id, **kwargs})
+            return {"delivered": True}
+
+        monkeypatch.setattr(mech_service, "result", fake_result)
+        assert await tools["mech_result"]("ab", timeout=5) == {"delivered": True}
+        assert calls[0] == {"request_id": "ab", "timeout": 5}

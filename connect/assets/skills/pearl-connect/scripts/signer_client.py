@@ -134,8 +134,10 @@ class SignerClient:
             f"retry with request_id='{request_id}' to avoid double-spending"
         ) from last_error
 
-    def sign_digest(self, digest: str) -> str:
-        """Sign a raw 32-byte digest (0x-hex), unprefixed."""
+    def sign_digest(self, digest: str | bytes) -> str:
+        """Sign a raw 32-byte digest (0x-hex or bytes), unprefixed."""
+        if isinstance(digest, bytes):
+            digest = "0x" + digest.hex()
         return self._post("/sign-message", {"digest": digest})["signature"]
 
     def wallet_info(self) -> dict:
@@ -149,6 +151,30 @@ class SignerClient:
                 return json.loads(response.read())
         except urllib.error.HTTPError as e:
             _raise_with_detail(e)
+
+    def chain_info(self, chain: str | None = None) -> dict:
+        """One chain's entry from /wallet: rpc, safe, balances, actionable.
+
+        The single reader of the response's shape, so a server-side change
+        breaks one place. Both failures name what the server actually said —
+        an unrecognised payload is not reported as missing operator config.
+        """
+        chain = chain or self.chain
+        chains = self.wallet_info().get("chains")
+        if not isinstance(chains, dict):
+            raise SignerRequestError(
+                "the signer's /wallet response carries no 'chains' map; this "
+                "client and the connect server are out of step — no conclusion "
+                "about the agent's configuration can be drawn from it"
+            )
+        entry = chains.get(chain)
+        if not isinstance(entry, dict):
+            configured = ", ".join(sorted(chains)) or "none"
+            raise SignerRequestError(
+                f"chain '{chain}' is not configured on this agent "
+                f"(configured: {configured}); ask the operator to add it"
+            )
+        return entry
 
 
 class SignerProvider(HTTPProvider):
@@ -172,8 +198,12 @@ class SignerProvider(HTTPProvider):
         return super().make_request(method, params)
 
 
-def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
-    """Find .mcp.json (cwd upwards) and return (server_base_url, token)."""
+def load_mcp_config_dir(start: Path | None = None) -> tuple[str, str, Path]:
+    """Find .mcp.json (cwd upwards); return (base_url, token, containing_dir).
+
+    The containing directory is the agent workspace — sibling skills that
+    keep their own state files there use it to locate that root.
+    """
     directory = (start or Path.cwd()).resolve()
     for candidate in (directory, *directory.parents):
         path = candidate / ".mcp.json"
@@ -181,16 +211,22 @@ def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
             entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"][
                 MCP_SERVER_NAME
             ]
-            base_url = entry["url"].removesuffix("/mcp")
+            base_url = entry["url"].rstrip("/").removesuffix("/mcp")
             token = entry["headers"]["Authorization"].removeprefix("Bearer ")
-            return base_url, token
+            return base_url, token, candidate
     raise FileNotFoundError(".mcp.json not found in cwd or parents")
+
+
+def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
+    """Find .mcp.json (cwd upwards) and return (server_base_url, token)."""
+    base_url, token, _ = load_mcp_config_dir(start)
+    return base_url, token
 
 
 def connect(chain: str) -> tuple[Web3, SignerClient]:
     """Web3 instance whose sends go through the signer, plus the raw client."""
     base_url, token = load_mcp_config()
     signer = SignerClient(base_url, token, chain)
-    rpc_url = signer.wallet_info()["rpcs"][chain]
+    rpc_url = signer.chain_info(chain)["rpc"]
     w3 = Web3(provider=SignerProvider(rpc_url, signer))
     return w3, signer

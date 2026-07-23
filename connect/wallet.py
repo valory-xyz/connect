@@ -80,18 +80,28 @@ def funds_status(config: AppConfig, signer: Signer) -> dict:
     return report
 
 
+def _not_actionable_because(safe: str | None, balances: dict) -> str | None:
+    """Why this chain is not one to act on, or None if it is."""
+    # first: config, so it holds even when the RPC below never answered
+    if not safe:
+        return "not deployed here: no service safe"
+    if "error" in balances:
+        return f"balances unreadable: {balances['error']}"
+    if int(balances.get("agent_eoa", "0")) == 0:
+        return "not funded here: agent EOA has no gas"
+    return None
+
+
 def wallet_overview(config: AppConfig, signer: Signer) -> dict:
-    """Agent addresses, per-chain safes/RPCs and native balances."""
-    overview: dict = {
-        "agent_eoa": signer.address,
-        "safes": {},
-        "rpcs": {},
-        "balances": {},
-    }
+    """Agent addresses and, per chain, whether it can actually be acted on.
+
+    The launcher sets an RPC per supported chain but safes come from the
+    operator's list, so a one-chain agent sees many chains. `actionable_chains`
+    states the verdict rather than leaving it to be inferred.
+    """
+    chains: dict = {}
     for chain, chain_config in config.chains.items():
-        overview["rpcs"][chain] = chain_config.rpc_url
-        if chain_config.safe_address:
-            overview["safes"][chain] = chain_config.safe_address
+        safe = chain_config.safe_address
         try:
             w3 = signer.w3(chain)
             balances = {
@@ -99,13 +109,25 @@ def wallet_overview(config: AppConfig, signer: Signer) -> dict:
                     w3.eth.get_balance(Web3.to_checksum_address(signer.address))
                 )
             }
-            if chain_config.safe_address:
+            if safe:
                 balances["safe"] = str(
-                    w3.eth.get_balance(
-                        Web3.to_checksum_address(chain_config.safe_address)
-                    )
+                    w3.eth.get_balance(Web3.to_checksum_address(safe))
                 )
-            overview["balances"][chain] = balances
         except Exception as e:  # pylint: disable=broad-exception-caught
-            overview["balances"][chain] = {"error": str(e)}
-    return overview
+            balances = {"error": str(e)}
+        reason = _not_actionable_because(safe, balances)
+        entry: dict = {
+            "rpc": chain_config.rpc_url,
+            "safe": safe,
+            "balances": balances,
+            "actionable": reason is None,
+        }
+        if reason is not None:
+            entry["not_actionable_because"] = reason
+        chains[chain] = entry
+    actionable = [chain for chain, entry in chains.items() if entry["actionable"]]
+    return {
+        "agent_eoa": signer.address,
+        "actionable_chains": actionable,
+        "chains": chains,
+    }

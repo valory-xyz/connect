@@ -32,6 +32,7 @@ no safe nonce appears anywhere here. Nothing is signed over it, so nobody has
 to predict it; the Safe reads and increments its own.
 """
 
+from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 
 # Safe v1.x execTransaction(address,uint256,bytes,uint8,uint256,uint256,
@@ -51,6 +52,8 @@ EXEC_TRANSACTION_TYPES = [
 ]
 OPERATION_CALL = 0
 ZERO_ADDRESS = "0x" + "00" * 20
+
+APPROVE_SELECTOR = "095ea7b3"  # approve(address,uint256)
 
 
 def prevalidated_signature(owner: str) -> bytes:
@@ -97,3 +100,18 @@ def exec_transaction(target: str, value: int, data: str, owner: str) -> str:
         ),
     )
     return "0x" + EXEC_TRANSACTION_SELECTOR + args.hex()
+
+
+def decode_approve(data: str) -> str | None:
+    """Return the spender of an ERC-20 `approve(address,uint256)`, else None.
+
+    None means the calldata is not a decodable approve.
+    """
+    calldata = (data or "").removeprefix("0x").lower()
+    if not calldata.startswith(APPROVE_SELECTOR):
+        return None
+    try:
+        spender, _ = abi_decode(["address", "uint256"], bytes.fromhex(calldata[8:]))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return str(spender)

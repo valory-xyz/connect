@@ -33,7 +33,7 @@ other non-aea agent. It:
      `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `safe_transaction`, `send_transaction`, `transaction_status`,
-     `sign_message`, `mech_tools`, `mech_request`, `settings`.
+     `sign_message`, `mech_tools`, `mech_request`, `mech_result`, `settings`.
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)
@@ -126,10 +126,13 @@ that survives those.
 
 The `mech_request` MCP tool drives [mech](https://olas.network/services/ai-mechs)
 requests through mech-client's `Signer` protocol, so every transaction and
-digest passes the guarded choke point. `legacy_on_chain=false` (default) uses
-the off-chain prepaid flow (needs unrestricted mode; `auto_deposit` tops up
-the prepaid balance from the safe on HTTP 402); `legacy_on_chain=true` sends
-the request on-chain through the MechMarketplace via the service safe.
+digest passes the guarded choke point. The default off-chain prepaid flow
+needs unrestricted mode (`auto_deposit` tops up the prepaid balance from the
+safe on HTTP 402), and it also needs a mech whose operator published an
+endpoint in its on-chain metadata — few have, so `mech_tools` reports
+`offchain_capable` per mech and a request to one that cannot serve it is
+refused before any payment. The on-chain path sends through the
+MechMarketplace via the service safe and works for any listed mech.
 
 ## Development
 

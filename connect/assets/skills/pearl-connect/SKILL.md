@@ -13,41 +13,33 @@ private key — and never need to.
 ## Wallet model
 
 - **Agent EOA** — one address across all chains; the signer holds its key.
-- **Service safe(s)** — one Gnosis Safe per configured chain, owned by the
-  agent EOA with threshold 1. Working funds live in the safe.
-- Call the `wallet_info` MCP tool first to get the EOA, per-chain safes,
-  RPC URLs, and balances.
+- **Service safe** — a Gnosis Safe owned by the EOA (threshold 1) on each
+  chain you were deployed to, usually one. Working funds live there; the
+  EOA pays gas.
+- Call `wallet_info` first: **act only on `actionable_chains`** — usually a
+  single chain. The launcher configures an RPC for every chain it supports,
+  so the rest are listed with no safe or no gas. That is the normal shape,
+  not something to fix; `not_actionable_because` says which state each is in.
 
 ## MCP tools (connect server)
 
-- `wallet_info()` — addresses, per-chain RPC URLs, native balances.
-- `safe_transaction(chain, target, value, data, request_id, wait_for_receipt, timeout)`
-  — **the normal way to act on-chain.** Describes the call the *safe* makes —
-  an approval, a swap, a stake, a claim, a transfer, anything. Most carry no
-  `value`; any they do carry leaves the safe, where the working funds are. The
-  server wraps the call in the safe's own transaction, so you never compose one
-  and never need the safe's address. Returns `{tx_hash}` (plus `receipt` if you
-  asked to wait and it mined in time).
-- `send_transaction(chain, to, value, data, request_id, wait_for_receipt, timeout)`
-  — the same call, made by the **EOA**, whose funds are for gas fees. Rarely what you
-  want; in restricted mode it can reach nothing but the safe.
-- For either: when retrying a send whose outcome you are unsure about, reuse
-  the same `request_id` and you get the original `tx_hash` back instead of
-  spending twice.
-- `transaction_status(chain, tx_hash)` — receipt once mined.
-- `sign_message(digest)` — sign a raw 32-byte digest (0x-hex), **unprefixed**
-  (plain ecrecover semantics; used by off-chain mech requests). Unavailable
-  in restricted mode.
-- `mech_tools(chain, priority_mech, limit, offset)` — discover live mechs
-  (most deliveries first; paginate with limit/offset, `total` tells you
-  when to stop) and, given a `priority_mech`, its payment type and tool
-  names.
-- `mech_request(prompt, tool, chain, legacy_on_chain, priority_mech, auto_deposit, timeout, max_payment)` —
-  send a request to an Olas mech (an on-chain-paid AI service) and wait for its delivery.
-  See "Mech requests" below.
-- `settings()` — the enforced settings in their canonical shape:
-  `{"protected": {"mode", "whitelist"}, "harness"}`. The protected object is
-  the guardrail state (read-only here; see "Guardrail modes" below).
+Each tool's own description carries its parameters and returns. What those
+cannot tell you is which to reach for:
+
+- `wallet_info` — start every on-chain task here.
+- `safe_transaction` — **the normal way to act on-chain.** It describes the
+  call the *safe* makes: an approval, a swap, a stake, a claim, a transfer,
+  anything. You never compose the safe's own transaction, and never need its
+  address.
+- `send_transaction` — the same call made by the **EOA**, whose funds are for
+  gas. Rarely what you want.
+- For either: if you are unsure whether a send landed, retry with the same
+  `request_id` rather than issuing a new one.
+- `transaction_status` — settle a hash you already hold.
+- `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
+- `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
+- `settings` — `{"protected": {"mode", "whitelist"}, "harness"}`; the
+  protected object is the guardrail state, read-only here.
 
 ## Guardrail modes
 
@@ -61,9 +53,8 @@ On top of that floor, the signer runs in one of two user-controlled modes
 - **unrestricted** — anything else you ask for is signed.
 - **restricted** (default) — the safe may only CALL a **whitelisted** address
   (any value, any calldata). Raw digest signing (`sign_message`) is disabled
-  entirely, which also disables off-chain mech requests — use
-  `mech_request(..., legacy_on_chain=true)`. A `send_transaction` from the EOA
-  can reach nothing but the safe.
+  entirely, which also disables off-chain mech requests — send them on-chain
+  instead. A `send_transaction` from the EOA can reach nothing but the safe.
 
 Every blocked request fails with the violated rule. You cannot lift the
 restrictions; the user changes the mode in the agent UI with their keystore
@@ -75,18 +66,38 @@ whitelist itself cannot be edited yet.
 [Mechs](https://olas.network/services/ai-mechs) are on-chain-paid AI services.
 `mech_request` drives the whole flow through the signer: metadata to IPFS,
 payment via the service safe, request, and delivery watching. Start with
-`mech_tools()` to pick a mech and a tool it serves.
+`mech_tools()` to pick a mech, then call it again with that `priority_mech`
+to see the tools it serves and whether it can be reached off-chain.
 
-- `legacy_on_chain=false` (default): off-chain request — no transaction; it
-  raw-signs a request digest and spends prepaid balance held by the mech
-  BalanceTracker. Requires unrestricted mode. With `auto_deposit=true` (the
-  default) an insufficient prepaid balance is topped up from the safe once
-  and the request retried.
+`chain` is optional throughout: it defaults to a configured chain, preferring
+one with a safe.
+
+Two things decide which flow you can use, and both are worth checking before
+composing a prompt:
+
+- **Payment asset.** A mech's `mech_type` names what it charges in (native,
+  USDC, OLAS). A mech pricing in an asset the safe does not hold cannot be
+  paid, and `auto_deposit` will fail rather than convert anything.
+- **`offchain_capable`.** The off-chain flow needs an endpoint published in
+  the mech's service metadata, and few mechs publish one; the rest serve
+  on-chain requests only. When it is `false`, `offchain_note` says why — a
+  mech with no endpoint must go on-chain, an unreadable fetch is worth
+  retrying first. Such a request is refused up front, not part-way through.
+
+- `legacy_on_chain=false` (default): no transaction; it raw-signs a request
+  digest and spends prepaid balance held by the mech BalanceTracker, so it
+  needs unrestricted mode. With `auto_deposit=true` (the default) an
+  insufficient balance is topped up from the safe once and the request
+  retried.
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
   via the service safe. Works in restricted mode out of the box (the
   marketplace contract ships in the default whitelist).
-- `timeout` (seconds, default 300) bounds the wait for the mech's answer; on
-  timeout you still get the `tx_hash`/`request_ids` and can check later.
+- `timeout` (seconds, default 300, max 900) bounds each phase of the wait —
+  the marketplace naming a delivering mech, then reading that mech's logs —
+  so the call itself can take up to twice it. A timeout does not lose the
+  request — it is paid for, and the ids come back as `pending_request_ids`.
+  Poll them with `mech_result(request_id)`, which resumes the watch and never
+  resends.
 - `max_payment` (wei, default 10^17 = 0.1 of the native unit) caps what one
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with
