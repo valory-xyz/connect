@@ -67,7 +67,7 @@ MIDDLEWARE_ENV_FILE = (
 
 
 def _resolve_rpc(name: str = RPC_ENV) -> str | None:
-    """A testnet RPC from the env, else from the middleware repo's .env."""
+    """Return a testnet RPC from the env, else the middleware repo's .env."""
     if os.environ.get(name):
         return os.environ[name]
     try:

@@ -70,7 +70,7 @@ def _slim(market: dict) -> dict:
 def _ends_within_bounds(
     window: str, now: datetime | None = None
 ) -> tuple[datetime, datetime]:
-    """The (start, end) instants a `48h` / `7d` / `2w` window covers from now.
+    """Return the (start, end) a `48h` / `7d` / `2w` window covers from now.
 
     The lower bound is now, so a market that already ended cannot come back.
     """

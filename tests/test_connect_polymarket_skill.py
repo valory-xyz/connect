@@ -1022,7 +1022,7 @@ def test_base_url_handles_the_url_the_server_actually_writes(tmp_path) -> None:
 
 
 def _cs_with_info(info: dict):
-    """A ConnectSigner with the /wallet response already cached."""
+    """Build a ConnectSigner with the /wallet response already cached."""
     cs = pm.ConnectSigner.__new__(pm.ConnectSigner)
     cs._info = info
     cs._w3 = None
@@ -1031,7 +1031,7 @@ def _cs_with_info(info: dict):
 
 
 def _wallet_payload(**entry) -> dict:
-    """The connect server's /wallet shape, with one entry for Polygon."""
+    """Build the connect server's /wallet shape, one entry for Polygon."""
     return {
         "agent_eoa": ADDR_A,
         "actionable_chains": [pm.CHAIN] if entry.get("safe") else [],
@@ -1117,7 +1117,7 @@ class _BalancesCS:
 
 
 def _only_usdc(w3, token, owner):
-    """A safe holding USDC and nothing else the onramp accepts."""
+    """Report a safe holding USDC and nothing else the onramp accepts."""
     return 5_000_000 if token == pm.USDC else 0
 
 
@@ -1133,7 +1133,7 @@ def test_balances_report_usdc(monkeypatch, capsys) -> None:
 
 
 def test_wrap_refusal_names_the_usdc_it_cannot_use(monkeypatch) -> None:
-    """ "Nothing to wrap" must say what the safe does hold, and why it is unusable."""
+    """Name what the safe does hold, and why the onramp cannot use it."""
     monkeypatch.setattr(pm, "erc20_balance_of", _only_usdc)
     with pytest.raises(SystemExit) as excinfo:
         funds.cmd_wrap(_BalancesCS(), None)
@@ -1245,7 +1245,8 @@ def test_cmd_list_sends_the_end_date_bounds(monkeypatch, capsys) -> None:
     monkeypatch.setattr(pm, "http_get_json", fake_get)
     markets.cmd_list(5, None, None, "48h")
     capsys.readouterr()
-    assert "end_date_min" in seen and "end_date_max" in seen
+    assert "end_date_min" in seen
+    assert "end_date_max" in seen
 
 
 def test_cmd_list_drops_markets_gamma_should_have_filtered(monkeypatch, capsys) -> None:
@@ -1293,7 +1294,8 @@ def test_main_wires_ends_within_through_the_parser(monkeypatch, capsys) -> None:
     )
     markets.main()
     capsys.readouterr()
-    assert "end_date_min" in seen and "end_date_max" in seen
+    assert "end_date_min" in seen
+    assert "end_date_max" in seen
 
 
 def test_cmd_list_without_the_flag_sends_no_bounds(monkeypatch, capsys) -> None:
