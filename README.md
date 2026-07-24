@@ -61,16 +61,29 @@ them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
 On that floor, the signer enforces one of two persistent modes:
 
 - **unrestricted** — any other well-formed request is signed;
-- **restricted** (default) — raw digest signing is off, and the only allowed
+- **restricted** (default) — raw digest signing is off, with one carve-out:
+  the mech flow recomputes the off-chain request id *locally* from inputs it
+  already validated, wraps it into the safe's ERC-1271 SafeMessage hash (the
+  safe is the off-chain requester of record), and registers exactly that
+  digest with the guard as a single-use, short-lived allowance before
+  mech-client asks for the signature (nothing the agent session names can
+  register one, and a digest the server did not derive — say, from a lying
+  RPC answering `getRequestId` — mismatches and is refused). The only allowed
   transaction is a safe `execTransaction` CALL to a whitelisted address with
   the gas-refund fields zeroed (a non-zero SafeTx `gasPrice` would pay a refund
-  out of the safe past the whitelist). The MechMarketplace contract per chain
+  out of the safe past the whitelist) — plus one analogous carve-out: before
+  an off-chain request that may auto-deposit, the mech flow pre-authorizes
+  the one safe→balance-tracker payment a 402 top-up would send, single-use,
+  shape-checked (bare native transfer or `deposit(uint256)` with no inner
+  value) and capped at the same bound mech-client itself enforces on the
+  shortfall (10× the mech's per-request rate). The MechMarketplace contract per chain
   (imported from the pinned mech-client) is whitelisted by default — the only
   contract the safe calls in the on-chain mech flow — so mech requests work out
   of the box. Balance trackers and payment tokens are deliberately not
   whitelisted: the whitelist is address-level (any calldata), so a token entry
   would permit arbitrary transfers, and the safe only calls trackers for prepaid
-  deposits, an off-chain-flow (unrestricted-mode) concern.
+  deposits, which restricted mode admits only through the one-shot capped
+  deposit allowance described above.
 
 Funding the safe is the operator's job, through Pearl — the agent has no
 EOA→safe sweep, because it never needed one.
@@ -127,8 +140,11 @@ that survives those.
 The `mech_request` MCP tool drives [mech](https://olas.network/services/ai-mechs)
 requests through mech-client's `Signer` protocol, so every transaction and
 digest passes the guarded choke point. The default off-chain prepaid flow
-needs unrestricted mode (`auto_deposit` tops up the prepaid balance from the
-safe on HTTP 402), and it also needs a mech whose operator published an
+works in both modes: it signs the request-id digest, which restricted mode
+allows through the server-derived single-use allowance described above, and
+its `auto_deposit` top-up (paying the balance tracker from the safe on HTTP
+402) is pre-authorized the same way — capped, single-use, armed only for the
+request being sent. The flow also needs a mech whose operator published an
 endpoint in its on-chain metadata — few have, so `mech_tools` reports
 `offchain_capable` per mech and a request to one that cannot serve it is
 refused before any payment. The on-chain path sends through the

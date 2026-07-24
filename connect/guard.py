@@ -38,11 +38,28 @@ with no further signing. The floor cannot see allowances; revoking them is
 part of flipping the switch back, not a consequence of it.
 
 Everything else is the mode. In restricted mode the agent EOA may only have the
-safe CALL a whitelisted address via execTransaction; raw digest signing is
-disabled entirely (which also rules out off-chain mech requests — their
-request-id digest is an opaque hash this gate cannot inspect).
+safe CALL a whitelisted address via execTransaction, and raw digest signing is
+disabled: a digest is an opaque hash this gate cannot inspect, and the EOA
+owns the safe at threshold 1, so an attacker-chosen digest could be the hash
+of a safe transaction — one signature over it and the whitelist is bypassed.
+The exceptions are allowances the server registers for itself, and the agent
+session can register neither. For signing, the mech flow recomputes the
+off-chain request id from inputs it already validated, wraps it into the
+safe's ERC-1271 SafeMessage hash, and registers exactly that digest
+(allow_digest_once) before mech-client asks for the signature.
+For transactions, the same flow may pre-authorize the one deposit its 402
+top-up would send — the safe paying the mech balance tracker
+(allow_safe_deposit_once), shape-checked (a bare native transfer, or
+deposit(uint256) with no inner value) and bounded by an amount cap. Every
+allowance is single-use and short-lived. A live allowance is a bounded grant,
+not a promise about the caller: any matching request may consume it — for the
+deposit that means the agent could send the tracker payment itself, moving at
+most the cap into a balance the mech flow spends — which is accepted and
+audited, not prevented.
 """
 
+import threading
+import time
 from dataclasses import dataclass
 
 from eth_abi import decode as abi_decode
@@ -54,6 +71,7 @@ from connect.safe import (
     OPERATION_CALL,
     ZERO_ADDRESS,
     decode_approve,
+    decode_deposit,
 )
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
 
@@ -62,11 +80,34 @@ class GuardError(Exception):
     """A transaction or signing request denied by the guardrail."""
 
 
+# How long a registered allowance stays consumable. Registration and use happen
+# inside one mech request() call, normally milliseconds apart (the deposit at
+# worst one HTTP 402 round-trip later); the TTL only bounds how long an entry
+# from a flow that failed in between stays live.
+ALLOWANCE_TTL = 120.0
+
+
+@dataclass(frozen=True)
+class _DepositAllowance:
+    """One pre-authorized safe -> balance-tracker payment, capped and typed.
+
+    `token` picks the shape: a `deposit(uint256 amount)` call with no inner
+    value (amount capped), or a bare native transfer (inner value capped).
+    """
+
+    chain: str
+    tracker: str  # lowercase
+    token: bool
+    amount_cap: int
+    expires: float
+
+
 @dataclass(frozen=True)
 class _SafeExec:
     """The execTransaction fields this gate has an opinion about."""
 
     to: str
+    value: int
     data: str
     operation: int
     gas_price: int
@@ -89,6 +130,7 @@ class _SafeExec:
             raise GuardError(f"could not decode execTransaction calldata: {e}") from e
         return cls(
             to=str(decoded[0]),
+            value=int(decoded[1]),
             data="0x" + decoded[2].hex(),
             operation=decoded[3],
             gas_price=decoded[6],
@@ -104,18 +146,80 @@ class Guard:
         """Initialize."""
         self._store = store
         self._config = config
+        self._allowance_lock = threading.Lock()
+        # digest -> monotonic expiry; entries are consumed by check_sign_digest
+        self._allowed_digests: dict[bytes, float] = {}
+        # pre-authorized deposits; entries are consumed by check_transaction
+        self._deposit_allowances: list[_DepositAllowance] = []
 
     def mode(self) -> str:
         """Return the currently enforced mode."""
         return self._store.load().protected.mode
 
-    def check_sign_digest(self) -> None:
-        """Raise unless raw digest signing is allowed in the current mode."""
-        if self._store.load().protected.mode == MODE_RESTRICTED:
-            raise GuardError(
-                "raw digest signing is disabled in restricted mode; ask the "
-                "operator to switch modes via the agent UI if it is required"
+    def allow_digest_once(self, digest: bytes) -> None:
+        """Permit one restricted-mode signature over a server-derived digest.
+
+        Server-side callers only (the mech flow): no MCP tool or HTTP route
+        reaches this, so the agent session cannot launder an arbitrary hash
+        into an allowance. The caller vouches that it computed the digest
+        itself from validated inputs — see the module docstring for why that
+        is the entire security argument.
+        """
+        with self._allowance_lock:
+            self._purge_expired()
+            self._allowed_digests[bytes(digest)] = time.monotonic() + ALLOWANCE_TTL
+
+    def allow_safe_deposit_once(
+        self, *, chain: str, tracker: str, amount_cap: int, token: bool
+    ) -> None:
+        """Permit one restricted-mode safe payment to a mech balance tracker.
+
+        Server-side callers only (the mech flow, arming a request's possible
+        402 top-up). The tracker address comes from the pinned mech-client's
+        own constants and the cap from the same bound mech-client enforces on
+        the deposit it would send, so the allowance never widens what the
+        flow could already do — it only lets the guard recognize it.
+        """
+        with self._allowance_lock:
+            self._purge_expired()
+            self._deposit_allowances.append(
+                _DepositAllowance(
+                    chain=chain.lower(),
+                    tracker=tracker.lower(),
+                    token=token,
+                    amount_cap=amount_cap,
+                    expires=time.monotonic() + ALLOWANCE_TTL,
+                )
             )
+
+    def _purge_expired(self) -> None:
+        """Drop expired allowances; the caller holds the allowance lock."""
+        now = time.monotonic()
+        self._allowed_digests = {
+            d: exp for d, exp in self._allowed_digests.items() if exp > now
+        }
+        self._deposit_allowances = [
+            a for a in self._deposit_allowances if a.expires > now
+        ]
+
+    def check_sign_digest(self, digest: bytes) -> None:
+        """Raise unless this digest may be signed; consumes its allowance.
+
+        Unrestricted mode signs anything. Restricted mode signs only a digest
+        previously registered via allow_digest_once, exactly once — the pop
+        makes a replayed request for the same signature a refusal, not a
+        second signature.
+        """
+        if self._store.load().protected.mode != MODE_RESTRICTED:
+            return
+        with self._allowance_lock:
+            self._purge_expired()
+            if self._allowed_digests.pop(bytes(digest), None) is not None:
+                return
+        raise GuardError(
+            "raw digest signing is disabled in restricted mode; ask the "
+            "operator to switch modes via the agent UI if it is required"
+        )
 
     def check_transaction(self, chain: str, to: str, value: int, data: str) -> None:
         """Raise unless the EOA transaction is allowed.
@@ -220,6 +324,8 @@ class Guard:
             return
         whitelist = self._store.load().protected.whitelist
         if exec_call.to.lower() not in whitelist.get(chain, ()):
+            if self._consume_deposit_allowance(chain, exec_call):
+                return
             # the whitelist is not editable through the API yet, so pointing at
             # it would send the operator down a path that does not exist
             raise GuardError(
@@ -227,3 +333,34 @@ class Guard:
                 "whitelist; ask the operator to switch to unrestricted mode "
                 "via the agent UI if it is required"
             )
+
+    def _consume_deposit_allowance(self, chain: str, exec_call: "_SafeExec") -> bool:
+        """Consume a deposit allowance this safe call matches, if any.
+
+        A non-matching call consumes nothing: an over-cap or wrong-shape
+        transaction is refused while the allowance stays live for the
+        compliant deposit the flow will actually send.
+        """
+        with self._allowance_lock:
+            self._purge_expired()
+            for index, allowance in enumerate(self._deposit_allowances):
+                if allowance.chain != chain:
+                    continue
+                if allowance.tracker != exec_call.to.lower():
+                    continue
+                if allowance.token:
+                    amount = decode_deposit(exec_call.data)
+                    matches = (
+                        amount is not None
+                        and amount <= allowance.amount_cap
+                        and exec_call.value == 0
+                    )
+                else:
+                    matches = (
+                        exec_call.data == "0x"
+                        and exec_call.value <= allowance.amount_cap
+                    )
+                if matches:
+                    del self._deposit_allowances[index]
+                    return True
+        return False

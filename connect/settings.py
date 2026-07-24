@@ -190,8 +190,9 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     request (`request`/`requestBatch`; native payment rides as the inner
     value); token-paid mechs additionally `approve` the payment token, see
     token_approve_targets(). Balance trackers are deliberately NOT whitelisted —
-    the safe only calls them for prepaid deposits, which our surface reaches
-    only via the off-chain flow (unrestricted mode). Payment token contracts
+    the safe only calls them for prepaid deposits, which restricted mode
+    admits through the guard's one-shot capped deposit allowances (armed per
+    off-chain request by the mech flow). Payment token contracts
     are NOT whitelisted either: the whitelist is address-level, so allowing a
     token contract would allow arbitrary `transfer`s of the safe's balance,
     not just the `approve` a token-paid mech needs. Token-paid mechs are

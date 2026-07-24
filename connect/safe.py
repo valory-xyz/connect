@@ -34,6 +34,7 @@ to predict it; the Safe reads and increments its own.
 
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
+from web3 import Web3
 
 # Safe v1.x execTransaction(address,uint256,bytes,uint8,uint256,uint256,
 #                           uint256,address,address,bytes)
@@ -54,6 +55,52 @@ OPERATION_CALL = 0
 ZERO_ADDRESS = "0x" + "00" * 20
 
 APPROVE_SELECTOR = "095ea7b3"  # approve(address,uint256)
+DEPOSIT_SELECTOR = "b6b55f25"  # deposit(uint256) — mech BalanceTracker top-up
+
+# EIP-712 typehashes of the Safe v1.3.0+ SafeMessage wrapping (unchanged in
+# v1.4.1): the domain the CompatibilityFallbackHandler rehashes a bare digest
+# into before ERC-1271 owner-signature checking.
+SAFE_DOMAIN_TYPEHASH = Web3.keccak(
+    text="EIP712Domain(uint256 chainId,address verifyingContract)"
+)
+SAFE_MESSAGE_TYPEHASH = Web3.keccak(text="SafeMessage(bytes message)")
+
+
+def safe_message_hash(safe_address: str, chain_id: int, digest: bytes) -> bytes:
+    r"""Return the hash Safe.isValidSignature checks owner signatures against.
+
+    The v1.3.0+ ``CompatibilityFallbackHandler`` rehashes a bare 32-byte
+    digest into an EIP-712 ``SafeMessage`` under the *safe's own* domain::
+
+        keccak256("\x19\x01"
+            ‖ keccak256(abi.encode(SAFE_DOMAIN_TYPEHASH, chainId, safe))
+            ‖ keccak256(abi.encode(SAFE_MESSAGE_TYPEHASH, keccak256(digest))))
+
+    Agent-mode off-chain mech requests are ERC-1271-verified against this
+    wrap (mech-client's ``Signer.sign_safe_message`` contract), so both the
+    signature and the guard's digest allowance must name the same bytes —
+    one implementation here keeps the writer and the reader from drifting.
+
+    Exactly 32 bytes are required: the inner ``keccak256(digest)`` shortcut
+    matches the handler's ``keccak256(abi.encode(bytes32))`` only at that
+    length, so anything else would silently produce a hash the safe never
+    accepts.
+    """
+    if len(digest) != 32:
+        raise ValueError(f"digest must be exactly 32 bytes, got {len(digest)}")
+    domain_separator = Web3.keccak(
+        abi_encode(
+            ["bytes32", "uint256", "address"],
+            [SAFE_DOMAIN_TYPEHASH, chain_id, safe_address],
+        )
+    )
+    struct_hash = Web3.keccak(
+        abi_encode(
+            ["bytes32", "bytes32"],
+            [SAFE_MESSAGE_TYPEHASH, Web3.keccak(digest)],
+        )
+    )
+    return bytes(Web3.keccak(b"\x19\x01" + domain_separator + struct_hash))
 
 
 def prevalidated_signature(owner: str) -> bytes:
@@ -115,3 +162,19 @@ def decode_approve(data: str) -> str | None:
     except Exception:  # pylint: disable=broad-exception-caught
         return None
     return str(spender)
+
+
+def decode_deposit(data: str) -> int | None:
+    """Return the amount of a BalanceTracker `deposit(uint256)`, else None.
+
+    None means the calldata is not a decodable deposit — the guard treats
+    that as "not the transaction the allowance covers", never as zero.
+    """
+    calldata = (data or "").removeprefix("0x").lower()
+    if not calldata.startswith(DEPOSIT_SELECTOR):
+        return None
+    try:
+        (amount,) = abi_decode(["uint256"], bytes.fromhex(calldata[8:]))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return int(amount)
