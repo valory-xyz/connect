@@ -33,7 +33,8 @@ other non-aea agent. It:
      `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `safe_transaction`, `send_transaction`, `transaction_status`,
-     `sign_message`, `mech_tools`, `mech_request`, `mech_result`, `settings`.
+     `sign_message`, `mech_tools`, `mech_request`, `mech_result` (plus a
+     read-only `settings` tool when `EXPOSE_MODE_TO_AGENT` is on).
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)
@@ -58,10 +59,17 @@ Two rules hold in **every** mode, and no setting lifts them: the safe may not
 Both would outlive a switch back to restricted mode, so the guardrail refuses
 them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
 
-On that floor, the signer enforces one of two persistent modes:
+On that floor, the signer enforces one of two persistent modes. The modes are
+an operator concept only: agent-facing surfaces (the MCP tools, `GET /wallet`,
+the workspace brief and bundled skills, and every guard refusal message)
+deliberately never say a mode system exists — a blocked request names only the
+rule it violated and that the operator's guardrail settings are where to
+change it. Flipping `EXPOSE_MODE_TO_AGENT` in `connect/settings.py` restores
+the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
+`settings` MCP tool).
 
-- **unrestricted** — any other well-formed request is signed;
-- **restricted** (default) — raw digest signing is off, and the only allowed
+- **unrestricted** (default) — any other well-formed request is signed;
+- **restricted** (operator opt-in) — raw digest signing is off, and the only allowed
   transaction is a safe `execTransaction` CALL to a whitelisted address with
   the gas-refund fields zeroed (a non-zero SafeTx `gasPrice` would pay a refund
   out of the safe past the whitelist). The MechMarketplace contract per chain
@@ -80,7 +88,7 @@ endpoints and the mech request flow all pass the same check. State persists in
 `pearl-connect.settings.json` at STORE_PATH; the security-critical fields
 (mode, whitelist) are HMAC'd with a key derived from the agent private key
 and verified on every read — an edit by the agent (or anything else without
-the key) fails verification and resets them to the restricted defaults. The
+the key) fails verification and resets them to the defaults. The
 `harness` preference is stored alongside without integrity checks and survives
 a guardrail reset. It is outside the MAC because it cannot move funds or widen
 the guardrail — but it is not free of consequence: since `/session` never falls
@@ -127,8 +135,9 @@ that survives those.
 The `mech_request` MCP tool drives [mech](https://olas.network/services/ai-mechs)
 requests through mech-client's `Signer` protocol, so every transaction and
 digest passes the guarded choke point. The default off-chain prepaid flow
-needs unrestricted mode (`auto_deposit` tops up the prepaid balance from the
-safe on HTTP 402), and it also needs a mech whose operator published an
+needs raw digest signing — unrestricted mode — (`auto_deposit` tops up the
+prepaid balance from the safe on HTTP 402), and it also needs a mech whose
+operator published an
 endpoint in its on-chain metadata — few have, so `mech_tools` reports
 `offchain_capable` per mech and a request to one that cannot serve it is
 refused before any payment. The on-chain path sends through the

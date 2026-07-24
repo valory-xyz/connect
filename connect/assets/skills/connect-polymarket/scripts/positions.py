@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Portfolio reads from the public data API — no auth, works in any mode.
+"""Portfolio reads from the public data API — no auth needed.
 
 Positions live wherever the funds flow put them: in the SAFE after a sweep
 (the normal, recoverable place) or briefly in the DW mid-trade. Default is

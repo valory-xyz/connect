@@ -44,7 +44,7 @@ Run standalone (mimicking the Pearl runner) — see README "Development" for the
 
 ## Architecture
 
-The security architecture is the thing to understand first: **every signing path funnels through one gate with no bypass.** MCP tools, HTTP signing endpoints, and the mech request flow all reduce to `Signer.send()` / `Signer.sign_digest()` (`connect/signer.py`), and every request passes the guardrail in `connect/guard.py` before signing. Two invariants hold in every mode and no setting lifts them: the safe may not `delegatecall`, and the safe may not call itself. On that floor sit two persistent modes: **restricted** (default: only safe `execTransaction` CALLs to whitelisted addresses, gas-refund fields zeroed, no raw digest signing) and **unrestricted**. The reasoning is documented at the top of `guard.py`.
+The security architecture is the thing to understand first: **every signing path funnels through one gate with no bypass.** MCP tools, HTTP signing endpoints, and the mech request flow all reduce to `Signer.send()` / `Signer.sign_digest()` (`connect/signer.py`), and every request passes the guardrail in `connect/guard.py` before signing. Two invariants hold in every mode and no setting lifts them: the safe may not `delegatecall`, and the safe may not call itself. On that floor sit two persistent modes: **unrestricted** (default) and **restricted** (operator opt-in via the UI: only safe `execTransaction` CALLs to whitelisted addresses, gas-refund fields zeroed, no raw digest signing). The modes are an operator concept only — agent-facing surfaces (MCP tools, `/wallet`, the workspace brief and skills, guard refusal messages) deliberately never mention that modes exist; `EXPOSE_MODE_TO_AGENT` in `connect/settings.py` is the one switch that turns the agent-visible mode readouts back on. The reasoning is documented at the top of `guard.py`.
 
 Core modules:
 
@@ -53,7 +53,7 @@ Core modules:
 - `connect/signer.py` — the single signing choke point.
 - `connect/guard.py` — the guardrail; one gate for every signing path.
 - `connect/safe.py` — the only place that knows what an `execTransaction` looks like. The agent names an inner call (target, value, calldata); the server wraps it in the safe's `execTransaction` with a threshold-1 pre-validated signature.
-- `connect/settings.py` — tamper-evident settings persisted in STORE_PATH. Security-critical fields (mode, whitelist) are HMAC'd with a key derived from the agent private key; a failed verification resets them to restricted defaults. The last-written MAC is also pinned in memory to defeat replay of old settings files. The `harness` preference sits outside the MAC deliberately (it can't move funds).
+- `connect/settings.py` — tamper-evident settings persisted in STORE_PATH. Security-critical fields (mode, whitelist) are HMAC'd with a key derived from the agent private key; a failed verification resets them to the (unrestricted) defaults. The last-written MAC is also pinned in memory to defeat replay of old settings files. The `harness` preference sits outside the MAC deliberately (it can't move funds).
 - `connect/mech.py` — mech marketplace requests via mech-client's `Signer` protocol, so every transaction/digest still passes the choke point.
 - `connect/config.py` — the only module that reads env vars (`CONNECTION_*`, injected by Pearl from the service template).
 - `connect/activity.py` — audit trail of every signer action + `agent_performance.json` (Pearl SDK contract file).

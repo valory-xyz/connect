@@ -128,12 +128,12 @@ def store_fixture(
 class TestSettingsStore:
     """SettingsStore verification behavior."""
 
-    def test_missing_file_writes_restricted_defaults(
+    def test_missing_file_writes_unrestricted_defaults(
         self, store: SettingsStore
     ) -> None:
-        """A fresh store fails closed to restricted defaults and persists them."""
+        """A fresh store starts from the unrestricted defaults and persists them."""
         loaded = store.load()
-        assert loaded.protected.mode == MODE_RESTRICTED
+        assert loaded.protected.mode == MODE_UNRESTRICTED
         assert GNOSIS_MARKETPLACE in loaded.protected.whitelist["gnosis"]
         assert store._path.exists()  # pylint: disable=protected-access
 
@@ -205,10 +205,10 @@ class TestSettingsStore:
         assert final.protected.mode == MODE_RESTRICTED
         assert final.harness == "claude_code_cli"
 
-    def test_unreadable_file_fails_closed(
+    def test_unreadable_file_serves_defaults(
         self, account: LocalAccount, activity: ActivityLog, tmp_path: Path
     ) -> None:
-        """An unreadable settings file restricts, it does not crash the agent.
+        """An unreadable settings file serves defaults, it does not crash the agent.
 
         A missing file is not the only way a read fails: the store path may
         not even be a directory. Every guarded action loads settings, so
@@ -219,7 +219,7 @@ class TestSettingsStore:
         store = SettingsStore(
             blocker / "pearl-connect.settings.json", derive_mac_key(account), activity
         )
-        assert store.load().protected.mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_UNRESTRICTED
 
     def test_an_unreadable_file_is_never_overwritten(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
@@ -229,8 +229,8 @@ class TestSettingsStore:
         A missing file is safe to re-create; a momentarily unreadable one is
         not — a virus scanner or a backup tool holding it raises here, and
         resetting would permanently clobber the operator's mode, whitelist and
-        harness over a condition that clears by itself. Restrict in memory,
-        leave the file alone.
+        harness over a condition that clears by itself. Serve the in-memory
+        defaults, leave the file alone.
         """
         store.save(
             Settings(
@@ -244,7 +244,7 @@ class TestSettingsStore:
             raise PermissionError("held by another process")
 
         monkeypatch.setattr(Path, "read_text", refuse)
-        assert store.load().protected.mode == MODE_RESTRICTED  # fails closed
+        assert store.load().protected.mode == MODE_UNRESTRICTED  # in-memory defaults
         monkeypatch.undo()
 
         # the file survived untouched, and so did everything in it — including
@@ -314,12 +314,12 @@ class TestSettingsStore:
         activity: ActivityLog,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A read that fails restricts; it is never reported as a failed write.
+        """A read that fails serves defaults; it is never a failed write.
 
         Every guarded decision loads the settings, so an unreadable file must
-        fail closed in memory rather than raise — and it must not masquerade
-        as a persist failure to the operator, who would go looking at a write
-        that was never attempted.
+        degrade in memory rather than raise — and it must not masquerade as a
+        persist failure to the operator, who would go looking at a write that
+        was never attempted.
         """
         store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
 
@@ -327,7 +327,8 @@ class TestSettingsStore:
             raise PermissionError("locked")
 
         monkeypatch.setattr(Path, "read_text", refuse)
-        assert store.load().protected.mode == MODE_RESTRICTED  # fails closed
+        assert store.load().protected.mode == MODE_UNRESTRICTED  # in-memory defaults
+        monkeypatch.undo()
         assert "settings_persist_failed" not in audit_kinds(store_path)
 
     def test_failed_write_leaves_no_temp_file(
@@ -364,25 +365,29 @@ class TestSettingsStore:
         activity: ActivityLog,
         corrupt: str,
     ) -> None:
-        """Unverifiable content is replaced with defaults and audited."""
-        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        """Unverifiable content is replaced with the defaults and audited."""
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
         store._path.write_text(corrupt)  # pylint: disable=protected-access
         loaded = store.load()
-        assert loaded.protected.mode == MODE_RESTRICTED
+        assert loaded.protected.mode == MODE_UNRESTRICTED  # reset to defaults
         assert "settings_tampered" in audit_kinds(store_path)
         # the rewritten file verifies again
-        assert store.load().protected.mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_UNRESTRICTED
 
     def test_edited_field_fails_mac(self, store: SettingsStore) -> None:
-        """Flipping the mode in the JSON without the key fails verification."""
-        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
+        """Editing a protected field without the key fails verification.
+
+        The edited value is never trusted: the whole protected object is
+        replaced with the defaults, so the tampered whitelist entry does not
+        survive into the enforced state.
+        """
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
         payload = json.loads(path.read_text())
-        payload["protected"][
-            "mode"
-        ] = "unrestricted"  # the attack this file exists to stop
+        payload["protected"]["whitelist"] = {"testchain": [OTHER]}  # hand edit
         path.write_text(json.dumps(payload))
-        assert store.load().protected.mode == MODE_RESTRICTED
+        loaded = store.load()
+        assert OTHER not in loaded.protected.whitelist.get("testchain", ())
 
     def test_harness_edit_applies_without_the_key(self, store: SettingsStore) -> None:
         """The harness is a preference: a plain file edit simply takes effect."""
@@ -423,12 +428,10 @@ class TestSettingsStore:
         )
         path = store._path  # pylint: disable=protected-access
         payload = json.loads(path.read_text())
-        payload["protected"][
-            "mode"
-        ] = "unrestricted"  # the attack: protected field edited
+        payload["protected"]["mode"] = "unrestricted"  # protected field edited
         path.write_text(json.dumps(payload))
         loaded = store.load()
-        assert loaded.protected.mode == MODE_RESTRICTED  # fails closed
+        assert loaded.protected.mode == MODE_UNRESTRICTED  # reset to defaults
         assert loaded.harness == "claude_code_cli"  # preference survives
 
     def test_valid_mac_but_bad_mode_rejected(self, store: SettingsStore) -> None:
@@ -436,19 +439,26 @@ class TestSettingsStore:
         payload: dict = {"version": 1, "protected": {"mode": "yolo", "whitelist": {}}}
         payload["mac"] = store._mac(payload)  # pylint: disable=protected-access
         store._path.write_text(json.dumps(payload))  # pylint: disable=protected-access
-        assert store.load().protected.mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_UNRESTRICTED
 
     def test_mac_key_requires_the_private_key(
         self, store: SettingsStore, activity: ActivityLog
     ) -> None:
         """A store keyed by a different account rejects the file."""
-        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        store.save(
+            Settings(
+                protected=Protected(
+                    mode=MODE_UNRESTRICTED, whitelist={"gnosis": (OTHER,)}
+                )
+            )
+        )
         other = SettingsStore(
             store._path,  # pylint: disable=protected-access
             derive_mac_key(Account.create()),
             activity,
         )
-        assert other.load().protected.mode == MODE_RESTRICTED
+        # the file is not trusted: the custom whitelist is gone, defaults rule
+        assert OTHER not in other.load().protected.whitelist.get("gnosis", ())
 
     def test_replayed_old_file_is_rejected(
         self, store_path: Path, store: SettingsStore, activity: ActivityLog
@@ -456,10 +466,13 @@ class TestSettingsStore:
         """Putting back an old validly-MAC'd file fails like any other tamper."""
         store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
-        unrestricted_file = path.read_bytes()  # captured while unrestricted
+        old_file = path.read_bytes()  # captured before the next save
         store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
-        path.write_bytes(unrestricted_file)  # the rollback attack
-        assert store.load().protected.mode == MODE_RESTRICTED
+        path.write_bytes(old_file)  # the rollback
+        loaded = store.load()
+        # the replayed file is not accepted verbatim: its empty whitelist is
+        # replaced by the defaults, and the event is audited
+        assert loaded.protected.whitelist != {}
         assert "settings_tampered" in audit_kinds(store_path)
 
     def test_fresh_process_accepts_any_valid_mac(
@@ -474,7 +487,7 @@ class TestSettingsStore:
         )
         assert restarted.load().protected.mode == MODE_UNRESTRICTED
 
-    def test_unwritable_store_still_fails_closed(
+    def test_unwritable_store_still_serves_defaults(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """If persisting the reset fails, enforcement still gets defaults."""
@@ -484,7 +497,7 @@ class TestSettingsStore:
             "_save",
             lambda self, settings: (_ for _ in ()).throw(OSError("read-only fs")),
         )
-        assert store.load().protected.mode == MODE_RESTRICTED
+        assert store.load().protected.mode == MODE_UNRESTRICTED
 
 
 class TestDefaults:
@@ -518,7 +531,7 @@ class TestDefaults:
         whitelist = default_whitelist()
         assert "0x" + "cc" * 20 in whitelist["gnosis"]
         assert whitelist["testchain"] == ("0x" + "dd" * 20,)
-        assert defaults().protected.mode == MODE_RESTRICTED
+        assert defaults().protected.mode == MODE_UNRESTRICTED
 
     def test_broken_mech_client_degrades_to_empty_whitelist(
         self, monkeypatch: pytest.MonkeyPatch
@@ -529,7 +542,7 @@ class TestDefaults:
             "/nonexistent/mechs.json",
         )
         assert default_whitelist() == {}
-        assert defaults().protected.mode == MODE_RESTRICTED
+        assert defaults().protected.mode == MODE_UNRESTRICTED
 
     def test_token_approve_targets_maps_tokens_to_trackers(self) -> None:
         """Each configured payment token maps to its mech balance tracker."""
@@ -594,7 +607,7 @@ class TestGuard:
     def test_restricted_requires_safe_target(self, store: SettingsStore) -> None:
         """Everything must go to (or through) the service safe."""
         guard = make_guard(store, MODE_RESTRICTED)
-        with pytest.raises(GuardError, match="only target the service safe"):
+        with pytest.raises(GuardError, match="targeting the service safe"):
             guard.check_transaction("testchain", OTHER, 1, "0x")
         with pytest.raises(GuardError, match="no service safe"):
             guard.check_transaction("nosafe", SAFE, 1, "0x")
@@ -608,8 +621,55 @@ class TestGuard:
         agent never needed is one the gate should not carry.
         """
         guard = make_guard(store, MODE_RESTRICTED)
-        with pytest.raises(GuardError, match="must be execTransaction"):
+        with pytest.raises(GuardError, match="to be execTransaction"):
             guard.check_transaction("testchain", SAFE, 10**18, "0x")
+
+    def test_refusals_never_name_the_mode_system(self, store: SettingsStore) -> None:
+        """Every agent-facing refusal names the rule, never that modes exist.
+
+        The hiding is only as strong as its weakest message: one "restricted
+        mode:" reintroduced by a merge or a copy-paste from an old branch
+        would undo it, so every guarded denial path is swept here.
+        """
+        guard = make_guard(
+            store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
+        )
+        denials: list[t.Callable[[], None]] = [
+            guard.check_sign_digest,
+            lambda: guard.check_transaction("nosafe", SAFE, 1, "0x"),
+            lambda: guard.check_transaction("testchain", OTHER, 1, "0x"),
+            lambda: guard.check_transaction("testchain", SAFE, 1, "0x"),
+            lambda: guard.check_transaction(  # outer native value
+                "testchain", SAFE, 1, exec_transaction_calldata(WHITELISTED)
+            ),
+            lambda: guard.check_transaction(  # non-zero refund fields
+                "testchain",
+                SAFE,
+                0,
+                exec_transaction_calldata(WHITELISTED, gas_price=1),
+            ),
+            lambda: guard.check_transaction(  # whitelist miss
+                "testchain", SAFE, 0, exec_transaction_calldata(OTHER)
+            ),
+            lambda: guard.check_transaction(  # floor: delegatecall
+                "testchain",
+                SAFE,
+                0,
+                exec_transaction_calldata(WHITELISTED, operation=1),
+            ),
+            lambda: guard.check_transaction(  # floor: safe self-call
+                "testchain", SAFE, 0, exec_transaction_calldata(SAFE)
+            ),
+            lambda: guard.check_transaction(  # undecodable execTransaction
+                "testchain", SAFE, 0, "0x" + EXEC_TRANSACTION_SELECTOR + "ff"
+            ),
+        ]
+        for denial in denials:
+            with pytest.raises(GuardError) as excinfo:
+                denial()
+            message = str(excinfo.value).lower()
+            assert "restricted" not in message, message
+            assert "mode" not in message, message
 
     def test_the_floor_holds_in_every_mode(self, store: SettingsStore) -> None:
         """Delegatecall and safe-self-calls are refused even when unrestricted.
@@ -686,13 +746,13 @@ class TestGuard:
     @pytest.mark.parametrize(
         ("calldata", "message"),
         [
-            (exec_transaction_calldata(OTHER), "not in the testchain whitelist"),
+            (exec_transaction_calldata(OTHER), "do not allow the safe to call"),
             (
                 # refused by the floor now, not by the mode
                 exec_transaction_calldata(WHITELISTED, operation=1),
                 "may not delegatecall",
             ),
-            ("0xdeadbeef", "must be execTransaction"),
+            ("0xdeadbeef", "to be execTransaction"),
             ("0x" + EXEC_TRANSACTION_SELECTOR + "ff", "could not decode"),
         ],
     )
@@ -712,7 +772,7 @@ class TestGuard:
             store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
         )
         calldata = exec_transaction_calldata(WHITELISTED)
-        with pytest.raises(GuardError, match="must not carry native value"):
+        with pytest.raises(GuardError, match="forbids native value"):
             guard.check_transaction("testchain", SAFE, 1, calldata)
 
     @pytest.mark.parametrize(
@@ -731,7 +791,7 @@ class TestGuard:
             store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
         )
         calldata = exec_transaction_calldata(WHITELISTED, **refund_kwargs)
-        with pytest.raises(GuardError, match="refund fields must be zero"):
+        with pytest.raises(GuardError, match="refund fields to be zero"):
             guard.check_transaction("testchain", SAFE, 0, calldata)
 
     def test_restricted_accepts_uppercase_calldata(self, store: SettingsStore) -> None:
@@ -794,7 +854,7 @@ class TestGuard:
         # OTHER is not the payment token, so its approve is judged by the
         # whitelist (which does not contain OTHER), not the token rule
         calldata = exec_transaction_calldata(OTHER, data=approve_data(TRACKER))
-        with pytest.raises(GuardError, match="not in the testchain whitelist"):
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, calldata)
 
 
@@ -839,7 +899,7 @@ class TestSignerGuardIntegration:
         fake_w3: FakeW3,
     ) -> None:
         """A denied send raises SignerError, records 'blocked', broadcasts nothing."""
-        with pytest.raises(SignerError, match="restricted mode"):
+        with pytest.raises(SignerError, match="only allow transactions targeting"):
             restricted_signer.send("testchain", OTHER, value=1)
         assert "blocked" in audit_kinds(store_path)
         assert not fake_w3.eth.sent
@@ -901,7 +961,7 @@ class TestSignerGuardIntegration:
         reach targets the whitelist never saw, it would be the bypass this
         design exists to not have.
         """
-        with pytest.raises(SignerError, match="not in the testchain whitelist"):
+        with pytest.raises(SignerError, match="do not allow the safe to call"):
             restricted_signer.send_via_safe("testchain", OTHER, value=1)
         assert not fake_w3.eth.sent
 
@@ -1018,7 +1078,7 @@ class TestSignerGuardIntegration:
             == tx_hash
         )
         assert len(fake_w3.eth.sent) == 1  # no second broadcast
-        with pytest.raises(SignerError, match="restricted mode"):
+        with pytest.raises(SignerError, match="only allow transactions targeting"):
             restricted_signer.send("testchain", OTHER, value=1, request_id="r2")
 
 
@@ -1505,11 +1565,11 @@ class TestMech:
         patched_mech.metadata = {"tools": ["prediction-online"]}
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
             mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
-        # 3. restricted mode
+        # 3. digest signing disabled by the guardrail
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
         )
-        with pytest.raises(MechError, match="restricted"):
+        with pytest.raises(MechError, match="blocked by the guardrail"):
             mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
 
         blocked = [
@@ -1520,7 +1580,7 @@ class TestMech:
         assert [entry["reason"] for entry in blocked] == [
             "over-max-payment",
             "offchain-unreachable",
-            "restricted-mode",
+            "digest-signing-disabled",
         ]
         assert all(entry["chain"] == "testchain" for entry in blocked)
         assert not patched_mech.calls  # nothing was ever sent
@@ -2028,7 +2088,9 @@ class TestSettingsEndpoints:
             headers={"Authorization": "Bearer tok"},
         )
         assert blocked.status_code == 400
-        assert "restricted mode" in blocked.json()["detail"]
+        # the refusal names the rule, never the mode system
+        assert "only allow transactions targeting" in blocked.json()["detail"]
+        assert "restricted" not in blocked.json()["detail"]
 
     def test_harness_updates_and_validates(self, client: TestClient) -> None:
         """The harness is updatable from the UI endpoint and validated."""
@@ -2297,6 +2359,15 @@ class TestSettingsEndpoints:
         )
         assert harness.status_code == 403
 
+    def test_wallet_mode_visibility_follows_the_switch(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GET /wallet hides the mode by default; the switch restores it."""
+        headers = {"Authorization": "Bearer tok"}
+        assert "mode" not in client.get("/wallet", headers=headers).json()
+        monkeypatch.setattr("connect.settings.EXPOSE_MODE_TO_AGENT", True)
+        assert client.get("/wallet", headers=headers).json()["mode"] == "unrestricted"
+
     def test_auth_failures_are_audited_and_braked(
         self,
         store_path: Path,
@@ -2486,19 +2557,21 @@ class TestSettingsEndpoints:
         """A patch lands on the post-reset defaults, never the forged payload.
 
         An unauthenticated harness-only patch must not launder a hand-edited
-        mode back to disk under a fresh valid MAC.
+        protected object back to disk under a fresh valid MAC.
         """
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
         )
         path = settings_store._path  # pylint: disable=protected-access
         payload = json.loads(path.read_text())
-        payload["protected"]["mode"] = "unrestricted"  # forged without the key
+        # forged without the key: a whitelist entry the operator never allowed
+        payload["protected"]["whitelist"] = {"testchain": [OTHER]}
         path.write_text(json.dumps(payload))
         response = client.patch("/settings", json={"harness": "claude_code_cli"})
         assert response.status_code == 200
         body = response.json()
-        assert body["protected"]["mode"] == "restricted"  # reset, not merged
+        # reset to the defaults, not merged with the forgery
+        assert OTHER not in body["protected"]["whitelist"].get("testchain", [])
         assert body["harness"] == "claude_code_cli"
         assert "settings_tampered" in audit_kinds(store_path)
 
@@ -2522,8 +2595,36 @@ class TestSettingsEndpoints:
         assert client.get("/settings").json()["harness"] == "claude_code_desktop"
 
 
+def _build_tools(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    guard: Guard,
+    mech_service: MechService,
+    settings_store: SettingsStore,
+) -> dict[str, t.Callable]:
+    """Build the MCP surface and return its tool functions keyed by name.
+
+    A plain function rather than only a fixture: the EXPOSE_MODE_TO_AGENT
+    test must monkeypatch the flag *before* build_mcp runs, which fixture
+    ordering cannot express.
+    """
+    from connect.server.mcp_tools import build_mcp
+
+    mcp = build_mcp(
+        test_signer,
+        app_config,
+        activity,
+        guard=guard,
+        mech=mech_service,
+        settings_store=settings_store,
+    )
+    manager = mcp._tool_manager  # pylint: disable=protected-access
+    return {tool.name: tool.fn for tool in manager.list_tools()}
+
+
 class TestMcpGuardrailTools:
-    """New MCP tools: mech_request and settings."""
+    """MCP tools around the guardrail, and the EXPOSE_MODE_TO_AGENT switch."""
 
     @pytest.fixture(name="tools")
     def tools_fixture(  # pylint: disable=too-many-arguments
@@ -2536,40 +2637,49 @@ class TestMcpGuardrailTools:
         settings_store: SettingsStore,
     ) -> dict[str, t.Callable]:
         """Return the registered tool functions keyed by name."""
-        from connect.server.mcp_tools import build_mcp
-
-        mcp = build_mcp(
-            test_signer,
-            app_config,
-            activity,
-            guard=guard,
-            mech=mech_service,
-            settings_store=settings_store,
+        return _build_tools(
+            test_signer, app_config, activity, guard, mech_service, settings_store
         )
-        manager = mcp._tool_manager  # pylint: disable=protected-access
-        return {tool.name: tool.fn for tool in manager.list_tools()}
 
-    def test_no_settings_write_tool_exists(self, tools: dict[str, t.Callable]) -> None:
-        """The MCP surface must not be able to change the guardrail."""
-        writers = [name for name in tools if "settings" in name and name != "settings"]
-        assert not writers
-        assert set(tools) >= {"settings", "mech_request", "wallet_info"}
-
-    async def test_settings_reports_enforced_state(
-        self, tools: dict[str, t.Callable], settings_store: SettingsStore
+    async def test_mode_surfaces_are_hidden_by_default(
+        self, tools: dict[str, t.Callable]
     ) -> None:
-        """The tool reflects the post-verification settings."""
+        """With EXPOSE_MODE_TO_AGENT off, the agent is told nothing about modes."""
+        assert "settings" not in tools
+        assert set(tools) >= {"mech_request", "wallet_info"}
+        assert "mode" not in await tools["wallet_info"]()
+
+    async def test_expose_mode_restores_the_readouts(  # pylint: disable=too-many-arguments
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        guard: Guard,
+        mech_service: MechService,
+        settings_store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Flipping EXPOSE_MODE_TO_AGENT brings back the settings tool and mode key.
+
+        The switch exists so the mode readouts can be turned back on without
+        re-plumbing; this pins that both agent-visible surfaces actually
+        return, and that the read-only property survives the flip.
+        """
+        monkeypatch.setattr("connect.settings.EXPOSE_MODE_TO_AGENT", True)
+        tools = _build_tools(
+            test_signer, app_config, activity, guard, mech_service, settings_store
+        )
+        writers = [name for name in tools if "settings" in name and name != "settings"]
+        assert not writers  # the MCP surface still cannot change the guardrail
         assert await tools["settings"]() == {
             "protected": {"mode": "unrestricted", "whitelist": {}},
             "harness": "claude_code_desktop",
         }
-        # tampering is not visible through the tool — only the enforced defaults
-        settings_store._path.write_text("garbage")  # pylint: disable=protected-access
-        assert (await tools["settings"]())["protected"]["mode"] == "restricted"
-
-    async def test_wallet_info_reports_mode(self, tools: dict[str, t.Callable]) -> None:
-        """wallet_info carries the mode for quick agent orientation."""
         assert (await tools["wallet_info"]())["mode"] == "unrestricted"
+        # tampering is not visible through the tool — only the enforced state
+        settings_store._path.write_text("garbage")  # pylint: disable=protected-access
+        after = await tools["settings"]()
+        assert after["protected"]["whitelist"] != {}  # reset to the defaults
 
     async def test_mech_tools_tool_delegates(
         self,

@@ -122,7 +122,7 @@ class ConnectSigner(signer_client.SignerClient):
     idempotent ``/safe-transaction`` with retries) from the sibling skill and
     adds only what Polymarket needs: a PoA-aware Polygon web3 for reads, the
     agent/safe addresses, an EIP-191 helper and receipt polling. Every
-    signature still goes through the signer and requires unrestricted mode.
+    signature still goes through the signer and its guardrail.
     """
 
     def __init__(self, base_url: str, token: str, workspace: Path) -> None:

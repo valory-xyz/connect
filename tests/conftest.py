@@ -231,8 +231,9 @@ def settings_store(
 ) -> SettingsStore:
     """Build a settings store pre-set to unrestricted so legacy tests keep signing.
 
-    The restricted default and its rules are exercised explicitly by the
-    guard/settings tests.
+    Pre-saving (rather than relying on the unrestricted defaults) keeps the
+    file's whitelist empty and deterministic; restricted mode and its rules
+    are exercised explicitly by the guard/settings tests.
     """
     store = SettingsStore(store_path / SETTINGS_FILE, derive_mac_key(account), activity)
     store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))

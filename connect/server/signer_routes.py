@@ -29,6 +29,7 @@ import typing as t
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
+from connect import settings as settings_config
 from connect import wallet
 from connect.signer import SignerError
 
@@ -116,5 +117,6 @@ def wallet_info(request: Request) -> dict:
     overview = wallet.wallet_overview(
         request.app.state.config, request.app.state.signer
     )
-    overview["mode"] = request.app.state.guard.mode()
+    if settings_config.EXPOSE_MODE_TO_AGENT:
+        overview["mode"] = request.app.state.guard.mode()
     return overview

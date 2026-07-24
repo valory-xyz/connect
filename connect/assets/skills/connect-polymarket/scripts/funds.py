@@ -89,7 +89,7 @@ def cmd_wrap(cs: pm.ConnectSigner, amount: float | None) -> None:
 
     Two sequential safe calls — approve, then wrap (the onramp pulls via
     transferFrom and mints pUSD back to the safe). NOT a multisend: connect's
-    guardrail floor refuses delegatecall in every mode. The onramp accepts
+    guardrail floor always refuses delegatecall. The onramp accepts
     USDC.e only; USDC must be swapped to USDC.e first.
     """
     safe = cs.safe_address

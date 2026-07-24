@@ -421,9 +421,10 @@ class MechService:
             try:
                 self._guard.check_sign_digest()
             except GuardError as e:
-                self._blocked(chain, tool, "restricted-mode", str(e))
+                self._blocked(chain, tool, "digest-signing-disabled", str(e))
                 raise MechError(
-                    f"off-chain mech requests are restricted: {e}; retry it on-chain"
+                    f"off-chain mech requests are blocked by the guardrail: {e}; "
+                    "retry it on-chain"
                 ) from e
         service = self._service(chain)
         priority_mech, service_id, rate = self._priced_mech(
