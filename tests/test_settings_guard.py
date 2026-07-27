@@ -642,12 +642,17 @@ class TestGuard:
         guard.check_sign_digest(b"\xab" * 32)
 
     def test_digest_allowance_expires(
-        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+        self,
+        store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """An allowance a failed flow left behind dies on its own.
+        """An allowance a failed flow left behind dies on its own — loudly.
 
         Registration and signing normally happen milliseconds apart; the TTL
-        only bounds how long a stale entry stays consumable.
+        only bounds how long a stale entry stays consumable. The refusal that
+        follows reads as a policy denial, so the expiry itself must leave a
+        distinguishable trace in the log.
         """
         guard = make_guard(store, MODE_RESTRICTED)
         guard.allow_digest_once(b"\xab" * 32)
@@ -658,6 +663,7 @@ class TestGuard:
         )
         with pytest.raises(GuardError, match="digest signing is disabled"):
             guard.check_sign_digest(b"\xab" * 32)
+        assert "expired unconsumed" in caplog.text
 
     def test_deposit_allowance_native(self, store: SettingsStore) -> None:
         """A pre-authorized bare transfer to the tracker passes — once, capped.
@@ -747,9 +753,12 @@ class TestGuard:
             guard.check_transaction("testchain", SAFE, 0, deposit)
 
     def test_deposit_allowance_expires(
-        self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
+        self,
+        store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A deposit allowance a failed flow left behind dies on its own."""
+        """A deposit allowance a failed flow left behind dies on its own — loudly."""
         guard = make_guard(store, MODE_RESTRICTED)
         guard.allow_safe_deposit_once(
             chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
@@ -763,6 +772,7 @@ class TestGuard:
             guard.check_transaction(
                 "testchain", SAFE, 0, exec_transaction_calldata(TRACKER, value=1)
             )
+        assert "expired unconsumed" in caplog.text
 
     def test_restricted_requires_safe_target(self, store: SettingsStore) -> None:
         """Everything must go to (or through) the service safe."""

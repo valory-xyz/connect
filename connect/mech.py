@@ -92,10 +92,12 @@ MAX_DELIVERY_TIMEOUT = 900.0
 DEFAULT_RESULT_TIMEOUT = 30.0
 DEFAULT_MECH_PAGE_SIZE = 20
 MAX_MECH_PAGE_SIZE = 100
-# A mech prices its own requests (max_delivery_rate) and the guardrail only
-# checks *where* payments go — this cap bounds *how much* a single request may
-# cost. 0.1 of the chain's native unit; raising it is an explicit, audited
-# per-request choice.
+# The agent's per-request spending budget, not a guardrail: the caller picks
+# max_payment per call and the server does not clamp it — the guardrail only
+# checks *where* payments go. A mech pricing above the budget is refused
+# before payment, and the accepted price is audited on success. Denominated
+# in the mech's payment asset base units (wei for native mechs, token base
+# units for OLAS/USDC ones); the default is 0.1 of a native unit.
 DEFAULT_MAX_PAYMENT = 10**17
 
 
@@ -540,7 +542,8 @@ class MechService:
 
         ``legacy_on_chain=False`` (default) uses the off-chain prepaid flow;
         ``True`` sends the request on-chain through the marketplace. The
-        mech's per-request price must not exceed ``max_payment`` (wei).
+        mech's per-request price must not exceed ``max_payment``, in the
+        mech's payment asset base units.
 
         Each refusal below is audited before it raises: the activity log is
         what an operator reconstructs an incident from, and a request blocked
@@ -556,13 +559,11 @@ class MechService:
             priced.rate,
         )
         if rate > max_payment:
-            self._blocked(
-                chain, tool, "over-max-payment", f"{rate} wei > {max_payment} wei"
-            )
+            self._blocked(chain, tool, "over-max-payment", f"{rate} > {max_payment}")
             raise MechError(
-                f"mech {priority_mech} charges {rate} wei per request, above "
-                f"max_payment={max_payment}; pass a higher max_payment to "
-                "accept that price"
+                f"mech {priority_mech} charges {rate} per request (in its "
+                f"payment asset base units), above max_payment={max_payment}; "
+                "pass a higher max_payment to accept that price"
             )
         if not legacy_on_chain:
             # mech-client discovers the endpoint mid-flow and fails there with
@@ -617,6 +618,8 @@ class MechService:
             chain=chain,
             tool=tool,
             offchain=not legacy_on_chain,
+            rate=str(rate),
+            max_payment=str(max_payment),
             request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
         return self._with_pending(

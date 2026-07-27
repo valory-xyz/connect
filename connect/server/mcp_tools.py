@@ -198,7 +198,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         `offchain_capable` with mech_tools first; legacy_on_chain=true goes
         through the marketplace instead. Both flows (and the off-chain
         auto_deposit top-up) work in restricted mode.
-        Refused before paying if the mech's price exceeds max_payment (wei).
+        Refused before paying if the mech's price exceeds max_payment
+        (base units of the mech's payment asset).
         On timeout the ids come back as `pending_request_ids` for mech_result.
         """
         # mech-client manages its own event loops (asyncio.run + sync gql):

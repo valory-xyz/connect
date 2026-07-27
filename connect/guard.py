@@ -58,6 +58,7 @@ most the cap into a balance the mech flow spends — which is accepted and
 audited, not prevented.
 """
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -74,6 +75,8 @@ from connect.safe import (
     decode_deposit,
 )
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
+
+logger = logging.getLogger("agent")
 
 
 class GuardError(Exception):
@@ -201,11 +204,24 @@ class Guard:
             )
 
     def _purge_expired(self) -> None:
-        """Drop expired allowances; the caller holds the allowance lock."""
+        """Drop expired allowances — loudly; the caller holds the allowance lock.
+
+        An allowance that dies unconsumed means a flow failed between arm
+        and use, and the next matching request is refused with the generic
+        policy message — these log lines are what tell the two apart.
+        """
         now = time.monotonic()
-        self._allowed_digests = {
-            d: exp for d, exp in self._allowed_digests.items() if exp > now
-        }
+        for digest, expiry in list(self._allowed_digests.items()):
+            if expiry <= now:
+                logger.warning("digest allowance 0x%s expired unconsumed", digest.hex())
+                del self._allowed_digests[digest]
+        for allowance in self._deposit_allowances:
+            if allowance.expires <= now:
+                logger.warning(
+                    "deposit allowance for tracker %s on %s expired unconsumed",
+                    allowance.tracker,
+                    allowance.chain,
+                )
         self._deposit_allowances = [
             a for a in self._deposit_allowances if a.expires > now
         ]

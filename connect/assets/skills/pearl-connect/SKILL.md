@@ -99,7 +99,8 @@ composing a prompt:
   request — it is paid for, and the ids come back as `pending_request_ids`.
   Poll them with `mech_result(request_id)`, which resumes the watch and never
   resends.
-- `max_payment` (wei, default 10^17 = 0.1 of the native unit) caps what one
+- `max_payment` (base units of the mech's payment asset — wei for native
+  mechs; default 10^17 = 0.1 native) caps what one
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with
   `mech_tools(priority_mech=...)` (`max_delivery_rate`).
