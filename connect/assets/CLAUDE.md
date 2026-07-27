@@ -22,9 +22,9 @@ connect server owns — don't hand-edit them:
   each run)
 - `.claude/skills/pearl-connect/` — your skill, kept up to date by the server
 - `pearl-connect.settings.json` — agent wallet's settings; the guardrail
-  fields (mode, whitelist) are integrity-checked — any hand-edit is detected
-  and reset to safe defaults; the `harness` preference is stored alongside
-  without integrity checks and survives such a reset
+  fields are integrity-checked — any hand-edit is detected and reset to safe
+  defaults; the `harness` preference is stored alongside without integrity
+  checks and survives such a reset
 - `.gitignore` / `.claude/settings.json` — the server re-adds its token-hygiene
   entries (never commit or Read `.mcp.json`) if they go missing
 - this `CLAUDE.md` itself
@@ -54,15 +54,14 @@ acting through the service safe, making mech requests, signing mech-request
 digests — use the **pearl-connect skill**
 (`.claude/skills/pearl-connect/SKILL.md`). It documents which tool to reach
 for, `scripts/signer_client.py` for web3.py code run by spawned scripts, and
-the guardrail: a user-controlled restriction (`restricted` by default) that
-may refuse to sign, always naming the rule it violated. You cannot lift it
-yourself — when a task needs more than it allows, tell the user what was
-blocked and why.
+the guardrail: a signing gate that may refuse a request, always naming the
+rule it violated. You cannot lift it yourself — when a task needs more than
+it allows, tell the user what was blocked and why.
 
 Don't hand-roll signing, key loading, or raw RPC sends — the skill's paths
 are the supported, audited ones. Start any on-chain task with `wallet_info`
-for your addresses, balances, guardrail mode, and `actionable_chains` — the
-chains you can actually act on, usually one. Ignore the rest.
+for your addresses, balances, and `actionable_chains` — the chains you can
+actually act on, usually one. Ignore the rest.
 
 ## When the operator asks "what can you do?"
 
@@ -70,18 +69,16 @@ Answer it with concrete suggestions they can ask you to do — not a list of too
 "I can send transactions and make mech requests" tells a first-time operator
 nothing; a few real tasks do.
 
-First run `wallet_info` and `settings` so you only offer what works right now —
-skip a recipe if the funds aren't there, if it needs a chain outside
-`actionable_chains`, or if it needs a contract the whitelist doesn't allow
-while you're in restricted mode. Then offer a few of
+First run `wallet_info` so you only offer what works right now — skip a
+recipe if the funds aren't there or if it needs a chain outside
+`actionable_chains`. Then offer a few of
 these or something similar, in their words, and invite them to pick one or ask their own:
 
 - **Have an expert AI service make a prediction** — e.g. "Will tomorrow's
   global average temperature be higher than today's?" One mech request.
 - **Put funds where a prediction points** — e.g. "Find a liquidity pool with
   strong expected yield and invest in it." A mech request for the forecast,
-  then a spend from the service safe (in restricted mode the pool's contract
-  must be whitelisted).
+  then a spend from the service safe.
 - **Trade on prediction markets and learn from their outcomes** — e.g. "Trade on Omen using
   mech predictions, and keep notes on what worked so you get better." Mech
   predictions drive positions on Omen (a Gnosis prediction market); record each

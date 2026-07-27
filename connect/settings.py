@@ -25,7 +25,11 @@ it, so every read verifies an HMAC keyed off the agent private key before the
 content is trusted. The canonical shape nests the security-critical fields
 under "protected" ({"protected": {"mode", "whitelist"}, "harness"}) and the
 MAC covers exactly that object (plus the version); a failed verification
-fails closed by resetting it to the built-in defaults (restricted mode).
+resets it to the built-in defaults. Landing on the defaults (rather than a
+narrower fail-closed state) is deliberate: a mistaken edit or deletion of
+the file must not brick the agent, and the defaults are exactly what a
+fresh install ships with — so the reset adds no exposure a new install does
+not already accept. Every reset-to-defaults transition is audited once per episode.
 Preference fields (harness) live outside "protected" without integrity
 checks: editing them simply applies, and they survive a protected reset.
 Legitimate protected changes go through the password-gated settings PATCH,
@@ -68,6 +72,19 @@ MAC_FIELDS = ("version", "protected")
 MODE_RESTRICTED = "restricted"
 MODE_UNRESTRICTED = "unrestricted"
 MODES = (MODE_RESTRICTED, MODE_UNRESTRICTED)
+
+# Whether agent-facing surfaces disclose the guardrail mode: the `mode` key in
+# wallet_info / GET /wallet and the `settings` MCP tool. Off, the agent is not
+# told a mode system exists — the guard still enforces whatever the operator
+# chose, and refusals name only the violated rule. Flip to True to restore the
+# readouts; the mode sections removed from the bundled workspace brief and
+# skills (connect/assets/) are a manual re-add from git history.
+# This hiding shapes the agent's prompt, it is NOT a confidentiality boundary:
+# the settings file sits readable in the agent's own workspace and the
+# operator UI's token-less GET /settings serves the same shape to any local
+# caller. Nothing security-relevant may ever depend on the agent not knowing
+# the mode — enforcement lives in the guard, which never trusts the agent.
+EXPOSE_MODE_TO_AGENT = False
 
 HARNESS_CLAUDE_CODE_CLI = "claude_code_cli"
 HARNESS_CLAUDE_CODE_DESKTOP = "claude_code_desktop"
@@ -273,9 +290,9 @@ def default_whitelist() -> dict[str, tuple[str, ...]]:
 
 
 def defaults() -> Settings:
-    """Return the fail-closed state: restricted, marketplaces whitelisted."""
+    """Return the default state: unrestricted, marketplaces whitelisted."""
     return Settings(
-        protected=Protected(mode=MODE_RESTRICTED, whitelist=default_whitelist())
+        protected=Protected(mode=MODE_UNRESTRICTED, whitelist=default_whitelist())
     )
 
 
@@ -293,7 +310,7 @@ def derive_mac_key(account: LocalAccount) -> bytes:
 class SettingsPersistError(OSError):
     """The settings could not be written to disk.
 
-    Distinct from the OSErrors of the read path (which fail closed to the
+    Distinct from the OSErrors of the read path (which degrade to the
     defaults in-memory): only this one means the caller's change did not land,
     so only this one may be reported as such.
     """
@@ -328,6 +345,7 @@ class SettingsStore:
         self._activity = activity
         self._lock = threading.Lock()
         self._expected_mac: str | None = None
+        self._degraded: str | None = None
 
     def load(self) -> Settings:
         """Return the verified settings, restoring defaults on any problem."""
@@ -358,33 +376,53 @@ class SettingsStore:
                 raise SettingsPersistError(str(e)) from e
             return PatchResult(previous=previous, updated=updated)
 
+    def _record_once(self, condition: str, kind: str, **fields: object) -> None:
+        """Audit a degraded-state transition once per episode, not per read.
+
+        The activity log is history, and an unhealed condition re-entering
+        this path on every signing request would bury that history under
+        identical records until rotation drops it. One record marks the
+        transition in; a verified load re-arms the next one.
+        """
+        if self._degraded == condition:
+            return
+        self._degraded = condition
+        self._activity.record(kind, **fields)
+
     def _load(self) -> Settings:
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            self._record_once(
+                "missing", "settings_reset", path=str(self._path), reason="missing"
+            )
             return self._reset(defaults())  # nothing to lose: create it
         except OSError as e:
             # An unreadable file is NOT a missing one, and must not be written
             # over: another process or a backup tool briefly holding the file
             # raises here, and resetting would destroy the operator's mode and
             # harness — permanently, silently — over a condition that clears by
-            # itself. Fail closed in memory instead: restricted until we can
-            # read it again. Raising is not an option either, since every
-            # guarded action loads the settings.
+            # itself. Serve the in-memory defaults instead, until it reads
+            # again. Raising is not an option either, since every guarded
+            # action loads the settings.
             logger.warning(
-                "settings file %s could not be read (%s); restricting until it can be",
+                "settings file %s could not be read (%s); using defaults until it can be",
                 self._path,
                 e,
+            )
+            self._record_once(
+                "unreadable", "settings_unreadable", path=str(self._path), error=str(e)
             )
             return defaults()
         payload = self._parse(raw)
         verified = self._verify(payload)
         if verified is not None:
+            self._degraded = None  # healthy again: re-arm transition records
             return verified
         logger.warning(
             "settings file %s failed verification; restoring defaults", self._path
         )
-        self._activity.record("settings_tampered", path=str(self._path))
+        self._record_once("tampered", "settings_tampered", path=str(self._path))
         fallback = defaults()
         # the harness is a preference, not a security control: a tampered
         # mode/whitelist resets those, but must not discard the harness

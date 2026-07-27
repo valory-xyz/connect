@@ -33,7 +33,8 @@ other non-aea agent. It:
      `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `safe_transaction`, `send_transaction`, `transaction_status`,
-     `sign_message`, `mech_tools`, `mech_request`, `mech_result`, `settings`.
+     `sign_message`, `mech_tools`, `mech_request`, `mech_result` (plus a
+     read-only `settings` tool when `EXPOSE_MODE_TO_AGENT` is on).
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)
@@ -58,14 +59,21 @@ Two rules hold in **every** mode, and no setting lifts them: the safe may not
 Both would outlive a switch back to restricted mode, so the guardrail refuses
 them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
 
-On that floor, the signer enforces one of two persistent modes:
+On that floor, the signer enforces one of two persistent modes. The modes are
+an operator concept only: agent-facing surfaces (the MCP tools, `GET /wallet`,
+the workspace brief and bundled skills, and every guard refusal message)
+deliberately never say a mode system exists — a blocked request names only the
+rule it violated and that the operator's guardrail settings are where to
+change it. Flipping `EXPOSE_MODE_TO_AGENT` in `connect/settings.py` restores
+the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
+`settings` MCP tool).
 
-- **unrestricted** — any other well-formed request is signed;
-- **restricted** (default) — raw digest signing is off, with one carve-out:
-  the mech flow recomputes the off-chain request id *locally* from inputs it
-  already validated, wraps it into the safe's ERC-1271 SafeMessage hash (the
-  safe is the off-chain requester of record), and registers exactly that
-  digest with the guard as a single-use, short-lived allowance before
+- **unrestricted** (default) — any other well-formed request is signed;
+- **restricted** (operator opt-in) — raw digest signing is off, with one
+  carve-out: the mech flow recomputes the off-chain request id *locally* from
+  inputs it already validated, wraps it into the safe's ERC-1271 SafeMessage
+  hash (the safe is the off-chain requester of record), and registers exactly
+  that digest with the guard as a single-use, short-lived allowance before
   mech-client asks for the signature (nothing the agent session names can
   register one, and a digest the server did not derive — say, from a lying
   RPC answering `getRequestId` — mismatches and is refused). The only allowed
@@ -93,7 +101,9 @@ endpoints and the mech request flow all pass the same check. State persists in
 `pearl-connect.settings.json` at STORE_PATH; the security-critical fields
 (mode, whitelist) are HMAC'd with a key derived from the agent private key
 and verified on every read — an edit by the agent (or anything else without
-the key) fails verification and resets them to the restricted defaults. The
+the key) fails verification and resets them to the defaults — deliberate,
+and audited; the reasoning lives in `connect/settings.py`'s module
+docstring. The
 `harness` preference is stored alongside without integrity checks and survives
 a guardrail reset. It is outside the MAC because it cannot move funds or widen
 the guardrail — but it is not free of consequence: since `/session` never falls

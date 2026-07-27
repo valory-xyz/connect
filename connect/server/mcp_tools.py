@@ -32,6 +32,7 @@ from hexbytes import HexBytes
 from mcp.server.fastmcp import FastMCP
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
+from connect import settings as settings_config
 from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
@@ -54,6 +55,13 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     settings_store: SettingsStore,
 ) -> FastMCP:
     """Build mcp."""
+    # Read once per build: tool registration happens here while wallet_info's
+    # mode key is added per call, and one snapshot keeps the MCP surface
+    # internally consistent (a registered `settings` tool always comes with
+    # the wallet_info mode key). GET /wallet reads the flag per request —
+    # the constant only changes with a rebuild, so the surfaces cannot
+    # actually diverge in a running process.
+    expose_mode = settings_config.EXPOSE_MODE_TO_AGENT
     mcp = FastMCP(
         name="connect",
         instructions=(
@@ -67,14 +75,15 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
     @mcp.tool()
     async def wallet_info() -> dict:
-        """Agent EOA, guard mode, and per-chain safes and balances.
+        """Agent EOA and per-chain safes and balances.
 
         Act only on `actionable_chains`; the rest say `not_actionable_because`.
         """
 
         def _run() -> dict:
             overview = wallet.wallet_overview(config, signer)
-            overview["mode"] = guard.mode()
+            if expose_mode:
+                overview["mode"] = guard.mode()
             return overview
 
         return await asyncio.to_thread(_run)
@@ -125,8 +134,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
         `to` is the EOA's own recipient, not a call the safe makes, and the
         EOA's funds are for gas: to spend or act on-chain use safe_transaction.
-        In restricted mode this reaches nothing but the safe. Returns and
-        request_id semantics are safe_transaction's.
+        Returns and request_id semantics are safe_transaction's.
         """
         return await _dispatch(
             signer.send,
@@ -168,10 +176,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def sign_message(digest: str) -> dict:
         """Sign a raw 32-byte digest (0x-hex), unprefixed.
 
-        Unrestricted mode only — the guardrail cannot inspect what a bare
-        digest commits to. The off-chain mech flow does not use this tool: it
-        signs its own SafeMessage-wrapped request-id digest internally,
-        through a server-only allowance that no MCP tool reaches.
+        The off-chain mech flow does not use this tool: it signs its own
+        SafeMessage-wrapped request-id digest internally, through a
+        server-only allowance that no MCP tool reaches.
         """
         try:
             raw = bytes.fromhex(digest.removeprefix("0x"))
@@ -196,8 +203,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         The safe pays, so `chain` defaults to a configured chain that has one.
         Off-chain by default: few mechs can serve that, so check
         `offchain_capable` with mech_tools first; legacy_on_chain=true goes
-        through the marketplace instead. Both flows (and the off-chain
-        auto_deposit top-up) work in restricted mode.
+        through the marketplace instead.
         Refused before paying if the mech's price exceeds max_payment
         (base units of the mech's payment asset).
         On timeout the ids come back as `pending_request_ids` for mech_result.
@@ -253,14 +259,16 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             offset=offset,
         )
 
-    @mcp.tool()
-    async def settings() -> dict:
-        """Read the enforced settings in their canonical shape.
+    if expose_mode:
 
-        "protected" is the guardrail state. Read-only: changes go through the
-        operator's agent UI, never this surface.
-        """
-        return await asyncio.to_thread(lambda: settings_store.load().to_dict())
+        @mcp.tool()
+        async def settings() -> dict:
+            """Read the enforced settings in their canonical shape.
+
+            "protected" is the guardrail state. Read-only: changes go through
+            the operator's agent UI, never this surface.
+            """
+            return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 
     return mcp
 

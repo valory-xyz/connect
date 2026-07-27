@@ -133,7 +133,7 @@ def fork_config_fixture(rpc_url: str, store_path: Path) -> AppConfig:
 
 @pytest.fixture(name="fork_store")
 def fork_store_fixture(account: LocalAccount, store_path: Path) -> SettingsStore:
-    """Return the settings store for the fork; fresh -> restricted defaults."""
+    """Return the settings store for the fork; fresh -> unrestricted defaults."""
     return SettingsStore(
         store_path / SETTINGS_FILE, derive_mac_key(account), ActivityLog(store_path)
     )
@@ -430,11 +430,12 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
     account: LocalAccount,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fresh settings boot restricted; the password-authed endpoint flips them.
+    """Fresh settings boot unrestricted; the password-authed endpoint flips them.
 
-    Covers: blocked arbitrary transfer, blocked bare transfer to the safe,
-    blocked raw digest signing, wrong password 401, the live effect of the mode
-    change — and the floor surviving it.
+    Covers: the unrestricted default, the live effect of an operator opt-in
+    to restricted (blocked arbitrary transfer, blocked bare transfer to the
+    safe, blocked raw digest signing — refusals that never name a mode
+    system), wrong password 401, the flip back — and the floor surviving it.
     """
     monkeypatch.chdir(keystore_dir)  # POST /settings re-decrypts the keystore
     fork_config.chains["gnosis"].safe_address = "0x" + "33" * 20
@@ -442,17 +443,28 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
     app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
     headers = {"Authorization": f"Bearer {token}"}
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
-        assert client.get("/settings").json()["protected"]["mode"] == "restricted"
-        assert client.get("/wallet", headers=headers).json()["mode"] == "restricted"
+        assert client.get("/settings").json()["protected"]["mode"] == "unrestricted"
+        # the agent-facing wallet endpoint says nothing about modes
+        assert "mode" not in client.get("/wallet", headers=headers).json()
 
-        # arbitrary transfer: blocked with the violated rule in the message
+        # the operator opts into restricted mode with their password
+        restricted = client.patch(
+            "/settings",
+            json={"password": TEST_PASSWORD, "protected": {"mode": "restricted"}},
+        )
+        assert restricted.status_code == 200, restricted.text
+        assert restricted.json()["protected"]["mode"] == "restricted"
+
+        # arbitrary transfer: blocked with the violated rule in the message —
+        # which names the guardrail, never the mode system
         blocked = client.post(
             "/sign-and-send",
             json={"chain": "gnosis", "to": account.address, "value": 1},
             headers=headers,
         )
         assert blocked.status_code == 400
-        assert "restricted mode" in blocked.json()["detail"]
+        assert "only allow transactions targeting" in blocked.json()["detail"]
+        assert "restricted" not in blocked.json()["detail"]
 
         # even a bare transfer to the safe is refused: funding the safe is the
         # operator's job, and a permission the agent never needed is one the
@@ -467,14 +479,15 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
             headers=headers,
         )
         assert bare.status_code == 400
-        assert "must be execTransaction" in bare.json()["detail"]
+        assert "to be execTransaction" in bare.json()["detail"]
 
-        # raw digest signing: off in restricted mode
+        # raw digest signing: off while restricted, refused without naming it
         digest_denied = client.post(
             "/sign-message", json={"digest": "0x" + "ab" * 32}, headers=headers
         )
         assert digest_denied.status_code == 400
-        assert "restricted" in digest_denied.json()["detail"]
+        assert "digest signing is disabled" in digest_denied.json()["detail"]
+        assert "restricted" not in digest_denied.json()["detail"]
 
         # settings write: wrong password rejected, right one applies live
         denied = client.patch(
@@ -709,8 +722,11 @@ def test_mech_request_on_fork_restricted_mode(
     fork_config.chains["gnosis"].safe_address = safe_address
 
     activity = ActivityLog(store_path)
+    # restricted mode is an operator opt-in now; set it explicitly, keeping
+    # the default whitelist so the marketplace flow stays reachable
+    fork_store.patch({"protected": {"mode": "restricted"}})
     guard = Guard(fork_store, fork_config)
-    assert guard.mode() == "restricted"  # fresh store -> restricted defaults
+    assert guard.mode() == "restricted"
     mech_service = MechService(funded_signer, fork_config, activity, guard)
 
     picked = _pick_live_mech(mech_service)
@@ -965,12 +981,15 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     """
     _set_balance(rpc_url, account.address, 10**18)
     activity = ActivityLog(store_path)
+    # restricted mode is an operator opt-in now; set it explicitly, keeping
+    # the default whitelist so the marketplace flow stays reachable
+    fork_store.patch({"protected": {"mode": "restricted"}})
     guard = Guard(fork_store, fork_config)
     signer = Signer(account=account, config=fork_config, activity=activity, guard=guard)
     safe_address = _deploy_safe(rpc_url, signer, account)
     _set_balance(rpc_url, safe_address, 10**18)
     fork_config.chains["gnosis"].safe_address = safe_address
-    assert guard.mode() == "restricted"  # fresh store -> restricted defaults
+    assert guard.mode() == "restricted"
     mech_service = MechService(signer, fork_config, activity, guard)
 
     picked = _pick_live_mech(mech_service)

@@ -57,9 +57,9 @@ Run them from anywhere in the workspace (they locate `.mcp.json` upwards).
 |---|---|
 | `deposit_wallet.py status\|ensure` | Deploy the DW via the relayer proxy and grant its trading approvals (idempotent one-time setup) |
 | `funds.py balances\|wrap\|top-up\|sweep\|return-position` | Treasury flows between safe and DW; `return-position` stages an already-swept position back in the DW for selling |
-| `markets.py list\|market\|book\|price` | Market discovery and prices (public, any mode); `list --ends-within 48h\|7d\|2w` filters by resolution date |
+| `markets.py list\|market\|book\|price` | Market discovery and prices (public reads); `list --ends-within 48h\|7d\|2w` filters by resolution date |
 | `trade.py buy\|sell\|limit\|order\|cancel` | CLOB orders (POLY_1271, DW-funded); market orders take `--order-type fok\|fak`, limit orders `gtc\|gtd --expires-in` |
-| `positions.py positions\|trades` | Portfolio reads (public, any mode) |
+| `positions.py positions\|trades` | Portfolio reads (public) |
 | `redeem.py list\|approve\|redeem\|all` | Redeem resolved positions from the safe |
 
 ### Python environment — use a virtualenv, don't touch system Python
@@ -106,12 +106,12 @@ A typical first session (once the venv is set up as above):
 
 ## Prerequisites — check before starting, report blocks honestly
 
-- **Unrestricted mode.** Order signing, CLOB auth, DW batches and relayer
-  challenges are all raw-digest signatures, which restricted mode disables;
-  the safe legs (wrap, top-up, redeem) target contracts outside the
-  whitelist. Check with the `settings` MCP tool. You cannot lift the mode —
-  the operator changes it in the agent UI with their keystore password;
-  never ask for the password in chat.
+- **Signing allowed by the guardrail.** Order signing, CLOB auth, DW batches
+  and relayer challenges are all raw-digest signatures, and the safe legs
+  (wrap, top-up, redeem) are safe calls — any of them may be refused by the
+  operator's guardrail settings, with the violated rule named. You cannot
+  lift a restriction — the operator changes it in the agent UI with their
+  keystore password; never ask for the password in chat.
 - **Polygon configured.** `wallet_info` must list a `polygon` RPC and safe,
   and the EOA needs POL for the safe legs' gas. If missing, tell the
   operator — nothing here can add a chain.

@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Market discovery and prices — public endpoints, no auth, works in any mode.
+"""Market discovery and prices — public endpoints, no auth needed.
 
 Usage:
     python markets.py list [--limit 20] [--query "bitcoin"] [--tag politics]

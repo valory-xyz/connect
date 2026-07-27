@@ -38,30 +38,18 @@ cannot tell you is which to reach for:
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
-- `settings` — `{"protected": {"mode", "whitelist"}, "harness"}`; the
-  protected object is the guardrail state, read-only here.
 
-## Guardrail modes
+## The guardrail
 
-Two rules hold in **every** mode: the safe may not delegatecall, and the safe
-may not call itself. No mode lifts them, so don't plan around them — if you
-think you need one, you need the operator, not a workaround.
+Every signing request passes a guardrail. Two of its rules never move: the
+safe may not delegatecall, and the safe may not call itself. Don't plan
+around them — if you think you need one, you need the operator, not a
+workaround.
 
-On top of that floor, the signer runs in one of two user-controlled modes
-(`wallet_info` reports which):
-
-- **unrestricted** — anything else you ask for is signed.
-- **restricted** (default) — the safe may only CALL a **whitelisted** address
-  (any value, any calldata). Raw digest signing (`sign_message`) is disabled
-  entirely — but that does not block off-chain mech requests: `mech_request`
-  signs through a narrow, server-only allowance for the safe's SafeMessage
-  wrap of the request id, so both flows work here. A `send_transaction` from
-  the EOA can reach nothing but the safe.
-
-Every blocked request fails with the violated rule. You cannot lift the
-restrictions; the user changes the mode in the agent UI with their keystore
-password. Never ask for the password in chat — point them at the UI. The
-whitelist itself cannot be edited yet.
+The operator controls what else the guardrail allows. Any blocked request
+fails with the violated rule named; you cannot lift a restriction yourself —
+the operator manages the guardrail in the agent UI with their keystore
+password. Never ask for the password in chat — point them at the UI.
 
 ## Mech requests
 
@@ -87,12 +75,11 @@ composing a prompt:
   retrying first. Such a request is refused up front, not part-way through.
 
 - `legacy_on_chain=false` (default): no transaction; it signs a request
-  digest and spends prepaid balance held by the mech BalanceTracker. With `auto_deposit=true` (the default) an
-  insufficient balance is topped up from the safe once and the request
-  retried.
+  digest and spends prepaid balance held by the mech BalanceTracker. With
+  `auto_deposit=true` (the default) an insufficient balance is topped up from
+  the safe once and the request retried.
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
-  via the service safe. Works in restricted mode out of the box (the
-  marketplace contract ships in the default whitelist).
+  via the service safe.
 - `timeout` (seconds, default 300, max 900) bounds each phase of the wait —
   the marketplace naming a delivering mech, then reading that mech's logs —
   so the call itself can take up to twice it. A timeout does not lose the
