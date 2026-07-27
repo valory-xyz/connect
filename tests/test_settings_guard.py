@@ -671,7 +671,7 @@ class TestGuard:
         with pytest.raises(GuardError, match="whitelist"):  # no allowance yet
             guard.check_transaction("testchain", SAFE, 0, deposit)
         guard.allow_safe_deposit_once(
-            chain="testchain", tracker=TRACKER, amount_cap=100, token=False
+            chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
         )
         over_cap = exec_transaction_calldata(TRACKER, value=101)
         with pytest.raises(GuardError, match="whitelist"):
@@ -693,7 +693,7 @@ class TestGuard:
             return exec_transaction_calldata(TRACKER, value=value, data=inner)
 
         guard.allow_safe_deposit_once(
-            chain="testchain", tracker=TRACKER, amount_cap=100, token=True
+            chain="testchain", tracker=TRACKER, amount_cap=100, is_token=True
         )
         undecodable = exec_transaction_calldata(
             TRACKER, data=bytes.fromhex(DEPOSIT_SELECTOR) + b"\xff"
@@ -717,12 +717,12 @@ class TestGuard:
         guard = make_guard(store, MODE_RESTRICTED)
         transfer = exec_transaction_calldata(TRACKER, value=1)
         guard.allow_safe_deposit_once(
-            chain="nosafe", tracker=TRACKER, amount_cap=100, token=False
+            chain="nosafe", tracker=TRACKER, amount_cap=100, is_token=False
         )
         with pytest.raises(GuardError, match="whitelist"):
             guard.check_transaction("testchain", SAFE, 0, transfer)
         guard.allow_safe_deposit_once(
-            chain="testchain", tracker=OTHER, amount_cap=100, token=False
+            chain="testchain", tracker=OTHER, amount_cap=100, is_token=False
         )
         with pytest.raises(GuardError, match="whitelist"):
             guard.check_transaction("testchain", SAFE, 0, transfer)
@@ -739,7 +739,7 @@ class TestGuard:
         guard = make_guard(store, MODE_RESTRICTED)
         for _ in range(3):
             guard.allow_safe_deposit_once(
-                chain="testchain", tracker=TRACKER, amount_cap=100, token=False
+                chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
             )
         deposit = exec_transaction_calldata(TRACKER, value=50)
         guard.check_transaction("testchain", SAFE, 0, deposit)  # the one grant
@@ -752,7 +752,7 @@ class TestGuard:
         """A deposit allowance a failed flow left behind dies on its own."""
         guard = make_guard(store, MODE_RESTRICTED)
         guard.allow_safe_deposit_once(
-            chain="testchain", tracker=TRACKER, amount_cap=100, token=False
+            chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
         )
         real_monotonic = time.monotonic
         monkeypatch.setattr(
@@ -1818,8 +1818,7 @@ class TestMech:
         """Unrestricted mode passes auto_deposit through, and still audits.
 
         The audit record is written in every mode, but the allowance itself
-        is not armed here: a grant created while unrestricted would outlive
-        an operator's switch back to restricted for its TTL.
+        is armed only while restricted — see _arm_auto_deposit for why.
         """
         mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         assert patched_mech.calls[0]["auto_deposit"] is True
@@ -1865,7 +1864,7 @@ class TestMech:
                 priced=PricedMech(
                     mech=OTHER,
                     service_id=42,
-                    rate_wei=10**16,
+                    rate=10**16,
                     payment_type=NATIVE_PAYMENT_TYPE,
                 ),
                 prompt="q",

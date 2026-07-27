@@ -108,7 +108,9 @@ class PricedMech(t.NamedTuple):
 
     mech: str
     service_id: int
-    rate_wei: int
+    # per-request price in the mech's payment asset base units (wei for
+    # native mechs, token base units for OLAS/USDC ones)
+    rate: int
     payment_type: str
 
 
@@ -551,7 +553,7 @@ class MechService:
         priority_mech, service_id, rate = (
             priced.mech,
             priced.service_id,
-            priced.rate_wei,
+            priced.rate,
         )
         if rate > max_payment:
             self._blocked(
@@ -788,7 +790,7 @@ class MechService:
             mech=priced.mech,
             requester=safe,
             data_hash=bytes.fromhex(data_hash.removeprefix("0x")),
-            delivery_rate=priced.rate_wei,
+            delivery_rate=priced.rate,
             payment_type=bytes.fromhex(priced.payment_type),
             nonce=nonce,
         )
@@ -818,7 +820,7 @@ class MechService:
         there would outlive a switch back to restricted for its TTL.
         When no tracker resolves for the payment type, restricted mode
         disarms instead of letting the flow die mid-request on a guard
-        denial; unrestricted mode needs no allowance and stays armed.
+        denial; unrestricted stays armed.
         """
         restricted = self._guard.mode() == MODE_RESTRICTED
         tracker, is_token = _deposit_tracker(chain, priced.payment_type)
@@ -832,17 +834,17 @@ class MechService:
                 )
                 return False
             return True
-        amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate_wei
+        amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate
         if restricted:
             self._guard.allow_safe_deposit_once(
-                chain=chain, tracker=tracker, amount_cap=amount_cap, token=is_token
+                chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
             )
         self._activity.record(
             "mech_deposit_allowance",
             chain=chain,
             tracker=tracker,
             amount_cap=str(amount_cap),
-            token=is_token,
+            is_token=is_token,
         )
         return True
 
@@ -885,6 +887,6 @@ class MechService:
         return PricedMech(
             mech=priority_mech,
             service_id=int(service_id),
-            rate_wei=int(max_delivery_rate),
+            rate=int(max_delivery_rate),
             payment_type=str(payment_type.value),
         )

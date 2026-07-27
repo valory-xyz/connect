@@ -80,24 +80,27 @@ class GuardError(Exception):
     """A transaction or signing request denied by the guardrail."""
 
 
-# How long a registered allowance stays consumable. Registration and use happen
-# inside one mech request() call, normally milliseconds apart (the deposit at
-# worst one HTTP 402 round-trip later); the TTL only bounds how long an entry
-# from a flow that failed in between stays live.
-ALLOWANCE_TTL = 120.0
+# How long a registered allowance stays consumable. Arming must happen before
+# the request leaves: mech-client swallows the 402 -> deposit -> retry cycle
+# internally, so the guard cannot arm on the 402 itself. Between arm and
+# deposit sit an IPFS metadata pin, the mech's HTTP round trip and the
+# deposit's own compose-and-sign — 90s covers that worst case; past it, only
+# an entry from a flow that failed in between stays live, and dies here.
+ALLOWANCE_TTL = 90.0
 
 
 @dataclass(frozen=True)
 class _DepositAllowance:
     """One pre-authorized safe -> balance-tracker payment, capped and typed.
 
-    `token` picks the shape: a `deposit(uint256 amount)` call with no inner
-    value (amount capped), or a bare native transfer (inner value capped).
+    `is_token` picks the shape: a `deposit(uint256 amount)` call with no
+    inner value (amount capped), or a bare native transfer (inner value
+    capped).
     """
 
     chain: str
     tracker: str  # lowercase
-    token: bool
+    is_token: bool
     amount_cap: int
     expires: float
 
@@ -170,7 +173,7 @@ class Guard:
             self._allowed_digests[bytes(digest)] = time.monotonic() + ALLOWANCE_TTL
 
     def allow_safe_deposit_once(
-        self, *, chain: str, tracker: str, amount_cap: int, token: bool
+        self, *, chain: str, tracker: str, amount_cap: int, is_token: bool
     ) -> None:
         """Permit one restricted-mode safe payment to a mech balance tracker.
 
@@ -183,14 +186,15 @@ class Guard:
         with self._allowance_lock:
             self._purge_expired()
             self._deposit_allowances = [
-                a for a in self._deposit_allowances
+                a
+                for a in self._deposit_allowances
                 if (a.chain, a.tracker) != (chain.lower(), tracker.lower())
             ]
             self._deposit_allowances.append(
                 _DepositAllowance(
                     chain=chain.lower(),
                     tracker=tracker.lower(),
-                    token=token,
+                    is_token=is_token,
                     amount_cap=amount_cap,
                     expires=time.monotonic() + ALLOWANCE_TTL,
                 )
@@ -352,7 +356,7 @@ class Guard:
                     continue
                 if allowance.tracker != exec_call.to.lower():
                     continue
-                if allowance.token:
+                if allowance.is_token:
                     amount = decode_deposit(exec_call.data)
                     matches = (
                         amount is not None
