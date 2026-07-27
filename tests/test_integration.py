@@ -31,20 +31,28 @@ import sys
 import threading
 import time
 import typing as t
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
 import uvicorn
 from eth_account.signers.local import LocalAccount
+from eth_typing import URI
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from mech_client.infrastructure.blockchain.abi_loader import get_abi
+from mech_client.infrastructure.config import PaymentType
+from safe_eth.eth import EthereumClient
+from safe_eth.safe import Safe
+from safe_eth.safe.safe_deployments import safe_deployments
 from web3 import Web3
 
 from connect.activity import ActivityLog
 from connect.config import AGENT_HTTP_PORT, AppConfig, ChainConfig
 from connect.guard import Guard
-from connect.mech import MechError, MechService
+from connect.mech import MechError, MechService, _deposit_tracker, _request_digest
 from connect.server.app import create_app
 from connect.settings import (
     MODE_UNRESTRICTED,
@@ -52,12 +60,13 @@ from connect.settings import (
     SETTINGS_FILE,
     Settings,
     SettingsStore,
+    _mech_system_addresses,
     derive_mac_key,
 )
 from connect.signer import Signer
 from connect.workspace import Workspace
 
-from tests.conftest import TEST_PASSWORD
+from tests.conftest import TEST_PASSWORD, audit_kinds
 
 RPC_ENV = "GNOSIS_TESTNET_RPC"
 POLYGON_RPC_ENV = "POLYGON_TESTNET_RPC"
@@ -506,11 +515,6 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
 
 def _deploy_safe(rpc_url: str, signer: Signer, account: LocalAccount) -> str:
     """Deploy a 1/1 Safe (v1.4.1 canonical) owned by the agent EOA on the fork."""
-    from eth_typing import URI
-    from safe_eth.eth import EthereumClient
-    from safe_eth.safe import Safe
-    from safe_eth.safe.safe_deployments import safe_deployments
-
     deployments = safe_deployments["1.4.1"]
     chain = "100"  # gnosis
     tx_sent = Safe.create(
@@ -709,10 +713,6 @@ def test_mech_request_on_fork_restricted_mode(
     assert guard.mode() == "restricted"  # fresh store -> restricted defaults
     mech_service = MechService(funded_signer, fork_config, activity, guard)
 
-    # off-chain requests are cleanly refused in restricted mode
-    with pytest.raises(MechError, match="retry it on-chain"):
-        mech_service.request("test", "test", chain="gnosis")
-
     picked = _pick_live_mech(mech_service)
     if picked is None:
         pytest.skip("no live native-payment mech found on gnosis")
@@ -750,3 +750,303 @@ def test_mech_request_on_fork_restricted_mode(
     assert polled["delivered"] is False
     assert polled["mech"] == mech_address
     assert mech_service.result(pending_id, timeout=5)["delivered"] is False
+
+
+def test_offchain_request_digest_matches_contract_on_fork(rpc_url: str) -> None:
+    """The locally derived request digest equals the contract's getRequestId.
+
+    Restricted-mode off-chain requests sign only the digest the server
+    recomputes itself (connect.mech._request_digest); if the deployed
+    marketplace's derivation ever drifts from it — a redeploy, a VERSION
+    bump — the allowance would stop matching and every restricted off-chain
+    request would be refused. This pins the two against each other on the
+    real (forked) contract, with the unit-test golden vector as the offline
+    fallback.
+    """
+    marketplace = Web3.to_checksum_address(_mech_system_addresses()["gnosis"][0])
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    contract = w3.eth.contract(address=marketplace, abi=get_abi("MechMarketplace.json"))
+
+    mech = Web3.to_checksum_address("0x" + "11" * 20)
+    requester = Web3.to_checksum_address("0x" + "22" * 20)
+    data_hash = bytes.fromhex("33" * 32)
+    rate, payment_type, nonce = 7, bytes.fromhex("44" * 32), 9
+
+    onchain = contract.functions.getRequestId(
+        mech, requester, data_hash, rate, payment_type, nonce
+    ).call()
+    local = _request_digest(
+        domain_separator=bytes(contract.functions.domainSeparator().call()),
+        marketplace=marketplace,
+        mech=mech,
+        requester=requester,
+        data_hash=data_hash,
+        delivery_rate=rate,
+        payment_type=payment_type,
+        nonce=nonce,
+    )
+    assert local == bytes(onchain)
+
+
+class _LocalMechEndpoint:
+    """A protocol-faithful local mech server for the off-chain flow.
+
+    Implements the two endpoints mech-client talks to — POST
+    /send_signed_requests and GET /fetch_offchain_info — with the validation
+    a real mech performs before serving a request: the request id must equal
+    the marketplace's getRequestId over the payload's own fields (read from
+    the forked contract), the signature must validate via the sender Safe's
+    ERC-1271 isValidSignature (agent mode, since mech-client 0.21.3), and the
+    first request is answered HTTP 402 until the prepaid deposit actually
+    lands on the balance tracker on-chain.
+    """
+
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        w3: t.Any,
+        marketplace_contract: t.Any,
+        mech: str,
+        payment_type_hex: str,
+        tracker: str,
+        required: int,
+    ) -> None:
+        """Initialize with the chain handles validation needs."""
+        self._w3 = w3
+        self._contract = marketplace_contract
+        self._mech = mech
+        self._payment_type_hex = payment_type_hex
+        self._tracker = Web3.to_checksum_address(tracker)
+        self.required = required
+        self.paid = 0  # tracker balance growth observed since start
+        self._tracker_balance_start = int(
+            w3.eth.get_balance(Web3.to_checksum_address(tracker))
+        )
+        self.saw_402 = False
+        self.validation_errors: list[str] = []
+        self.delivered: dict[str, dict] = {}
+
+    def _validate(self, form: dict[str, str]) -> None:
+        """Run the mech-side checks; record rather than raise, for assertions.
+
+        Since mech-client 0.21.3 the agent-mode ``sender`` is the requester
+        Safe and the signature is ERC-1271: validated by calling the real
+        Safe's ``isValidSignature(bytes32,bytes)`` on the fork and expecting
+        the magic value — exactly what the marketplace does at settlement.
+        """
+        request_id = int(form["request_id"])
+        expected = self._contract.functions.getRequestId(
+            Web3.to_checksum_address(self._mech),
+            Web3.to_checksum_address(form["sender"]),
+            bytes.fromhex(form["ipfs_hash"].removeprefix("0x")),
+            int(form["delivery_rate"]),
+            bytes.fromhex(self._payment_type_hex.removeprefix("0x")),
+            int(form["nonce"]),
+        ).call()
+        if int.from_bytes(bytes(expected), "big") != request_id:
+            self.validation_errors.append("request id != contract getRequestId")
+        signature = bytes.fromhex(form["signature"].removeprefix("0x"))
+        erc1271 = self._w3.eth.contract(
+            address=Web3.to_checksum_address(form["sender"]),
+            abi=[
+                {
+                    "name": "isValidSignature",
+                    "inputs": [{"type": "bytes32"}, {"type": "bytes"}],
+                    "outputs": [{"type": "bytes4"}],
+                    "stateMutability": "view",
+                    "type": "function",
+                }
+            ],
+        )
+        try:
+            magic = erc1271.functions.isValidSignature(
+                request_id.to_bytes(32, "big"), signature
+            ).call()
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self.validation_errors.append(f"isValidSignature reverted: {e}")
+            return
+        if bytes(magic) != bytes.fromhex("1626ba7e"):
+            self.validation_errors.append(f"isValidSignature returned {magic!r}")
+
+    def handle_send(self, form: dict[str, str]) -> tuple[int, dict]:
+        """POST /send_signed_requests: 402 until the deposit is on the tracker."""
+        self._validate(form)
+        self.paid = (
+            int(self._w3.eth.get_balance(self._tracker)) - self._tracker_balance_start
+        )
+        if self.paid < self.required:
+            self.saw_402 = True
+            return 402, {
+                "required": str(self.required),
+                "currentBalance": str(self.paid),
+                "payTo": self._tracker,
+                "asset": "",
+                "chainId": 100,
+                "error": "payment required",
+            }
+        self.delivered[form["request_id"]] = {
+            "requestId": form["request_id"],
+            "result": json.dumps({"answer": "e2e", "tool": "integration"}),
+        }
+        return 200, {"request_id": form["request_id"]}
+
+    def handle_fetch(self, form: dict[str, str]) -> tuple[int, dict]:
+        """GET /fetch_offchain_info: {} until delivered, then the answer."""
+        return 200, self.delivered.get(form.get("request_id", ""), {})
+
+
+@contextlib.contextmanager
+def _serving_mech_endpoint(endpoint: _LocalMechEndpoint) -> t.Iterator[str]:
+    """Serve the local mech endpoint on a loopback socket, yielding its URL."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        """Route the two mech endpoints to the stub, urlencoded like requests."""
+
+        def _reply(self, status: int, payload: dict) -> None:
+            """Serialize one JSON response."""
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _form(self) -> dict[str, str]:
+            """Read the urlencoded body (requests sends data=dict that way)."""
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode()
+            return {k: v[0] for k, v in parse_qs(raw).items()}
+
+        def do_POST(self) -> None:  # noqa: N802
+            """Handle /send_signed_requests."""
+            assert self.path.endswith("/send_signed_requests"), self.path
+            self._reply(*endpoint.handle_send(self._form()))
+
+        def do_GET(self) -> None:  # noqa: N802
+            """Handle /fetch_offchain_info."""
+            assert self.path.endswith("/fetch_offchain_info"), self.path
+            self._reply(*endpoint.handle_fetch(self._form()))
+
+        def log_message(self, *args: t.Any) -> None:
+            """Keep the test output quiet."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=10)
+
+
+def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-many-locals,too-many-statements
+    rpc_url: str,
+    fork_config: AppConfig,
+    fork_store: SettingsStore,
+    store_path: Path,
+    account: LocalAccount,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full restricted off-chain flow, request to delivery, on the fork.
+
+    One guard instance shared by signer and mech service (the __main__
+    wiring): the digest the flow signs is derived against the real forked
+    marketplace and validated mech-side by the local endpoint, the HTTP 402
+    triggers a real safe -> tracker deposit that must pass the guard through
+    its one-shot allowance, and the retried request is served and delivered.
+    A second request rides the now-funded balance straight through — the
+    no-402 path — proving the deposit allowance is not needed twice.
+
+    The mech endpoint is local (no live mech serves a fork); everything else
+    — marketplace reads, nonces, digests, signing, the deposit transaction —
+    is real chain state. Only the metadata document is stubbed to point the
+    flow at the local endpoint, since its `url` field is exactly what is
+    being stood in for.
+    """
+    _set_balance(rpc_url, account.address, 10**18)
+    activity = ActivityLog(store_path)
+    guard = Guard(fork_store, fork_config)
+    signer = Signer(account=account, config=fork_config, activity=activity, guard=guard)
+    safe_address = _deploy_safe(rpc_url, signer, account)
+    _set_balance(rpc_url, safe_address, 10**18)
+    fork_config.chains["gnosis"].safe_address = safe_address
+    assert guard.mode() == "restricted"  # fresh store -> restricted defaults
+    mech_service = MechService(signer, fork_config, activity, guard)
+
+    picked = _pick_live_mech(mech_service)
+    if picked is None:
+        pytest.skip("no live native-payment mech found on gnosis")
+    assert picked is not None  # mypy: pytest.skip's NoReturn isn't visible
+    mech_address, tool = picked
+
+    # price the mech as the flow will, and resolve the tracker our way
+    service = mech_service._service("gnosis")  # pylint: disable=protected-access
+    # pylint: disable-next=protected-access
+    _, service_id, rate = service._fetch_mech_info(mech_address)
+    tracker, is_token = _deposit_tracker("gnosis", PaymentType.NATIVE.value)
+    assert tracker is not None
+    assert is_token is False
+
+    w3 = signer.w3("gnosis")
+    endpoint = _LocalMechEndpoint(
+        w3=w3,
+        # pylint: disable-next=protected-access
+        marketplace_contract=service._get_marketplace_contract(),
+        mech=mech_address,
+        payment_type_hex="0x" + PaymentType.NATIVE.value,
+        tracker=tracker,
+        required=int(rate),
+    )
+    safe_balance_before = int(
+        w3.eth.get_balance(Web3.to_checksum_address(safe_address))
+    )
+    with _serving_mech_endpoint(endpoint) as url:
+        # the metadata document is the only stub: its `url` names the mech
+        # endpoint, and reachability pre-flight + send both read it
+        monkeypatch.setattr(
+            service.tool_manager,
+            "fetch_tools_metadata",
+            lambda sid: {"tools": [tool], "url": url},
+        )
+        monkeypatch.setattr(service.tool_manager, "get_offchain_url", lambda sid: url)
+        first = mech_service.request(
+            f"integration offchain {secrets.token_hex(4)}",
+            tool,
+            chain="gnosis",
+            priority_mech=mech_address,
+            timeout=60,
+            max_payment=10**18,
+        )
+        second = mech_service.request(
+            f"integration offchain {secrets.token_hex(4)}",
+            tool,
+            chain="gnosis",
+            priority_mech=mech_address,
+            timeout=60,
+            max_payment=10**18,
+        )
+
+    # the mech-side validation a real mech performs all passed
+    assert endpoint.validation_errors == []
+    # the 402 fired, and the deposit it demanded landed on the tracker; the
+    # safe paid exactly the shortfall (the fork is shared, so the tracker's
+    # own growth is only bounded from below)
+    assert endpoint.saw_402 is True
+    assert endpoint.paid >= endpoint.required
+    assert (
+        int(w3.eth.get_balance(Web3.to_checksum_address(safe_address)))
+        == safe_balance_before - endpoint.required
+    )
+    # both requests were served and delivered
+    for result in (first, second):
+        assert result["request_ids"], result
+        assert result["delivery_results"], result
+        assert not result.get("pending_request_ids"), result
+    # the audit trail shows the allowances, the signatures, and no refusal
+    kinds = audit_kinds(store_path)
+    assert kinds.count("mech_offchain_digest") == 2
+    assert kinds.count("mech_deposit_allowance") == 2  # armed per request
+    assert kinds.count("sign_message") == 2
+    assert kinds.count("mech_request") == 2
+    assert "blocked" not in kinds
+    assert "mech_request_blocked" not in kinds

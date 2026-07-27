@@ -352,12 +352,15 @@ class Signer:
     def sign_digest(self, digest: bytes) -> str:
         """Sign a raw 32-byte digest (no EIP-191 prefix); returns 0x-hex 65-byte signature.
 
-        mech-client's off-chain flow verifies with plain ecrecover, so the
-        digest must be signed unprefixed.
+        The caller passes the exact 32 bytes to be signed and this signs them
+        unprefixed. For off-chain mech requests that is the safe's ERC-1271
+        SafeMessage hash (agent mode), which the marketplace verifies via
+        Safe.isValidSignature — the wrapping is the mech flow's job, not this
+        method's; here the digest is opaque and the guard gates it.
         """
         if self._guard is not None:
             try:
-                self._guard.check_sign_digest()
+                self._guard.check_sign_digest(digest)
             except GuardError as e:
                 self._activity.record("blocked", action="sign_digest", reason=str(e))
                 raise SignerError(str(e)) from e

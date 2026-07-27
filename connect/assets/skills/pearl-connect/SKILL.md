@@ -53,8 +53,10 @@ On top of that floor, the signer runs in one of two user-controlled modes
 - **unrestricted** — anything else you ask for is signed.
 - **restricted** (default) — the safe may only CALL a **whitelisted** address
   (any value, any calldata). Raw digest signing (`sign_message`) is disabled
-  entirely, which also disables off-chain mech requests — send them on-chain
-  instead. A `send_transaction` from the EOA can reach nothing but the safe.
+  entirely — but that does not block off-chain mech requests: `mech_request`
+  signs through a narrow, server-only allowance for the safe's SafeMessage
+  wrap of the request id, so both flows work here. A `send_transaction` from
+  the EOA can reach nothing but the safe.
 
 Every blocked request fails with the violated rule. You cannot lift the
 restrictions; the user changes the mode in the agent UI with their keystore
@@ -84,9 +86,8 @@ composing a prompt:
   mech with no endpoint must go on-chain, an unreadable fetch is worth
   retrying first. Such a request is refused up front, not part-way through.
 
-- `legacy_on_chain=false` (default): no transaction; it raw-signs a request
-  digest and spends prepaid balance held by the mech BalanceTracker, so it
-  needs unrestricted mode. With `auto_deposit=true` (the default) an
+- `legacy_on_chain=false` (default): no transaction; it signs a request
+  digest and spends prepaid balance held by the mech BalanceTracker. With `auto_deposit=true` (the default) an
   insufficient balance is topped up from the safe once and the request
   retried.
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
@@ -98,7 +99,8 @@ composing a prompt:
   request — it is paid for, and the ids come back as `pending_request_ids`.
   Poll them with `mech_result(request_id)`, which resumes the watch and never
   resends.
-- `max_payment` (wei, default 10^17 = 0.1 of the native unit) caps what one
+- `max_payment` (base units of the mech's payment asset — wei for native
+  mechs; default 10^17 = 0.1 native) caps what one
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with
   `mech_tools(priority_mech=...)` (`max_delivery_rate`).

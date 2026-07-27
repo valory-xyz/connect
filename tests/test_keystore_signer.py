@@ -23,6 +23,7 @@ import threading
 from pathlib import Path
 
 import pytest
+import rlp
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from hexbytes import HexBytes
@@ -156,8 +157,6 @@ class TestSigner:
 
 def _tx_nonce(raw: bytes) -> int:
     """Extract the nonce from a signed typed (EIP-1559) transaction."""
-    import rlp
-
     assert raw[0] == 2  # typed tx envelope
     fields = rlp.decode(raw[1:])
     return int.from_bytes(fields[1], "big")

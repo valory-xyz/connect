@@ -44,7 +44,7 @@ Run standalone (mimicking the Pearl runner) — see README "Development" for the
 
 ## Architecture
 
-The security architecture is the thing to understand first: **every signing path funnels through one gate with no bypass.** MCP tools, HTTP signing endpoints, and the mech request flow all reduce to `Signer.send()` / `Signer.sign_digest()` (`connect/signer.py`), and every request passes the guardrail in `connect/guard.py` before signing. Two invariants hold in every mode and no setting lifts them: the safe may not `delegatecall`, and the safe may not call itself. On that floor sit two persistent modes: **restricted** (default: only safe `execTransaction` CALLs to whitelisted addresses, gas-refund fields zeroed, no raw digest signing) and **unrestricted**. The reasoning is documented at the top of `guard.py`.
+The security architecture is the thing to understand first: **every signing path funnels through one gate with no bypass.** MCP tools, HTTP signing endpoints, and the mech request flow all reduce to `Signer.send()` / `Signer.sign_digest()` (`connect/signer.py`), and every request passes the guardrail in `connect/guard.py` before signing. Two invariants hold in every mode and no setting lifts them: the safe may not `delegatecall`, and the safe may not call itself. On that floor sit two persistent modes: **restricted** (default: only safe `execTransaction` CALLs to whitelisted addresses, gas-refund fields zeroed, no raw digest signing — except single-use allowances the mech flow registers for the safe's ERC-1271 wrap of off-chain request ids it derived locally and for the one capped safe→tracker deposit a 402 top-up would send) and **unrestricted**. The reasoning is documented at the top of `guard.py`.
 
 Core modules:
 

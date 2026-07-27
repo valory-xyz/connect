@@ -29,11 +29,13 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from hexbytes import HexBytes
 from web3 import Web3
+from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechService
+from connect.server.app import create_app
 from connect.settings import (
     MODE_UNRESTRICTED,
     Protected,
@@ -122,8 +124,6 @@ class FakeEth:
 
     def get_transaction_receipt(self, tx_hash: object) -> dict:
         """Return the configured receipt or raise TransactionNotFound (as web3 does)."""
-        from web3.exceptions import TransactionNotFound
-
         if self.receipt is None:
             raise TransactionNotFound(f"{tx_hash!r} not mined")
         return self.receipt
@@ -132,8 +132,6 @@ class FakeEth:
         self, tx_hash: object, timeout: float = 120, poll_latency: float = 0.1
     ) -> dict:
         """Return the configured receipt or raise TimeExhausted."""
-        from web3.exceptions import TimeExhausted
-
         if self.receipt is None:
             raise TimeExhausted(f"tx not mined within {timeout}s")
         return self.receipt
@@ -258,7 +256,6 @@ def make_app(
     guard: Guard, settings_store: SettingsStore, mech_service: MechService
 ) -> t.Callable:
     """Return an app factory threading the guard/settings/mech wiring."""
-    from connect.server.app import create_app
 
     def _make(
         signer: Signer,
