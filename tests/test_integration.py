@@ -981,12 +981,15 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     """
     _set_balance(rpc_url, account.address, 10**18)
     activity = ActivityLog(store_path)
+    # restricted mode is an operator opt-in now; set it explicitly, keeping
+    # the default whitelist so the marketplace flow stays reachable
+    fork_store.patch({"protected": {"mode": "restricted"}})
     guard = Guard(fork_store, fork_config)
     signer = Signer(account=account, config=fork_config, activity=activity, guard=guard)
     safe_address = _deploy_safe(rpc_url, signer, account)
     _set_balance(rpc_url, safe_address, 10**18)
     fork_config.chains["gnosis"].safe_address = safe_address
-    assert guard.mode() == "restricted"  # fresh store -> restricted defaults
+    assert guard.mode() == "restricted"
     mech_service = MechService(signer, fork_config, activity, guard)
 
     picked = _pick_live_mech(mech_service)
