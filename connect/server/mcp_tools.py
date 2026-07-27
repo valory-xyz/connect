@@ -174,7 +174,12 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
     @mcp.tool()
     async def sign_message(digest: str) -> dict:
-        """Sign a raw 32-byte digest (0x-hex), unprefixed — for off-chain mech requests."""
+        """Sign a raw 32-byte digest (0x-hex), unprefixed.
+
+        The off-chain mech flow does not use this tool: it signs its own
+        SafeMessage-wrapped request-id digest internally, through a
+        server-only allowance that no MCP tool reaches.
+        """
         try:
             raw = bytes.fromhex(digest.removeprefix("0x"))
         except ValueError as e:
@@ -199,7 +204,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         Off-chain by default: few mechs can serve that, so check
         `offchain_capable` with mech_tools first; legacy_on_chain=true goes
         through the marketplace instead.
-        Refused before paying if the mech's price exceeds max_payment (wei).
+        Refused before paying if the mech's price exceeds max_payment
+        (base units of the mech's payment asset).
         On timeout the ids come back as `pending_request_ids` for mech_result.
         """
         # mech-client manages its own event loops (asyncio.run + sync gql):

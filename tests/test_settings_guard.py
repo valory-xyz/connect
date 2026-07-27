@@ -24,22 +24,28 @@ import json
 import threading
 import time
 import typing as t
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import safe_eth.eth as se
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client.infrastructure.config import PaymentType
+from mech_client.infrastructure.ipfs import metadata as ipfs_metadata
+from web3 import Web3
 from web3.datastructures import AttributeDict
 
+from connect import mech as mech_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig, ChainConfig
-from connect.guard import Guard, GuardError
+from connect.guard import ALLOWANCE_TTL, Guard, GuardError
 from connect.mech import (
     DEFAULT_MECH_CHAIN,
     MAX_DELIVERY_TIMEOUT,
@@ -47,14 +53,27 @@ from connect.mech import (
     MechService,
     MechSigner,
     PendingDelivery,
+    PricedMech,
+    _MAX_AUTO_DEPOSIT_RATIO,
+    _deposit_tracker,
+    _request_digest,
 )
 from connect.safe import (
     APPROVE_SELECTOR,
+    DEPOSIT_SELECTOR,
     EXEC_TRANSACTION_SELECTOR,
     EXEC_TRANSACTION_TYPES,
     decode_approve,
+    decode_deposit,
+    safe_message_hash,
 )
-from connect.server.settings_routes import WHITELIST_FROZEN
+from connect.server import auth as auth_module
+from connect.server import settings_routes
+from connect.server.settings_routes import (
+    ProtectedPatch,
+    SettingsPatch,
+    WHITELIST_FROZEN,
+)
 from connect.settings import (
     MAC_FIELDS,
     MODE_RESTRICTED,
@@ -67,7 +86,7 @@ from connect.settings import (
     derive_mac_key,
     token_approve_targets,
 )
-from connect.signer import Signer, SignerError
+from connect.signer import Signer, SignerError, _ChainState
 
 from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
 
@@ -627,6 +646,14 @@ class TestDefaults:
         """The approve selector with unparseable args decodes to no spender."""
         assert decode_approve("0x" + APPROVE_SELECTOR + "ff") is None
 
+    def test_decode_deposit(self) -> None:
+        """deposit(uint256) decodes to its amount; anything else to None."""
+        good = "0x" + DEPOSIT_SELECTOR + abi_encode(["uint256"], [42]).hex()
+        assert decode_deposit(good) == 42
+        not_deposit = "0x" + APPROVE_SELECTOR + abi_encode(["uint256"], [42]).hex()
+        assert decode_deposit(not_deposit) is None
+        assert decode_deposit("0x" + DEPOSIT_SELECTOR + "ff") is None
+
 
 def make_guard(
     store: SettingsStore, mode: str, whitelist: dict[str, tuple[str, ...]] | None = None
@@ -650,14 +677,171 @@ class TestGuard:
         """Unrestricted mode is today's behavior."""
         guard = make_guard(store, MODE_UNRESTRICTED)
         guard.check_transaction("testchain", OTHER, 10**18, "0xdeadbeef")
-        guard.check_sign_digest()
+        guard.check_sign_digest(b"\x11" * 32)  # any digest, no allowance needed
         assert guard.mode() == MODE_UNRESTRICTED
 
     def test_restricted_blocks_sign_digest(self, store: SettingsStore) -> None:
         """Raw digest signing is off in restricted mode."""
         guard = make_guard(store, MODE_RESTRICTED)
         with pytest.raises(GuardError, match="digest signing is disabled"):
-            guard.check_sign_digest()
+            guard.check_sign_digest(b"\x11" * 32)
+
+    def test_digest_allowance_is_single_use(self, store: SettingsStore) -> None:
+        """A registered digest is signable exactly once, then refused again.
+
+        The pop is what makes a replayed request for the same signature a
+        refusal instead of a second signature.
+        """
+        guard = make_guard(store, MODE_RESTRICTED)
+        digest = b"\xab" * 32
+        guard.allow_digest_once(digest)
+        guard.check_sign_digest(digest)  # consumes the allowance
+        with pytest.raises(GuardError, match="digest signing is disabled"):
+            guard.check_sign_digest(digest)
+
+    def test_digest_allowance_matches_exactly(self, store: SettingsStore) -> None:
+        """A near-miss digest consumes nothing and is refused."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_digest_once(b"\xab" * 32)
+        with pytest.raises(GuardError, match="digest signing is disabled"):
+            guard.check_sign_digest(b"\xac" * 32)
+        # the registered digest was not consumed by the miss
+        guard.check_sign_digest(b"\xab" * 32)
+
+    def test_digest_allowance_expires(
+        self,
+        store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An allowance a failed flow left behind dies on its own — loudly.
+
+        Registration and signing normally happen milliseconds apart; the TTL
+        only bounds how long a stale entry stays consumable. The refusal that
+        follows reads as a policy denial, so the expiry itself must leave a
+        distinguishable trace in the log.
+        """
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_digest_once(b"\xab" * 32)
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            "connect.guard.time.monotonic",
+            lambda: real_monotonic() + ALLOWANCE_TTL + 1,
+        )
+        with pytest.raises(GuardError, match="digest signing is disabled"):
+            guard.check_sign_digest(b"\xab" * 32)
+        assert "expired unconsumed" in caplog.text
+
+    def test_deposit_allowance_native(self, store: SettingsStore) -> None:
+        """A pre-authorized bare transfer to the tracker passes — once, capped.
+
+        A near-miss (over the cap, or carrying calldata a native deposit
+        never has) is refused without consuming the allowance, so the
+        compliant deposit the flow actually sends still goes through.
+        """
+        guard = make_guard(store, MODE_RESTRICTED)
+        deposit = exec_transaction_calldata(TRACKER, value=50)
+        with pytest.raises(
+            GuardError, match="do not allow the safe to call"
+        ):  # no allowance yet
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+        guard.allow_safe_deposit_once(
+            chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
+        )
+        over_cap = exec_transaction_calldata(TRACKER, value=101)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, over_cap)
+        with_data = exec_transaction_calldata(TRACKER, value=50, data=b"\x01\x02")
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, with_data)
+        guard.check_transaction("testchain", SAFE, 0, deposit)  # consumes
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    def test_deposit_allowance_token(self, store: SettingsStore) -> None:
+        """A pre-authorized deposit(amount) passes once; wrong shapes refused."""
+        guard = make_guard(store, MODE_RESTRICTED)
+
+        def deposit_calldata(amount: int, value: int = 0) -> str:
+            """Compose safe->tracker execTransaction carrying deposit(amount)."""
+            inner = bytes.fromhex(DEPOSIT_SELECTOR) + abi_encode(["uint256"], [amount])
+            return exec_transaction_calldata(TRACKER, value=value, data=inner)
+
+        guard.allow_safe_deposit_once(
+            chain="testchain", tracker=TRACKER, amount_cap=100, is_token=True
+        )
+        undecodable = exec_transaction_calldata(
+            TRACKER, data=bytes.fromhex(DEPOSIT_SELECTOR) + b"\xff"
+        )
+        for bad in (
+            deposit_calldata(101),  # over the cap
+            deposit_calldata(50, value=1),  # a deposit carries no inner value
+            exec_transaction_calldata(TRACKER, value=50),  # not a deposit call
+            undecodable,
+        ):
+            with pytest.raises(GuardError, match="do not allow the safe to call"):
+                guard.check_transaction("testchain", SAFE, 0, bad)
+        guard.check_transaction("testchain", SAFE, 0, deposit_calldata(100))
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit_calldata(100))
+
+    def test_deposit_allowance_binds_chain_and_tracker(
+        self, store: SettingsStore
+    ) -> None:
+        """An allowance for another chain or another target matches nothing."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        transfer = exec_transaction_calldata(TRACKER, value=1)
+        guard.allow_safe_deposit_once(
+            chain="nosafe", tracker=TRACKER, amount_cap=100, is_token=False
+        )
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, transfer)
+        guard.allow_safe_deposit_once(
+            chain="testchain", tracker=OTHER, amount_cap=100, is_token=False
+        )
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, transfer)
+
+    def test_rearming_replaces_the_deposit_allowance(
+        self, store: SettingsStore
+    ) -> None:
+        """N arms for one (chain, tracker) still admit exactly one deposit.
+
+        Appending would stack grants — fifty requests arming the same
+        tracker would authorize fifty deposits at fifty caps. Re-arming must
+        refresh the single grant instead.
+        """
+        guard = make_guard(store, MODE_RESTRICTED)
+        for _ in range(3):
+            guard.allow_safe_deposit_once(
+                chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
+            )
+        deposit = exec_transaction_calldata(TRACKER, value=50)
+        guard.check_transaction("testchain", SAFE, 0, deposit)  # the one grant
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    def test_deposit_allowance_expires(
+        self,
+        store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A deposit allowance a failed flow left behind dies on its own — loudly."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_safe_deposit_once(
+            chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
+        )
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            "connect.guard.time.monotonic",
+            lambda: real_monotonic() + ALLOWANCE_TTL + 1,
+        )
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction(
+                "testchain", SAFE, 0, exec_transaction_calldata(TRACKER, value=1)
+            )
+        assert "expired unconsumed" in caplog.text
 
     def test_restricted_requires_safe_target(self, store: SettingsStore) -> None:
         """Everything must go to (or through) the service safe."""
@@ -690,7 +874,7 @@ class TestGuard:
             store, MODE_RESTRICTED, {"testchain": (WHITELISTED.lower(),)}
         )
         denials: list[t.Callable[[], None]] = [
-            guard.check_sign_digest,
+            lambda: guard.check_sign_digest(b"\xab" * 32),  # unregistered digest
             lambda: guard.check_transaction("nosafe", SAFE, 1, "0x"),
             lambda: guard.check_transaction("testchain", OTHER, 1, "0x"),
             lambda: guard.check_transaction("testchain", SAFE, 1, "0x"),
@@ -926,12 +1110,6 @@ class TestSignerGuardIntegration:
         settings_store: SettingsStore,
     ) -> Signer:
         """Return a signer whose guard enforces restricted mode."""
-        import threading
-
-        from web3 import Web3
-
-        from connect.signer import _ChainState
-
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
         )
@@ -1137,6 +1315,60 @@ class TestSignerGuardIntegration:
             restricted_signer.send("testchain", OTHER, value=1, request_id="r2")
 
 
+class FakeMarketplaceContract:
+    """Marketplace contract stand-in: domain reads and an honest getRequestId.
+
+    `request_id_override` simulates a lying RPC: the id mech-client asks to
+    sign then differs from the one the server derived, which must be refused.
+    """
+
+    def __init__(self) -> None:
+        """Initialize with fixed domain state."""
+        self.address = Web3.to_checksum_address("0x" + "77" * 20)
+        self.domain_separator = b"\x58" * 32
+        self.nonce = 5
+        self.request_id_override: bytes | None = None
+        self.functions = SimpleNamespace(
+            domainSeparator=lambda: SimpleNamespace(call=lambda: self.domain_separator),
+            mapNonces=lambda address: SimpleNamespace(call=lambda: self.nonce),
+            getRequestId=lambda *args: SimpleNamespace(
+                call=lambda: self._request_id(*args)
+            ),
+        )
+
+    def _request_id(
+        self,
+        mech: str,
+        requester: str,
+        data: bytes,
+        rate: int,
+        payment_type: bytes,
+        nonce: int,
+    ) -> bytes:
+        """Answer as the deployed contract would — or lie, if told to."""
+        if self.request_id_override is not None:
+            return self.request_id_override
+        return _request_digest(
+            domain_separator=self.domain_separator,
+            marketplace=self.address,
+            mech=mech,
+            requester=requester,
+            data_hash=bytes(data),
+            delivery_rate=rate,
+            payment_type=bytes(payment_type),
+            nonce=nonce,
+        )
+
+
+# the real NATIVE payment-type id (keccak256-derived), as PaymentType.value
+NATIVE_PAYMENT_TYPE = "ba699a34be8fe0e7725e93dcbce1701b0211a8ca61330aaeb8a05bf2ec7abed1"
+
+
+def native_mech_info(rate: int) -> tuple:
+    """Canned _fetch_mech_info answer for a native-payment mech."""
+    return (SimpleNamespace(name="NATIVE", value=NATIVE_PAYMENT_TYPE), 42, rate)
+
+
 class FakeMarketplaceService:
     """Captures send_request kwargs and serves canned mech info."""
 
@@ -1152,7 +1384,7 @@ class FakeMarketplaceService:
             "delivery_results": {"ab": {"answer": "42"}},
         }
         self.raises: Exception | None = None
-        self.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**16)
+        self.mech_info = native_mech_info(10**16)
         # A mech that publishes both a tool list and an off-chain endpoint —
         # the rare healthy case; tests that need a blocker override `metadata`.
         self.metadata: dict | None = {
@@ -1162,16 +1394,55 @@ class FakeMarketplaceService:
         self.tool_manager = SimpleNamespace(
             fetch_tools_metadata=lambda service_id: self.metadata
         )
+        self.contract = FakeMarketplaceContract()
+        self.signer: t.Any = None  # the MechSigner mech-client would sign with
+        self.safe_address: str | None = None  # agent-mode requester of record
+        # mirrors BaseTransactionService.mech_config, whose chain id the flow
+        # threads into sign_safe_message
+        self.mech_config = SimpleNamespace(
+            ledger_config=SimpleNamespace(chain_id=31337)
+        )
 
     def _fetch_mech_info(self, mech: str) -> tuple:
         """Return the canned (payment_type, service_id, max_delivery_rate)."""
         return self.mech_info
 
+    def _get_marketplace_contract(self) -> FakeMarketplaceContract:
+        """Return the contract stand-in (the private helper the code pins)."""
+        return self.contract
+
     async def send_request(self, **kwargs: object) -> dict:
-        """Record the call and return the canned result."""
+        """Record the call; for off-chain, walk mech-client's signing sequence.
+
+        The sequence mirrors _send_offchain_request in the pinned mech-client:
+        metadata CID from fetch_ipfs_hash with the caller's extra_attributes
+        (whose pinned salt is what makes it deterministic), then the
+        contract's request id bound to the safe (the agent-mode requester of
+        record since 0.21.3), then an ERC-1271 SafeMessage signature over it
+        via sign_safe_message. That order is what the digest-allowance tests
+        exercise end to end.
+        """
         self.calls.append(kwargs)
         if self.raises is not None:
             raise self.raises
+        if kwargs.get("use_offchain") and self.signer is not None:
+            prompts = t.cast(tuple, kwargs["prompts"])
+            tools = t.cast(tuple, kwargs["tools"])
+            extra = t.cast(dict, kwargs.get("extra_attributes") or {})
+            data_hash, _, _ = ipfs_metadata.fetch_ipfs_hash(prompts[0], tools[0], extra)
+            request_id = self.contract.functions.getRequestId(
+                kwargs["priority_mech"],
+                self.safe_address,
+                bytes.fromhex(data_hash.removeprefix("0x")),
+                self.mech_info[2],
+                bytes.fromhex(self.mech_info[0].value),
+                self.contract.nonce,
+            ).call()
+            self.signer.sign_safe_message(
+                self.safe_address,
+                self.mech_config.ledger_config.chain_id,
+                request_id,
+            )
         return self.result
 
 
@@ -1195,6 +1466,47 @@ class TestMech:
         signature = MechSigner(test_signer, "testchain").sign_message(b"\x22" * 32)
         assert len(signature) == 65
 
+    def test_mech_signer_signs_safe_messages(self, test_signer: Signer) -> None:
+        """sign_safe_message signs the ERC-1271 wrap, recoverable to the EOA.
+
+        The wrap the signature covers must be safe_message_hash's — the same
+        bytes the mech flow registers with the guard — and the raw-hash
+        recovery mirrors what the safe's fallback handler checks on-chain.
+        """
+        digest = b"\x22" * 32
+        signature = MechSigner(test_signer, "testchain").sign_safe_message(
+            SAFE, 31337, digest
+        )
+        assert len(signature) == 65
+        wrapped = safe_message_hash(SAFE, 31337, digest)
+        # pylint: disable-next=protected-access,no-value-for-parameter
+        recovered = Account._recover_hash(wrapped, signature=signature)
+        assert recovered.lower() == test_signer.address.lower()
+
+    def test_safe_message_hash_requires_32_bytes(self) -> None:
+        """The keccak(digest) shortcut only holds at exactly 32 bytes."""
+        with pytest.raises(ValueError, match="exactly 32 bytes"):
+            safe_message_hash(SAFE, 31337, b"\x22" * 31)
+
+    def test_safe_message_hash_golden_vector(self) -> None:
+        """Pin the SafeMessage wrap against an independent EIP-712 computation.
+
+        Byte-for-byte vector for (safe=0xab..ab, chain_id=100, digest=0x11..11)
+        produced by eth_account's typed-data encoder over the Safe v1.3.0+
+        domain (EIP712Domain(uint256 chainId,address verifyingContract) +
+        SafeMessage(bytes message)) — a different implementation from the
+        manual keccak in safe_message_hash. A silent slip in the typehash
+        strings, field order, or the keccak(digest) shortcut breaks every
+        restricted-mode off-chain signature; without this, only the
+        RPC-gated fork test would catch it. Companion to
+        test_request_digest_matches_deployed_marketplace.
+        """
+        safe = "0x" + "ab" * 20
+        assert (
+            safe_message_hash(safe, 100, bytes.fromhex("11" * 32)).hex()
+            == "0ba56b6a14af933d206925a33ab1291b5381bb0f0f3b6aebe824492d0b61a586"
+        )
+
     @pytest.fixture(name="patched_mech")
     def patched_mech_fixture(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1204,12 +1516,15 @@ class TestMech:
         Patched on `connect.mech`, the name that module actually calls —
         patching mech-client's own module would miss the import-time binding.
         """
-        import safe_eth.eth as se
-
-        from connect import mech as mech_module
-
         fake = FakeMarketplaceService()
-        monkeypatch.setattr(mech_module, "MarketplaceService", lambda **kwargs: fake)
+
+        def _construct(**kwargs: object) -> FakeMarketplaceService:
+            """Capture the MechSigner and safe the service would sign with."""
+            fake.signer = kwargs.get("signer")
+            fake.safe_address = t.cast(str, kwargs.get("safe_address"))
+            return fake
+
+        monkeypatch.setattr(mech_module, "MarketplaceService", _construct)
         monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
         return fake
 
@@ -1395,8 +1710,6 @@ class TestMech:
         self, monkeypatch: pytest.MonkeyPatch, offchain: bool
     ) -> None:
         """Off-chain polls the mech's endpoint; on-chain scans from its block."""
-        import mech_client.domain.delivery as delivery_module
-
         seen: dict = {}
 
         class _Watcher:
@@ -1408,8 +1721,9 @@ class TestMech:
                 seen.update(kwargs)
                 return {"ab": "delivered"}
 
-        monkeypatch.setattr(delivery_module, "OffchainDeliveryWatcher", _Watcher)
-        monkeypatch.setattr(delivery_module, "OnchainDeliveryWatcher", _Watcher)
+        # patched on connect.mech, the module-level names _watch actually calls
+        monkeypatch.setattr(mech_module, "OffchainDeliveryWatcher", _Watcher)
+        monkeypatch.setattr(mech_module, "OnchainDeliveryWatcher", _Watcher)
         service = SimpleNamespace(
             tool_manager=SimpleNamespace(
                 get_offchain_url=lambda service_id: "https://mech.example/offchain"
@@ -1453,19 +1767,277 @@ class TestMech:
         )
         assert result == {"chain": "testchain", **patched_mech.result}
 
-    def test_request_offchain_denied_in_restricted(
-        self,
-        mech_service: MechService,
+    @staticmethod
+    def _restricted_mech_service(
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
         settings_store: SettingsStore,
-        patched_mech: FakeMarketplaceService,
-    ) -> None:
-        """The off-chain preflight points at the route that still works."""
+    ) -> tuple[MechService, Guard]:
+        """Build a mech service whose signer and flow share a restricted guard.
+
+        The shared mech_service fixture wires no guard into its signer, so it
+        cannot show a signature being *allowed through* restricted mode —
+        which is exactly what the off-chain tests below are about. The guard
+        comes back with the service so a test can probe what the flow's
+        allowances admit.
+        """
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
         )
-        with pytest.raises(MechError, match="retry it on-chain"):
-            mech_service.request("q", "tool", chain="testchain")
+        guard = Guard(settings_store, app_config)
+        signer = Signer(
+            account=account, config=app_config, activity=activity, guard=guard
+        )
+        return MechService(signer, app_config, activity, guard), guard
+
+    def test_offchain_request_signs_in_restricted_mode(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """Restricted mode signs exactly the digest the server derived itself.
+
+        End to end: the capture wrapper sees the CID mech-client will sign
+        for, the locally recomputed request id is registered as a one-shot
+        allowance, and the signature over it passes the guard — with the
+        prepaid top-up disarmed here only because no balance tracker
+        resolves for a chain mech-client does not know (the armed case is
+        test_restricted_auto_deposit_is_armed_via_allowance).
+        """
+        service, _ = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        result = service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert result == {"chain": "testchain", **patched_mech.result}
+        call = patched_mech.calls[0]
+        assert call["use_offchain"] is True
+        assert call["auto_deposit"] is False
+        # the pinned salt travels to mech-client, making its CID (and the
+        # request id it signs) the one the registered allowance was derived for
+        assert isinstance(call["extra_attributes"], dict)
+        assert call["extra_attributes"].keys() == {"nonce"}
+        kinds = audit_kinds(store_path)
+        assert "mech_offchain_digest" in kinds  # the granted allowance
+        assert "sign_message" in kinds  # the signature it covered
+        assert "blocked" not in kinds
+        # the allowance record exists for incident reconstruction, so its
+        # fields must be well-formed, not just the kind present: the recorded
+        # digest is the SafeMessage wrap of the recorded request id (the exact
+        # bytes the signature was produced over), keyed to this mech and the
+        # safe's marketplace nonce
+        entry = next(
+            e for e in audit_entries(store_path) if e["kind"] == "mech_offchain_digest"
+        )
+        assert entry["chain"] == "testchain"
+        assert entry["mech"] == OTHER
+        assert entry["nonce"] == patched_mech.contract.nonce
+        request_id = bytes.fromhex(entry["request_id"].removeprefix("0x"))
+        assert len(request_id) == 32
+        assert (
+            entry["digest"] == "0x" + safe_message_hash(SAFE, 31337, request_id).hex()
+        )
+
+    def test_offchain_digest_mismatch_is_refused(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """A request id the server did not derive is not signed.
+
+        This is the lying-RPC case: mech-client asks the contract for the id
+        over eth_call, so a hostile RPC can hand back any 32 bytes — a safe
+        transaction hash included. The local derivation turns that into a
+        mismatch, and the mismatch into a refusal.
+        """
+        patched_mech.contract.request_id_override = b"\xee" * 32
+        service, _ = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        with pytest.raises(SignerError, match="digest signing is disabled"):
+            service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert "blocked" in audit_kinds(store_path)
+
+    def test_restricted_auto_deposit_is_armed_via_allowance(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """auto_deposit survives restricted mode: the top-up is pre-authorized.
+
+        testchain is unknown to mech-client, so the tracker is injected; the
+        allowance the flow arms is then consumed by exactly the safe->tracker
+        payment mech-client's deposit path would send — once.
+        """
+        monkeypatch.setattr(
+            mech_module,
+            "_deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        service, guard = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert patched_mech.calls[0]["auto_deposit"] is True
+        armed = [
+            entry
+            for entry in audit_entries(store_path)
+            if entry["kind"] == "mech_deposit_allowance"
+        ]
+        assert armed[0]["tracker"] == TRACKER
+        assert armed[0]["amount_cap"] == str(_MAX_AUTO_DEPOSIT_RATIO * 10**16)
+        deposit = exec_transaction_calldata(TRACKER, value=10**16)
+        guard.check_transaction("testchain", SAFE, 0, deposit)  # the one top-up
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    def test_auto_deposit_cap_matches_mech_client(self) -> None:
+        """The armed cap multiplies by the exact bound mech-client enforces.
+
+        mech-client refuses a 402 shortfall above 10x the signed rate and
+        deposits at most the shortfall; the allowance cap mirrors that bound,
+        so a bump of the pinned mech-client that moves it must be seen here.
+        """
+        assert _MAX_AUTO_DEPOSIT_RATIO == 10
+
+    def test_deposit_tracker_reads_mech_client_constants(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """(tracker, is_token) resolves per payment type and fails closed."""
+        native, is_token = _deposit_tracker("gnosis", PaymentType.NATIVE.value)
+        assert native is not None
+        assert native.startswith("0x")
+        assert is_token is False
+        olas, is_token = _deposit_tracker("gnosis", PaymentType.OLAS_TOKEN.value)
+        assert olas is not None
+        assert is_token is True
+        # gnosis configures no USDC tracker: fail closed, not a zero address
+        assert _deposit_tracker("gnosis", PaymentType.USDC_TOKEN.value) == (None, False)
+        # NVM subscription types are deliberately unsupported, like mech-client
+        assert _deposit_tracker("gnosis", PaymentType.NATIVE_NVM.value) == (None, False)
+        assert _deposit_tracker("testchain", PaymentType.NATIVE.value) == (None, False)
+        # broken constants fail closed; patched on connect.mech, the binding
+        # the function actually reads since the imports were hoisted
+        monkeypatch.setattr("connect.mech.CHAIN_NAME_TO_ID", None)
+        assert _deposit_tracker("gnosis", PaymentType.NATIVE.value) == (None, False)
+
+    def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        guard: Guard,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """Unrestricted mode passes auto_deposit through, and still audits.
+
+        The audit record is written in every mode, but the allowance itself
+        is armed only while restricted — see _arm_auto_deposit for why.
+        """
+        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert patched_mech.calls[0]["auto_deposit"] is True
+        assert "mech_offchain_digest" in audit_kinds(store_path)
+        # nothing armed: no grant survives a flip back to restricted
+        assert not guard._allowed_digests  # pylint: disable=protected-access
+        assert not guard._deposit_allowances  # pylint: disable=protected-access
+
+    def test_unrestricted_auto_deposit_audits_but_arms_nothing(
+        self,
+        mech_service: MechService,
+        guard: Guard,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With a tracker resolved, unrestricted still audits and arms nothing."""
+        monkeypatch.setattr(
+            mech_module,
+            "_deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert "mech_deposit_allowance" in audit_kinds(store_path)
+        assert not guard._deposit_allowances  # pylint: disable=protected-access
+
+    def test_register_offchain_digest_needs_a_safe(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """The requester of record is the safe; without one there is no digest.
+
+        Unreachable through request() — _service refuses safe-less chains
+        first — but the invariant must fail loudly, not silently, if the
+        call order ever changes.
+        """
+        # pylint: disable-next=protected-access
+        mech_service._config.chains["testchain"].safe_address = None
+        with pytest.raises(MechError, match="no service safe"):
+            # pylint: disable-next=protected-access
+            mech_service._register_offchain_digest(
+                t.cast(t.Any, patched_mech),
+                chain="testchain",
+                priced=PricedMech(
+                    mech=OTHER,
+                    service_id=42,
+                    rate=10**16,
+                    payment_type=NATIVE_PAYMENT_TYPE,
+                ),
+                prompt="q",
+                tool="t",
+                salt="s",
+            )
+
+    def test_offchain_context_failure_is_a_mech_error(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing domain/nonce read refuses before any request is sent."""
+
+        def _boom() -> None:
+            raise RuntimeError("rpc down")
+
+        monkeypatch.setattr(patched_mech, "_get_marketplace_contract", _boom)
+        with pytest.raises(MechError, match="could not derive the off-chain"):
+            mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         assert not patched_mech.calls
+
+    def test_request_digest_matches_deployed_marketplace(self) -> None:
+        """Golden vector recorded from the deployed gnosis marketplace.
+
+        domainSeparator() and getRequestId(...) were called on
+        0x735FAAb1c4Ec41128c367AFb5c3baC73509f70bB (2026-07-23) with these
+        synthetic inputs; the local derivation must reproduce the contract's
+        answer byte for byte, or restricted-mode off-chain requests break.
+        """
+        digest = _request_digest(
+            domain_separator=bytes.fromhex(
+                "58fbb2508b962bcf6e2708fdfc23222115504128df851ae75ef8c66f2e0bdade"
+            ),
+            marketplace=GNOSIS_MARKETPLACE,
+            mech="0x" + "11" * 20,
+            requester="0x" + "22" * 20,
+            data_hash=bytes.fromhex("33" * 32),
+            delivery_rate=7,
+            payment_type=bytes.fromhex("44" * 32),
+            nonce=9,
+        )
+        assert (
+            digest.hex()
+            == "512e9b1dd2d2d253ba226f6d47af046720b1d97a09ae71e4ecc3f640f33bf36b"
+        )
 
     def test_request_refuses_an_unreachable_offchain_mech(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -1530,15 +2102,13 @@ class TestMech:
         Only paying needs one. Refusing to list left an agent on a deployment
         with no safe configured unable to see mechs it could previously browse.
         """
-        import mech_client.infrastructure.subgraph.queries as queries
-
         asked: list[str] = []
 
         def record(chain: str) -> list:
             asked.append(chain)
             return []
 
-        monkeypatch.setattr(queries, "query_mm_mechs_info", record)
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", record)
         # pylint: disable=protected-access
         chains = mech_service._config.chains
         chains["testchain"].safe_address = None
@@ -1607,24 +2177,18 @@ class TestMech:
 
         The activity log is what an operator reconstructs an incident from. A
         request blocked by policy must not look there like one that was never
-        attempted, and the three rules must be distinguishable from each other.
+        attempted, and the rules must be distinguishable from each other.
         """
         # 1. price cap
-        patched_mech.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**18)
+        patched_mech.mech_info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request(
                 "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
             )
         # 2. mech unreachable off-chain
-        patched_mech.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**16)
+        patched_mech.mech_info = native_mech_info(10**16)
         patched_mech.metadata = {"tools": ["prediction-online"]}
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
-        # 3. digest signing disabled by the guardrail
-        settings_store.save(
-            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
-        )
-        with pytest.raises(MechError, match="blocked by the guardrail"):
             mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
 
         blocked = [
@@ -1635,7 +2199,6 @@ class TestMech:
         assert [entry["reason"] for entry in blocked] == [
             "over-max-payment",
             "offchain-unreachable",
-            "digest-signing-disabled",
         ]
         assert all(entry["chain"] == "testchain" for entry in blocked)
         assert not patched_mech.calls  # nothing was ever sent
@@ -1648,7 +2211,7 @@ class TestMech:
         Ordering matters: an over-priced mech is disqualified on price alone,
         so the pre-flight's network fetch is never reached.
         """
-        patched_mech.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**18)
+        patched_mech.mech_info = native_mech_info(10**18)
         patched_mech.tool_manager = SimpleNamespace(
             fetch_tools_metadata=lambda service_id: pytest.fail(
                 "priced out already; the metadata fetch should not be reached"
@@ -1681,10 +2244,8 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The listing maps subgraph entries and appends the follow-up note."""
-        import mech_client.infrastructure.subgraph.queries as queries
-
         monkeypatch.setattr(
-            queries,
+            mech_module,
             "query_mm_mechs_info",
             lambda chain: [
                 {
@@ -1715,8 +2276,6 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """limit/offset slice the listing; out-of-range values are clamped."""
-        import mech_client.infrastructure.subgraph.queries as queries
-
         entries = [
             {
                 "address": f"0x{i:040x}",
@@ -1726,7 +2285,7 @@ class TestMech:
             }
             for i in range(5)
         ]
-        monkeypatch.setattr(queries, "query_mm_mechs_info", lambda chain: entries)
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", lambda chain: entries)
 
         page = mech_service.tools(chain="testchain", limit=2, offset=2)
         assert [m["service_id"] for m in page["mechs"]] == ["2", "3"]
@@ -1747,10 +2306,8 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A subgraph failure surfaces as a structured MechError."""
-        import mech_client.infrastructure.subgraph.queries as queries
-
         monkeypatch.setattr(
-            queries,
+            mech_module,
             "query_mm_mechs_info",
             lambda chain: (_ for _ in ()).throw(RuntimeError("subgraph down")),
         )
@@ -1936,9 +2493,7 @@ class TestMech:
         self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Discovery is a pure subgraph query — no safe, no service build."""
-        import mech_client.infrastructure.subgraph.queries as queries
-
-        monkeypatch.setattr(queries, "query_mm_mechs_info", lambda chain: [])
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", lambda chain: [])
         # pylint: disable=protected-access
         mech_service._config.chains["testchain"].safe_address = None
         assert mech_service.tools(chain="testchain")["mechs"] == []
@@ -1950,7 +2505,7 @@ class TestMech:
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """A mech pricing above max_payment is refused before any work."""
-        patched_mech.mech_info = (SimpleNamespace(name="NATIVE"), 42, 10**18)
+        patched_mech.mech_info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request(
                 "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
@@ -1992,10 +2547,8 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Without priority_mech the top listed mech is priced and used."""
-        import mech_client.infrastructure.subgraph.queries as queries
-
         monkeypatch.setattr(
-            queries,
+            mech_module,
             "query_mm_mechs_info",
             lambda chain: [
                 {
@@ -2009,7 +2562,7 @@ class TestMech:
         mech_service.request("q", "t", chain="testchain", legacy_on_chain=True)
         assert patched_mech.calls[0]["priority_mech"] == OTHER
         # an empty listing is a structured error, not an opaque one
-        monkeypatch.setattr(queries, "query_mm_mechs_info", lambda chain: [])
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", lambda chain: [])
         with pytest.raises(MechError, match="no live mechs"):
             mech_service.request("q", "t", chain="testchain", legacy_on_chain=True)
 
@@ -2020,10 +2573,8 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A subgraph entry missing fields surfaces as MechError, not KeyError."""
-        import mech_client.infrastructure.subgraph.queries as queries
-
         monkeypatch.setattr(
-            queries, "query_mm_mechs_info", lambda chain: [{"address": OTHER}]
+            mech_module, "query_mm_mechs_info", lambda chain: [{"address": OTHER}]
         )
         with pytest.raises(MechError, match="could not list mechs"):
             mech_service.tools(chain="testchain")
@@ -2085,8 +2636,6 @@ class TestSettingsEndpoints:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Bad passwords burn a second and reveal nothing."""
-        from connect.server import settings_routes
-
         sleeps: list[float] = []
         monkeypatch.setattr(settings_routes.time, "sleep", sleeps.append)
         response = client.patch(
@@ -2327,8 +2876,6 @@ class TestSettingsEndpoints:
         No guess was made, so feeding the brake would let any local process
         429-lock every authenticated surface with free requests.
         """
-        from connect.server import auth as auth_module
-
         for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
             response = client.patch(
                 "/settings", json={"protected": {"mode": "restricted"}}
@@ -2431,9 +2978,6 @@ class TestSettingsEndpoints:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Probing is recorded and, past the threshold, answered with 429."""
-        from connect.server import auth as auth_module
-        from connect.server import settings_routes
-
         monkeypatch.setattr(settings_routes.time, "sleep", lambda _: None)
 
         # a failed token and a failed password both land in the audit log
@@ -2493,8 +3037,6 @@ class TestSettingsEndpoints:
         they fed the limiter, a background tab could hold every authenticated
         surface at 429 indefinitely (including the settings UI).
         """
-        from connect.server import auth as auth_module
-
         headers = {"Origin": "https://evil.example"}
         for _ in range(auth_module.MAX_AUTH_FAILURES * 2):
             assert client.get("/wallet", headers=headers).status_code == 403
@@ -2535,9 +3077,6 @@ class TestSettingsEndpoints:
         handful of stray clicks (or any local process, for free) trip the
         global limiter and 429-lock every authenticated surface.
         """
-        from connect.server import auth as auth_module
-        from connect.server import settings_routes
-
         slept: list[float] = []
         monkeypatch.setattr(settings_routes.time, "sleep", slept.append)
 
@@ -2568,10 +3107,6 @@ class TestSettingsEndpoints:
         to the matching patch model (or freeze it deliberately, as the
         whitelist is).
         """
-        from dataclasses import fields
-
-        from connect.server.settings_routes import ProtectedPatch, SettingsPatch
-
         assert set(SettingsPatch.model_fields) - {"password"} == {
             f.name for f in fields(Settings)
         }
@@ -2790,10 +3325,6 @@ class TestMcpGuardrailTools:
         push the whole mech flow to a worker thread. Awaiting the tool under
         pytest's loop reproduces the server condition end to end.
         """
-        import safe_eth.eth as se
-
-        from connect import mech as mech_module
-
         fake = FakeMarketplaceService()
         monkeypatch.setattr(mech_module, "MarketplaceService", lambda **kwargs: fake)
         monkeypatch.setattr(se, "EthereumClient", lambda uri: object())

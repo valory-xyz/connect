@@ -24,7 +24,19 @@ the service safe, delivery watching) and hands every transaction and digest to
 our Signer through its ``Signer`` protocol — so mech requests pass the exact
 same guardrail as any other signing request. In restricted mode the on-chain
 flow works because the mech system contracts ship in the default whitelist;
-the off-chain flow needs raw digest signing and therefore unrestricted mode.
+the off-chain flow signs the safe's ERC-1271 SafeMessage wrap of the
+request id (the safe is the requester of record in agent mode), which
+restricted mode allows only through a scoped allowance: this module
+recomputes the request id locally from inputs it already validated (see
+_request_digest), wraps it with safe_message_hash, and registers exactly
+that value with the guard before mech-client asks for the signature. The
+prepaid top-up (auto_deposit) moves funds safe -> balance tracker; before the
+send, the flow pre-authorizes that one deposit the same way — tracker address
+from the pinned mech-client's constants, amount capped by the same bound
+mech-client enforces on the 402 shortfall — so a short prepaid balance tops
+itself up in restricted mode too. Only when no tracker can be resolved for
+the payment type is auto_deposit disarmed there, surfacing mech-client's
+actionable HTTP 402 error instead of a mid-flow guard denial.
 """
 
 import asyncio
@@ -32,13 +44,36 @@ import logging
 import os
 import threading
 import typing as t
+import uuid
 from collections.abc import Mapping
 
-from mech_client.services.marketplace_service import MarketplaceService
+from eth_abi import encode as abi_encode
+from eth_typing import URI
+from mech_client.domain.delivery import (
+    OffchainDeliveryWatcher,
+    OnchainDeliveryWatcher,
+)
+from mech_client.infrastructure.config import (
+    CHAIN_TO_NATIVE_BALANCE_TRACKER,
+    CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS,
+    CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC,
+    PaymentType,
+)
+from mech_client.infrastructure.ipfs.metadata import fetch_ipfs_hash
+from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
+from mech_client.services.marketplace_service import (
+    MarketplaceService,
+    _MAX_AUTO_DEPOSIT_RATIO,
+)
+from mech_client.utils.constants import CHAIN_NAME_TO_ID
+from safe_eth.eth import EthereumClient
+from web3 import Web3
 
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.guard import Guard, GuardError
+from connect.guard import Guard
+from connect.safe import ZERO_ADDRESS, safe_message_hash
+from connect.settings import MODE_RESTRICTED
 from connect.signer import Signer, SignerError
 
 logger = logging.getLogger("agent")
@@ -57,10 +92,12 @@ MAX_DELIVERY_TIMEOUT = 900.0
 DEFAULT_RESULT_TIMEOUT = 30.0
 DEFAULT_MECH_PAGE_SIZE = 20
 MAX_MECH_PAGE_SIZE = 100
-# A mech prices its own requests (max_delivery_rate) and the guardrail only
-# checks *where* payments go — this cap bounds *how much* a single request may
-# cost. 0.1 of the chain's native unit; raising it is an explicit, audited
-# per-request choice.
+# The agent's per-request spending budget, not a guardrail: the caller picks
+# max_payment per call and the server does not clamp it — the guardrail only
+# checks *where* payments go. A mech pricing above the budget is refused
+# before payment, and the accepted price is audited on success. Denominated
+# in the mech's payment asset base units (wei for native mechs, token base
+# units for OLAS/USDC ones); the default is 0.1 of a native unit.
 DEFAULT_MAX_PAYMENT = 10**17
 
 
@@ -73,7 +110,10 @@ class PricedMech(t.NamedTuple):
 
     mech: str
     service_id: int
-    rate_wei: int
+    # per-request price in the mech's payment asset base units (wei for
+    # native mechs, token base units for OLAS/USDC ones)
+    rate: int
+    payment_type: str
 
 
 class PendingDelivery(t.NamedTuple):
@@ -134,6 +174,92 @@ def _offchain_blocker(read: MetadataRead) -> str | None:
     return None
 
 
+def _request_digest(  # pylint: disable=too-many-arguments
+    *,
+    domain_separator: bytes,
+    marketplace: str,
+    mech: str,
+    requester: str,
+    data_hash: bytes,
+    delivery_rate: int,
+    payment_type: bytes,
+    nonce: int,
+) -> bytes:
+    r"""Recompute MechMarketplace.getRequestId locally — trusting no RPC for it.
+
+    The id an off-chain request signs is EIP-712-shaped::
+
+        keccak256("\x19\x01" ‖ domainSeparator ‖ keccak256(abi.encode(
+            marketplace, mech, requester, keccak256(data),
+            deliveryRate, paymentType, nonce)))
+
+    (pinned byte-for-byte against the deployed gnosis marketplace by a
+    golden-vector test). Deriving it here is what keeps the RPC out of the
+    signing trust base: mech-client asks the *contract* for the id over
+    eth_call, and were that answer signed on faith, a lying RPC could hand
+    back any 32 bytes — a safe transaction hash included — and collect a
+    signature on it. Locally derived, the digest is always our own keccak
+    over a preimage we assembled, so a lying RPC (domain separator and nonce
+    are still reads) can only produce a mismatch, which is refused.
+    """
+    struct_hash = Web3.keccak(
+        abi_encode(
+            [
+                "address",
+                "address",
+                "address",
+                "bytes32",
+                "uint256",
+                "bytes32",
+                "uint256",
+            ],
+            [
+                marketplace,
+                mech,
+                requester,
+                Web3.keccak(data_hash),
+                delivery_rate,
+                payment_type,
+                nonce,
+            ],
+        )
+    )
+    return bytes(Web3.keccak(b"\x19\x01" + domain_separator + struct_hash))
+
+
+def _deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
+    """Resolve (tracker, is_token) for a payment type; (None, False) otherwise.
+
+    The addresses come from the pinned mech-client's own constants — the same
+    source its deposit path reads — so the allowance armed from this answer
+    names the contract mech-client will actually pay. NVM subscription types
+    resolve to nothing on purpose: mech-client's auto-deposit refuses them
+    too. Malformed constants fail closed to (None, False) — auto-deposit is
+    disarmed rather than a request dying mid-flow. (Unlike the settings-side
+    readers of these tables, a wholly broken mech-client is not survivable
+    here: this module hard-imports it at the top either way.)
+    """
+    try:
+        chain_id = CHAIN_NAME_TO_ID.get(chain.lower())
+        if chain_id is None:
+            return None, False
+        trackers_by_type: dict[str, tuple[dict, bool]] = {
+            PaymentType.NATIVE.value: (CHAIN_TO_NATIVE_BALANCE_TRACKER, False),
+            PaymentType.OLAS_TOKEN.value: (CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS, True),
+            PaymentType.USDC_TOKEN.value: (CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC, True),
+        }
+        entry = trackers_by_type.get(payment_type)
+        if entry is None:
+            return None, False
+        tracker = str(entry[0].get(chain_id) or "").lower()
+        if not tracker or tracker == ZERO_ADDRESS:
+            return None, False
+        return tracker, entry[1]
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.warning("could not resolve the mech balance tracker: %s", e)
+        return None, False
+
+
 class MechSigner:
     """mech-client ``Signer`` protocol adapter over our guarded Signer.
 
@@ -167,6 +293,22 @@ class MechSigner:
     def sign_message(self, message: bytes) -> bytes:
         """Sign a raw digest via the choke point (guardrail-checked)."""
         signature = self._signer.sign_digest(bytes(message))
+        return bytes.fromhex(signature.removeprefix("0x"))
+
+    def sign_safe_message(
+        self, safe_address: str, chain_id: int, message: bytes
+    ) -> bytes:
+        """Sign the Safe-wrapped hash of a digest (ERC-1271 owner signature).
+
+        Agent-mode off-chain requests are verified with
+        ``Safe.isValidSignature``, so mech-client hands the request id here
+        to be wrapped and signed (``Signer.sign_safe_message`` contract).
+        The wrap is computed by the same safe_message_hash the mech flow
+        registered its allowance with, and the signature still goes through
+        Signer.sign_digest — same choke point, same guardrail.
+        """
+        wrapped = safe_message_hash(safe_address, chain_id, bytes(message))
+        signature = self._signer.sign_digest(wrapped)
         return bytes.fromhex(signature.removeprefix("0x"))
 
 
@@ -255,10 +397,6 @@ class MechService:
 
     def _service(self, chain: str) -> MarketplaceService:
         """Lazily build the MarketplaceService for a configured chain."""
-        # pylint: disable=import-outside-toplevel
-        from eth_typing import URI
-        from safe_eth.eth import EthereumClient
-
         chain = chain.lower()
         chain_config = self._config.chain(chain)  # raises ValueError on unknown
         safe = chain_config.safe_address
@@ -277,7 +415,7 @@ class MechService:
                 # race the env var and construct against each other's RPC.
                 # First use of one chain therefore stalls the others; the fix
                 # is a constructor arg upstream (valory-xyz/mech-client#247).
-                # The exact ==0.21.2 pin keeps the construction-time-read
+                # The exact ==0.21.3 pin keeps the construction-time-read
                 # behavior from drifting underneath this lock.
                 os.environ["MECHX_CHAIN_RPC"] = chain_config.rpc_url
                 service = MarketplaceService(
@@ -358,9 +496,6 @@ class MechService:
         list in one response), so pages are sliced here; `total` lets the
         caller know whether another page exists.
         """
-        # pylint: disable=import-outside-toplevel
-        from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
-
         limit = max(1, min(limit, MAX_MECH_PAGE_SIZE))
         offset = max(0, offset)
         try:
@@ -391,7 +526,7 @@ class MechService:
             ),
         }
 
-    def request(  # pylint: disable=too-many-arguments
+    def request(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         prompt: str,
         tool: str,
@@ -407,7 +542,8 @@ class MechService:
 
         ``legacy_on_chain=False`` (default) uses the off-chain prepaid flow;
         ``True`` sends the request on-chain through the marketplace. The
-        mech's per-request price must not exceed ``max_payment`` (wei).
+        mech's per-request price must not exceed ``max_payment``, in the
+        mech's payment asset base units.
 
         Each refusal below is audited before it raises: the activity log is
         what an operator reconstructs an incident from, and a request blocked
@@ -415,29 +551,19 @@ class MechService:
         """
         timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
         chain = self._resolve_chain(chain)
-        if not legacy_on_chain:
-            # Same rule the signer enforces, surfaced before any work happens
-            # (the off-chain flow raw-signs the request-id digest).
-            try:
-                self._guard.check_sign_digest()
-            except GuardError as e:
-                self._blocked(chain, tool, "digest-signing-disabled", str(e))
-                raise MechError(
-                    f"off-chain mech requests are blocked by the guardrail: {e}; "
-                    "retry it on-chain"
-                ) from e
         service = self._service(chain)
-        priority_mech, service_id, rate = self._priced_mech(
-            service, chain, priority_mech
+        priced = self._priced_mech(service, chain, priority_mech)
+        priority_mech, service_id, rate = (
+            priced.mech,
+            priced.service_id,
+            priced.rate,
         )
         if rate > max_payment:
-            self._blocked(
-                chain, tool, "over-max-payment", f"{rate} wei > {max_payment} wei"
-            )
+            self._blocked(chain, tool, "over-max-payment", f"{rate} > {max_payment}")
             raise MechError(
-                f"mech {priority_mech} charges {rate} wei per request, above "
-                f"max_payment={max_payment}; pass a higher max_payment to "
-                "accept that price"
+                f"mech {priority_mech} charges {rate} per request (in its "
+                f"payment asset base units), above max_payment={max_payment}; "
+                "pass a higher max_payment to accept that price"
             )
         if not legacy_on_chain:
             # mech-client discovers the endpoint mid-flow and fails there with
@@ -451,6 +577,23 @@ class MechService:
                     f"mech {priority_mech} (service {service_id}) cannot serve "
                     f"off-chain requests: {blocker}"
                 )
+            # Pin the metadata salt so the CID — and with it the request id
+            # mech-client will derive and sign — is known here first; the
+            # matching allowance is registered before the send. Armed in
+            # every mode so both leave the same audit trail.
+            extra_attributes = {"nonce": str(uuid.uuid4())}
+            self._register_offchain_digest(
+                service,
+                chain=chain,
+                priced=priced,
+                prompt=prompt,
+                tool=tool,
+                salt=extra_attributes["nonce"],
+            )
+            if auto_deposit:
+                auto_deposit = self._arm_auto_deposit(chain, priced)
+        else:
+            extra_attributes = None
         try:
             result = asyncio.run(
                 service.send_request(
@@ -459,6 +602,7 @@ class MechService:
                     priority_mech=priority_mech,
                     use_offchain=not legacy_on_chain,
                     auto_deposit=auto_deposit,
+                    extra_attributes=extra_attributes,
                     timeout=timeout,
                 )
             )
@@ -474,6 +618,8 @@ class MechService:
             chain=chain,
             tool=tool,
             offchain=not legacy_on_chain,
+            rate=str(rate),
+            max_payment=str(max_payment),
             request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
         return self._with_pending(
@@ -579,18 +725,131 @@ class MechService:
         timeout: float,
     ) -> dict:
         """Run the watcher for the flow this request was sent through."""
-        # pylint: disable=import-outside-toplevel, protected-access
-        from mech_client.domain.delivery import (
-            OffchainDeliveryWatcher,
-            OnchainDeliveryWatcher,
-        )
-
+        # pylint: disable=protected-access
         if pending.offchain:
             url = service.tool_manager.get_offchain_url(pending.service_id)
             return await OffchainDeliveryWatcher(url, timeout).watch([key])
         contract = service._get_marketplace_contract()
         watcher = OnchainDeliveryWatcher(contract, service.ledger_api, timeout)
         return await watcher.watch([key], from_block=pending.from_block)
+
+    def _register_offchain_digest(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        service: MarketplaceService,
+        *,
+        chain: str,
+        priced: PricedMech,
+        prompt: str,
+        tool: str,
+        salt: str,
+    ) -> None:
+        """Derive the digest mech-client will sign, and pre-authorize it once.
+
+        The requester of record is the service safe (mech-client ≥0.21.3
+        binds agent-mode off-chain requests to the safe on every surface),
+        so the request id commits to the safe, the marketplace nonce is the
+        safe's, and what actually gets signed is the ERC-1271 SafeMessage
+        wrap of the request id — the allowance registers that wrapped hash,
+        the same bytes MechSigner.sign_safe_message will produce.
+
+        The request id commits to the metadata CID, which is deterministic
+        here because the salt is pinned: fetch_ipfs_hash generates a random
+        nonce but merges ``extra_attributes`` over it, so this method and
+        mech-client (handed the same ``{"nonce": salt}`` moments later) run
+        the same pure function on the same inputs and get the same CID. The
+        domain separator and the marketplace nonce are RPC reads; a wrong
+        answer makes the derived digest mismatch the one mech-client asks
+        to sign, so the failure mode is a refusal, never a wrong signature.
+
+        Audited: the allowance is what lets funds-adjacent signing happen in
+        restricted mode, so the trail must show each one that was granted,
+        not only the signatures that followed.
+        """
+        safe = self._config.chain(chain).safe_address
+        if safe is None:
+            # unreachable through request(): _service already refused the
+            # chain — kept as a real error so the invariant is not silent
+            raise MechError(
+                f"no service safe is configured for chain '{chain}'; the "
+                "off-chain requester of record is the safe"
+            )
+        try:
+            # same private-but-pinned helper _watch already leans on
+            # pylint: disable-next=protected-access
+            contract = service._get_marketplace_contract()
+            domain_separator = bytes(contract.functions.domainSeparator().call())
+            nonce = int(
+                contract.functions.mapNonces(Web3.to_checksum_address(safe)).call()
+            )
+            marketplace = str(contract.address)
+        except Exception as e:
+            raise MechError(
+                f"could not derive the off-chain request digest: {e}"
+            ) from e
+        data_hash, _, _ = fetch_ipfs_hash(prompt, tool, {"nonce": salt})
+        request_id = _request_digest(
+            domain_separator=domain_separator,
+            marketplace=marketplace,
+            mech=priced.mech,
+            requester=safe,
+            data_hash=bytes.fromhex(data_hash.removeprefix("0x")),
+            delivery_rate=priced.rate,
+            payment_type=bytes.fromhex(priced.payment_type),
+            nonce=nonce,
+        )
+        # the chain id mech-client passes to sign_safe_message for this chain
+        chain_id = int(service.mech_config.ledger_config.chain_id)
+        digest = safe_message_hash(safe, chain_id, request_id)
+        if self._guard.mode() == MODE_RESTRICTED:
+            self._guard.allow_digest_once(digest)
+        self._activity.record(
+            "mech_offchain_digest",
+            chain=chain,
+            mech=priced.mech,
+            request_id="0x" + request_id.hex(),
+            digest="0x" + digest.hex(),
+            nonce=nonce,
+        )
+
+    def _arm_auto_deposit(self, chain: str, priced: PricedMech) -> bool:
+        """Pre-authorize the one 402 top-up this request may send, and say so.
+
+        Returns whether auto_deposit should stay on. The deposit pays the
+        balance tracker from the safe, which restricted mode only allows
+        through a one-shot allowance bounded by the same cap mech-client
+        itself enforces on the shortfall (ratio x the mech's per-request
+        rate). The audit record is written in every mode; the allowance is
+        armed only while restricted — unrestricted needs none, and one armed
+        there would outlive a switch back to restricted for its TTL.
+        When no tracker resolves for the payment type, restricted mode
+        disarms instead of letting the flow die mid-request on a guard
+        denial; unrestricted stays armed.
+        """
+        restricted = self._guard.mode() == MODE_RESTRICTED
+        tracker, is_token = _deposit_tracker(chain, priced.payment_type)
+        if tracker is None:
+            if restricted:
+                logger.info(
+                    "no balance tracker for payment type %s on %s; auto_deposit "
+                    "disarmed in restricted mode",
+                    priced.payment_type,
+                    chain,
+                )
+                return False
+            return True
+        amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate
+        if restricted:
+            self._guard.allow_safe_deposit_once(
+                chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
+            )
+        self._activity.record(
+            "mech_deposit_allowance",
+            chain=chain,
+            tracker=tracker,
+            amount_cap=str(amount_cap),
+            is_token=is_token,
+        )
+        return True
 
     def _blocked(self, chain: str, tool: str, reason: str, detail: str) -> None:
         """Audit a request refused by policy, before raising it to the caller."""
@@ -625,11 +884,12 @@ class MechService:
             priority_mech = str(listing["mechs"][0]["address"])
         fetch_info = service._fetch_mech_info  # pylint: disable=protected-access
         try:
-            _, service_id, max_delivery_rate = fetch_info(priority_mech)
+            payment_type, service_id, max_delivery_rate = fetch_info(priority_mech)
         except Exception as e:
             raise MechError(f"could not price mech {priority_mech}: {e}") from e
         return PricedMech(
             mech=priority_mech,
             service_id=int(service_id),
-            rate_wei=int(max_delivery_rate),
+            rate=int(max_delivery_rate),
+            payment_type=str(payment_type.value),
         )
