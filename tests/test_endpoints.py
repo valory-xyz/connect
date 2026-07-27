@@ -31,7 +31,7 @@ from connect import wallet as wallet_module
 from connect import workspace
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.settings import HARNESSES, MODES
+from connect.settings import HARNESSES
 from connect.signer import Signer
 
 from tests.conftest import FakeW3
@@ -219,11 +219,14 @@ class TestOpenEndpoints:
     ) -> None:
         """The real UI's contract with the server, pinned against its bundle.
 
-        Nothing in the Python suite executes the UI's JavaScript, and that page
-        is the operator's only way to change the guardrail. So at least hold
-        the shipped bundle to the endpoint paths and settings values it embeds:
-        renaming either side would otherwise break the control surface with
-        every test still green.
+        Nothing in the Python suite executes the UI's JavaScript. So at least
+        hold the shipped bundle to the endpoint paths and settings values it
+        embeds: renaming either side would otherwise break the control surface
+        with every test still green.
+
+        Since v0.1.2-connect the UI no longer offers a mode control
+        (VLOP-114), so the mode values are deliberately not pinned — the
+        harness select is the one settings control the page still submits.
         """
         ui_dir = workspace.assets_dir() / workspace.UI_SUBDIR
         bundle = "".join(
@@ -233,10 +236,8 @@ class TestOpenEndpoints:
         # the endpoints the build drives, same-origin on this server's port
         for needle in ("/settings", "/session", "127.0.0.1:8716"):
             assert needle in bundle
-        # the mode values it submits must be values the API accepts — a typo
-        # here is invisible to every other test in the suite
-        for mode in MODES:
-            assert f'"{mode}"' in bundle
+        # the harness values it submits must be values the API accepts — a
+        # typo here is invisible to every other test in the suite
         for harness in HARNESSES:
             assert f'"{harness}"' in bundle
         # the canonical shape it renders, exactly as GET /settings returns it
