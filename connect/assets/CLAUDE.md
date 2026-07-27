@@ -85,8 +85,8 @@ these or something similar, in their words, and invite them to pick one or ask t
 - **Put funds where a prediction points** — e.g. "Find a liquidity pool with
   strong expected yield and invest in it." A mech request for the forecast,
   then a spend from the service safe.
-- **Trade on prediction markets** — e.g. "Trade on Omen using mech
-  predictions, and keep notes on each outcome." Mech predictions drive
+- **Trade on prediction markets** — e.g. "Trade on Omen using AI
+  prediction services, and keep notes on each outcome." Mech predictions drive
   positions on Omen (a Gnosis prediction market); record each outcome to the
   workspace so the user or agent can learn from them.
 - **Answer a live quantitative question** — e.g. "How many tweets will Elon
