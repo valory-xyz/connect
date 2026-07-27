@@ -226,7 +226,10 @@ class TestSettingsStore:
             blocker / "pearl-connect.settings.json", derive_mac_key(account), activity
         )
         assert store.load().protected.mode == MODE_UNRESTRICTED
-        assert "settings_unreadable" in audit_kinds(store_path)
+        # the flavor is platform-dependent — POSIX raises NotADirectoryError
+        # (unreadable), Windows FileNotFoundError (missing) — but either way
+        # the arrival at the defaults leaves a trace
+        assert {"settings_unreadable", "settings_reset"} & set(audit_kinds(store_path))
 
     def test_an_unreadable_file_is_never_overwritten(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
@@ -337,6 +340,7 @@ class TestSettingsStore:
         assert store.load().protected.mode == MODE_UNRESTRICTED  # in-memory defaults
         monkeypatch.undo()
         assert "settings_persist_failed" not in audit_kinds(store_path)
+        assert "settings_unreadable" in audit_kinds(store_path)
 
     def test_failed_write_leaves_no_temp_file(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
