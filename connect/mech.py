@@ -795,7 +795,8 @@ class MechService:
         # the chain id mech-client passes to sign_safe_message for this chain
         chain_id = int(service.mech_config.ledger_config.chain_id)
         digest = safe_message_hash(safe, chain_id, request_id)
-        self._guard.allow_digest_once(digest)
+        if self._guard.mode() == MODE_RESTRICTED:
+            self._guard.allow_digest_once(digest)
         self._activity.record(
             "mech_offchain_digest",
             chain=chain,
@@ -812,14 +813,17 @@ class MechService:
         balance tracker from the safe, which restricted mode only allows
         through a one-shot allowance bounded by the same cap mech-client
         itself enforces on the shortfall (ratio x the mech's per-request
-        rate). Armed in every mode for one code path and one audit trail.
+        rate). The audit record is written in every mode; the allowance is
+        armed only while restricted — unrestricted needs none, and one armed
+        there would outlive a switch back to restricted for its TTL.
         When no tracker resolves for the payment type, restricted mode
         disarms instead of letting the flow die mid-request on a guard
         denial; unrestricted mode needs no allowance and stays armed.
         """
+        restricted = self._guard.mode() == MODE_RESTRICTED
         tracker, is_token = _deposit_tracker(chain, priced.payment_type)
         if tracker is None:
-            if self._guard.mode() == MODE_RESTRICTED:
+            if restricted:
                 logger.info(
                     "no balance tracker for payment type %s on %s; auto_deposit "
                     "disarmed in restricted mode",
@@ -829,9 +833,10 @@ class MechService:
                 return False
             return True
         amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate_wei
-        self._guard.allow_safe_deposit_once(
-            chain=chain, tracker=tracker, amount_cap=amount_cap, token=is_token
-        )
+        if restricted:
+            self._guard.allow_safe_deposit_once(
+                chain=chain, tracker=tracker, amount_cap=amount_cap, token=is_token
+            )
         self._activity.record(
             "mech_deposit_allowance",
             chain=chain,

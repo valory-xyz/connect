@@ -182,6 +182,10 @@ class Guard:
         """
         with self._allowance_lock:
             self._purge_expired()
+            self._deposit_allowances = [
+                a for a in self._deposit_allowances
+                if (a.chain, a.tracker) != (chain.lower(), tracker.lower())
+            ]
             self._deposit_allowances.append(
                 _DepositAllowance(
                     chain=chain.lower(),

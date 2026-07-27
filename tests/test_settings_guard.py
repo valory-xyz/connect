@@ -727,6 +727,25 @@ class TestGuard:
         with pytest.raises(GuardError, match="whitelist"):
             guard.check_transaction("testchain", SAFE, 0, transfer)
 
+    def test_rearming_replaces_the_deposit_allowance(
+        self, store: SettingsStore
+    ) -> None:
+        """N arms for one (chain, tracker) still admit exactly one deposit.
+
+        Appending would stack grants — fifty requests arming the same
+        tracker would authorize fifty deposits at fifty caps. Re-arming must
+        refresh the single grant instead.
+        """
+        guard = make_guard(store, MODE_RESTRICTED)
+        for _ in range(3):
+            guard.allow_safe_deposit_once(
+                chain="testchain", tracker=TRACKER, amount_cap=100, token=False
+            )
+        deposit = exec_transaction_calldata(TRACKER, value=50)
+        guard.check_transaction("testchain", SAFE, 0, deposit)  # the one grant
+        with pytest.raises(GuardError, match="whitelist"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+
     def test_deposit_allowance_expires(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1789,20 +1808,43 @@ class TestMech:
         monkeypatch.setattr("connect.mech.CHAIN_NAME_TO_ID", None)
         assert _deposit_tracker("gnosis", PaymentType.NATIVE.value) == (None, False)
 
-    def test_unrestricted_offchain_keeps_auto_deposit(
+    def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
         self,
         mech_service: MechService,
+        guard: Guard,
         store_path: Path,
         patched_mech: FakeMarketplaceService,
     ) -> None:
         """Unrestricted mode passes auto_deposit through, and still audits.
 
-        The allowance registration runs in every mode — same code path, same
-        trail — even though unrestricted signing would pass without it.
+        The audit record is written in every mode, but the allowance itself
+        is not armed here: a grant created while unrestricted would outlive
+        an operator's switch back to restricted for its TTL.
         """
         mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         assert patched_mech.calls[0]["auto_deposit"] is True
         assert "mech_offchain_digest" in audit_kinds(store_path)
+        # nothing armed: no grant survives a flip back to restricted
+        assert not guard._allowed_digests  # pylint: disable=protected-access
+        assert not guard._deposit_allowances  # pylint: disable=protected-access
+
+    def test_unrestricted_auto_deposit_audits_but_arms_nothing(
+        self,
+        mech_service: MechService,
+        guard: Guard,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With a tracker resolved, unrestricted still audits and arms nothing."""
+        monkeypatch.setattr(
+            mech_module,
+            "_deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert "mech_deposit_allowance" in audit_kinds(store_path)
+        assert not guard._deposit_allowances  # pylint: disable=protected-access
 
     def test_register_offchain_digest_needs_a_safe(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
