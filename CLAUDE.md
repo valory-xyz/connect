@@ -53,7 +53,7 @@ Core modules:
 - `connect/signer.py` — the single signing choke point.
 - `connect/guard.py` — the guardrail; one gate for every signing path.
 - `connect/safe.py` — the only place that knows what an `execTransaction` looks like. The agent names an inner call (target, value, calldata); the server wraps it in the safe's `execTransaction` with a threshold-1 pre-validated signature.
-- `connect/settings.py` — tamper-evident settings persisted in STORE_PATH. Security-critical fields (mode, whitelist) are HMAC'd with a key derived from the agent private key; a failed verification resets them to the (unrestricted) defaults. The last-written MAC is also pinned in memory to defeat replay of old settings files. The `harness` preference sits outside the MAC deliberately (it can't move funds).
+- `connect/settings.py` — tamper-evident settings persisted in STORE_PATH. Security-critical fields (mode, whitelist) are HMAC'd with a key derived from the agent private key; a failed verification resets them to the (unrestricted) defaults — deliberate and audited, see the module docstring for the reasoning. The last-written MAC is also pinned in memory to defeat replay of old settings files. The `harness` preference sits outside the MAC deliberately (it can't move funds).
 - `connect/mech.py` — mech marketplace requests via mech-client's `Signer` protocol, so every transaction/digest still passes the choke point.
 - `connect/config.py` — the only module that reads env vars (`CONNECTION_*`, injected by Pearl from the service template).
 - `connect/activity.py` — audit trail of every signer action + `agent_performance.json` (Pearl SDK contract file).

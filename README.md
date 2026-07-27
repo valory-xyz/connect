@@ -88,7 +88,9 @@ endpoints and the mech request flow all pass the same check. State persists in
 `pearl-connect.settings.json` at STORE_PATH; the security-critical fields
 (mode, whitelist) are HMAC'd with a key derived from the agent private key
 and verified on every read — an edit by the agent (or anything else without
-the key) fails verification and resets them to the defaults. The
+the key) fails verification and resets them to the defaults — deliberate,
+and audited; the reasoning lives in `connect/settings.py`'s module
+docstring. The
 `harness` preference is stored alongside without integrity checks and survives
 a guardrail reset. It is outside the MAC because it cannot move funds or widen
 the guardrail — but it is not free of consequence: since `/session` never falls

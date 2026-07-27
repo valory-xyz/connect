@@ -25,7 +25,11 @@ it, so every read verifies an HMAC keyed off the agent private key before the
 content is trusted. The canonical shape nests the security-critical fields
 under "protected" ({"protected": {"mode", "whitelist"}, "harness"}) and the
 MAC covers exactly that object (plus the version); a failed verification
-resets it to the built-in defaults.
+resets it to the built-in defaults. Landing on the defaults (rather than a
+narrower fail-closed state) is deliberate: a mistaken edit or deletion of
+the file must not brick the agent, and the defaults are exactly what a
+fresh install ships with — so the reset adds no exposure a new install does
+not already accept. Every reset-to-defaults transition is audited.
 Preference fields (harness) live outside "protected" without integrity
 checks: editing them simply applies, and they survive a protected reset.
 Legitimate protected changes go through the password-gated settings PATCH,
@@ -374,6 +378,9 @@ class SettingsStore:
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            self._activity.record(
+                "settings_reset", path=str(self._path), reason="missing"
+            )
             return self._reset(defaults())  # nothing to lose: create it
         except OSError as e:
             # An unreadable file is NOT a missing one, and must not be written
@@ -387,6 +394,9 @@ class SettingsStore:
                 "settings file %s could not be read (%s); using defaults until it can be",
                 self._path,
                 e,
+            )
+            self._activity.record(
+                "settings_unreadable", path=str(self._path), error=str(e)
             )
             return defaults()
         payload = self._parse(raw)

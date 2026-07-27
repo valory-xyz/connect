@@ -129,13 +129,15 @@ class TestSettingsStore:
     """SettingsStore verification behavior."""
 
     def test_missing_file_writes_unrestricted_defaults(
-        self, store: SettingsStore
+        self, store: SettingsStore, store_path: Path
     ) -> None:
         """A fresh store starts from the unrestricted defaults and persists them."""
         loaded = store.load()
         assert loaded.protected.mode == MODE_UNRESTRICTED
         assert GNOSIS_MARKETPLACE in loaded.protected.whitelist["gnosis"]
         assert store._path.exists()  # pylint: disable=protected-access
+        # arriving at the widest state leaves a trace, even on first boot
+        assert "settings_reset" in audit_kinds(store_path)
 
     def test_roundtrip(self, store: SettingsStore) -> None:
         """Saved settings load back identically, immediately (no cache)."""
@@ -205,8 +207,12 @@ class TestSettingsStore:
         assert final.protected.mode == MODE_RESTRICTED
         assert final.harness == "claude_code_cli"
 
-    def test_unreadable_file_serves_defaults(
-        self, account: LocalAccount, activity: ActivityLog, tmp_path: Path
+    def test_unreadable_file_serves_defaults(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        activity: ActivityLog,
+        tmp_path: Path,
+        store_path: Path,
     ) -> None:
         """An unreadable settings file serves defaults, it does not crash the agent.
 
@@ -220,6 +226,7 @@ class TestSettingsStore:
             blocker / "pearl-connect.settings.json", derive_mac_key(account), activity
         )
         assert store.load().protected.mode == MODE_UNRESTRICTED
+        assert "settings_unreadable" in audit_kinds(store_path)
 
     def test_an_unreadable_file_is_never_overwritten(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
@@ -388,6 +395,23 @@ class TestSettingsStore:
         path.write_text(json.dumps(payload))
         loaded = store.load()
         assert OTHER not in loaded.protected.whitelist.get("testchain", ())
+        assert loaded.protected.mode == MODE_UNRESTRICTED  # the default posture
+
+    def test_a_forged_mode_value_is_never_trusted(self, store: SettingsStore) -> None:
+        """The enforced mode after tamper is the default, not the forged value.
+
+        Resetting to the (unrestricted) defaults is deliberate — a mistaken
+        edit or deletion must not brick the agent, and the defaults are the
+        shipped state anyway. What must never happen is the forged value
+        itself winning: forging "restricted" still yields the default, so the
+        payload is demonstrably discarded rather than believed.
+        """
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        path = store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        payload["protected"]["mode"] = MODE_RESTRICTED  # forged without the key
+        path.write_text(json.dumps(payload))
+        assert store.load().protected.mode == MODE_UNRESTRICTED  # not the forgery
 
     def test_harness_edit_applies_without_the_key(self, store: SettingsStore) -> None:
         """The harness is a preference: a plain file edit simply takes effect."""

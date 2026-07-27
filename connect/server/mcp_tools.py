@@ -56,9 +56,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 ) -> FastMCP:
     """Build mcp."""
     # Read once per build: tool registration happens here while wallet_info's
-    # mode key is added per call, and one snapshot keeps the two surfaces
-    # agreeing for the life of this server instance even if the module
-    # attribute is ever toggled at runtime.
+    # mode key is added per call, and one snapshot keeps the MCP surface
+    # internally consistent (a registered `settings` tool always comes with
+    # the wallet_info mode key). GET /wallet reads the flag per request —
+    # the constant only changes with a rebuild, so the surfaces cannot
+    # actually diverge in a running process.
     expose_mode = settings_config.EXPOSE_MODE_TO_AGENT
     mcp = FastMCP(
         name="connect",
