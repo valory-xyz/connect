@@ -166,10 +166,12 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
     @mcp.tool()
     async def sign_message(digest: str) -> dict:
-        """Sign a raw 32-byte digest (0x-hex), unprefixed — for off-chain mech requests.
+        """Sign a raw 32-byte digest (0x-hex), unprefixed.
 
-        Unavailable in restricted mode (the guardrail cannot inspect what a
-        digest commits to).
+        Unrestricted mode only — the guardrail cannot inspect what a bare
+        digest commits to. The off-chain mech flow does not use this tool: it
+        signs its own SafeMessage-wrapped request-id digest internally,
+        through a server-only allowance that no MCP tool reaches.
         """
         try:
             raw = bytes.fromhex(digest.removeprefix("0x"))
@@ -194,8 +196,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         The safe pays, so `chain` defaults to a configured chain that has one.
         Off-chain by default: few mechs can serve that, so check
         `offchain_capable` with mech_tools first; legacy_on_chain=true goes
-        through the marketplace instead and works in restricted mode.
-        Refused before paying if the mech's price exceeds max_payment (wei).
+        through the marketplace instead. Both flows (and the off-chain
+        auto_deposit top-up) work in restricted mode.
+        Refused before paying if the mech's price exceeds max_payment
+        (base units of the mech's payment asset).
         On timeout the ids come back as `pending_request_ids` for mech_result.
         """
         # mech-client manages its own event loops (asyncio.run + sync gql):

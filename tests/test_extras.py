@@ -21,6 +21,8 @@
 
 import json
 import logging
+import threading
+import time as time_module
 import typing as t
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from fastapi.testclient import TestClient
 from web3 import Web3
 
 from connect import __main__ as main_module
+from connect import signer as signer_module
 from connect import wallet, workspace
 from connect.activity import ActivityLog, MAX_LOG_BYTES
 from connect.config import (
@@ -47,7 +50,7 @@ from connect.mech import MechService
 from connect.server.auth import AuthFailureLimiter, AuthMiddleware
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
-from connect.signer import Signer, SignerError
+from connect.signer import Signer, SignerError, _IdempotencyCache
 
 from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
 
@@ -666,8 +669,6 @@ class TestSignerExtras:
         self, monkeypatch: pytest.MonkeyPatch, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
         """Unknown-but-configured chains get a Web3 client, cached."""
-        from connect import signer as signer_module
-
         pool = test_signer._chains  # pylint: disable=protected-access
         pool._config.chains["otherchain"] = (  # pylint: disable=protected-access
             ChainConfig(rpc_url="http://127.0.0.1:9")
@@ -721,8 +722,6 @@ class TestSignerExtras:
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
         """A retry racing an in-flight send with the same id cannot double-spend."""
-        import threading
-
         started = threading.Event()
         release = threading.Event()
         original_estimate = fake_w3.eth.estimate_gas
@@ -757,16 +756,12 @@ class TestSignerExtras:
 
     def test_idempotency_cache_returns_cached_inside_run(self) -> None:
         """run() itself replays a completed key (guards the racing-caller path)."""
-        from connect.signer import _IdempotencyCache
-
         cache = _IdempotencyCache()
         assert cache.run("k", lambda: "0xaaa") == "0xaaa"
         assert cache.run("k", lambda: "0xbbb") == "0xaaa"  # action not re-run
 
     def test_idempotency_cache_evicts_oldest(self) -> None:
         """The result cache is bounded; the oldest replays are dropped first."""
-        from connect.signer import _IdempotencyCache
-
         cache = _IdempotencyCache(max_results=2)
         cache.run("a", lambda: "0xa")
         cache.run("b", lambda: "0xb")
@@ -969,10 +964,6 @@ class TestPearlRoutesExtras:
         make_app: t.Callable,
     ) -> None:
         """A warm cache short-circuits computation."""
-        import time as time_module
-
-        from fastapi.testclient import TestClient
-
         app = make_app(test_signer, app_config, activity)
         app.state.funds_cache["at"] = time_module.monotonic()
         app.state.funds_cache["value"] = {"cached": True}
@@ -988,8 +979,6 @@ class TestPearlRoutesExtras:
         make_app: t.Callable,
     ) -> None:
         """RPC failure yields {} instead of an error."""
-        from fastapi.testclient import TestClient
-
         monkeypatch.setattr(
             wallet, "funds_status", lambda c, s: (_ for _ in ()).throw(RuntimeError())
         )
@@ -1010,8 +999,6 @@ class TestSignerRoutesExtras:
         make_app: t.Callable,
     ) -> None:
         """Integer values pass the coercing validator untouched."""
-        from fastapi.testclient import TestClient
-
         app = make_app(test_signer, app_config, activity)
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             response = client.post(
@@ -1030,8 +1017,6 @@ class TestSignerRoutesExtras:
         make_app: t.Callable,
     ) -> None:
         """Negative amounts are rejected by validation, before the signer."""
-        from fastapi.testclient import TestClient
-
         app = make_app(test_signer, app_config, activity)
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             response = client.post(
@@ -1050,8 +1035,6 @@ class TestSignerRoutesExtras:
         make_app: t.Callable,
     ) -> None:
         """A short digest is rejected with 400."""
-        from fastapi.testclient import TestClient
-
         app = make_app(test_signer, app_config, activity)
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             response = client.post(
