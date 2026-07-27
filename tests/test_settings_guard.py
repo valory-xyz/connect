@@ -231,6 +231,33 @@ class TestSettingsStore:
         # the arrival at the defaults leaves a trace
         assert {"settings_unreadable", "settings_reset"} & set(audit_kinds(store_path))
 
+    def test_degraded_state_is_audited_once_per_episode(
+        self, store: SettingsStore, store_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A condition that does not heal records one transition, not per read.
+
+        Every guarded decision loads the settings, so a stuck unreadable file
+        would otherwise append an identical record per signing request until
+        rotation drops the real history. Recovery re-arms the next episode.
+        """
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+
+        def refuse(self: Path, **kwargs: object) -> str:
+            raise PermissionError("held by another process")
+
+        monkeypatch.setattr(Path, "read_text", refuse)
+        for _ in range(5):  # five guarded decisions during one outage
+            store.load()
+        monkeypatch.undo()
+        kinds = audit_kinds(store_path)
+        assert kinds.count("settings_unreadable") == 1
+
+        store.load()  # heals: the file is readable and verifies again
+        monkeypatch.setattr(Path, "read_text", refuse)
+        store.load()  # a second outage is a new episode
+        monkeypatch.undo()
+        assert audit_kinds(store_path).count("settings_unreadable") == 2
+
     def test_an_unreadable_file_is_never_overwritten(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:

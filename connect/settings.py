@@ -29,7 +29,7 @@ resets it to the built-in defaults. Landing on the defaults (rather than a
 narrower fail-closed state) is deliberate: a mistaken edit or deletion of
 the file must not brick the agent, and the defaults are exactly what a
 fresh install ships with — so the reset adds no exposure a new install does
-not already accept. Every reset-to-defaults transition is audited.
+not already accept. Every reset-to-defaults transition is audited once per episode.
 Preference fields (harness) live outside "protected" without integrity
 checks: editing them simply applies, and they survive a protected reset.
 Legitimate protected changes go through the password-gated settings PATCH,
@@ -344,6 +344,7 @@ class SettingsStore:
         self._activity = activity
         self._lock = threading.Lock()
         self._expected_mac: str | None = None
+        self._degraded: str | None = None
 
     def load(self) -> Settings:
         """Return the verified settings, restoring defaults on any problem."""
@@ -374,12 +375,25 @@ class SettingsStore:
                 raise SettingsPersistError(str(e)) from e
             return PatchResult(previous=previous, updated=updated)
 
+    def _record_once(self, condition: str, kind: str, **fields: object) -> None:
+        """Audit a degraded-state transition once per episode, not per read.
+
+        The activity log is history, and an unhealed condition re-entering
+        this path on every signing request would bury that history under
+        identical records until rotation drops it. One record marks the
+        transition in; a verified load re-arms the next one.
+        """
+        if self._degraded == condition:
+            return
+        self._degraded = condition
+        self._activity.record(kind, **fields)
+
     def _load(self) -> Settings:
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            self._activity.record(
-                "settings_reset", path=str(self._path), reason="missing"
+            self._record_once(
+                "missing", "settings_reset", path=str(self._path), reason="missing"
             )
             return self._reset(defaults())  # nothing to lose: create it
         except OSError as e:
@@ -395,18 +409,19 @@ class SettingsStore:
                 self._path,
                 e,
             )
-            self._activity.record(
-                "settings_unreadable", path=str(self._path), error=str(e)
+            self._record_once(
+                "unreadable", "settings_unreadable", path=str(self._path), error=str(e)
             )
             return defaults()
         payload = self._parse(raw)
         verified = self._verify(payload)
         if verified is not None:
+            self._degraded = None  # healthy again: re-arm transition records
             return verified
         logger.warning(
             "settings file %s failed verification; restoring defaults", self._path
         )
-        self._activity.record("settings_tampered", path=str(self._path))
+        self._record_once("tampered", "settings_tampered", path=str(self._path))
         fallback = defaults()
         # the harness is a preference, not a security control: a tampered
         # mode/whitelist resets those, but must not discard the harness
