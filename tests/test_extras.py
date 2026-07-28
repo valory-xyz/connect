@@ -19,6 +19,7 @@
 
 """Tests for entrypoint, MCP tools, wallet helpers, workspace launch and auth ASGI."""
 
+import io
 import json
 import logging
 import threading
@@ -88,6 +89,81 @@ class TestMain:
         """Both --password forms parse."""
         assert main_module.parse_args(["--password", "x"]).password == "x"  # nosec B105
         assert main_module.parse_args(["--password=y"]).password == "y"  # nosec B105
+
+    def test_parse_args_password_stdin(self) -> None:
+        """--password-stdin parses; combining or omitting the sources fails."""
+        assert main_module.parse_args(["--password-stdin"]).password_stdin
+        with pytest.raises(SystemExit):
+            main_module.parse_args(["--password", "x", "--password-stdin"])
+        with pytest.raises(SystemExit):
+            main_module.parse_args([])
+
+    def test_password_stdin_strips_line_ending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r"""Only the trailing newline is stripped — CRLF included, spaces kept.
+
+        The middleware writes password + "\n" and closes the pipe; a password
+        with leading/trailing spaces must survive the trip.
+        """
+        monkeypatch.setattr("sys.stdin", io.StringIO(" spaced pw \r\n"))
+        resolved = main_module.resolve_password(["--password-stdin"])
+        assert resolved == " spaced pw "  # nosec B105
+
+    def test_password_stdin_tty_prompts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An interactive run gets a hidden-input prompt, not a silent hang.
+
+        Piped stdin (the middleware launch) must stay promptless — getpass
+        writes to the terminal, and a human at a TTY would otherwise stare at
+        a blank line.
+        """
+        tty_stdin = io.StringIO()
+        monkeypatch.setattr(tty_stdin, "isatty", lambda: True)
+        monkeypatch.setattr("sys.stdin", tty_stdin)
+        prompts: list[str] = []
+
+        def fake_getpass(prompt: str) -> str:
+            prompts.append(prompt)
+            return "typed pw"
+
+        monkeypatch.setattr(main_module.getpass, "getpass", fake_getpass)
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "typed pw"
+        )  # nosec B105
+        assert prompts == ["Enter password: "]
+
+        monkeypatch.setattr(main_module.getpass, "getpass", lambda prompt: "")
+        assert main_module.resolve_password(["--password-stdin"]) is None
+
+    def test_main_password_stdin_happy_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        keystore_dir: Path,
+        store_path: Path,
+        served: list[StubServer],
+    ) -> None:
+        """The stdin password path boots exactly like the argv path.
+
+        This is the launch shape the middleware moves to for OPE-1832: argv is
+        world-readable via /proc/<pid>/cmdline, stdin is not.
+        """
+        monkeypatch.chdir(keystore_dir)
+        monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
+        monkeypatch.delenv(SAFES_ENV, raising=False)
+        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+        monkeypatch.setattr("sys.stdin", io.StringIO(TEST_PASSWORD + "\n"))
+        assert main_module.main(["--password-stdin"]) == 0
+        app = served[0].config.app
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            assert client.get("/healthcheck").json() == {"is_healthy": True}
+
+    def test_main_password_stdin_empty(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An empty/closed stdin is a clear boot failure, not a keystore error."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+        assert main_module.main(["--password-stdin"]) == 1
 
     def test_main_config_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

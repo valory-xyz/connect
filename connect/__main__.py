@@ -19,13 +19,18 @@
 
 """Run the connect agent server.
 
-Started by the Pearl middleware as: <binary> --password <password>.
+Started by the Pearl middleware as: <binary> --password-stdin, with the
+keystore password written to stdin (one line, pipe closed after). The legacy
+form <binary> --password <password> is still accepted, but argv is
+world-readable via /proc/<pid>/cmdline for the whole process lifetime, so
+stdin is the supported path (see OPE-1832).
 
 cwd is the deployment build dir (contains ethereum_private_key.txt); all other
 configuration arrives via environment variables (see config.py).
 """
 
 import argparse
+import getpass
 import logging
 import secrets
 import sys
@@ -61,13 +66,41 @@ def setup_logging(level: str = "info") -> logging.Logger:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse args."""
     parser = argparse.ArgumentParser(prog="connect")
-    parser.add_argument("--password", required=True, help="keystore password")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--password",
+        help="keystore password (visible in the process argv; prefer --password-stdin)",
+    )
+    source.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the keystore password from the first line of stdin",
+    )
     return parser.parse_args(argv)
+
+
+def resolve_password(argv: list[str] | None = None) -> str | None:
+    """Parse argv and resolve the keystore password.
+
+    With --password-stdin the password is the first line of stdin (trailing
+    newline stripped, spaces kept); None means stdin was empty or closed. On
+    an interactive run (stdin is a TTY) it prompts instead, with the typed
+    input hidden.
+    """
+    args = parse_args(argv)
+    if not args.password_stdin:
+        return str(args.password)
+    if sys.stdin.isatty():
+        return getpass.getpass("Enter password: ") or None
+    return sys.stdin.readline().rstrip("\r\n") or None
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the agent server; return the process exit code."""
-    args = parse_args(argv)
+    password = resolve_password(argv)
+    if password is None:
+        setup_logging().error("--password-stdin: no password received on stdin")
+        return 1
 
     try:
         config = load_config()
@@ -79,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("connect starting")
 
     try:
-        account = load_account(args.password)
+        account = load_account(password)
     except KeystoreError as e:
         logger.error("keystore error: %s", e)
         return 1
