@@ -141,6 +141,28 @@ class TestMain:
             main_module.resolve_password(["--password-stdin"]) == "pw\r"
         )  # nosec B105
 
+    def test_password_stdin_preserves_embedded_newline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r"""The read is EOF-terminated, not line-terminated (docker semantics).
+
+        The account layer accepts passwords containing newlines, so the pipe
+        protocol must carry them; a readline()-style read would silently
+        truncate at the first "\n" and surface as a wrong-password keystore
+        error. Only the single trailing terminator the writer appends is
+        stripped.
+        """
+        monkeypatch.setattr("sys.stdin", io.StringIO("line1\nline2\n"))
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "line1\nline2"
+        )  # nosec B105
+        # password genuinely ending in "\n": writer sends pw\n + \n; exactly
+        # one terminator is stripped, restoring the original
+        monkeypatch.setattr("sys.stdin", io.StringIO("pw\n\n"))
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "pw\n"
+        )  # nosec B105
+
     @pytest.mark.usefixtures("tty_stdin")
     def test_password_stdin_tty_prompts(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -270,7 +292,7 @@ class TestMain:
         """A piped read that dies is a logged exit 1 — and leaks no password bytes.
 
         The pipe is the production launch path: this pins the try block
-        around the readline() branch, not just the getpass one, and pins
+        around the read() branch, not just the getpass one, and pins
         class-name-only logging (a UnicodeDecodeError's repr embeds the
         very bytes it was decoding).
         """
@@ -283,7 +305,7 @@ class TestMain:
             )
 
         stdin = io.StringIO()
-        monkeypatch.setattr(stdin, "readline", raise_decode_error)
+        monkeypatch.setattr(stdin, "read", raise_decode_error)
         monkeypatch.setattr("sys.stdin", stdin)
         with caplog.at_level(logging.ERROR):
             assert main_module.main(["--password-stdin"]) == 1

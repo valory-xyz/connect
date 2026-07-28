@@ -74,7 +74,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     source.add_argument(
         "--password-stdin",
         action="store_true",
-        help="read the keystore password from the first line of stdin",
+        help="read the keystore password from stdin, until EOF (docker-style)",
     )
     return parser.parse_args(argv)
 
@@ -82,13 +82,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def resolve_password(argv: list[str] | None = None) -> str | None:
     r"""Parse argv and resolve the keystore password; None (already logged) on failure.
 
-    With --password-stdin the password is the first line of piped stdin —
-    exactly one trailing LF or CRLF stripped (a Windows writer's text-mode
-    pipe turns "\n" into "\r\n"), everything else kept — or, on an
-    interactive TTY, a hidden "Enter password:" prompt. Failure means an
-    empty password from any source, or a read that died (EOF at the prompt,
-    Ctrl-C, closed descriptor, undecodable bytes); it is logged here because
-    it happens before the configured logger exists, and a crash on this path
+    With --password-stdin the password is the whole of piped stdin up to EOF
+    (`docker login --password-stdin` semantics: the writer closes the pipe to
+    terminate the read) — exactly one trailing LF or CRLF stripped (a Windows
+    writer's text-mode pipe turns "\n" into "\r\n"), everything else kept, so
+    embedded newlines survive — or, on an interactive TTY, a hidden
+    "Enter password:" prompt (a deliberate deviation from docker, which never
+    prompts; prompt entry is inherently single-line). Failure means an empty
+    password from any source, or a read that died (EOF at the prompt, Ctrl-C,
+    closed descriptor, undecodable bytes); it is logged here because it
+    happens before the configured logger exists, and a crash on this path
     would otherwise never reach log.txt.
     """
     args = parse_args(argv)
@@ -98,7 +101,7 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
         elif sys.stdin.isatty():
             password = getpass.getpass("Enter password: ")
         else:
-            password = sys.stdin.readline().removesuffix("\n").removesuffix("\r")
+            password = sys.stdin.read().removesuffix("\n").removesuffix("\r")
     except (EOFError, KeyboardInterrupt, OSError, ValueError) as e:
         setup_logging().error(
             "failed to read the keystore password: %s", type(e).__name__

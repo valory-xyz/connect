@@ -5,8 +5,9 @@ Pearl Connect agent. When a user starts the BYOA agent in
 other non-aea agent. It:
 
 1. decrypts the agent EOA keystore (`./ethereum_private_key.txt`) in memory
-   using the keystore password — read from stdin with `--password-stdin`
-   (preferred: argv is world-readable via `/proc/<pid>/cmdline` on Linux) or
+   using the keystore password — read from stdin until EOF with
+   `--password-stdin` (docker-style, one trailing newline stripped;
+   preferred: argv is world-readable via `/proc/<pid>/cmdline` on Linux) or
    from the legacy `--password` argument — key material never leaves the
    process;
 2. populates the service's persistent workspace (`STORE_PATH`) with a
