@@ -100,7 +100,9 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
         else:
             password = sys.stdin.readline().removesuffix("\n").removesuffix("\r")
     except (EOFError, KeyboardInterrupt, OSError, ValueError) as e:
-        setup_logging().error("failed to read the keystore password: %r", e)
+        setup_logging().error(
+            "failed to read the keystore password: %s", type(e).__name__
+        )
         return None
     if not password:
         setup_logging().error(

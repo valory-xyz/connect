@@ -97,6 +97,15 @@ def boot_env_fixture(
     return store_path
 
 
+@pytest.fixture(name="tty_stdin")
+def tty_stdin_fixture(monkeypatch: pytest.MonkeyPatch) -> io.StringIO:
+    """Fake an interactive stdin: sys.stdin becomes a StringIO claiming to be a TTY."""
+    stdin = io.StringIO()
+    monkeypatch.setattr(stdin, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin)
+    return stdin
+
+
 class TestMain:
     """Entrypoint tests."""
 
@@ -132,6 +141,7 @@ class TestMain:
             main_module.resolve_password(["--password-stdin"]) == "pw\r"
         )  # nosec B105
 
+    @pytest.mark.usefixtures("tty_stdin")
     def test_password_stdin_tty_prompts(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -142,9 +152,6 @@ class TestMain:
         a blank line.
         """
         monkeypatch.chdir(tmp_path)  # failure paths write log.txt to cwd
-        tty_stdin = io.StringIO()
-        monkeypatch.setattr(tty_stdin, "isatty", lambda: True)
-        monkeypatch.setattr("sys.stdin", tty_stdin)
         prompts: list[str] = []
 
         def fake_getpass(prompt: str) -> str:
@@ -177,6 +184,7 @@ class TestMain:
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/healthcheck").json() == {"is_healthy": True}
 
+    @pytest.mark.usefixtures("tty_stdin")
     def test_main_password_tty_happy_path(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -184,9 +192,6 @@ class TestMain:
         served: list[StubServer],
     ) -> None:
         """A TTY-prompted password drives the same full boot as a piped one."""
-        tty_stdin = io.StringIO()
-        monkeypatch.setattr(tty_stdin, "isatty", lambda: True)
-        monkeypatch.setattr("sys.stdin", tty_stdin)
         monkeypatch.setattr(
             main_module.getpass, "getpass", lambda prompt: TEST_PASSWORD
         )
@@ -208,6 +213,7 @@ class TestMain:
         monkeypatch.chdir(tmp_path)
         assert main_module.main(["--password", ""]) == 1
 
+    @pytest.mark.usefixtures("tty_stdin")
     def test_main_password_read_failure(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -218,12 +224,11 @@ class TestMain:
 
         getpass raises EOFError on EOF-at-prompt (terminal hangup, closed
         pty); this happens before the configured logger exists, so an
-        uncaught crash here would never reach log.txt.
+        uncaught crash here would never reach log.txt. Only the exception
+        class name may be logged — a UnicodeDecodeError's repr embeds the
+        password bytes it was decoding.
         """
         monkeypatch.chdir(tmp_path)
-        tty_stdin = io.StringIO()
-        monkeypatch.setattr(tty_stdin, "isatty", lambda: True)
-        monkeypatch.setattr("sys.stdin", tty_stdin)
 
         def raise_eof(prompt: str) -> str:
             raise EOFError
@@ -231,7 +236,59 @@ class TestMain:
         monkeypatch.setattr(main_module.getpass, "getpass", raise_eof)
         with caplog.at_level(logging.ERROR):
             assert main_module.main(["--password-stdin"]) == 1
-        assert "failed to read the keystore password" in caplog.text
+        assert "failed to read the keystore password: EOFError" in caplog.text
+
+    @pytest.mark.usefixtures("tty_stdin")
+    def test_main_password_prompt_interrupt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Ctrl-C at the prompt is a logged exit 1, not an uncaught interrupt.
+
+        Pins KeyboardInterrupt's place in the except tuple: dropping it
+        would pass line coverage and every other test, silently reverting
+        an interactive cancel to a raw traceback.
+        """
+        monkeypatch.chdir(tmp_path)
+
+        def raise_interrupt(prompt: str) -> str:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(main_module.getpass, "getpass", raise_interrupt)
+        with caplog.at_level(logging.ERROR):
+            assert main_module.main(["--password-stdin"]) == 1
+        assert "failed to read the keystore password: KeyboardInterrupt" in caplog.text
+
+    def test_main_password_pipe_read_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A piped read that dies is a logged exit 1 — and leaks no password bytes.
+
+        The pipe is the production launch path: this pins the try block
+        around the readline() branch, not just the getpass one, and pins
+        class-name-only logging (a UnicodeDecodeError's repr embeds the
+        very bytes it was decoding).
+        """
+        monkeypatch.chdir(tmp_path)
+
+        def raise_decode_error(size: int = -1) -> str:
+            # the decode error a bad-locale pipe read raises, bytes and all
+            raise UnicodeDecodeError(
+                "utf-8", b"sup3r\xffsecret\n", 5, 6, "invalid start byte"
+            )
+
+        stdin = io.StringIO()
+        monkeypatch.setattr(stdin, "readline", raise_decode_error)
+        monkeypatch.setattr("sys.stdin", stdin)
+        with caplog.at_level(logging.ERROR):
+            assert main_module.main(["--password-stdin"]) == 1
+        assert "failed to read the keystore password: UnicodeDecodeError" in caplog.text
+        assert "secret" not in caplog.text
 
     def test_main_config_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
