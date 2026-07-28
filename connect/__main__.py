@@ -80,26 +80,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def resolve_password(argv: list[str] | None = None) -> str | None:
-    """Parse argv and resolve the keystore password.
+    r"""Parse argv and resolve the keystore password; None (already logged) on failure.
 
-    With --password-stdin the password is the first line of stdin (trailing
-    newline stripped, spaces kept); None means stdin was empty or closed. On
-    an interactive run (stdin is a TTY) it prompts instead, with the typed
-    input hidden.
+    With --password-stdin the password is the first line of piped stdin —
+    exactly one trailing LF or CRLF stripped (a Windows writer's text-mode
+    pipe turns "\n" into "\r\n"), everything else kept — or, on an
+    interactive TTY, a hidden "Enter password:" prompt. Failure means an
+    empty password from any source, or a read that died (EOF at the prompt,
+    Ctrl-C, closed descriptor, undecodable bytes); it is logged here because
+    it happens before the configured logger exists, and a crash on this path
+    would otherwise never reach log.txt.
     """
     args = parse_args(argv)
-    if not args.password_stdin:
-        return str(args.password)
-    if sys.stdin.isatty():
-        return getpass.getpass("Enter password: ") or None
-    return sys.stdin.readline().rstrip("\r\n") or None
+    try:
+        if not args.password_stdin:
+            password: str = args.password
+        elif sys.stdin.isatty():
+            password = getpass.getpass("Enter password: ")
+        else:
+            password = sys.stdin.readline().removesuffix("\n").removesuffix("\r")
+    except (EOFError, KeyboardInterrupt, OSError, ValueError) as e:
+        setup_logging().error("failed to read the keystore password: %r", e)
+        return None
+    if not password:
+        setup_logging().error(
+            "no keystore password received (empty --password value or stdin line)"
+        )
+        return None
+    return password
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the agent server; return the process exit code."""
     password = resolve_password(argv)
     if password is None:
-        setup_logging().error("--password-stdin: no password received on stdin")
         return 1
 
     try:
