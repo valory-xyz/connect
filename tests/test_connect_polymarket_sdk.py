@@ -22,8 +22,9 @@
 These import ``py_clob_client_v2``, which is NOT a repo dependency (the agent
 pip-installs it into its own venv). So the whole module SKIPS when the SDK is
 absent — e.g. in the repo's CI — and runs where it is installed (the agent
-env, or a dev venv with the SDK). It covers the two branches the live e2e did
-not: the auth-failure creds-refresh retry, and the Account-shim routing.
+env, or a dev venv with the SDK). It covers the branches the live e2e did
+not: the auth-failure creds-refresh retry, the Account-shim routing, and the
+ambiguous-submission reconciliation (lost responses, provisional "matched").
 """
 
 # mypy: ignore-errors
@@ -205,11 +206,58 @@ class _OrderClient:
 
 
 class _AmbiguousOrderClient:
-    """A CLOB client that loses the response after a possible acceptance."""
+    """A CLOB client that loses the response after a possible acceptance.
+
+    It has no read methods at all, so the pre-submission snapshot fails and
+    reconciliation cannot attribute anything — the worst case.
+    """
 
     def post_order(self, order, order_type):
         """Raise without an HTTP status, leaving submission outcome unknown."""
         raise PolyApiException(error_msg="Request exception!")
+
+
+class _LostResponseClient:
+    """Submission raises a transport error; reads replay configured pages.
+
+    The first page of each series is what the pre-submission snapshot sees;
+    later polls pop the next page and then repeat the last one.
+    """
+
+    def __init__(self, trades_pages=None, orders_pages=None):
+        """Store the page series for get_trades and get_open_orders."""
+        self._trades = [list(p) for p in (trades_pages or [[]])]
+        self._orders = [list(p) for p in (orders_pages or [[]])]
+
+    @staticmethod
+    def _page(pages):
+        """Pop pages until one remains, then keep returning it."""
+        return pages.pop(0) if len(pages) > 1 else pages[0]
+
+    def get_trades(self, params=None, **kwargs):
+        """Return the next configured trades page."""
+        return self._page(self._trades)
+
+    def get_open_orders(self, params=None, **kwargs):
+        """Return the next configured open-orders page."""
+        return self._page(self._orders)
+
+    def post_order(self, order, order_type):
+        """Raise the transport failure that loses the CLOB's response."""
+        raise PolyApiException(error_msg="The read operation timed out")
+
+
+class _MatchedResponseClient(_LostResponseClient):
+    """A CLOB client whose submission succeeds with a "matched" payload."""
+
+    def post_order(self, order, order_type):
+        """Return the success/matched response under settlement test."""
+        return {
+            "success": True,
+            "status": "matched",
+            "orderID": "0xAB",
+            "tradeIDs": ["0bfda62e"],
+        }
 
 
 class _HttpErrorOrderClient:
@@ -234,8 +282,8 @@ class _AuthMessageOrderClient:
         raise PolyApiException(error_msg="unauthorized")
 
 
-def test_buy_hint_survives_ambiguous_submission(monkeypatch) -> None:
-    """A lost response must leave a hint that a later sweep can inspect."""
+def _track_intents(monkeypatch):
+    """Stub the intent bookkeeping; return (recorded, confirmed, rejected)."""
     recorded = []
     confirmed = []
     rejected = []
@@ -248,8 +296,28 @@ def test_buy_hint_survives_ambiguous_submission(monkeypatch) -> None:
     monkeypatch.setattr(
         trade.pm, "reject_dw_buy_intent", lambda cs, tid: rejected.append(tid)
     )
+    return recorded, confirmed, rejected
 
-    with pytest.raises(PolyApiException):
+
+def _no_network_no_sleep(monkeypatch, book_ok=True):
+    """Keep reconciliation off the wire and off the clock."""
+    monkeypatch.setattr(trade, "RECONCILE_DELAYS", ())
+    if book_ok:
+        monkeypatch.setattr(trade.pm, "http_get_json", lambda url, params=None: {})
+    else:
+        monkeypatch.setattr(
+            trade.pm,
+            "http_get_json",
+            lambda url, params=None: (_ for _ in ()).throw(OSError("down")),
+        )
+
+
+def test_buy_hint_survives_ambiguous_submission(monkeypatch, capsys) -> None:
+    """A lost response with no read access reports unknown, keeping its hint."""
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch)
+
+    with pytest.raises(SystemExit):
         trade._post_buy_with_recovery_hint(
             _AmbiguousOrderClient(), object(), "12345", "order", "FOK"
         )
@@ -257,29 +325,152 @@ def test_buy_hint_survives_ambiguous_submission(monkeypatch) -> None:
     assert recorded == [12345]
     assert confirmed == []
     assert rejected == []
+    output = json.loads(capsys.readouterr().out)
+    assert output["submission"] == "unknown"
+    assert "double fill" in output["recovery"]
+    assert "order endpoint" in output["venue_health"]
 
 
-def test_buy_hint_survives_http_408(monkeypatch) -> None:
+def test_buy_hint_survives_http_408(monkeypatch, capsys) -> None:
     """A timeout response is ambiguous and must retain its recovery marker."""
-    recorded = []
-    confirmed = []
-    rejected = []
-    monkeypatch.setattr(
-        trade.pm, "record_dw_buy_intent", lambda cs, tid: recorded.append(tid)
-    )
-    monkeypatch.setattr(
-        trade.pm, "confirm_dw_buy_intent", lambda cs, tid: confirmed.append(tid)
-    )
-    monkeypatch.setattr(
-        trade.pm, "reject_dw_buy_intent", lambda cs, tid: rejected.append(tid)
-    )
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch)
 
-    with pytest.raises(PolyApiException):
+    with pytest.raises(SystemExit):
         trade._post_buy_with_recovery_hint(
             _HttpErrorOrderClient(408), object(), "12345", "order", "FOK"
         )
 
     assert recorded == [12345]
+    assert confirmed == []
+    assert rejected == []
+    assert json.loads(capsys.readouterr().out)["submission"] == "unknown"
+
+
+def test_http_400_rejection_still_propagates(monkeypatch) -> None:
+    """A CLOB application 4xx is an answer, not ambiguity — it raises as-is."""
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+
+    with pytest.raises(PolyApiException):
+        trade._post_buy_with_recovery_hint(
+            _HttpErrorOrderClient(400), object(), "12345", "order", "FOK"
+        )
+
+    assert recorded == [12345]
+    assert confirmed == []
+    assert rejected == []
+
+
+def test_lost_submission_reports_fill(monkeypatch) -> None:
+    """A timed-out submission that actually filled is reported as filled."""
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch)
+    client = _LostResponseClient(trades_pages=[[], [{"id": "t1", "size": "1.38"}]])
+
+    result = trade._post_buy_with_recovery_hint(
+        client, object(), "12345", "order", "FOK"
+    )
+
+    assert result["submission"] == "filled"
+    assert result["trades"] == [{"id": "t1", "size": "1.38"}]
+    assert "do NOT resubmit" in result["warning"]
+    assert confirmed == [12345]
+    assert rejected == []
+
+
+def test_lost_submission_reports_resting_order(monkeypatch) -> None:
+    """A timed-out limit submission that rests on the book is reported so."""
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch)
+    client = _LostResponseClient(orders_pages=[[], [{"id": "0xa"}]])
+
+    result = trade._post_buy_with_recovery_hint(
+        client, object(), "12345", "order", "GTC"
+    )
+
+    assert result["submission"] == "resting"
+    assert result["open_orders"] == [{"id": "0xa"}]
+    assert confirmed == [12345]
+    assert rejected == []
+
+
+def test_lost_submission_ignores_preexisting_activity(monkeypatch, capsys) -> None:
+    """Old trades and resting orders must not be claimed as this submission."""
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch)
+    client = _LostResponseClient(
+        trades_pages=[[{"id": "t0"}]], orders_pages=[[{"id": "o0"}]]
+    )
+
+    with pytest.raises(SystemExit):
+        trade._post_buy_with_recovery_hint(client, object(), "12345", "order", "FOK")
+
+    assert confirmed == []
+    assert json.loads(capsys.readouterr().out)["submission"] == "unknown"
+
+
+def test_lost_submission_reports_venue_down_when_reads_fail(
+    monkeypatch, capsys
+) -> None:
+    """When reads fail too, the venue-health hint says so instead of guessing."""
+    _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch, book_ok=False)
+
+    with pytest.raises(SystemExit):
+        trade._post_buy_with_recovery_hint(
+            _AmbiguousOrderClient(), object(), "12345", "order", "FOK"
+        )
+
+    assert "reads fail too" in json.loads(capsys.readouterr().out)["venue_health"]
+
+
+def test_matched_response_settles_via_backing_trade(monkeypatch) -> None:
+    """A matched response backed by a trade for our order id is settled."""
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch)
+    client = _MatchedResponseClient(
+        trades_pages=[[], [{"id": "t1", "taker_order_id": "0xab"}]]
+    )
+
+    response = trade._post_buy_with_recovery_hint(
+        client, object(), "12345", "order", "FOK"
+    )
+
+    assert response["settlement"] == "settled"
+    assert response["settlement_trades"] == [{"id": "t1", "taker_order_id": "0xab"}]
+    assert confirmed == [12345]
+
+
+def test_matched_response_settles_via_new_trade_fallback(monkeypatch) -> None:
+    """Without taker attribution, a trade new since the snapshot settles it."""
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch)
+    client = _MatchedResponseClient(
+        trades_pages=[[{"id": "t0"}], [{"id": "t0"}, {"id": "t9"}]]
+    )
+
+    response = trade._post_buy_with_recovery_hint(
+        client, object(), "12345", "order", "FOK"
+    )
+
+    assert response["settlement"] == "settled"
+    assert response["settlement_trades"] == [{"id": "t9"}]
+    assert confirmed == [12345]
+
+
+def test_matched_response_without_backing_trade_is_provisional(monkeypatch) -> None:
+    """A phantom match keeps its pending marker and warns instead of confirming."""
+    recorded, confirmed, rejected = _track_intents(monkeypatch)
+    _no_network_no_sleep(monkeypatch)
+    client = _MatchedResponseClient(trades_pages=[[]])
+
+    response = trade._post_buy_with_recovery_hint(
+        client, object(), "12345", "order", "FOK"
+    )
+
+    assert response["success"] is True
+    assert response["settlement"] == "unverified"
+    assert "phantom match" in response["warning"]
     assert confirmed == []
     assert rejected == []
 
