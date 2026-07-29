@@ -163,6 +163,34 @@ class TestMain:
             main_module.resolve_password(["--password-stdin"]) == "pw\n"
         )  # nosec B105
 
+    def test_password_stdin_stall_logs_a_diagnostic(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A piped read stalled past the deadline logs a warning, then proceeds.
+
+        Log-only by design: recovery from a hung boot belongs to the
+        middleware's healthcheck restart; this line is what turns that
+        silent restart loop into something diagnosable from log.txt.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(main_module, "PASSWORD_STDIN_WARN_SECONDS", 0.01)
+
+        def stalled_read() -> str:
+            time_module.sleep(0.2)  # outlive the watchdog deadline
+            return "pw\n"
+
+        stdin = io.StringIO()
+        monkeypatch.setattr(stdin, "read", stalled_read)
+        monkeypatch.setattr("sys.stdin", stdin)
+        with caplog.at_level(logging.WARNING):
+            assert (
+                main_module.resolve_password(["--password-stdin"]) == "pw"
+            )  # nosec B105
+        assert "still no password on stdin" in caplog.text
+
     @pytest.mark.usefixtures("tty_stdin")
     def test_password_stdin_tty_prompts(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

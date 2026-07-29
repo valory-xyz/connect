@@ -34,6 +34,7 @@ import getpass
 import logging
 import secrets
 import sys
+import threading
 from pathlib import Path
 
 import uvicorn
@@ -49,6 +50,12 @@ from connect.settings import SETTINGS_FILE, SettingsStore, derive_mac_key
 from connect.signer import Signer
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [agent] %(message)s"
+
+# how long the piped --password-stdin read may stall before a diagnostic is
+# logged. Log-only: recovery from a hung boot is the middleware's job (its
+# healthcheck poll restarts an agent that never comes up); this line is what
+# makes that restart loop diagnosable from log.txt instead of silent.
+PASSWORD_STDIN_WARN_SECONDS = 60.0
 
 
 def setup_logging(level: str = "info") -> logging.Logger:
@@ -88,11 +95,13 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
     writer's text-mode pipe turns "\n" into "\r\n"), everything else kept, so
     embedded newlines survive — or, on an interactive TTY, a hidden
     "Enter password:" prompt (a deliberate deviation from docker, which never
-    prompts; prompt entry is inherently single-line). Failure means an empty
-    password from any source, or a read that died (EOF at the prompt, Ctrl-C,
-    closed descriptor, undecodable bytes); it is logged here because it
-    happens before the configured logger exists, and a crash on this path
-    would otherwise never reach log.txt.
+    prompts; prompt entry is inherently single-line). A piped read stalled
+    past PASSWORD_STDIN_WARN_SECONDS (writer never closes its end) logs a
+    diagnostic but keeps waiting — see the constant's comment. Failure means
+    an empty password from any source, or a read that died (EOF at the
+    prompt, Ctrl-C, closed descriptor, undecodable bytes); it is logged here
+    because it happens before the configured logger exists, and a crash on
+    this path would otherwise never reach log.txt.
     """
     args = parse_args(argv)
     try:
@@ -101,7 +110,20 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
         elif sys.stdin.isatty():
             password = getpass.getpass("Enter password: ")
         else:
-            password = sys.stdin.read().removesuffix("\n").removesuffix("\r")
+            watchdog = threading.Timer(
+                PASSWORD_STDIN_WARN_SECONDS,
+                lambda: setup_logging().warning(
+                    "still no password on stdin after %.0fs — is the writer "
+                    "closing the pipe? (the read blocks until EOF)",
+                    PASSWORD_STDIN_WARN_SECONDS,
+                ),
+            )
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                password = sys.stdin.read().removesuffix("\n").removesuffix("\r")
+            finally:
+                watchdog.cancel()
     except (EOFError, KeyboardInterrupt, OSError, ValueError) as e:
         setup_logging().error(
             "failed to read the keystore password: %s", type(e).__name__
@@ -109,7 +131,7 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
         return None
     if not password:
         setup_logging().error(
-            "no keystore password received (empty --password value or stdin line)"
+            "no keystore password received (empty --password value or stdin)"
         )
         return None
     return password
