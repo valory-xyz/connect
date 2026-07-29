@@ -109,6 +109,26 @@ def tty_stdin_fixture(monkeypatch: pytest.MonkeyPatch) -> io.StringIO:
 class TestMain:
     """Entrypoint tests."""
 
+    def test_setup_logging_reapplies_level(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A later setup_logging call re-applies the level once handlers exist.
+
+        The stall watchdog may configure logging (at the default "info")
+        before main() knows the operator's level; basicConfig no-ops once
+        root handlers exist, so the level must be set unconditionally or the
+        operator's choice is silently ignored for the whole run.
+        """
+        monkeypatch.chdir(tmp_path)
+        root = logging.getLogger()
+        old_level = root.level
+        try:
+            main_module.setup_logging()
+            main_module.setup_logging("debug")
+            assert root.level == logging.DEBUG
+        finally:
+            root.setLevel(old_level)
+
     def test_parse_args_both_forms(self) -> None:
         """Both --password forms parse."""
         assert main_module.parse_args(["--password", "x"]).password == "x"  # nosec B105

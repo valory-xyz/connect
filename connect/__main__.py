@@ -59,14 +59,22 @@ PASSWORD_STDIN_WARN_SECONDS = 60.0
 
 
 def setup_logging(level: str = "info") -> logging.Logger:
-    """Set up logging to log.txt in the SDK format."""
+    """Set up logging to log.txt in the SDK format.
+
+    Safe to call more than once: basicConfig only installs handlers on the
+    first call (and delay=True keeps a no-op call from opening a duplicate
+    log.txt fd), but the level is applied unconditionally — the stall
+    watchdog may configure logging before main() knows the operator's level,
+    and that early call must not pin it. Deliberately not basicConfig
+    (force=True): that would strip root handlers an embedder (or pytest's
+    caplog) installed.
+    """
     handlers: list[logging.Handler] = [
-        logging.FileHandler(Path.cwd() / "log.txt", encoding="utf-8"),
+        logging.FileHandler(Path.cwd() / "log.txt", encoding="utf-8", delay=True),
         logging.StreamHandler(),
     ]
-    logging.basicConfig(
-        level=getattr(logging, level.upper()), format=LOG_FORMAT, handlers=handlers
-    )
+    logging.basicConfig(format=LOG_FORMAT, handlers=handlers)
+    logging.getLogger().setLevel(getattr(logging, level.upper()))
     return logging.getLogger("agent")
 
 
