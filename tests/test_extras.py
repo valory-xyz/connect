@@ -160,6 +160,12 @@ class TestMain:
         assert (
             main_module.resolve_password(["--password-stdin"]) == "pw\r"
         )  # nosec B105
+        # a bare trailing CR with no LF is password material, not a terminator
+        # (a writer that appends nothing at all: printf '%s' "$pw" | connect)
+        monkeypatch.setattr("sys.stdin", io.StringIO("pw\r"))
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "pw\r"
+        )  # nosec B105
 
     def test_password_stdin_preserves_embedded_newline(
         self, monkeypatch: pytest.MonkeyPatch
@@ -330,6 +336,24 @@ class TestMain:
         with caplog.at_level(logging.ERROR):
             assert main_module.main(["--password-stdin"]) == 1
         assert "failed to read the keystore password: KeyboardInterrupt" in caplog.text
+
+    def test_main_password_no_stdin_handle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A process spawned with no stdin at all is a logged exit 1.
+
+        On a frozen no-console launch sys.stdin is None, so even isatty()
+        raises AttributeError — which must land in the except tuple like
+        every other pre-logging death on this path.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("sys.stdin", None)
+        with caplog.at_level(logging.ERROR):
+            assert main_module.main(["--password-stdin"]) == 1
+        assert "failed to read the keystore password: AttributeError" in caplog.text
 
     def test_main_password_pipe_read_failure(
         self,

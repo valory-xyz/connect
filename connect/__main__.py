@@ -52,9 +52,12 @@ from connect.signer import Signer
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [agent] %(message)s"
 
 # how long the piped --password-stdin read may stall before a diagnostic is
-# logged. Log-only: recovery from a hung boot is the middleware's job (its
-# healthcheck poll restarts an agent that never comes up); this line is what
-# makes that restart loop diagnosable from log.txt instead of silent.
+# logged. Log-only: recovery from a hung boot is the middleware's job —
+# olas-operate-middleware's HealthChecker restarts a deployment whose port
+# never binds after PORT_UP_TIMEOUT_DEFAULT (300s, health_checker.py), not
+# merely one failing /healthcheck — so this deadline must stay below 300s
+# for the line to land in log.txt before the restart. It is what makes that
+# restart loop diagnosable instead of silent.
 PASSWORD_STDIN_WARN_SECONDS = 60.0
 
 
@@ -103,13 +106,15 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
     writer's text-mode pipe turns "\n" into "\r\n"), everything else kept, so
     embedded newlines survive — or, on an interactive TTY, a hidden
     "Enter password:" prompt (a deliberate deviation from docker, which never
-    prompts; prompt entry is inherently single-line). A piped read stalled
-    past PASSWORD_STDIN_WARN_SECONDS (writer never closes its end) logs a
-    diagnostic but keeps waiting — see the constant's comment. Failure means
-    an empty password from any source, or a read that died (EOF at the
-    prompt, Ctrl-C, closed descriptor, undecodable bytes); it is logged here
-    because it happens before the configured logger exists, and a crash on
-    this path would otherwise never reach log.txt.
+    prompts; prompt entry is inherently single-line). A bare trailing CR with
+    no LF is kept — only "\n" and "\r\n" are terminators. A piped read
+    stalled past PASSWORD_STDIN_WARN_SECONDS (writer never closes its end)
+    logs a diagnostic but keeps waiting — see the constant's comment.
+    Failure means an empty password from any source, or a read that died
+    (EOF at the prompt, Ctrl-C, closed descriptor, no stdin handle at all,
+    undecodable bytes); it is logged here because it happens before the
+    configured logger exists, and a crash on this path would otherwise never
+    reach log.txt.
     """
     args = parse_args(argv)
     try:
@@ -129,10 +134,11 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
             watchdog.daemon = True
             watchdog.start()
             try:
-                password = sys.stdin.read().removesuffix("\n").removesuffix("\r")
+                raw = sys.stdin.read()
             finally:
                 watchdog.cancel()
-    except (EOFError, KeyboardInterrupt, OSError, ValueError) as e:
+            password = raw[:-2] if raw.endswith("\r\n") else raw.removesuffix("\n")
+    except (AttributeError, EOFError, KeyboardInterrupt, OSError, ValueError) as e:
         setup_logging().error(
             "failed to read the keystore password: %s", type(e).__name__
         )
