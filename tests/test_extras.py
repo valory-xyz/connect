@@ -19,6 +19,7 @@
 
 """Tests for entrypoint, MCP tools, wallet helpers, workspace launch and auth ASGI."""
 
+import io
 import json
 import logging
 import threading
@@ -81,13 +82,307 @@ def served_fixture(monkeypatch: pytest.MonkeyPatch) -> list[StubServer]:
     return servers
 
 
+@pytest.fixture(name="boot_env")
+def boot_env_fixture(
+    monkeypatch: pytest.MonkeyPatch, keystore_dir: Path, store_path: Path
+) -> Path:
+    """Set up the standard clean-boot environment: cwd at the keystore, STORE_PATH set.
+
+    Returns the store path so tests can assert on what a boot wrote there.
+    """
+    monkeypatch.chdir(keystore_dir)
+    monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
+    monkeypatch.delenv(SAFES_ENV, raising=False)
+    monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+    return store_path
+
+
+@pytest.fixture(name="tty_stdin")
+def tty_stdin_fixture(monkeypatch: pytest.MonkeyPatch) -> io.StringIO:
+    """Fake an interactive stdin: sys.stdin becomes a StringIO claiming to be a TTY."""
+    stdin = io.StringIO()
+    monkeypatch.setattr(stdin, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin)
+    return stdin
+
+
 class TestMain:
     """Entrypoint tests."""
+
+    def test_setup_logging_reapplies_level(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A later setup_logging call re-applies the level once handlers exist.
+
+        The stall watchdog may configure logging (at the default "info")
+        before main() knows the operator's level; basicConfig no-ops once
+        root handlers exist, so the level must be set unconditionally or the
+        operator's choice is silently ignored for the whole run.
+        """
+        monkeypatch.chdir(tmp_path)
+        root = logging.getLogger()
+        old_level = root.level
+        try:
+            main_module.setup_logging()
+            main_module.setup_logging("debug")
+            assert root.level == logging.DEBUG
+        finally:
+            root.setLevel(old_level)
 
     def test_parse_args_both_forms(self) -> None:
         """Both --password forms parse."""
         assert main_module.parse_args(["--password", "x"]).password == "x"  # nosec B105
         assert main_module.parse_args(["--password=y"]).password == "y"  # nosec B105
+
+    def test_parse_args_password_stdin(self) -> None:
+        """--password-stdin parses; combining or omitting the sources fails."""
+        assert main_module.parse_args(["--password-stdin"]).password_stdin
+        with pytest.raises(SystemExit):
+            main_module.parse_args(["--password", "x", "--password-stdin"])
+        with pytest.raises(SystemExit):
+            main_module.parse_args([])
+
+    def test_password_stdin_strips_line_ending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r"""Exactly one LF or CRLF terminator is stripped — password bytes kept.
+
+        The middleware writes password + "\n" and closes the pipe (a Windows
+        writer's text-mode pipe turns that "\n" into "\r\n"). Spaces and even
+        a genuine trailing "\r" in the password itself must survive the trip
+        — rstrip-style stripping would silently truncate them.
+        """
+        monkeypatch.setattr("sys.stdin", io.StringIO(" spaced pw \r\n"))
+        resolved = main_module.resolve_password(["--password-stdin"])
+        assert resolved == " spaced pw "  # nosec B105
+        # password "pw\r" through a Windows text-mode pipe: pw\r + \r\n
+        monkeypatch.setattr("sys.stdin", io.StringIO("pw\r\r\n"))
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "pw\r"
+        )  # nosec B105
+        # a bare trailing CR with no LF is password material, not a terminator
+        # (a writer that appends nothing at all: printf '%s' "$pw" | connect)
+        monkeypatch.setattr("sys.stdin", io.StringIO("pw\r"))
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "pw\r"
+        )  # nosec B105
+
+    def test_password_stdin_preserves_embedded_newline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r"""The read is EOF-terminated, not line-terminated (docker semantics).
+
+        The account layer accepts passwords containing newlines, so the pipe
+        protocol must carry them; a readline()-style read would silently
+        truncate at the first "\n" and surface as a wrong-password keystore
+        error. Only the single trailing terminator the writer appends is
+        stripped.
+        """
+        monkeypatch.setattr("sys.stdin", io.StringIO("line1\nline2\n"))
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "line1\nline2"
+        )  # nosec B105
+        # password genuinely ending in "\n": writer sends pw\n + \n; exactly
+        # one terminator is stripped, restoring the original
+        monkeypatch.setattr("sys.stdin", io.StringIO("pw\n\n"))
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "pw\n"
+        )  # nosec B105
+
+    def test_password_stdin_stall_logs_a_diagnostic(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A piped read stalled past the deadline logs a warning, then proceeds.
+
+        Log-only by design: recovery from a hung boot belongs to the
+        middleware's healthcheck restart; this line is what turns that
+        silent restart loop into something diagnosable from log.txt.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(main_module, "PASSWORD_STDIN_WARN_SECONDS", 0.01)
+
+        def stalled_read() -> str:
+            time_module.sleep(0.2)  # outlive the watchdog deadline
+            return "pw\n"
+
+        stdin = io.StringIO()
+        monkeypatch.setattr(stdin, "read", stalled_read)
+        monkeypatch.setattr("sys.stdin", stdin)
+        with caplog.at_level(logging.WARNING):
+            assert (
+                main_module.resolve_password(["--password-stdin"]) == "pw"
+            )  # nosec B105
+        assert "still no password on stdin" in caplog.text
+
+    @pytest.mark.usefixtures("tty_stdin")
+    def test_password_stdin_tty_prompts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An interactive run gets a hidden-input prompt, not a silent hang.
+
+        Piped stdin (the middleware launch) must stay promptless — getpass
+        writes to the terminal, and a human at a TTY would otherwise stare at
+        a blank line.
+        """
+        monkeypatch.chdir(tmp_path)  # failure paths write log.txt to cwd
+        prompts: list[str] = []
+
+        def fake_getpass(prompt: str) -> str:
+            prompts.append(prompt)
+            return "typed pw"
+
+        monkeypatch.setattr(main_module.getpass, "getpass", fake_getpass)
+        assert (
+            main_module.resolve_password(["--password-stdin"]) == "typed pw"
+        )  # nosec B105
+        assert prompts == ["Enter password: "]
+
+        monkeypatch.setattr(main_module.getpass, "getpass", lambda prompt: "")
+        assert main_module.resolve_password(["--password-stdin"]) is None
+
+    def test_main_password_stdin_happy_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+    ) -> None:
+        """The stdin password path boots exactly like the argv path.
+
+        This is the launch shape the middleware moves to for OPE-1832: argv is
+        world-readable via /proc/<pid>/cmdline, stdin is not.
+        """
+        monkeypatch.setattr("sys.stdin", io.StringIO(TEST_PASSWORD + "\n"))
+        assert main_module.main(["--password-stdin"]) == 0
+        app = served[0].config.app
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            assert client.get("/healthcheck").json() == {"is_healthy": True}
+
+    @pytest.mark.usefixtures("tty_stdin")
+    def test_main_password_tty_happy_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+    ) -> None:
+        """A TTY-prompted password drives the same full boot as a piped one."""
+        monkeypatch.setattr(
+            main_module.getpass, "getpass", lambda prompt: TEST_PASSWORD
+        )
+        assert main_module.main(["--password-stdin"]) == 0
+        assert served[0].config.app.state.workspace.reason is None
+
+    def test_main_password_stdin_empty(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An empty/closed stdin is a clear boot failure, not a keystore error."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+        assert main_module.main(["--password-stdin"]) == 1
+
+    def test_main_empty_argv_password(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """--password "" fails the same clear way as an empty stdin line."""
+        monkeypatch.chdir(tmp_path)
+        assert main_module.main(["--password", ""]) == 1
+
+    @pytest.mark.usefixtures("tty_stdin")
+    def test_main_password_read_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A password read that dies is a logged exit 1, not a raw traceback.
+
+        getpass raises EOFError on EOF-at-prompt (terminal hangup, closed
+        pty); this happens before the configured logger exists, so an
+        uncaught crash here would never reach log.txt. Only the exception
+        class name may be logged — a UnicodeDecodeError's repr embeds the
+        password bytes it was decoding.
+        """
+        monkeypatch.chdir(tmp_path)
+
+        def raise_eof(prompt: str) -> str:
+            raise EOFError
+
+        monkeypatch.setattr(main_module.getpass, "getpass", raise_eof)
+        with caplog.at_level(logging.ERROR):
+            assert main_module.main(["--password-stdin"]) == 1
+        assert "failed to read the keystore password: EOFError" in caplog.text
+
+    @pytest.mark.usefixtures("tty_stdin")
+    def test_main_password_prompt_interrupt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Ctrl-C at the prompt is a logged exit 1, not an uncaught interrupt.
+
+        Pins KeyboardInterrupt's place in the except tuple: dropping it
+        would pass line coverage and every other test, silently reverting
+        an interactive cancel to a raw traceback.
+        """
+        monkeypatch.chdir(tmp_path)
+
+        def raise_interrupt(prompt: str) -> str:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(main_module.getpass, "getpass", raise_interrupt)
+        with caplog.at_level(logging.ERROR):
+            assert main_module.main(["--password-stdin"]) == 1
+        assert "failed to read the keystore password: KeyboardInterrupt" in caplog.text
+
+    def test_main_password_no_stdin_handle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A process spawned with no stdin at all is a logged exit 1.
+
+        On a frozen no-console launch sys.stdin is None, so even isatty()
+        raises AttributeError — which must land in the except tuple like
+        every other pre-logging death on this path.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("sys.stdin", None)
+        with caplog.at_level(logging.ERROR):
+            assert main_module.main(["--password-stdin"]) == 1
+        assert "failed to read the keystore password: AttributeError" in caplog.text
+
+    def test_main_password_pipe_read_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A piped read that dies is a logged exit 1 — and leaks no password bytes.
+
+        The pipe is the production launch path: this pins the try block
+        around the read() branch, not just the getpass one, and pins
+        class-name-only logging (a UnicodeDecodeError's repr embeds the
+        very bytes it was decoding).
+        """
+        monkeypatch.chdir(tmp_path)
+
+        def raise_decode_error(size: int = -1) -> str:
+            # the decode error a bad-locale pipe read raises, bytes and all
+            raise UnicodeDecodeError(
+                "utf-8", b"sup3r\xffsecret\n", 5, 6, "invalid start byte"
+            )
+
+        stdin = io.StringIO()
+        monkeypatch.setattr(stdin, "read", raise_decode_error)
+        monkeypatch.setattr("sys.stdin", stdin)
+        with caplog.at_level(logging.ERROR):
+            assert main_module.main(["--password-stdin"]) == 1
+        assert "failed to read the keystore password: UnicodeDecodeError" in caplog.text
+        assert "secret" not in caplog.text
 
     def test_main_config_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -107,9 +402,7 @@ class TestMain:
 
     def test_main_happy_path(
         self,
-        monkeypatch: pytest.MonkeyPatch,
-        keystore_dir: Path,
-        store_path: Path,
+        boot_env: Path,
         served: list[StubServer],
     ) -> None:
         """A clean boot provisions the workspace and reports itself healthy.
@@ -118,12 +411,8 @@ class TestMain:
         once is_healthy turns true, so a regression that left a good boot
         unhealthy would quietly mean no session ever opens.
         """
-        monkeypatch.chdir(keystore_dir)
-        monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
-        monkeypatch.delenv(SAFES_ENV, raising=False)
-        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
-        assert (store_path / ".mcp.json").exists()
+        assert (boot_env / ".mcp.json").exists()
         app = served[0].config.app
         assert app.state.workspace.reason is None
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
@@ -161,8 +450,7 @@ class TestMain:
     def test_degraded_boot_still_writes_the_sdk_contract_file(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        keystore_dir: Path,
-        store_path: Path,
+        boot_env: Path,
         served: list[StubServer],
     ) -> None:
         """Pearl reads agent_performance.json whatever our health says.
@@ -171,16 +459,12 @@ class TestMain:
         still leaves a readable store — withholding the SDK contract file on
         top of reporting unhealthy would just break the desktop app twice.
         """
-        assets = store_path / "fake-assets"
+        assets = boot_env / "fake-assets"
         (assets / "skills").mkdir(parents=True)  # no CLAUDE.md: populate raises
         monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
-        monkeypatch.chdir(keystore_dir)
-        monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
-        monkeypatch.delenv(SAFES_ENV, raising=False)
-        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         assert served[0].config.app.state.workspace.reason is not None
-        assert (store_path / "agent_performance.json").exists()
+        assert (boot_env / "agent_performance.json").exists()
 
     def test_unusable_store_serves_unhealthy(
         self,
@@ -211,8 +495,7 @@ class TestMain:
     def test_boot_opens_no_session(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        keystore_dir: Path,
-        store_path: Path,
+        boot_env: Path,
         served: list[StubServer],
     ) -> None:
         """Booting never opens a session: Pearl drives POST /session itself.
@@ -220,10 +503,6 @@ class TestMain:
         Launching here would strand a failure in this process's log, where
         neither the FE nor the operator can see it.
         """
-        monkeypatch.chdir(keystore_dir)
-        monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
-        monkeypatch.delenv(SAFES_ENV, raising=False)
-        monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
         opened: list[Path] = []
         monkeypatch.setattr(
             workspace.Workspace,

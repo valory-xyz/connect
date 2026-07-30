@@ -19,16 +19,22 @@
 
 """Run the connect agent server.
 
-Started by the Pearl middleware as: <binary> --password <password>.
+Started by the Pearl middleware as: <binary> --password-stdin, with the
+keystore password written to stdin (one line, pipe closed after). The legacy
+form <binary> --password <password> is still accepted, but argv is
+world-readable via /proc/<pid>/cmdline for the whole process lifetime, so
+stdin is the supported path (see OPE-1832).
 
 cwd is the deployment build dir (contains ethereum_private_key.txt); all other
 configuration arrives via environment variables (see config.py).
 """
 
 import argparse
+import getpass
 import logging
 import secrets
 import sys
+import threading
 from pathlib import Path
 
 import uvicorn
@@ -45,29 +51,111 @@ from connect.signer import Signer
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [agent] %(message)s"
 
+# how long the piped --password-stdin read may stall before a diagnostic is
+# logged. Log-only: recovery from a hung boot is the middleware's job —
+# olas-operate-middleware's HealthChecker restarts a deployment whose port
+# never binds after PORT_UP_TIMEOUT_DEFAULT (300s, health_checker.py), not
+# merely one failing /healthcheck — so this deadline must stay below 300s
+# for the line to land in log.txt before the restart. It is what makes that
+# restart loop diagnosable instead of silent.
+PASSWORD_STDIN_WARN_SECONDS = 60.0
+
 
 def setup_logging(level: str = "info") -> logging.Logger:
-    """Set up logging to log.txt in the SDK format."""
+    """Set up logging to log.txt in the SDK format.
+
+    Safe to call more than once: basicConfig only installs handlers on the
+    first call (and delay=True keeps a no-op call from opening a duplicate
+    log.txt fd), but the level is applied unconditionally — the stall
+    watchdog may configure logging before main() knows the operator's level,
+    and that early call must not pin it. Deliberately not basicConfig
+    (force=True): that would strip root handlers an embedder (or pytest's
+    caplog) installed.
+    """
     handlers: list[logging.Handler] = [
-        logging.FileHandler(Path.cwd() / "log.txt", encoding="utf-8"),
+        logging.FileHandler(Path.cwd() / "log.txt", encoding="utf-8", delay=True),
         logging.StreamHandler(),
     ]
-    logging.basicConfig(
-        level=getattr(logging, level.upper()), format=LOG_FORMAT, handlers=handlers
-    )
+    logging.basicConfig(format=LOG_FORMAT, handlers=handlers)
+    logging.getLogger().setLevel(getattr(logging, level.upper()))
     return logging.getLogger("agent")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse args."""
     parser = argparse.ArgumentParser(prog="connect")
-    parser.add_argument("--password", required=True, help="keystore password")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--password",
+        help="keystore password (visible in the process argv; prefer --password-stdin)",
+    )
+    source.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the keystore password from stdin, until EOF (docker-style)",
+    )
     return parser.parse_args(argv)
+
+
+def resolve_password(argv: list[str] | None = None) -> str | None:
+    r"""Parse argv and resolve the keystore password; None (already logged) on failure.
+
+    With --password-stdin the password is the whole of piped stdin up to EOF
+    (`docker login --password-stdin` semantics: the writer closes the pipe to
+    terminate the read) — exactly one trailing LF or CRLF stripped (a Windows
+    writer's text-mode pipe turns "\n" into "\r\n"), everything else kept, so
+    embedded newlines survive — or, on an interactive TTY, a hidden
+    "Enter password:" prompt (a deliberate deviation from docker, which never
+    prompts; prompt entry is inherently single-line). A bare trailing CR with
+    no LF is kept — only "\n" and "\r\n" are terminators. A piped read
+    stalled past PASSWORD_STDIN_WARN_SECONDS (writer never closes its end)
+    logs a diagnostic but keeps waiting — see the constant's comment.
+    Failure means an empty password from any source, or a read that died
+    (EOF at the prompt, Ctrl-C, closed descriptor, no stdin handle at all,
+    undecodable bytes); it is logged here because it happens before the
+    configured logger exists, and a crash on this path would otherwise never
+    reach log.txt.
+    """
+    args = parse_args(argv)
+    try:
+        if not args.password_stdin:
+            password: str = args.password
+        elif sys.stdin.isatty():
+            password = getpass.getpass("Enter password: ")
+        else:
+            watchdog = threading.Timer(
+                PASSWORD_STDIN_WARN_SECONDS,
+                lambda: setup_logging().warning(
+                    "still no password on stdin after %.0fs — is the writer "
+                    "closing the pipe? (the read blocks until EOF)",
+                    PASSWORD_STDIN_WARN_SECONDS,
+                ),
+            )
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                raw = sys.stdin.read()
+            finally:
+                watchdog.cancel()
+            password = raw[:-2] if raw.endswith("\r\n") else raw.removesuffix("\n")
+    except (AttributeError, EOFError, KeyboardInterrupt, OSError, ValueError) as e:
+        setup_logging().error(
+            "failed to read the keystore password: %s", type(e).__name__
+        )
+        return None
+    if not password:
+        setup_logging().error(
+            "no keystore password received (empty --password value or stdin)"
+        )
+        return None
+    return password
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the agent server; return the process exit code."""
-    args = parse_args(argv)
+    password = resolve_password(argv)
+    if password is None:
+        return 1
 
     try:
         config = load_config()
@@ -79,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("connect starting")
 
     try:
-        account = load_account(args.password)
+        account = load_account(password)
     except KeystoreError as e:
         logger.error("keystore error: %s", e)
         return 1

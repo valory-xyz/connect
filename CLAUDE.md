@@ -32,7 +32,7 @@ tox -e fix-copyright                        # fix copyright headers (CI checks t
 
 If you change anything under `packages/`: `autonomy packages lock` (CI verifies the pinned hashes in `packages/packages.json`).
 
-Run standalone (mimicking the Pearl runner) — see README "Development" for the required `CONNECTION_*` env vars; cwd must contain `ethereum_private_key.txt`, then `uv run python -m connect --password <password>`.
+Run standalone (mimicking the Pearl runner) — see README "Development" for the required `CONNECTION_*` env vars; cwd must contain `ethereum_private_key.txt`, then `uv run python -m connect --password-stdin` (password on stdin until EOF, docker-style, one trailing newline stripped; legacy `--password <password>` still works but leaks into `/proc/<pid>/cmdline`).
 
 ## Constraints CI enforces
 

@@ -21,8 +21,9 @@
 
 The Pearl middleware places the password-encrypted web3 keystore JSON at
 ./ethereum_private_key.txt in the deployment build dir (the agent's cwd)
-and passes the password via --password. The decrypted key exists only inside
-the returned LocalAccount.
+and delivers the password on stdin (--password-stdin; the legacy --password
+argv form leaks into /proc/<pid>/cmdline — see __main__.py). The decrypted
+key exists only inside the returned LocalAccount.
 """
 
 import json

@@ -5,7 +5,11 @@ Pearl Connect agent. When a user starts the BYOA agent in
 other non-aea agent. It:
 
 1. decrypts the agent EOA keystore (`./ethereum_private_key.txt`) in memory
-   using the `--password` argument — key material never leaves the process;
+   using the keystore password — read from stdin until EOF with
+   `--password-stdin` (docker-style, one trailing newline stripped;
+   preferred: argv is world-readable via `/proc/<pid>/cmdline` on Linux) or
+   from the legacy `--password` argument — key material never leaves the
+   process;
 2. populates the service's persistent workspace (`STORE_PATH`) with a
    `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
    the agent session, and the bundled `connect` skill;
@@ -185,6 +189,8 @@ export CONNECTION_CONFIGS_CONFIG_STORE_PATH=/path/to/persistent_data
 export CONNECTION_CONFIGS_CONFIG_SAFE_CONTRACT_ADDRESSES='{"gnosis":"0x..."}'
 export CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS='{"gnosis":{"agent":{"0x0000000000000000000000000000000000000000":"1000000000000000000"}}}'
 # cwd must contain ethereum_private_key.txt (encrypted web3 keystore JSON)
+uv run python -m connect --password-stdin   # prompts "Enter password:" on a TTY
+# legacy (password lands in /proc/<pid>/cmdline, readable by any local user):
 uv run python -m connect --password <password>
 ```
 
