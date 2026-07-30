@@ -29,9 +29,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             asset: agent_runner_linux_x64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             asset: agent_runner_linux_arm64
           - runner: macos-15-large
             asset: agent_runner_macos_x64
