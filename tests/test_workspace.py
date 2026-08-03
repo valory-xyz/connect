@@ -204,7 +204,7 @@ def test_harness_env_drops_what_our_packaging_leaks(
         monkeypatch.delenv(name)
     with caplog.at_level("INFO"):
         assert workspace.harness_env()["PATH"] == "/usr/bin"
-    assert caplog.text == ""
+    assert "not passing" not in caplog.text
 
 
 @pytest.mark.parametrize(

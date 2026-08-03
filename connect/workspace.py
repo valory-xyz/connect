@@ -82,7 +82,10 @@ GITIGNORE_ENTRIES = (".mcp.json",)
 # and MCP server (silently: it just never appears in the tool list). Restoring
 # LD_LIBRARY_PATH_ORIG, PyInstaller's advice, is wrong here: under Pearl the
 # AppImage poisons that one too, with the same libcrypto. DYLD_* is the macOS
-# spelling of the same leak — we ship mac binaries too. See OPE-1866.
+# spelling of the same leak — we ship mac binaries too, though nothing there
+# leans on the scrub: `open` hands the launch to launchd, which gives the app
+# its own environment, and SIP strips DYLD_* from protected binaries anyway.
+# See OPE-1866.
 LOADER_ENV_VARS = (
     "LD_LIBRARY_PATH",
     "LD_LIBRARY_PATH_ORIG",
@@ -401,26 +404,26 @@ def harness_env() -> dict[str, str]:
     dropped = sorted(set(os.environ) - set(scrubbed))
     if dropped:
         logger.info(
-            "not passing %s to the session — our packaging leaks them",
+            "not passing %s to the session — our packaging leaks them; "
+            "to set one deliberately, use the workspace's .claude/settings.json",
             ", ".join(dropped),
         )
     return scrubbed
 
 
 def _open_url(url: str) -> bool:
-    env = harness_env()
     try:
         if sys.platform == "darwin":  # pragma: no cover — macOS only
             args = ["open", url]
         elif sys.platform == "win32":  # pragma: no cover — Windows only
-            # the scrub does not reach this branch, and needs not: os.startfile
-            # takes no environment, and there is no LD_/DYLD_ loader path here
+            # os.startfile takes no environment, and there is no LD_/DYLD_
+            # loader path here — so no scrub, and nothing claiming one either
             os.startfile(url)  # type: ignore[attr-defined] # nosec B606
             return True
         else:  # pragma: no cover — Linux/Unix only
             args = ["xdg-open", url]
         result = subprocess.run(  # nosec B603, B607
-            args, capture_output=True, timeout=15, check=False, env=env
+            args, capture_output=True, timeout=15, check=False, env=harness_env()
         )
         return result.returncode == 0
     except Exception as e:  # pylint: disable=broad-exception-caught
