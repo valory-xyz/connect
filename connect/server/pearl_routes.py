@@ -89,13 +89,17 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
     this process's log.
 
     A deep link that will not open is the operator's environment, not a server
-    fault, so it answers 200 with {launched: false, harness, error} for the UI
-    to show — where a bad request does not: 503 before the workspace is ready,
-    400 on an unknown harness, 403 cross-origin.
+    fault, so it answers 200 with {launched: false, harness, requested, error}
+    for the UI to show — where a bad request does not: 503 before the workspace
+    is ready, 400 on an unknown harness, 403 cross-origin.
 
     An explicit `harness` overrides the saved preference for this launch only:
-    the session opens where the caller asked without rewriting what the
-    operator chose — PATCH /settings is how that preference changes.
+    the session opens where the caller asked — and only there — without
+    rewriting what the operator chose; PATCH /settings is how that preference
+    changes. Naming none falls back instead (see Workspace.open_session), so
+    the answer carries both harnesses: `requested` is the one asked for and
+    `harness` the one that opened — equal unless a launch fell back, and equal
+    again when nothing opened at all.
     """
     state = request.app.state
     if not state.workspace.ensure():
@@ -105,7 +109,7 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
         )
     override = body.harness if body else None
     try:
-        harness = (
+        requested = (
             validate_harness(override)
             if override is not None
             else state.settings_store.load().harness
@@ -114,14 +118,23 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
         # server fault to 500 over: answer the caller the same way as any other
         # unusable harness (a test pins DEEP_LINKS against HARNESSES so this
         # cannot go unnoticed)
-        state.workspace.open_session(harness)
+        harness = state.workspace.open_session(requested, fallback=override is None)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except workspace.LaunchError as e:
         logger.warning("session launch failed: %s", e)
         # the reason, not just the harness: log.txt rotates, and "not
         # installed" and "no handler for the deep link" need different answers
-        state.activity.record("session_launch_failed", harness=harness, error=str(e))
-        return {"launched": False, "harness": harness, "error": str(e)}
-    state.activity.record("session_launched", harness=harness)
-    return {"launched": True, "harness": harness}
+        state.activity.record("session_launch_failed", harness=requested, error=str(e))
+        # the same harness under both names: nothing opened, and a caller
+        # should not have to branch on `launched` to know which fields exist
+        return {
+            "launched": False,
+            "harness": requested,
+            "requested": requested,
+            "error": str(e),
+        }
+    # both: a trail naming only the harness that opened cannot show the
+    # preference the operator has silently stopped getting
+    state.activity.record("session_launched", harness=harness, requested=requested)
+    return {"launched": True, "harness": harness, "requested": requested}

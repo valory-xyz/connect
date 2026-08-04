@@ -507,7 +507,7 @@ class TestMain:
         monkeypatch.setattr(
             workspace.Workspace,
             "open_session",
-            lambda self, harness=None: opened.append(self.path),
+            lambda self, harness=None, **kwargs: opened.append(self.path),
         )
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         assert not opened
@@ -1380,24 +1380,57 @@ class TestWorkspaceExtras:
         assert (installed / "my-skill" / "SKILL.md").exists()
         assert not (installed / "stray.txt").exists()
 
-    def test_open_url_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """xdg-open success, failure and exception paths."""
+    def test_open_url_linux(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """xdg-open success, failure and exception paths.
+
+        A refusal is the only place the OS says why a link did not open, and
+        the caller answers every one of them with the same "is Claude Code
+        installed?" guess — so both failing paths are pinned to a level the
+        default config shows, carrying what the handler said.
+        """
 
         class Result:
             """subprocess result stub."""
 
-            def __init__(self, code: int) -> None:
+            def __init__(self, code: int, stderr: bytes = b"") -> None:
                 """Initialize."""
                 self.returncode = code
+                self.stderr = stderr
 
         monkeypatch.setattr(workspace.sys, "platform", "linux")
         monkeypatch.setattr(workspace.subprocess, "run", lambda *a, **k: Result(0))
         assert workspace._open_url("claude://x")  # pylint: disable=protected-access
+
+        monkeypatch.setattr(
+            workspace.subprocess, "run", lambda *a, **k: Result(4, b"no handler for x")
+        )
+        with caplog.at_level("WARNING"):
+            assert not workspace._open_url(  # pylint: disable=protected-access
+                "claude://x?folder=/tmp"  # nosec B108
+            )
+        assert "exit 4" in caplog.text
+        assert "no handler for x" in caplog.text
+        assert "folder=/tmp" not in caplog.text  # the scheme, not the query
+
+        # a refusal with nothing to say still names the link and the exit code
+        caplog.clear()
         monkeypatch.setattr(workspace.subprocess, "run", lambda *a, **k: Result(1))
-        assert not workspace._open_url("claude://x")  # pylint: disable=protected-access
+        with caplog.at_level("WARNING"):
+            assert not workspace._open_url(  # pylint: disable=protected-access
+                "claude://x"
+            )
+        assert "exit 1" in caplog.text
+
+        caplog.clear()
         monkeypatch.setattr(
             workspace.subprocess,
             "run",
             lambda *a, **k: (_ for _ in ()).throw(OSError("no handler")),
         )
-        assert not workspace._open_url("claude://x")  # pylint: disable=protected-access
+        with caplog.at_level("WARNING"):
+            assert not workspace._open_url(  # pylint: disable=protected-access
+                "claude://x"
+            )
+        assert "no handler" in caplog.text

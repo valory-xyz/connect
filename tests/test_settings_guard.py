@@ -2714,18 +2714,58 @@ class TestSettingsEndpoints:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """POST /session opens a session on demand, in the chosen harness."""
-        opened: list[str] = []
-        monkeypatch.setattr(
-            workspace_module.Workspace,
-            "open_session",
-            lambda self, harness: opened.append(harness),
-        )
+        opened: list[tuple[str, bool]] = []
+
+        def record(
+            self: workspace_module.Workspace, harness: str, *, fallback: bool = False
+        ) -> str:
+            opened.append((harness, fallback))
+            return harness
+
+        monkeypatch.setattr(workspace_module.Workspace, "open_session", record)
         client.patch("/settings", json={"harness": "claude_code_cli"})
         response = client.post("/session")
         assert response.status_code == 200
-        assert response.json() == {"launched": True, "harness": "claude_code_cli"}
-        assert opened == ["claude_code_cli"]
+        assert response.json() == {
+            "launched": True,
+            "harness": "claude_code_cli",
+            "requested": "claude_code_cli",
+        }
+        # nobody named a harness on the call, so the saved preference is ours
+        # to fall back from — see test_session_reports_the_harness_it_opened
+        assert opened == [("claude_code_cli", True)]
         assert "session_launched" in audit_kinds(store_path)
+
+    def test_session_reports_the_harness_it_opened(
+        self,
+        client: TestClient,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fallback launch answers with where it went, not where it aimed.
+
+        On a machine with only one Claude Code installed, the preference and
+        the session part ways (OPE-1867). Answering with the preference would
+        have the UI report a desktop session the operator never got.
+        """
+        monkeypatch.setattr(
+            workspace_module.Workspace,
+            "open_session",
+            lambda self, harness, *, fallback=False: "claude_code_cli",
+        )
+        response = client.post("/session")
+        assert response.status_code == 200
+        assert response.json() == {
+            "launched": True,
+            "harness": "claude_code_cli",
+            "requested": "claude_code_desktop",
+        }
+        entry = audit_entries(store_path)[-1]
+        assert entry["kind"] == "session_launched"
+        assert (entry["harness"], entry["requested"]) == (
+            "claude_code_cli",
+            "claude_code_desktop",
+        )
 
     def test_session_launch_failure_is_reported(
         self,
@@ -2739,16 +2779,22 @@ class TestSettingsEndpoints:
         is not installed is the operator's environment, not a server fault.
         """
 
-        def refuse(self: workspace_module.Workspace, harness: str) -> None:
+        def refuse(
+            self: workspace_module.Workspace, harness: str, *, fallback: bool = False
+        ) -> str:
             raise workspace_module.LaunchError(f"could not open {harness}")
 
         monkeypatch.setattr(workspace_module.Workspace, "open_session", refuse)
         response = client.post("/session")
         assert response.status_code == 200
-        body = response.json()
-        assert body["launched"] is False
-        assert body["harness"] == "claude_code_desktop"
-        assert "could not open claude_code_desktop" in body["error"]
+        # the whole shape, not a few keys: the fields the docs promise must not
+        # depend on whether the launch worked
+        assert response.json() == {
+            "launched": False,
+            "harness": "claude_code_desktop",
+            "requested": "claude_code_desktop",
+            "error": "could not open claude_code_desktop",
+        }
         assert "session_launch_failed" in audit_kinds(store_path)
 
     def test_session_rejects_cross_origin(self, client: TestClient) -> None:
@@ -2760,20 +2806,28 @@ class TestSettingsEndpoints:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An explicit harness opens there once, leaving the preference alone."""
-        opened: list[str] = []
-        monkeypatch.setattr(
-            workspace_module.Workspace,
-            "open_session",
-            lambda self, harness: opened.append(harness),
-        )
+        opened: list[tuple[str, bool]] = []
+
+        def record(
+            self: workspace_module.Workspace, harness: str, *, fallback: bool = False
+        ) -> str:
+            opened.append((harness, fallback))
+            return harness
+
+        monkeypatch.setattr(workspace_module.Workspace, "open_session", record)
         response = client.post("/session", json={"harness": "claude_code_cli"})
         assert response.status_code == 200
-        assert response.json() == {"launched": True, "harness": "claude_code_cli"}
-        assert opened == ["claude_code_cli"]
+        assert response.json() == {
+            "launched": True,
+            "harness": "claude_code_cli",
+            "requested": "claude_code_cli",
+        }
+        # named, so it opens there or nowhere: no fallback to the other one
+        assert opened == [("claude_code_cli", False)]
         # the saved preference is untouched: the next default launch uses it
         assert client.get("/settings").json()["harness"] == "claude_code_desktop"
         client.post("/session")
-        assert opened == ["claude_code_cli", "claude_code_desktop"]
+        assert opened[-1] == ("claude_code_desktop", True)
 
     def test_session_survives_an_unwritable_audit_log(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -2784,11 +2838,14 @@ class TestSettingsEndpoints:
         operator open a second session for work that succeeded.
         """
         opened: list[str] = []
-        monkeypatch.setattr(
-            workspace_module.Workspace,
-            "open_session",
-            lambda self, harness: opened.append(harness),
-        )
+
+        def record(
+            self: workspace_module.Workspace, harness: str, *, fallback: bool = False
+        ) -> str:
+            opened.append(harness)
+            return harness
+
+        monkeypatch.setattr(workspace_module.Workspace, "open_session", record)
         monkeypatch.setattr(
             ActivityLog,
             "_append",

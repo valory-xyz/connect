@@ -53,7 +53,7 @@ never be embedded in the UI.
 | --- | --- |
 | `GET /settings` | current settings: `{"protected": {"mode", "whitelist"}, "harness"}` |
 | `PATCH /settings` | merge-patch. The keystore password is required **only** when the body touches `protected`; a `harness`-only change needs none. **The whitelist is frozen:** a `whitelist` key in the patch is refused with a 422, password or not — send `protected: {mode}` alone |
-| `POST /session` | open a Claude Code session → `{launched, harness, error?}`. An optional `{"harness": …}` overrides the saved preference for that launch alone |
+| `POST /session` | open a Claude Code session → `{launched, harness, requested, error?}`: `requested` is the harness asked for, `harness` the one that opened — they differ when a launch falls back to the other Claude Code, and are equal when nothing opened. An optional `{"harness": …}` overrides the preference for that launch alone, and opens there or not at all |
 | `GET /healthcheck` | `{"is_healthy": bool}` — false until the workspace is provisioned |
 | `GET /funds-status` | balances against the funding requirements |
 

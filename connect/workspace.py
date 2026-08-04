@@ -260,28 +260,58 @@ class Workspace:
             raise ValueError(f"no deep link for harness {harness!r}") from e
         return build(self.path)
 
-    def open_session(self, harness: str = DEFAULT_HARNESS) -> None:
-        """Open a Claude Code session here, in the chosen harness only.
+    def open_session(
+        self, harness: str = DEFAULT_HARNESS, *, fallback: bool = False
+    ) -> str:
+        """Open a Claude Code session here; return the harness it opened in.
 
         Success means the URL handler accepted the deep link, which is as much
         as the OS tells us: `xdg-open` (and `open`) can exit 0 without any
         handler having actually opened a window. So a "launched" answer is a
         best effort, not a proof that the session appeared on screen.
 
+        `fallback` says the harness was ours to pick, not the operator's: try
+        it first, then the others. A caller who *names* a harness gets that one
+        or an error, because naming one is a choice and quietly opening the
+        other Claude Code would make the choice a lie. But an unnamed one is
+        only DEFAULT_HARNESS, our guess — and Pearl and the agent UI both
+        launch without naming one, so on a machine with only the CLI installed
+        that guess was the whole reason no session ever opened (OPE-1867).
+
         :raises ValueError: on an unknown harness;
-        :raises LaunchError: when that harness's deep link does not open.
+        :raises LaunchError: when none of the deep links tried would open.
         """
-        url = self.deep_link(harness)
-        if not _open_url(url):
-            # no fallback, by design — so name the way out: an operator with
-            # only the other Claude Code installed would otherwise see every
-            # launch fail with no hint that the harness setting is what to change
-            raise LaunchError(
-                f"could not open {harness} via its deep link — is it installed? "
-                f"if you use the other Claude Code, change the harness in the "
-                f"agent UI. the workspace is at {self.path}"
+        order = [harness]
+        if fallback:
+            order += [known for known in DEEP_LINKS if known != harness]
+        for candidate in order:
+            url = self.deep_link(candidate)  # only order[0] can be unknown
+            if not _open_url(url):
+                continue
+            logger.info("launched %s via %s", candidate, url.split("?", maxsplit=1)[0])
+            if candidate != harness:
+                logger.info(
+                    "%s would not open, so the session went to %s instead — "
+                    "set the harness in the agent UI to stop us guessing",
+                    harness,
+                    candidate,
+                )
+            return candidate
+        # "change the harness" is no way out on a machine where both have
+        # already been tried, so the exhausted case names what it tried instead
+        if len(order) == 1:
+            reason = (
+                f"Could not open {harness} via its deep link — is it installed? "
+                f"If you use the other Claude Code, change the harness in the "
+                f"agent UI."
             )
-        logger.info("launched %s via %s", harness, url.split("?", maxsplit=1)[0])
+        else:
+            reason = (
+                f"Could not open a Claude Code session — none of "
+                f"{', '.join(order)} answered its deep link. Is Claude Code "
+                f"installed?"
+            )
+        raise LaunchError(f"{reason} The workspace is at {self.path}")
 
     def _provision(self) -> None:
         """Write our files into the workspace, leaving every other one alone."""
@@ -425,7 +455,21 @@ def _open_url(url: str) -> bool:
         result = subprocess.run(  # nosec B603, B607
             args, capture_output=True, timeout=15, check=False, env=harness_env()
         )
-        return result.returncode == 0
+        if result.returncode == 0:
+            return True
+        # Loudly, and at a level the default config shows. This is the only
+        # place the OS says *why* a link did not open, and the caller turns
+        # every failure into the same "is Claude Code installed?" guess — with
+        # a fallback trying two links, a silent first refusal would leave the
+        # operator's actual problem nowhere to be read.
+        detail = (result.stderr or b"").decode(errors="replace").strip()
+        logger.warning(
+            "deep link %s was refused (exit %s)%s",
+            url.split("?", maxsplit=1)[0],
+            result.returncode,
+            f": {detail[:200]}" if detail else "",
+        )
+        return False
     except Exception as e:  # pylint: disable=broad-exception-caught
-        logger.debug("deep link %s failed: %s", url.split("?", maxsplit=1)[0], e)
+        logger.warning("deep link %s failed: %s", url.split("?", maxsplit=1)[0], e)
         return False
