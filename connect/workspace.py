@@ -26,8 +26,9 @@ knows whether it is fit to open a session into, and re-attempts a failed
 provisioning while it is not; and it opens the session itself.
 
 What stays outside the class is what is not about *a* workspace: where the
-bundle lives, the MCP URL, the harness-to-deep-link registry, and the OS call
-that hands a URL to a URL handler.
+bundle lives, the MCP URL, the harness-to-deep-link registry, the OS call that
+hands a URL to a URL handler, and the environment scrub that keeps our own
+packaging out of the session it starts.
 """
 
 import json
@@ -74,6 +75,24 @@ CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 TOKEN_DENY_RULES = ("Read(./.mcp.json)",)
 # a `git init` in the workspace must never be able to stage the token
 GITIGNORE_ENTRIES = (".mcp.json",)
+
+# Loader variables our PyInstaller bootloader leaks: its extraction directory
+# leads LD_LIBRARY_PATH and ships an older libcrypto, so a session inheriting
+# them cannot start the distro `node` — killing every node-based hook (loudly)
+# and MCP server (silently: it just never appears in the tool list). Restoring
+# LD_LIBRARY_PATH_ORIG, PyInstaller's advice, is wrong here: under Pearl the
+# AppImage poisons that one too, with the same libcrypto. DYLD_* is the macOS
+# spelling of the same leak — we ship mac binaries too, though nothing there
+# leans on the scrub: `open` hands the launch to launchd, which gives the app
+# its own environment, and SIP strips DYLD_* from protected binaries anyway.
+# See OPE-1866.
+LOADER_ENV_VARS = (
+    "LD_LIBRARY_PATH",
+    "LD_LIBRARY_PATH_ORIG",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH_ORIG",
+)
+LOADER_ENV_PREFIXES = ("_PYI_",)
 
 
 class LaunchError(Exception):
@@ -369,19 +388,43 @@ class Workspace:
             )
 
 
+def harness_env() -> dict[str, str]:
+    """Our environment minus the loader variables our packaging leaks.
+
+    Everything the session goes on to start — hooks, MCP servers, whatever it
+    shells out to — inherits this. See LOADER_ENV_VARS. What was dropped is
+    logged, because an operator who set one of these on purpose would otherwise
+    have nothing to go on: the scrub is invisible from inside the session.
+    """
+    scrubbed = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in LOADER_ENV_VARS and not key.startswith(LOADER_ENV_PREFIXES)
+    }
+    dropped = sorted(set(os.environ) - set(scrubbed))
+    if dropped:
+        logger.info(
+            "not passing %s to the session — our packaging leaks them; "
+            "to set one deliberately, use the workspace's .claude/settings.json",
+            ", ".join(dropped),
+        )
+    return scrubbed
+
+
 def _open_url(url: str) -> bool:
     try:
         if sys.platform == "darwin":  # pragma: no cover — macOS only
-            result = subprocess.run(  # nosec B603, B607
-                ["open", url], capture_output=True, timeout=15, check=False
-            )
+            args = ["open", url]
         elif sys.platform == "win32":  # pragma: no cover — Windows only
+            # os.startfile takes no environment, and there is no LD_/DYLD_
+            # loader path here — so no scrub, and nothing claiming one either
             os.startfile(url)  # type: ignore[attr-defined] # nosec B606
             return True
         else:  # pragma: no cover — Linux/Unix only
-            result = subprocess.run(  # nosec B603, B607
-                ["xdg-open", url], capture_output=True, timeout=15, check=False
-            )
+            args = ["xdg-open", url]
+        result = subprocess.run(  # nosec B603, B607
+            args, capture_output=True, timeout=15, check=False, env=harness_env()
+        )
         return result.returncode == 0
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.debug("deep link %s failed: %s", url.split("?", maxsplit=1)[0], e)

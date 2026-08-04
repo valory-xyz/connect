@@ -49,13 +49,13 @@ The security architecture is the thing to understand first: **every signing path
 Core modules:
 
 - `connect/__main__.py` — entrypoint; decrypts the keystore (`connect/keystore.py`) in memory, provisions the workspace, starts the server.
-- `connect/workspace.py` — provisions STORE_PATH (the Claude session's cwd): writes `.mcp.json` with a fresh per-run bearer token, the `CLAUDE.md` brief, and copies the bundled skills from `connect/assets/skills/`.
+- `connect/workspace.py` — provisions STORE_PATH (the Claude session's cwd): writes `.mcp.json` with a fresh per-run bearer token, the `CLAUDE.md` brief, and copies the bundled skills from `connect/assets/skills/`. It also opens the session, and does so through `harness_env()`, which strips the dynamic-loader variables our PyInstaller packaging leaks (`LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` + their `_ORIG` twins, `_PYI_*`) — left in, our bundled OpenSSL shadows the system one and every node-based hook and MCP server in the session fails, the MCP servers silently. See the `LOADER_ENV_VARS` comment.
 - `connect/signer.py` — the single signing choke point.
 - `connect/guard.py` — the guardrail; one gate for every signing path.
 - `connect/safe.py` — the only place that knows what an `execTransaction` looks like. The agent names an inner call (target, value, calldata); the server wraps it in the safe's `execTransaction` with a threshold-1 pre-validated signature.
 - `connect/settings.py` — tamper-evident settings persisted in STORE_PATH. Security-critical fields (mode, whitelist) are HMAC'd with a key derived from the agent private key; a failed verification resets them to the (unrestricted) defaults — deliberate and audited, see the module docstring for the reasoning. The last-written MAC is also pinned in memory to defeat replay of old settings files. The `harness` preference sits outside the MAC deliberately (it can't move funds).
 - `connect/mech.py` — mech marketplace requests via mech-client's `Signer` protocol, so every transaction/digest still passes the choke point.
-- `connect/config.py` — the only module that reads env vars (`CONNECTION_*`, injected by Pearl from the service template).
+- `connect/config.py` — the only module that reads env vars *as configuration* (`CONNECTION_*`, injected by Pearl from the service template); `workspace.harness_env()` touches the environment only to scrub it on the way out.
 - `connect/activity.py` — audit trail of every signer action + `agent_performance.json` (Pearl SDK contract file).
 - `connect/wallet.py` — balance queries shared by `/funds-status`, `/wallet`, and the `wallet_info` MCP tool.
 

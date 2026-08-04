@@ -46,6 +46,21 @@ then reaches the operator's UI as a dismissable error instead of dying in this
 process's log — which is also why `/session` never falls back to the harness
 the operator did not choose.
 
+What the session must *not* inherit is our own packaging. We ship as a
+PyInstaller one-file binary, whose bootloader puts its extraction directory at
+the front of `LD_LIBRARY_PATH` — and that directory carries our
+`libcrypto.so.3`, built against an older OpenSSL than a modern distro's. A
+session started with it cannot run the system `node`, so every node-based hook
+and MCP server dies: the hooks noisily, the MCP servers by silently never
+appearing in the tool list. So the deep link is handed off with
+`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, their `_ORIG` twins and the `_PYI_*`
+variables stripped. Restoring `LD_LIBRARY_PATH_ORIG`, PyInstaller's usual
+advice, is wrong here: under Pearl that variable names the middleware's private
+lib dir, carrying the same old libcrypto — the child needs these gone, not
+restored. An operator who genuinely needs one of them can set it back for the
+session in the workspace's `.claude/settings.json`, which we merge into rather
+than own.
+
 The agent-harness session names the actions; the server signs and broadcasts
 them — a single audited choke point, no plaintext secrets on disk. The agent
 acts *as the service safe*: it is the `msg.sender` contracts see, and approvals,

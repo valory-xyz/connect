@@ -170,6 +170,75 @@ def test_claude_settings_deny_rule_merged(store_path: Path) -> None:
     assert settings_path.with_suffix(".json.bak").read_text() == "{nope"
 
 
+def test_harness_env_drops_what_our_packaging_leaks(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The launched session inherits none of the PyInstaller loader state.
+
+    The names are spelled out rather than read back from LOADER_ENV_VARS: a
+    regression that shrinks that tuple must fail here, not move the goalposts
+    with it.
+    """
+    leaks = {
+        "LD_LIBRARY_PATH": "/tmp/_MEIabc123",  # nosec B108
+        "LD_LIBRARY_PATH_ORIG": "/opt/pearl/_internal",
+        "DYLD_LIBRARY_PATH": "/tmp/_MEIabc123",  # nosec B108
+        "DYLD_LIBRARY_PATH_ORIG": "/opt/pearl/_internal",
+        "_PYI_APPLICATION_HOME_DIR": "/tmp/_MEIabc123",  # nosec B108
+    }
+    for name, value in leaks.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    with caplog.at_level("INFO"):
+        env = workspace.harness_env()
+    for leaked in leaks:
+        assert leaked not in env
+        assert leaked in caplog.text  # the scrub says what it took
+    assert "/opt/pearl/_internal" not in env.values()  # _ORIG is not restored
+    assert env["PATH"] == "/usr/bin"  # everything else is passed through
+
+    # nothing to strip: nothing to say
+    caplog.clear()
+    for name in leaks:
+        monkeypatch.delenv(name)
+    with caplog.at_level("INFO"):
+        assert workspace.harness_env()["PATH"] == "/usr/bin"
+    assert "not passing" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("platform", "opener"), [("linux", "xdg-open"), ("darwin", "open")]
+)
+def test_launch_hands_the_url_handler_a_scrubbed_environment(
+    platform: str, opener: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No platform that spawns an opener spawns it with our extraction dir.
+
+    Both branches, because a fix applied to one of them is the regression this
+    guards: the mac binaries are as much a release asset as the Linux ones.
+    """
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIabc123")  # nosec B108
+    monkeypatch.setattr(workspace.sys, "platform", platform)
+    seen: dict = {}
+
+    class Result:
+        """subprocess result stub."""
+
+        returncode = 0
+
+    def record(*args: object, **kwargs: object) -> Result:
+        """Capture the child's argv and environment."""
+        seen["args"] = args
+        seen.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(workspace.subprocess, "run", record)
+    assert workspace._open_url("claude://x")  # pylint: disable=protected-access
+    assert seen["args"][0] == [opener, "claude://x"]
+    assert "LD_LIBRARY_PATH" not in seen["env"]
+
+
 def test_provisioning_ships_token_hygiene(store_path: Path) -> None:
     """The gitignore and the deny rule ship alongside the skill, not apart."""
     provisioned(store_path)
