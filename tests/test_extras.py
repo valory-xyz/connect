@@ -1412,7 +1412,9 @@ class TestWorkspaceExtras:
             )
         assert "exit 4" in caplog.text
         assert "no handler for x" in caplog.text
-        assert "folder=/tmp" not in caplog.text  # the scheme, not the query
+        # hygiene over the half we compose, not a boundary: the stderr we pass
+        # through may echo the query back, and nothing in a link is secret
+        assert "folder=/tmp" not in caplog.text
 
         # a refusal with nothing to say still names the link and the exit code
         caplog.clear()

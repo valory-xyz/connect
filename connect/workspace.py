@@ -292,14 +292,15 @@ class Workspace:
             if candidate != harness:
                 logger.info(
                     "%s would not open, so the session went to %s instead — "
-                    "set the harness in the agent UI to stop us guessing",
+                    "if that preference is stale, update the harness in the "
+                    "agent UI",
                     harness,
                     candidate,
                 )
             return candidate
         # "change the harness" is no way out on a machine where both have
         # already been tried, so the exhausted case names what it tried instead
-        if len(order) == 1:
+        if not fallback:
             reason = (
                 f"Could not open {harness} via its deep link — is it installed? "
                 f"If you use the other Claude Code, change the harness in the "

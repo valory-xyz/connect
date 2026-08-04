@@ -125,7 +125,12 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
         logger.warning("session launch failed: %s", e)
         # the reason, not just the harness: log.txt rotates, and "not
         # installed" and "no handler for the deep link" need different answers
-        state.activity.record("session_launch_failed", harness=requested, error=str(e))
+        state.activity.record(
+            "session_launch_failed",
+            harness=requested,
+            requested=requested,
+            error=str(e),
+        )
         # the same harness under both names: nothing opened, and a caller
         # should not have to branch on `launched` to know which fields exist
         return {

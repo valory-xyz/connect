@@ -2795,7 +2795,13 @@ class TestSettingsEndpoints:
             "requested": "claude_code_desktop",
             "error": "could not open claude_code_desktop",
         }
-        assert "session_launch_failed" in audit_kinds(store_path)
+        # the trail carries both harnesses on this outcome too
+        entry = audit_entries(store_path)[-1]
+        assert entry["kind"] == "session_launch_failed"
+        assert (entry["harness"], entry["requested"]) == (
+            "claude_code_desktop",
+            "claude_code_desktop",
+        )
 
     def test_session_rejects_cross_origin(self, client: TestClient) -> None:
         """A webpage must not be able to spawn agent sessions."""
