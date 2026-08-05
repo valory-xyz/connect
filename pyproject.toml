@@ -6,7 +6,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi==0.139.2",
+    "fastapi==0.141.1",
     "uvicorn==0.51.0",
     "web3==7.16.0",
     "eth-account==0.13.7",
@@ -115,4 +115,4 @@ markers = [
 # import-only baggage for us (mech-client's operate paths never run: we always
 # set MECHX_CHAIN_RPC and never call its CLI/setup services). Override keeps
 # our own server on the pinned fastapi.
-override-dependencies = ["fastapi==0.139.2"]
+override-dependencies = ["fastapi==0.141.1"]
