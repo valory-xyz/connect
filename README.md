@@ -29,10 +29,11 @@ other non-aea agent. It:
    - `POST /session` (origin-gated, no token): opens a Claude Code session in
      the configured harness (`claude_code_desktop` →
      `claude://code/new?folder=…`, `claude_code_cli` →
-     `claude-cli://open?cwd=…`) and answers `{launched, harness, error?}`.
-     An optional `{"harness": …}` body overrides the saved preference for that
-     launch alone — it opens where the caller asked without rewriting what the
-     operator chose
+     `claude-cli://open?cwd=…`) and answers
+     `{launched, harness, requested, error?}` — `harness` is the one that
+     opened, `requested` the one it aimed for. An optional `{"harness": …}`
+     body overrides the saved preference for that launch alone, without
+     rewriting what the operator chose
    - a bearer-authed signing surface: `POST /safe-transaction`,
      `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
@@ -43,8 +44,11 @@ other non-aea agent. It:
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)
 then reaches the operator's UI as a dismissable error instead of dying in this
-process's log — which is also why `/session` never falls back to the harness
-the operator did not choose.
+process's log. Neither Pearl nor the UI names a harness, so those launches
+start at the saved preference — until an operator changes it, only our default
+guess — and fall back to the other Claude Code rather than leave them with no
+session at all. A launch that *does* name one opens there or not at all:
+naming a harness is a choice.
 
 What the session must *not* inherit is our own packaging. We ship as a
 PyInstaller one-file binary, whose bootloader puts its extraction directory at
@@ -125,11 +129,11 @@ and audited; the reasoning lives in `connect/settings.py`'s module
 docstring. The
 `harness` preference is stored alongside without integrity checks and survives
 a guardrail reset. It is outside the MAC because it cannot move funds or widen
-the guardrail — but it is not free of consequence: since `/session` never falls
-back to the harness the operator did not choose, a tampered (or simply
-uninstalled) harness makes every launch answer `launched: false` until someone
-changes it back. That is visible and recoverable in the UI, which is the trade
-we are making. The MAC of the last file the server wrote is also pinned
+the guardrail — both harnesses are only ways to open Claude Code on the
+operator's own machine, and editing the field just reorders which one is tried
+first. What a tamper can still do is mislead: leave the UI showing a preference
+the operator's sessions are not opening in.
+The MAC of the last file the server wrote is also pinned
 in memory, so replaying an *old* validly-MAC'd settings file (say, captured
 while the mode was unrestricted) fails the same way; only a replay staged
 while the server is stopped escapes the pin. Operators change the mode in the agent UI at

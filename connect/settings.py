@@ -60,10 +60,10 @@ SETTINGS_VERSION = 1
 # The MAC covers the version and the "protected" object of the canonical
 # shape — everything an attacker could profit from editing. The harness is
 # deliberately outside it: it cannot move funds or widen the guardrail. It is
-# not free of consequence, though — /session never falls back to a harness the
-# operator did not choose, so a tampered value denies session launches until
-# it is changed back, which is visible in the UI and recoverable there. A new
-# top-level field
+# not free of consequence, though — a tampered value is the preference the UI
+# shows and the harness /session reaches for first. What it cannot do is deny
+# a session (an unnamed launch falls back), so what it buys is a misleading
+# readout, visible in the UI and correctable there. A new top-level field
 # ships outside the MAC unless it is named here, so a test pins the file's
 # top-level keys against this tuple: adding one fails it until its integrity
 # coverage is a decision rather than an oversight.

@@ -257,7 +257,7 @@ def test_deep_links(store_path: Path) -> None:
     # opens on "what can you do?" and the agent answers with its recipe tour
     for url in (desktop, cli):
         assert parse_qs(urlparse(url).query)["q"] == [workspace.FIRST_PROMPT]
-    # the harness resolves to exactly one link — the other is never a fallback
+    # each harness resolves to exactly one link, and to its own
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     assert agent_workspace.deep_link().startswith("claude://")
     assert agent_workspace.deep_link("claude_code_cli").startswith("claude-cli://")
@@ -320,6 +320,31 @@ def test_deep_link_rejects_an_unknown_harness(store_path: Path) -> None:
         agent_workspace.deep_link("cursor")
 
 
+def test_an_unknown_harness_raises_even_with_a_fallback_offered(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fallback is for a harness that would not open, not for a bogus name.
+
+    settings.py leans on "an unnamed launch falls back" to argue a tampered
+    harness cannot deny a session — true only because _harness_or_default
+    sanitizes the value on the way out of the settings file, never because
+    open_session tolerates a name it does not know. Pin the seam: a value that
+    slipped past that sanitizing is a ValueError (a 400), not a quiet open of
+    whatever else happens to be installed.
+    """
+    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    tried: list[str] = []
+
+    def accept(url: str) -> bool:
+        tried.append(url)
+        return True
+
+    monkeypatch.setattr(workspace, "_open_url", accept)
+    with pytest.raises(ValueError, match="cursor"):
+        agent_workspace.open_session("cursor", fallback=True)
+    assert not tried  # no link was opened on the way to the raise
+
+
 def test_every_choosable_harness_can_be_opened() -> None:
     """Whatever the operator may choose, we must be able to open.
 
@@ -331,13 +356,13 @@ def test_every_choosable_harness_can_be_opened() -> None:
     assert set(workspace.DEEP_LINKS) == set(HARNESSES)
 
 
-def test_open_session_never_falls_back(
+def test_a_named_harness_never_falls_back(
     store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On demand, only the chosen harness counts: no silent other-harness open.
+    """Ask for a harness by name and you get that one: no silent other open.
 
-    The operator picked a harness: they need to see that one fail, not to be
-    handed the other one and told it worked.
+    Naming one is a choice. The caller needs to see *that* one fail, not to be
+    handed the other and told it worked.
     """
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     tried: list[str] = []
@@ -347,7 +372,7 @@ def test_open_session_never_falls_back(
         return False
 
     monkeypatch.setattr(workspace, "_open_url", refuse)
-    with pytest.raises(workspace.LaunchError, match="claude_code_cli"):
+    with pytest.raises(workspace.LaunchError, match="change the harness"):
         agent_workspace.open_session("claude_code_cli")
     assert len(tried) == 1  # the desktop link was never tried as a fallback
     assert tried[0].startswith("claude-cli://")
@@ -359,5 +384,48 @@ def test_open_session_never_falls_back(
         return True
 
     monkeypatch.setattr(workspace, "_open_url", accept)
-    agent_workspace.open_session("claude_code_cli")
+    assert agent_workspace.open_session("claude_code_cli") == "claude_code_cli"
     assert tried == [workspace.cli_deep_link(store_path)]
+
+
+def test_an_unnamed_harness_falls_back_to_the_other_claude_code(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Our own guess is not a choice to hold the operator to (OPE-1867).
+
+    An operator with only the CLI installed met nothing but the default
+    failing — so a launch nobody named tries the other one too, and says which
+    one it ended up in.
+    """
+    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    tried: list[str] = []
+
+    def only_the_cli(url: str) -> bool:
+        tried.append(url)
+        return url.startswith("claude-cli://")
+
+    monkeypatch.setattr(workspace, "_open_url", only_the_cli)
+    with caplog.at_level("INFO"):
+        launched = agent_workspace.open_session(fallback=True)
+    assert launched == "claude_code_cli"  # the harness that opened, not the ask
+    assert tried == [
+        workspace.desktop_deep_link(store_path),
+        workspace.cli_deep_link(store_path),
+    ]
+    # never silently: the preference the operator has stopped getting is named
+    assert "went to claude_code_cli instead" in caplog.text
+
+    # and with neither installed, the error names what was tried — "change the
+    # harness" is no answer once both harnesses have already been tried
+    tried.clear()
+
+    def refuse(url: str) -> bool:
+        tried.append(url)
+        return False
+
+    monkeypatch.setattr(workspace, "_open_url", refuse)
+    with pytest.raises(workspace.LaunchError, match="none of claude_code_desktop") as e:
+        agent_workspace.open_session(fallback=True)
+    assert "claude_code_cli" in str(e.value)
+    assert str(store_path) in str(e.value)
+    assert len(tried) == len(workspace.DEEP_LINKS)
