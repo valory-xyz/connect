@@ -606,6 +606,109 @@ def http_get_json(url: str, params: dict | None = None) -> t.Any:
     return response.json()
 
 
+def http_post_json(url: str, payload: t.Any) -> t.Any:
+    """POST to a public JSON endpoint (the CLOB's batched price reads)."""
+    response = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+
+def price_or_none(value: t.Any) -> float | None:
+    """Parse a price string, or None when it is missing/empty/unparseable."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def clob_live_prices(token_ids: t.Iterable) -> dict:
+    """Live top of book per token id: {token_id: {best_bid, best_ask, mid}}.
+
+    One batched POST covers every token, so pricing a whole listing costs a
+    single call.
+
+    Mind the CLOB's side convention, the opposite of what the names suggest:
+    ``side=BUY`` returns the best **bid** and ``side=SELL`` the best **ask**
+    (verified against the raw book), so a taker *pays* the ask and *receives*
+    the bid. The keys here are named for what the numbers are, never for the
+    side that produced them.
+    """
+    tokens = [str(token) for token in dict.fromkeys(token_ids) if token]
+    if not tokens:
+        return {}
+    payload = [
+        {"token_id": token, "side": side}
+        for token in tokens
+        for side in ("BUY", "SELL")
+    ]
+    raw = http_post_json(f"{CLOB_HOST}/prices", payload)
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"CLOB /prices returned {type(raw).__name__}, expected an object"
+        )
+    live = {}
+    for token, sides in raw.items():
+        sides = sides if isinstance(sides, dict) else {}
+        best_bid = price_or_none(sides.get("BUY"))
+        best_ask = price_or_none(sides.get("SELL"))
+        mid = None
+        if best_bid is not None and best_ask is not None:
+            mid = round((best_bid + best_ask) / 2, 6)
+        live[str(token)] = {"best_bid": best_bid, "best_ask": best_ask, "mid": mid}
+    return live
+
+
+# --- order pricing ----------------------------------------------------------------
+
+# The CLOB rejects a marketable order worth less than this once the taker-fee
+# reserve is out of the spend — which is why a bet equal to the whole DW
+# balance bounces.
+MIN_MARKETABLE_USD = 1.0
+
+BUY_SIDE = "BUY"
+
+
+def quote_buy(  # pylint: disable=protected-access
+    client: t.Any, token_id: str, usd: float, balance: float, order_type: t.Any
+) -> dict:
+    """Price a buy against the live book: fill price, fee, shares, top-up.
+
+    Every number comes from the CLOB SDK's own sizing rather than a
+    reimplementation, so a quote and the buy that follows it cannot disagree.
+    The per-market taker fee is measured, not derived: it is whatever the SDK
+    declines to spend when the balance is exactly the order amount.
+
+    `client` is duck-typed on purpose — this lives here, away from trade.py's
+    SDK imports, so the arithmetic can be tested without installing the SDK.
+    """
+    price = client.calculate_market_price(token_id, BUY_SIDE, usd, order_type)
+    # The fee at full size is what a balance of exactly `usd` cannot cover.
+    fee = usd - client._adjust_buy_amount_for_balance(token_id, usd, price, usd, None)
+    affordable = client._adjust_buy_amount_for_balance(
+        token_id, usd, price, balance, None
+    )
+    required = usd + fee
+    return {
+        "token_id": token_id,
+        "side": "buy",
+        "order_type": str(order_type),
+        "requested_usd": round(usd, 6),
+        "fill_price": price,
+        "estimated_shares": round(usd / price, 6) if price else None,
+        "estimated_fee_usd": round(fee, 6),
+        "required_dw_balance_usd": round(required, 6),
+        "dw_balance_usd": round(balance, 6),
+        "shortfall_usd": round(max(0.0, required - balance), 6),
+        "spendable_now_usd": round(affordable, 6),
+        "blocked": affordable < usd and affordable < MIN_MARKETABLE_USD,
+        "note": (
+            "fill_price is the average price this size would pay at the "
+            "current book, not the top of book; the book moves, so a quote is "
+            "an estimate until the order matches"
+        ),
+    }
+
+
 def fetch_all_positions(
     params: dict, *, label: str, page_limit: int, max_offset: int
 ) -> list:

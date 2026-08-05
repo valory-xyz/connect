@@ -57,52 +57,83 @@ Run them from anywhere in the workspace (they locate `.mcp.json` upwards).
 |---|---|
 | `deposit_wallet.py status\|ensure` | Deploy the DW via the relayer proxy and grant its trading approvals (idempotent one-time setup) |
 | `funds.py balances\|wrap\|top-up\|sweep\|return-position` | Treasury flows between safe and DW; `return-position` stages an already-swept position back in the DW for selling |
-| `markets.py list\|market\|book\|price` | Market discovery and prices (public reads); `list --ends-within 48h\|7d\|2w` filters by resolution date |
-| `trade.py buy\|sell\|limit\|order\|cancel` | CLOB orders (POLY_1271, DW-funded); market orders take `--order-type fok\|fak`, limit orders `gtc\|gtd --expires-in` |
-| `positions.py positions\|trades` | Portfolio reads (public) |
+| `markets.py list\|market\|group\|book\|price` | Market discovery and prices (public reads); `list --query` searches, `list --ends-within 48h\|7d\|2w` filters by resolution date, `group` lists a neg-risk market's siblings |
+| `trade.py quote\|buy\|sell\|limit\|order\|cancel` | CLOB orders (POLY_1271, DW-funded); `quote` prices a buy without placing it; market orders take `--order-type fok\|fak`, limit orders `gtc\|gtd --expires-in` |
+| `positions.py positions\|trades` | Portfolio reads (indexed, with an on-chain confirmation) |
 | `redeem.py list\|approve\|redeem\|all` | Redeem resolved positions from the safe |
+| `netcheck.py` | Prove Polymarket is reachable before blaming the venue |
+| `bootstrap_env.sh` | Create/reuse the venv and export the TLS trust store |
 
-### Python environment — use a virtualenv, don't touch system Python
+### Python environment — one command, then reuse it
 
-The scripts need a few third-party packages (the Polymarket SDK, web3,
-requests). Run everything from a **persistent virtualenv**: create it if it doesn't
-exist already, and reuse the same one on every run afterwards — don't
-reinstall each time, and never install into the system Python. Keep the
-venv **outside** `.claude/skills/` (the server overwrites that directory on
-every boot, which would wipe a venv placed inside it).
+`bootstrap_env.sh` builds a virtualenv with the packages the scripts need
+(Polymarket SDK, web3, requests) and prints the environment to adopt. Run it
+once per shell — it is idempotent and reuses what it built:
 
 ```bash
-# Create-if-missing, reuse-if-present. Kept in a home cache dir (outside the
-# workspace), so it survives both restarts and skill refreshes. Override the
-# location with CONNECT_POLYMARKET_VENV if you prefer somewhere else.
-VENV="${CONNECT_POLYMARKET_VENV:-$HOME/.cache/connect-polymarket/venv}"
-if [ ! -x "$VENV/bin/python" ]; then
-  python3 -m venv "$VENV"
-  "$VENV/bin/pip" install -q --upgrade pip
-  "$VENV/bin/pip" install -q "py-clob-client-v2==1.0.2" "web3>=7.15,<8" requests
-fi
-PY="$VENV/bin/python"   # run every script below with "$PY", not plain python
-# Point TLS at certifi's CA bundle, on every run — not only at creation. A
-# pyenv/source-built Python often carries no trust store, and every Polymarket
-# HTTPS call then dies with CERTIFICATE_VERIFY_FAILED, which reads as a venue
-# outage rather than a local gap.
-SSL_CERT_FILE="$("$PY" -c 'import certifi; print(certifi.where())')"
-export SSL_CERT_FILE
-export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
+eval "$(bash scripts/bootstrap_env.sh)"   # sets $PY, SSL_CERT_FILE, REQUESTS_CA_BUNDLE
+"$PY" scripts/markets.py list             # run every script with "$PY"
 ```
 
-A typical first session (once the venv is set up as above):
+Don't skip the `eval`: `SSL_CERT_FILE` points at certifi's CA bundle, without
+which a pyenv or source-built Python fails every HTTPS call with
+`CERTIFICATE_VERIFY_FAILED` — an error that reads like a venue outage but is
+a local gap.
+
+The venv is `.venv` at this workspace's root: persistent, so it survives
+restarts, and outside `.claude/skills/`, which the server overwrites on every
+boot. Override with `CONNECT_POLYMARKET_VENV`; never install into the system
+Python.
+
+A typical first session, with `$PY` exported as above:
 
 ```bash
+"$PY" scripts/netcheck.py                  # optional: prove the network works
 "$PY" scripts/deposit_wallet.py ensure     # once: DW + approvals
 "$PY" scripts/funds.py wrap                # USDC.e → pUSD in the safe
 "$PY" scripts/markets.py list --query "bitcoin"
+"$PY" scripts/trade.py quote --token-id <id> --usd 10   # fee, shares, top-up
 "$PY" scripts/funds.py top-up --amount 10
 "$PY" scripts/trade.py buy --token-id <id> --usd 10
 "$PY" scripts/funds.py sweep               # position → safe
 # ...after resolution:
 "$PY" scripts/redeem.py all
 ```
+
+### Prices: which number is real
+
+Two sources disagree, and only one of them is tradeable.
+
+- **`outcome_prices_indicative`** is Gamma's cached snapshot. Never quote it
+  as the current price.
+- **`live_prices`** is the CLOB's own top of book — `best_bid`, `best_ask`,
+  `mid` — fetched on every `list`/`market`/`group` call unless you pass
+  `--no-live`. If it could not be fetched you get `live_prices_error`
+  instead, which means "unknown", not "the cache is fine".
+- A taker **pays `best_ask`** and **receives `best_bid`**. The CLOB's raw
+  `/price?side=buy` returns the best *bid*, which is why `markets.py price`
+  takes no `--side` and labels both sides instead.
+- `markets.py group` sums the siblings' first-outcome prices. A neg-risk
+  group should sum to ~1.0; a sum well off that means the set is incomplete
+  or the prices aren't live.
+
+Before any buy, `trade.py quote --token-id <id> --usd <n>` returns the fill
+price, the taker fee, the estimated shares and `shortfall_usd` — the exact
+amount to pass to `funds.py top-up`.
+
+### Portfolio reads lag the chain
+
+`positions.py` reads Polymarket's indexer, which trails the chain by seconds
+to minutes. An empty list right after a confirmed fill means "not indexed
+yet", never "no position".
+
+- It re-checks any token you may hold against the CTF contract, in both the
+  safe and the DW, and reports each hit under `onchain_check.held`. Treat
+  those as authoritative where they disagree with `positions`.
+- **`location: deposit_wallet` means the position is unswept** — it still
+  needs `funds.py sweep`.
+- `--token-ids <id>` confirms a specific token.
+- `onchain_check` is missing only under `--no-onchain`: nothing was verified.
 
 ## Prerequisites — check before starting, report blocks honestly
 
@@ -119,20 +150,19 @@ A typical first session (once the venv is set up as above):
 - **Relayer proxy reachable.** DW operations go through Valory's predict-api
   proxy (Polymarket's DW relayer needs a Builder key that can't ship in a
   desktop app). Override with `POLYMARKET_RELAYER_PROXY_URL` if instructed.
-- **Network reachable.** Some ISPs block Polymarket at the DNS level, which
-  looks nothing like the venue's 403 — connections hang or fail TLS, and
-  every host resolves to one address the ISP owns. Check before blaming the
-  venue or the code:
+- **Network reachable.** Some networks block Polymarket, which looks nothing
+  like the venue's 403 — connections hang or fail TLS. Test it by making a
+  request, not by inspecting DNS:
 
   ```bash
-  "$PY" -c "import socket
-  for h in ('clob.polymarket.com','gamma-api.polymarket.com','data-api.polymarket.com'):
-      print(h, socket.gethostbyname(h))"
+  "$PY" scripts/netcheck.py
   ```
 
-  Three distinct addresses is healthy; one address for all three means the
-  network is intercepting the lookup. Report that to the operator — it is
-  theirs to fix, and nothing here can route around it.
+  It resolves each host, completes a real HTTPS request, and says which layer
+  failed. **Identical IP addresses across the three hosts are normal** —
+  Cloudflare fronts all of them from one anycast address — so matching
+  addresses are never evidence of interception. A genuine block is the
+  operator's to fix; nothing here can route around it.
 - **Geoblocking.** Polymarket rejects order placement from the US, UK and
   ~30 other jurisdictions by IP (close-only). A `403`/geoblock error on
   order posting is the venue's policy, not a bug — report it to the operator
@@ -151,11 +181,10 @@ A typical first session (once the venv is set up as above):
   where the rate is 0.07 for crypto, 0.05 for sports/culture, 0.04 for
   politics/finance, 0 for geopolitics (makers pay nothing). The CLOB's
   marketable-order minimum is $1 **after** the fee reserve, so when the DW
-  balance equals the bet, a $1 bet shrinks below the minimum and is
-  rejected — `trade.py buy` preflights this with the SDK's exact per-market
-  sizing and tells you the precise top-up. Resting limit orders reserve the
-  same per-market fee on top of `price × size`. In short: **never buy with
-  the DW's full balance** — leave the fee room above the bet.
+  balance equals the bet, a $1 bet shrinks below the minimum and is rejected
+  (`trade.py quote` computes the exact figures). Resting limit orders reserve
+  the same per-market fee on top of `price × size`. In short: **never buy
+  with the DW's full balance** — leave the fee room above the bet.
 - pUSD has **no unwrap**: the onramp is wrap-only. The exit back to USDC is
   a DEX swap (Uniswap v3 pUSD/USDC pools) or selling positions and
   withdrawing pUSD as-is.

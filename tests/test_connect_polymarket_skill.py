@@ -33,6 +33,8 @@ covered by the live e2e, not here).
 # mypy: ignore-errors
 
 import json
+import os
+import subprocess  # nosec B404 - runs the skill's own bootstrap script
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,11 +64,33 @@ sys.path.insert(0, str(_SCRIPTS))
 import deposit_wallet  # noqa: E402
 import funds  # noqa: E402
 import markets  # noqa: E402
+import netcheck  # noqa: E402
 import pm_common as pm  # noqa: E402
 import positions  # noqa: E402
 import redeem  # noqa: E402
 import relayer_proxy  # noqa: E402
 import signer_client  # noqa: E402  (on sys.path via pm_common's sibling import)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail loudly rather than reach the internet from a unit test.
+
+    `markets.py`'s commands price live by default, so a test that drives one
+    without stubbing the CLOB quietly makes a real request: it passes on a
+    developer machine and hangs for HTTP_TIMEOUT on an isolated CI runner.
+    Tests that need these install their own fakes, which override this.
+    """
+
+    def explode(*args, **kwargs):
+        raise AssertionError(
+            "a unit test tried to reach the network — stub pm.http_get_json / "
+            "pm.http_post_json / pm.clob_live_prices in the test instead"
+        )
+
+    monkeypatch.setattr(pm, "http_get_json", explode)
+    monkeypatch.setattr(pm, "http_post_json", explode)
+
 
 ADDR_A = to_checksum_address("0x" + "11" * 20)
 ADDR_B = to_checksum_address("0x" + "22" * 20)
@@ -864,10 +888,10 @@ def test_positions_command_fetches_every_page(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr(pm, "http_get_json", fake_get)
 
-    positions.cmd_positions(_SweepCS({}), "safe", False)
+    positions.cmd_positions(_SweepCS({}), "safe", False, None, False)
 
     reported = json.loads(capsys.readouterr().out)
-    assert [p["token_id"] for p in reported] == ["11", "12", "13"]
+    assert [p["token_id"] for p in reported["positions"]] == ["11", "12", "13"]
     assert [params["offset"] for params in seen] == [0, 2]
 
 
@@ -880,6 +904,373 @@ def test_positions_command_rejects_non_list_page(monkeypatch, payload) -> None:
 
     with pytest.raises(SystemExit, match="expected a list"):
         positions.cmd_positions(_SweepCS({}), "safe", False)
+
+
+# --- positions: the indexer lags the chain (OPE-1862 #5) ------------------------
+
+
+class _ChainCS:
+    """A signer whose CTF reads are scripted and whose state is on disk."""
+
+    safe_address = SAFE_ADDR
+    w3 = object()
+
+    def __init__(self, workspace) -> None:
+        self.workspace = workspace
+
+
+DW_HELD = to_checksum_address("0x" + "dd" * 20)
+
+
+def _positions_mocks(monkeypatch, *, indexed, chain_balances, dw=DW_HELD):
+    """Mock the indexer and the chain.
+
+    `chain_balances` is keyed by (owner, token_id): a balance belongs to ONE
+    wallet, and a mock that ignored the owner would pass whichever address the
+    code read — which is how a safe/DW mix-up stayed invisible.
+    """
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: list(indexed))
+    monkeypatch.setattr(positions, "_resolve_dw", lambda cs: dw)
+    monkeypatch.setattr(
+        pm,
+        "erc1155_balance_of",
+        lambda w3, token, owner, token_id: chain_balances.get((owner, token_id), 0),
+    )
+
+
+def test_positions_confirms_a_fill_the_indexer_has_not_caught_up_to(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """The reported failure: [] right after a confirmed fill.
+
+    The position was on-chain the whole time; only the indexer was behind.
+    An empty list reads as "the buy did not fill".
+    """
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    # the hint says the DW holds it — that is where a just-filled buy lands,
+    # and the safe holds nothing until a sweep runs
+    _positions_mocks(
+        monkeypatch, indexed=[], chain_balances={(DW_HELD, 77): 12_500_000}
+    )
+
+    positions.cmd_positions(cs, "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["positions"] == []
+    assert out["onchain_check"]["held"] == [
+        {
+            "token_id": "77",  # nosec B105
+            "address": DW_HELD,
+            "location": "deposit_wallet",
+            "size": 12.5,
+            "size_base_units": 12_500_000,
+        }
+    ]
+    assert [a["address"] for a in out["onchain_check"]["addresses"]] == [
+        SAFE_ADDR,
+        DW_HELD,
+    ]
+    assert out["onchain_check"]["held"][0]["address"] == DW_HELD
+    assert "missing from the indexer" in out["warning"]
+    # the lag note is for a genuinely empty portfolio, not this one
+    assert "note" not in out
+
+
+def test_recorded_hints_are_checked_at_the_deposit_wallet_not_the_safe(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """The hints describe the DW, so reading the safe finds nothing.
+
+    A hint exists only while the position is unswept, i.e. at the DW.
+    Confirming it against the default `--wallet safe` reads the wrong
+    contract, always finds zero, and the fresh fill looks like it never
+    happened.
+    """
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    # ONLY the DW holds it; the safe's balance for the same token is zero
+    _positions_mocks(monkeypatch, indexed=[], chain_balances={(DW_HELD, 77): 5_000_000})
+
+    positions.cmd_positions(cs, "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert [h["token_id"] for h in out["onchain_check"]["held"]] == ["77"]
+    assert out["address"] == SAFE_ADDR  # the portfolio asked about
+    assert out["onchain_check"]["held"][0]["address"] == DW_HELD  # found there
+
+
+def test_onchain_check_is_present_whenever_verification_ran(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """Absence must mean --no-onchain and nothing else.
+
+    Otherwise "verified, found nothing" and "never verified" are the same JSON.
+    """
+    _positions_mocks(monkeypatch, indexed=[{"asset": "77"}], chain_balances={})
+
+    positions.cmd_positions(_ChainCS(tmp_path), "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["onchain_check"] == {
+        "addresses": [
+            {"address": SAFE_ADDR, "location": "requested_wallet"},
+            {"address": DW_HELD, "location": "deposit_wallet"},
+        ],
+        "checked_token_ids": [],
+        "held": [],
+    }
+
+
+def test_positions_says_empty_may_only_mean_unindexed(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """Nothing anywhere still has to disclose that the source lags."""
+    _positions_mocks(monkeypatch, indexed=[], chain_balances={})
+
+    positions.cmd_positions(_ChainCS(tmp_path), "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["positions"] == []
+    assert "lags the chain" in out["note"]
+    assert out["source"] == "data-api (indexer)"
+
+
+def test_a_repeat_buy_is_confirmed_even_though_the_indexer_lists_the_token(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """Buying more of a position you already hold must still be confirmed.
+
+    A second buy re-records the hint while the indexer still shows the OLD
+    size, so skipping already-reported tokens drops exactly the fresh
+    quantity — and silently no-ops an explicit --token-ids.
+    """
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)  # bought again; indexer still shows the old size
+    _positions_mocks(
+        monkeypatch,
+        indexed=[{"asset": "77", "size": 3}],
+        chain_balances={(DW_HELD, 77): 9_000_000},
+    )
+
+    positions.cmd_positions(cs, "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["onchain_check"]["checked_token_ids"] == ["77"]
+    assert out["onchain_check"]["held"][0]["size"] == 9.0
+    assert out["onchain_check"]["held"][0]["location"] == "deposit_wallet"
+    # the indexer listed this token, but at the pre-buy size — a caller gating
+    # on `warning` must still be told its 3.0 is stale against the chain's 9.0
+    assert "different size" in out["warning"]
+
+
+def test_no_warning_when_the_indexer_and_the_chain_agree(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """A matching size is not a discrepancy — don't cry wolf."""
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    _positions_mocks(
+        monkeypatch,
+        indexed=[{"asset": "77", "size": 4.0}],
+        chain_balances={(SAFE_ADDR, 77): 4_000_000},
+    )
+
+    positions.cmd_positions(cs, "safe", False)
+
+    assert "warning" not in json.loads(capsys.readouterr().out)
+
+
+def test_a_half_swept_position_is_one_holding_not_a_disagreement(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """Balances split across both wallets sum before being compared."""
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    _positions_mocks(
+        monkeypatch,
+        indexed=[{"asset": "77", "size": 10.0}],
+        chain_balances={(SAFE_ADDR, 77): 6_000_000, (DW_HELD, 77): 4_000_000},
+    )
+
+    positions.cmd_positions(cs, "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert len(out["onchain_check"]["held"]) == 2  # both legs still reported
+    assert "warning" not in out  # 6 + 4 == the indexer's 10
+
+
+@pytest.mark.parametrize(
+    ("chain_size", "indexer_size"),
+    [
+        # real values observed live: the indexer truncates size to 4 decimals
+        # while the chain carries 6. An exact comparison called every healthy
+        # position a disagreement — a warning that always fires is ignored.
+        (411.435578, 411.4355),
+        (358.836593, 358.8365),
+        (342.138861, 342.1388),
+    ],
+)
+def test_indexer_rounding_is_not_a_disagreement(chain_size, indexer_size) -> None:
+    """Display precision must not read as the chain and indexer disagreeing."""
+    assert (
+        positions._indexer_disagrees(
+            [{"token_id": "77", "size": indexer_size}],  # nosec B105
+            [{"token_id": "77", "size": chain_size}],  # nosec B105
+        )
+        == set()
+    )
+
+
+def test_a_real_size_change_still_disagrees() -> None:
+    """The tolerance must not grow big enough to swallow an actual top-up."""
+    assert positions._indexer_disagrees(
+        [{"token_id": "77", "size": 3.0}],  # nosec B105
+        [{"token_id": "77", "size": 9.0}],  # nosec B105
+    ) == {"77"}
+
+
+@pytest.mark.parametrize("bad_size", [float("nan"), float("inf"), "nan", None])
+def test_an_unusable_indexer_size_counts_as_a_disagreement(bad_size) -> None:
+    """A size that is not a usable number must not read as agreement.
+
+    NaN survives `float()` and `json.loads`, and every comparison against it
+    is False — so the check would silently pass on it.
+    """
+    held = [{"token_id": "77", "size": 9.0}]  # nosec B105
+    assert positions._indexer_disagrees(
+        [{"token_id": "77", "size": bad_size}], held  # nosec B105
+    ) == {"77"}
+
+
+def test_explicit_token_ids_are_never_filtered_by_the_indexer(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """An explicit request is a question, and it must always be answered."""
+    cs = _ChainCS(tmp_path)
+    _positions_mocks(
+        monkeypatch,
+        indexed=[{"asset": "55", "size": 1}],
+        chain_balances={(SAFE_ADDR, 55): 2_000_000},
+    )
+
+    positions.cmd_positions(cs, "safe", False, [55])
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["onchain_check"]["checked_token_ids"] == ["55"]
+    assert out["onchain_check"]["held"][0]["size"] == 2.0
+
+
+def test_positions_explicit_token_ids_override_the_hints(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """--token-ids is the escape hatch when the hints are gone (post-sweep)."""
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    # explicit ids are the caller's own question, so they follow --wallet
+    _positions_mocks(
+        monkeypatch, indexed=[], chain_balances={(SAFE_ADDR, 99): 1_000_000}
+    )
+
+    positions.cmd_positions(cs, "safe", False, [99])
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["onchain_check"]["checked_token_ids"] == ["99"]
+    assert out["onchain_check"]["held"][0]["address"] == SAFE_ADDR
+    assert out["onchain_check"]["held"][0]["size"] == 1.0
+
+
+def test_documented_recovery_command_finds_an_unswept_buy(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """`positions.py positions --token-ids <id>` must work as documented.
+
+    INDEXER_LAG_NOTE and SKILL.md send the caller here with no --wallet, but a
+    fresh buy is unswept and --wallet defaults to the safe: reading only the
+    safe returns held: [] and the caller may buy again with real funds.
+    """
+    cs = _ChainCS(tmp_path)
+    _positions_mocks(monkeypatch, indexed=[], chain_balances={(DW_HELD, 42): 7_000_000})
+
+    positions.cmd_positions(cs, "safe", False, [42])
+
+    out = json.loads(capsys.readouterr().out)
+    assert [h["token_id"] for h in out["onchain_check"]["held"]] == ["42"]
+    assert out["onchain_check"]["held"][0]["address"] == DW_HELD
+    assert "note" not in out  # never "may not be indexed yet" for a real hit
+
+
+def test_an_rpc_failure_does_not_discard_the_portfolio(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """The confirmation is advisory; a chain blip must not lose the read.
+
+    `_resolve_dw` raises SystemExit to abort a DW *deployment*. Letting that
+    escape a read-only query threw away positions already fetched.
+    """
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    monkeypatch.setattr(
+        pm, "http_get_json", lambda url, params=None: [{"asset": "55", "size": 2}]
+    )
+
+    def boom(_cs):
+        raise SystemExit("persisted DepositWallet has no readable owner()")
+
+    monkeypatch.setattr(positions, "_resolve_dw", boom)
+
+    positions.cmd_positions(cs, "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert [p["token_id"] for p in out["positions"]] == ["55"]  # not discarded
+    assert "could not confirm on-chain" in out["onchain_check"]["error"]
+    assert "held" not in out["onchain_check"]  # never reads as "checked, none"
+
+
+def test_positions_no_onchain_flag_trusts_the_indexer(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """--no-onchain must not silently still hit the chain."""
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    called = []
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: [])
+    monkeypatch.setattr(
+        pm,
+        "erc1155_balance_of",
+        lambda *a: called.append(a) or 0,
+    )
+
+    positions.cmd_positions(cs, "safe", False, None, False)
+
+    assert called == []
+    assert "onchain_check" not in json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("1,2", [1, 2]), ("1 2", [1, 2]), ("3", [3]), (None, []), ("", [])],
+)
+def test_parse_token_ids_accepts_commas_and_spaces(raw, expected) -> None:
+    """Both separators an operator might reasonably type."""
+    assert positions._parse_token_ids(raw) == expected
+
+
+def test_parse_token_ids_rejects_junk() -> None:
+    """A typo must fail loudly, not silently check nothing."""
+    with pytest.raises(SystemExit, match="comma/space separated"):
+        positions._parse_token_ids("77,abc")
+
+
+def test_trades_discloses_the_same_lag(monkeypatch, capsys, tmp_path) -> None:
+    """Trade history is indexed too, so an empty answer proves nothing."""
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: [])
+
+    positions.cmd_trades(_ChainCS(tmp_path), "safe", 10)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["trades"] == []
+    assert "lags the chain" in out["note"]
 
 
 @pytest.mark.parametrize("payload", [None, {"positions": []}])
@@ -919,6 +1310,9 @@ def test_market_events_fallback(monkeypatch, capsys) -> None:
         ]
 
     monkeypatch.setattr(pm, "http_get_json", fake_get)
+    # cmd_market now prices live by default; without this the test would make a
+    # real POST to the CLOB — fine here, a 30s hang on an isolated CI runner.
+    monkeypatch.setattr(pm, "clob_live_prices", lambda tokens: {})
     markets.cmd_market("s", None)
     out = json.loads(capsys.readouterr().out)
     assert out[0]["question"] == "Q"
@@ -1317,3 +1711,896 @@ def test_cmd_list_without_the_flag_sends_no_bounds(monkeypatch, capsys) -> None:
     markets.cmd_list(5, None, None)
     capsys.readouterr()
     assert "end_date_min" not in seen
+
+
+# --- live prices vs Gamma's cache (OPE-1862 #1) ---------------------------------
+
+
+def test_clob_live_prices_names_each_side_for_what_it_is() -> None:
+    """The CLOB's BUY side is the best *bid*; mislabelling it misprices trades.
+
+    Verified against the raw book: side=BUY is max(bids), side=SELL is
+    min(asks). A taker pays the ask.
+    """
+    captured = {}
+
+    def fake_post(url, payload):
+        captured["url"] = url
+        captured["payload"] = payload
+        return {"7": {"BUY": "0.85", "SELL": "0.86"}}
+
+    original = pm.http_post_json
+    try:
+        pm.http_post_json = fake_post
+        live = pm.clob_live_prices(["7"])
+    finally:
+        pm.http_post_json = original
+
+    assert live == {"7": {"best_bid": 0.85, "best_ask": 0.86, "mid": 0.855}}
+    assert captured["url"].endswith("/prices")
+    assert captured["payload"] == [
+        {"token_id": "7", "side": "BUY"},  # nosec B105
+        {"token_id": "7", "side": "SELL"},  # nosec B105
+    ]
+
+
+def test_clob_live_prices_batches_and_dedupes(monkeypatch) -> None:
+    """One call prices a whole listing; a repeated token is asked for once."""
+    seen = {}
+
+    def fake_post(url, payload):
+        seen["payload"] = payload
+        return {}
+
+    monkeypatch.setattr(pm, "http_post_json", fake_post)
+    pm.clob_live_prices(["7", "8", "7"])
+    assert [entry["token_id"] for entry in seen["payload"]] == ["7", "7", "8", "8"]
+
+
+def test_clob_live_prices_empty_input_makes_no_call(monkeypatch) -> None:
+    """No tokens, no HTTP."""
+    monkeypatch.setattr(
+        pm,
+        "http_post_json",
+        lambda url, payload: pytest.fail("should not have called the CLOB"),
+    )
+    assert pm.clob_live_prices([]) == {}
+
+
+def test_clob_live_prices_leaves_an_empty_side_as_none(monkeypatch) -> None:
+    """A one-sided book must not fabricate a mid."""
+    monkeypatch.setattr(
+        pm, "http_post_json", lambda url, payload: {"7": {"BUY": "0.4", "SELL": ""}}
+    )
+    assert pm.clob_live_prices(["7"])["7"] == {
+        "best_bid": 0.4,
+        "best_ask": None,
+        "mid": None,
+    }
+
+
+def test_clob_live_prices_rejects_a_non_object_payload(monkeypatch) -> None:
+    """A malformed response must not read as "no prices"."""
+    monkeypatch.setattr(pm, "http_post_json", lambda url, payload: ["nope"])
+    with pytest.raises(ValueError, match="expected an object"):
+        pm.clob_live_prices(["7"])
+
+
+def test_slim_renames_gammas_cache_so_it_cannot_pass_as_live() -> None:
+    """Gamma's outcomePrices was quoted as fact at 0.45 against a 0.24 book."""
+    slim = markets._slim({"outcomePrices": '["0.45", "0.55"]'})
+    assert slim["outcome_prices_indicative"] == ["0.45", "0.55"]
+    assert "outcome_prices" not in slim
+
+
+def test_attach_live_prices_keys_each_quote_by_outcome(monkeypatch) -> None:
+    """The live book is reported per outcome name, next to the cache."""
+    monkeypatch.setattr(
+        pm,
+        "clob_live_prices",
+        lambda tokens: {
+            "1": {"best_bid": 0.24, "best_ask": 0.30, "mid": 0.27},
+            "2": {"best_bid": 0.70, "best_ask": 0.76, "mid": 0.73},
+        },
+    )
+    [slim] = markets._attach_live_prices(
+        [markets._slim({"outcomes": '["Yes","No"]', "clobTokenIds": '["1","2"]'})]
+    )
+    assert slim["live_prices"]["Yes"]["mid"] == 0.27
+    assert slim["live_prices"]["No"]["best_ask"] == 0.76
+
+
+def test_attach_live_prices_reports_failure_instead_of_falling_back(
+    monkeypatch,
+) -> None:
+    """An unchecked book must never look like a current one."""
+
+    def boom(tokens):
+        raise RuntimeError("clob down")
+
+    monkeypatch.setattr(pm, "clob_live_prices", boom)
+    [slim] = markets._attach_live_prices(
+        [markets._slim({"outcomes": '["Yes","No"]', "clobTokenIds": '["1","2"]'})]
+    )
+    assert "live_prices" not in slim
+    assert "clob down" in slim["live_prices_error"]
+    assert "cached snapshot" in slim["live_prices_error"]
+
+
+def test_a_market_with_no_tokens_still_gets_the_key(monkeypatch) -> None:
+    """The never-neither guarantee must not depend on the rest of the batch.
+
+    A market with no clobTokenIds would otherwise carry the key when listed
+    beside tradeable ones and lack it when looked up alone.
+    """
+    monkeypatch.setattr(pm, "clob_live_prices", lambda tokens: {})
+    [alone] = markets._attach_live_prices([markets._slim({"question": "no tokens"})])
+    assert alone["live_prices"] is None
+
+    beside = markets._attach_live_prices(
+        [
+            markets._slim({"question": "no tokens"}),
+            markets._slim({"outcomes": '["Yes"]', "clobTokenIds": '["1"]'}),
+        ]
+    )
+    assert beside[0]["live_prices"] is None
+
+
+def test_no_live_skips_the_clob_entirely(monkeypatch) -> None:
+    """--no-live is opt-out, and it really opts out."""
+    monkeypatch.setattr(
+        pm,
+        "clob_live_prices",
+        lambda tokens: pytest.fail("should not have priced anything"),
+    )
+    [slim] = markets._attach_live_prices(
+        [markets._slim({"clobTokenIds": '["1","2"]'})], live=False
+    )
+    assert "live_prices" not in slim
+
+
+def test_cmd_price_labels_both_sides_and_takes_no_side_flag(
+    monkeypatch, capsys
+) -> None:
+    """`price --side buy` used to return the best bid under a buyer's name."""
+    monkeypatch.setattr(
+        pm,
+        "clob_live_prices",
+        lambda tokens: {"7": {"best_bid": 0.85, "best_ask": 0.86, "mid": 0.855}},
+    )
+    markets.cmd_price("7")
+    out = json.loads(capsys.readouterr().out)
+    assert out["7"]["best_ask"] == 0.86
+
+
+def test_cmd_price_fails_loudly_when_the_clob_says_nothing(monkeypatch) -> None:
+    """An unknown token is an error, not an empty object."""
+    monkeypatch.setattr(pm, "clob_live_prices", lambda tokens: {})
+    with pytest.raises(SystemExit, match="no prices"):
+        markets.cmd_price("7")
+
+
+# --- search: --query returned [] for markets that exist (OPE-1862 #2) -----------
+
+
+def _search_payload(*events):
+    return {"events": list(events)}
+
+
+def test_query_searches_the_index_instead_of_scanning_a_page(
+    monkeypatch, capsys
+) -> None:
+    """The reported failure: --query "largest company" returned [].
+
+    /markets has no text parameter at all, so the old substring scan could
+    only match inside the volume-ordered head.
+    """
+    calls = []
+
+    def fake_get(url, params=None):
+        calls.append((url, dict(params or {})))
+        return _search_payload(
+            {
+                "markets": [
+                    {
+                        "question": "Will NVIDIA be the largest company?",
+                        "volumeNum": 272080.0,
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    markets.cmd_list(5, "largest company", None, None, False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert [m["question"] for m in out] == ["Will NVIDIA be the largest company?"]
+    url, params = calls[0]
+    assert url.endswith("/public-search")
+    assert params["q"] == "largest company"
+
+
+def test_search_drops_resolved_markets(monkeypatch, capsys) -> None:
+    """public-search returns closed markets even asked for active events."""
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: _search_payload(
+            {
+                "markets": [
+                    {"question": "open", "volumeNum": 1},
+                    {"question": "resolved", "closed": True, "volumeNum": 999},
+                    {"question": "inactive", "active": False, "volumeNum": 998},
+                ]
+            }
+        ),
+    )
+    markets.cmd_list(5, "anything", None, None, False)
+    out = json.loads(capsys.readouterr().out)
+    assert [m["question"] for m in out] == ["open"]
+
+
+def test_search_orders_by_volume_so_limit_keeps_the_biggest(
+    monkeypatch, capsys
+) -> None:
+    """Relevance order would otherwise let --limit drop the liquid markets."""
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: _search_payload(
+            {
+                "markets": [
+                    {"question": "small", "volumeNum": 10},
+                    {"question": "big", "volumeNum": 5000},
+                    {"question": "unparseable volume", "volumeNum": "oops"},
+                ]
+            }
+        ),
+    )
+    markets.cmd_list(2, "anything", None, None, False)
+    out = json.loads(capsys.readouterr().out)
+    assert [m["question"] for m in out] == ["big", "small"]
+
+
+def test_search_can_still_be_narrowed_by_tag(monkeypatch, capsys) -> None:
+    """--tag filters on the event's tags, since search is event-shaped."""
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: _search_payload(
+            {"tags": [{"slug": "tech"}], "markets": [{"question": "kept"}]},
+            {"tags": [{"slug": "sports"}], "markets": [{"question": "dropped"}]},
+            {"markets": [{"question": "untagged"}]},
+        ),
+    )
+    markets.cmd_list(5, "anything", "tech", None, False)
+    out = json.loads(capsys.readouterr().out)
+    assert [m["question"] for m in out] == ["kept"]
+
+
+def test_search_survives_a_shapeless_response(monkeypatch, capsys) -> None:
+    """A payload without events is no results, not a crash."""
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: [])
+    markets.cmd_list(5, "anything", None, None, False)
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_query_and_ends_within_compose(monkeypatch, capsys) -> None:
+    """A searched market still has to resolve inside the window."""
+    soon = (datetime.now(timezone.utc) + timedelta(hours=5)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    later = (datetime.now(timezone.utc) + timedelta(days=40)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: _search_payload(
+            {
+                "markets": [
+                    {"question": "soon", "endDate": soon},
+                    {"question": "later", "endDate": later},
+                ]
+            }
+        ),
+    )
+    markets.cmd_list(5, "anything", None, "48h", False)
+    out = json.loads(capsys.readouterr().out)
+    assert [m["question"] for m in out] == ["soon"]
+
+
+# --- group: neg-risk siblings (OPE-1862 #3) ------------------------------------
+
+
+def _group_event(*markets_):
+    return {
+        "title": "Largest Company end of August?",
+        "slug": "largest-company",
+        "negRisk": True,
+        "markets": list(markets_),
+    }
+
+
+def test_group_lists_siblings_and_sums_their_first_outcome(monkeypatch, capsys) -> None:
+    """The sum is the sanity check that was previously found by accident."""
+
+    def fake_get(url, params=None):
+        if url.endswith("/markets"):
+            return [{"slug": "apple", "events": [{"slug": "largest-company"}]}]
+        return [
+            _group_event(
+                {
+                    "question": "Apple?",
+                    "groupItemTitle": "Apple",
+                    "outcomes": '["Yes","No"]',
+                    "clobTokenIds": '["1","2"]',
+                },
+                {
+                    "question": "Alphabet?",
+                    "groupItemTitle": "Alphabet",
+                    "outcomes": '["Yes","No"]',
+                    "clobTokenIds": '["3","4"]',
+                },
+            )
+        ]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    monkeypatch.setattr(
+        pm,
+        "clob_live_prices",
+        lambda tokens: {
+            "1": {"best_bid": 0.55, "best_ask": 0.57, "mid": 0.56},
+            "3": {"best_bid": 0.41, "best_ask": 0.43, "mid": 0.42},
+        },
+    )
+
+    markets.cmd_group("apple", None, None)
+
+    out = json.loads(capsys.readouterr().out)
+    assert [s["group_item_title"] for s in out["siblings"]] == ["Apple", "Alphabet"]
+    assert out["first_outcome_price_sum"] == 0.98
+    assert out["priced_markets"] == 2
+    assert out["neg_risk"] is True
+
+
+def test_group_sums_live_prices_not_the_stale_cache(monkeypatch, capsys) -> None:
+    """Summing cached prices would give a confident number that means nothing."""
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: (
+            [{"events": [{"slug": "e"}]}]
+            if url.endswith("/markets")
+            else [
+                _group_event(
+                    {
+                        "outcomes": '["Yes","No"]',
+                        "outcomePrices": '["0.45","0.55"]',
+                        "clobTokenIds": '["1","2"]',
+                    }
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        pm,
+        "clob_live_prices",
+        lambda tokens: {"1": {"best_bid": 0.24, "best_ask": 0.30, "mid": 0.27}},
+    )
+
+    markets.cmd_group("s", None, None)
+
+    assert json.loads(capsys.readouterr().out)["first_outcome_price_sum"] == 0.27
+
+
+def test_group_falls_back_to_the_cache_only_when_live_is_off(
+    monkeypatch, capsys
+) -> None:
+    """With --no-live there is nothing but the cache, so say the sum anyway."""
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: (
+            [{"events": [{"slug": "e"}]}]
+            if url.endswith("/markets")
+            else [
+                _group_event(
+                    {"outcomes": '["Yes","No"]', "outcomePrices": '["0.45","0.55"]'}
+                )
+            ]
+        ),
+    )
+    markets.cmd_group("s", None, None, False)
+    assert json.loads(capsys.readouterr().out)["first_outcome_price_sum"] == 0.45
+
+
+def test_group_accepts_the_event_slug_directly(monkeypatch, capsys) -> None:
+    """--event-slug skips the market lookup entirely."""
+    calls = []
+
+    def fake_get(url, params=None):
+        calls.append(url)
+        return [_group_event({"question": "Apple?"})]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    markets.cmd_group(None, None, "largest-company", False)
+    assert all(url.endswith("/events") for url in calls)
+    assert json.loads(capsys.readouterr().out)["markets"] == 1
+
+
+def test_group_says_so_when_a_market_belongs_to_no_group(monkeypatch) -> None:
+    """A standalone market has no siblings; invent none."""
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        # /markets finds the market, /events knows no such event
+        lambda url, params=None: (
+            [{"slug": "solo", "events": []}] if url.endswith("/markets") else []
+        ),
+    )
+    with pytest.raises(SystemExit, match="not part of a market group"):
+        markets.cmd_group("solo", None, None, False)
+
+
+def test_group_resolves_a_slug_the_events_index_served(monkeypatch, capsys) -> None:
+    """The recurring series /markets doesn't serve must still reach its group.
+
+    Their markets come from the /events fallback and carry no `events` key, so
+    keying only on that made `group` impossible for them — even though the
+    fallback had already proved the slug names an event.
+    """
+    calls = []
+
+    def fake_get(url, params=None):
+        calls.append(url)
+        if url.endswith("/markets"):
+            return []  # not served here — the documented fallback case
+        return [_group_event({"question": "Apple?"})]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    markets.cmd_group("btc-updown-5m-1234567890", None, None, False)
+
+    assert json.loads(capsys.readouterr().out)["markets"] == 1
+
+
+def test_group_reports_an_unknown_event_slug(monkeypatch) -> None:
+    """An empty events index is an error, not an empty group."""
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: [])
+    with pytest.raises(SystemExit, match="no event found"):
+        markets.cmd_group(None, None, "nope", False)
+
+
+def test_main_wires_group_and_no_live(monkeypatch, capsys) -> None:
+    """The CLI is the only way this runs in production, so parse it for real."""
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: [_group_event({"question": "Apple?"})],
+    )
+    monkeypatch.setattr(
+        pm,
+        "clob_live_prices",
+        lambda tokens: pytest.fail("--no-live must reach cmd_group"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["markets.py", "group", "--event-slug", "largest-company", "--no-live"],
+    )
+    markets.main()
+    assert json.loads(capsys.readouterr().out)["markets"] == 1
+
+
+# --- quote: the buy math, before the buy (OPE-1862 #4) --------------------------
+
+
+class _QuoteClient:
+    """The two SDK sizing calls quote_buy leans on, with a flat 3% taker fee."""
+
+    def __init__(self, price=0.5, fee_rate=0.03) -> None:
+        self.price = price
+        self.fee_rate = fee_rate
+
+    def calculate_market_price(self, token_id, side, amount, order_type):
+        return self.price
+
+    def _adjust_buy_amount_for_balance(self, token_id, amount, price, balance, _):
+        # the SDK spends at most what the balance covers once the fee is held
+        return min(amount, balance / (1 + self.fee_rate))
+
+
+def test_quote_surfaces_price_fee_shares_and_topup() -> None:
+    """The numbers existed only inside the buy preflight's error message."""
+    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 100.0, "FOK")
+
+    assert quote["fill_price"] == 0.5
+    assert quote["estimated_shares"] == 20.0
+    assert quote["estimated_fee_usd"] == pytest.approx(0.291262, abs=1e-6)
+    assert quote["required_dw_balance_usd"] == pytest.approx(10.291262, abs=1e-6)
+    assert quote["shortfall_usd"] == 0.0
+    assert quote["blocked"] is False
+
+
+def test_quote_names_the_exact_topup_when_the_balance_is_short() -> None:
+    """shortfall_usd goes straight to `funds.py top-up --amount`."""
+    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 4.0, "FOK")
+    assert quote["dw_balance_usd"] == 4.0
+    assert quote["shortfall_usd"] == pytest.approx(6.291262, abs=1e-6)
+
+
+def test_quote_flags_the_dollar_minimum_that_breaks_small_bets() -> None:
+    """A $1 bet on a $1 balance is fee-shrunk under the CLOB's minimum."""
+    quote = pm.quote_buy(_QuoteClient(), "7", 1.0, 1.0, "FOK")
+    assert quote["spendable_now_usd"] < 1.0
+    assert quote["blocked"] is True
+    assert quote["shortfall_usd"] > 0
+
+
+def test_quote_works_against_an_empty_deposit_wallet() -> None:
+    """How much do I need? is the question an empty DW most needs answered."""
+    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 0.0, "FOK")
+    assert quote["spendable_now_usd"] == 0.0
+    assert quote["shortfall_usd"] == quote["required_dw_balance_usd"]
+
+
+def test_quote_does_not_divide_by_a_zero_price() -> None:
+    """An empty book must not turn a quote into a ZeroDivisionError."""
+    quote = pm.quote_buy(_QuoteClient(price=0), "7", 10.0, 50.0, "FOK")
+    assert quote["estimated_shares"] is None
+
+
+# --- netcheck: the DNS heuristic was inverted (OPE-1862 #7) ---------------------
+
+
+def _netcheck_hosts(monkeypatch, *, addresses, probe):
+    monkeypatch.setattr(
+        netcheck, "_resolve", lambda host: {"addresses": list(addresses), "error": None}
+    )
+    monkeypatch.setattr(netcheck, "_probe", lambda host: dict(probe))
+
+
+def test_identical_cloudflare_addresses_are_healthy(monkeypatch) -> None:
+    """The reported false positive, inverted.
+
+    All three hosts share one Cloudflare address on a healthy machine; the old
+    check called exactly that "the ISP is intercepting your DNS".
+    """
+    _netcheck_hosts(
+        monkeypatch,
+        addresses=["172.64.153.51"],
+        probe={"state": "reachable", "status_code": 200},
+    )
+    report = netcheck.check()
+
+    assert report["ok"] is True
+    assert "NOT evidence of DNS interception" in report["shared_addresses_note"]
+    assert "Cloudflare" in report["shared_addresses_note"]
+
+
+def test_a_403_still_counts_as_reachable(monkeypatch) -> None:
+    """Geoblocking is the venue's policy, not a broken network."""
+    _netcheck_hosts(
+        monkeypatch,
+        addresses=["172.64.153.51"],
+        probe={"state": "reachable", "status_code": 403},
+    )
+    assert netcheck.check()["ok"] is True
+
+
+def test_tls_failure_points_at_the_ca_bundle_first(monkeypatch) -> None:
+    """A trust-store gap is far likelier than interception, and it's fixable."""
+    _netcheck_hosts(
+        monkeypatch,
+        addresses=["172.64.153.51"],
+        probe={"state": "tls_failed", "detail": "CERTIFICATE_VERIFY_FAILED"},
+    )
+    report = netcheck.check()
+
+    assert report["ok"] is False
+    assert "bootstrap_env.sh" in report["next_step"]
+
+
+def test_unresolvable_hosts_are_reported_as_dns(monkeypatch) -> None:
+    """A real DNS failure still has to be named."""
+    monkeypatch.setattr(
+        netcheck,
+        "_resolve",
+        lambda host: {"addresses": [], "error": "gaierror: nope"},
+    )
+    monkeypatch.setattr(
+        netcheck, "_probe", lambda host: {"state": "unreachable", "detail": "no"}
+    )
+    report = netcheck.check()
+
+    assert report["ok"] is False
+    assert "do not resolve" in report["conclusion"]
+
+
+def test_resolving_but_unreachable_is_a_block(monkeypatch) -> None:
+    """Resolution working while connections die is the blocking signature."""
+    _netcheck_hosts(
+        monkeypatch,
+        addresses=["172.64.153.51"],
+        probe={"state": "timeout", "detail": "timed out"},
+    )
+    report = netcheck.check()
+
+    assert report["ok"] is False
+    assert "blocking traffic" in report["conclusion"]
+
+
+def test_distinct_addresses_get_no_shared_note(monkeypatch) -> None:
+    """Nothing shared, nothing to explain."""
+    counter = iter(["1.1.1.1", "2.2.2.2", "3.3.3.3"])
+    monkeypatch.setattr(
+        netcheck, "_resolve", lambda host: {"addresses": [next(counter)], "error": None}
+    )
+    monkeypatch.setattr(
+        netcheck, "_probe", lambda host: {"state": "reachable", "status_code": 200}
+    )
+    assert "shared_addresses_note" not in netcheck.check()
+
+
+def test_a_shared_non_cloudflare_address_is_still_not_a_verdict(
+    monkeypatch,
+) -> None:
+    """Any CDN can front several hosts; that is not evidence of hijacking."""
+    _netcheck_hosts(
+        monkeypatch,
+        addresses=["203.0.113.7"],
+        probe={"state": "reachable", "status_code": 200},
+    )
+    note = netcheck.check()["shared_addresses_note"]
+    assert "single CDN" in note
+    assert "NOT evidence of DNS interception" in note
+
+
+@pytest.mark.parametrize(
+    ("exc", "state"),
+    [
+        (netcheck.requests.exceptions.SSLError("bad cert"), "tls_failed"),
+        (netcheck.requests.exceptions.ConnectTimeout("slow"), "timeout"),
+        (netcheck.requests.exceptions.ConnectionError("refused"), "unreachable"),
+        (netcheck.requests.exceptions.TooManyRedirects("loop"), "error"),
+    ],
+)
+def test_probe_names_the_layer_that_failed(monkeypatch, exc, state) -> None:
+    """Each failure mode maps to a distinct, actionable state."""
+
+    def boom(url, timeout=None):
+        raise exc
+
+    monkeypatch.setattr(netcheck.requests, "get", boom)
+    assert netcheck._probe("clob.polymarket.com")["state"] == state
+
+
+def test_probe_reports_the_status_code_on_success(monkeypatch) -> None:
+    """A completed request is the whole point of the check."""
+
+    class _Response:
+        status_code = 200
+
+    monkeypatch.setattr(netcheck.requests, "get", lambda url, timeout=None: _Response())
+    assert netcheck._probe("clob.polymarket.com") == {
+        "state": "reachable",
+        "status_code": 200,
+    }
+
+
+def test_resolve_returns_every_address(monkeypatch) -> None:
+    """Both A and AAAA records, deduped."""
+    monkeypatch.setattr(
+        netcheck.socket,
+        "getaddrinfo",
+        lambda host, port, proto=None: [
+            (None, None, None, None, ("172.64.153.51", 443)),
+            (None, None, None, None, ("172.64.153.51", 443)),
+            (None, None, None, None, ("2606:4700::1", 443, 0, 0)),
+        ],
+    )
+    assert netcheck._resolve("clob.polymarket.com") == {
+        "addresses": ["172.64.153.51", "2606:4700::1"],
+        "error": None,
+    }
+
+
+def test_resolve_reports_the_resolver_error(monkeypatch) -> None:
+    """A resolver failure is data for the verdict, not an exception."""
+
+    def boom(host, port, proto=None):
+        raise netcheck.socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr(netcheck.socket, "getaddrinfo", boom)
+    result = netcheck._resolve("clob.polymarket.com")
+    assert result["addresses"] == []
+    assert "gaierror" in result["error"]
+
+
+def test_netcheck_main_exits_nonzero_when_unreachable(monkeypatch, capsys) -> None:
+    """The exit code has to make a broken network scriptable."""
+    monkeypatch.setattr(
+        netcheck,
+        "check",
+        lambda: {"ok": False, "hosts": [], "conclusion": "nope", "next_step": None},
+    )
+    monkeypatch.setattr(sys, "argv", ["netcheck.py"])
+    with pytest.raises(SystemExit) as exc:
+        netcheck.main()
+    assert exc.value.code == 1
+    assert json.loads(capsys.readouterr().out)["conclusion"] == "nope"
+
+
+# --- the bundled skill ships what SKILL.md tells the agent to run ---------------
+
+
+def test_skill_ships_the_scripts_its_docs_reference() -> None:
+    """A documented command that isn't installed is a dead end mid-session."""
+    skill = _SCRIPTS.parent
+    doc = (skill / "SKILL.md").read_text(encoding="utf-8")
+    for script in ("bootstrap_env.sh", "netcheck.py", "markets.py", "trade.py"):
+        assert (skill / "scripts" / script).is_file()
+        assert script in doc
+
+
+# --- bootstrap_env.sh: the venv is .venv in the workspace (OPE-1862 #6) --------
+
+
+BOOTSTRAP = _SCRIPTS / "bootstrap_env.sh"
+
+
+def _fake_venv(root: Path, complete: bool = True) -> Path:
+    """Build a venv stub whose python answers the certifi query.
+
+    `complete=False` reproduces a venv whose pip install died partway: the
+    interpreter exists, the sentinel does not.
+    """
+    venv = root / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    python = venv / "bin" / "python"
+    python.write_text("#!/bin/sh\necho /fake/cacert.pem\n", encoding="utf-8")
+    python.chmod(0o755)
+    if complete:
+        (venv / ".bootstrap-complete").touch()
+    return venv
+
+
+def _fake_pip(venv: Path, exit_code: int = 0) -> Path:
+    """Put a stub pip in the venv so no real install is attempted."""
+    pip = venv / "bin" / "pip"
+    pip.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
+    pip.chmod(0o755)
+    return pip
+
+
+def _run_bootstrap(cwd: Path, env_extra: dict | None = None):
+    return subprocess.run(  # nosec B603 B607 - fixed argv, test-controlled paths
+        ["bash", str(BOOTSTRAP)],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"], "HOME": str(cwd), **(env_extra or {})},
+        check=False,
+    )
+
+
+def test_bootstrap_puts_the_venv_in_the_workspace(tmp_path) -> None:
+    """`.venv` at the workspace root — persistent, and beside the skill state."""
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _fake_venv(tmp_path)
+
+    result = _run_bootstrap(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert f"export PY={venv / 'bin' / 'python'}" in result.stdout
+    assert "export SSL_CERT_FILE=/fake/cacert.pem" in result.stdout
+    assert "export REQUESTS_CA_BUNDLE=/fake/cacert.pem" in result.stdout
+    assert "reusing venv" in result.stderr
+
+
+def test_bootstrap_finds_the_root_from_a_nested_directory(tmp_path) -> None:
+    """The scripts are run from anywhere in the workspace, so this must be too."""
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _fake_venv(tmp_path)
+    nested = tmp_path / ".claude" / "skills" / "connect-polymarket"
+    nested.mkdir(parents=True)
+
+    result = _run_bootstrap(nested)
+
+    assert result.returncode == 0, result.stderr
+    assert f"export PY={venv / 'bin' / 'python'}" in result.stdout
+
+
+def test_bootstrap_refuses_when_there_is_no_workspace(tmp_path) -> None:
+    """Guessing a location would strand the venv somewhere nothing looks."""
+    result = _run_bootstrap(tmp_path)
+
+    assert result.returncode == 1
+    assert "could not be located" in result.stderr
+    assert not (tmp_path / ".venv").exists()
+
+
+def test_bootstrap_retries_a_venv_whose_install_died_partway(tmp_path) -> None:
+    """An interpreter without the sentinel is a half-built venv, not a ready one.
+
+    `python3 -m venv` writes bin/python before the packages land, so gating on
+    the interpreter alone would call a broken venv "ready" forever.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _fake_venv(tmp_path, complete=False)
+    _fake_pip(venv)
+
+    result = _run_bootstrap(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "installing dependencies" in result.stderr
+    assert (venv / ".bootstrap-complete").is_file()
+
+
+def test_bootstrap_failure_makes_the_callers_eval_fail(tmp_path) -> None:
+    """`eval "$(...)"` discards the exit status, so stdout has to carry it.
+
+    Without this the caller sees exit 0 and an unset $PY after a failed
+    install.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _fake_venv(tmp_path, complete=False)
+    _fake_pip(venv, exit_code=1)
+
+    result = _run_bootstrap(tmp_path)
+
+    assert result.returncode != 0
+    assert "false" in result.stdout  # eval'ing this fails the caller too
+    assert "export PY=" not in result.stdout
+    assert not (venv / ".bootstrap-complete").exists()
+
+    # prove the emitted snippet really does fail the caller's eval
+    evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test-controlled input
+        ["bash", "-c", f"eval \"$(cat <<'EOF'\n{result.stdout}\nEOF\n)\""],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert evaled.returncode != 0
+    assert "bootstrap FAILED" in evaled.stderr
+
+
+def test_bootstrap_override_wins_over_the_workspace(tmp_path) -> None:
+    """CONNECT_POLYMARKET_VENV stays the escape hatch, workspace or not."""
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    _fake_venv(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "bin").mkdir(parents=True)
+    python = elsewhere / "bin" / "python"
+    python.write_text("#!/bin/sh\necho /other/cacert.pem\n", encoding="utf-8")
+    python.chmod(0o755)
+    (elsewhere / ".bootstrap-complete").touch()
+
+    result = _run_bootstrap(tmp_path, {"CONNECT_POLYMARKET_VENV": str(elsewhere)})
+
+    assert result.returncode == 0, result.stderr
+    assert f"export PY={python}" in result.stdout
+
+
+def test_bootstrap_emits_only_shell_assignments_on_stdout(tmp_path) -> None:
+    """The stdout is eval'd, so a stray log line there would be executed."""
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    _fake_venv(tmp_path)
+
+    result = _run_bootstrap(tmp_path)
+
+    assert all(
+        line.startswith("export ") for line in result.stdout.splitlines() if line
+    )
+
+
+def test_workspace_gitignores_the_skill_venv() -> None:
+    """A `git init` in the workspace must not be able to stage the venv."""
+    assert ".venv/" in workspace.GITIGNORE_ENTRIES
+
+
+def test_skill_no_longer_teaches_the_inverted_dns_rule() -> None:
+    """Three identical IPs is the healthy result, and the doc must not say otherwise."""
+    doc = (_SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+    assert "one address for all three means" not in doc
+    assert "Identical IP addresses across the three hosts are normal" in doc

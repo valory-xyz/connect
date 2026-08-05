@@ -73,8 +73,9 @@ CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harness itself reads .mcp.json; the model never needs to, and reading
 # it would put the bearer token into the session transcript
 TOKEN_DENY_RULES = ("Read(./.mcp.json)",)
-# a `git init` in the workspace must never be able to stage the token
-GITIGNORE_ENTRIES = (".mcp.json",)
+# a `git init` in the workspace must never be able to stage the token, nor
+# the virtualenv the connect-polymarket skill builds at the workspace root
+GITIGNORE_ENTRIES = (".mcp.json", ".venv/")
 
 # Loader variables our PyInstaller bootloader leaks: its extraction directory
 # leads LD_LIBRARY_PATH and ships an older libcrypto, so a session inheriting
@@ -366,7 +367,9 @@ class Workspace:
         missing = [entry for entry in GITIGNORE_ENTRIES if entry not in existing]
         if not missing:
             return
-        lines = existing + ["# connect: never commit the signer token"] + missing
+        lines = (
+            existing + ["# connect: never commit the signer token or venv"] + missing
+        )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _write_claude_settings(self) -> None:
