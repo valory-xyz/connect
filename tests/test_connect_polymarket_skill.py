@@ -39,8 +39,10 @@ from pathlib import Path
 
 import pytest
 from eth_abi import decode as abi_decode
-from eth_utils import to_checksum_address
-from web3.exceptions import ContractLogicError, TimeExhausted
+from eth_utils import is_address, to_checksum_address
+from web3 import Web3
+from web3.exceptions import ContractLogicError, ExtraDataLengthError, TimeExhausted
+from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 
 from connect import workspace
 from connect.config import AGENT_HTTP_PORT, BIND_HOST
@@ -334,6 +336,14 @@ def test_relayer_transaction_no_false_match(monkeypatch: pytest.MonkeyPatch) -> 
 class _StubCS:
     agent_eoa = to_checksum_address("0x" + "9e" * 20)
     w3 = object()
+
+
+class _StubProxy:
+    """Relayer proxy that answers the one question `cmd_status` asks it."""
+
+    @staticmethod
+    def deployed(dw: str) -> bool:
+        return True
 
 
 def test_resolve_dw_none_when_no_record(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -967,6 +977,224 @@ def test_deploy_fatal_when_owner_never_reads(monkeypatch, tmp_path) -> None:
     with pytest.raises(SystemExit):
         deposit_wallet._deploy(cs, _DeployProxy())
     assert pm.load_state(cs) == {}
+
+
+# --- connect(): the web3 the documented send path needs -------------------------
+
+
+ERC20_APPROVE_ABI = [
+    {
+        "name": "approve",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [{"type": "bool"}],
+    }
+]
+
+
+def _connected(monkeypatch, chain_entry: dict):
+    """Build the client's web3 without touching .mcp.json or the network."""
+    monkeypatch.setattr(
+        signer_client, "load_mcp_config", lambda: ("http://127.0.0.1:8716", "t0ken")
+    )
+    monkeypatch.setattr(
+        signer_client.SignerClient, "chain_info", lambda self, c=None: chain_entry
+    )
+    return signer_client.connect("polygon")
+
+
+def _record_chain_rpc(monkeypatch, answers: dict) -> list:
+    """Answer chain RPC from `answers`, returning the list of methods asked.
+
+    Anything the client asks that is not in `answers` fails the test rather
+    than reaching the network — an unexpected round trip is the thing these
+    tests are here to notice.
+    """
+    seen: list = []
+
+    def make_request(self, method, params):  # noqa: ARG001
+        seen.append(method)
+        assert method in answers, f"unexpected chain RPC: {method}"
+        return {"jsonrpc": "2.0", "id": 1, "result": answers[method]}
+
+    monkeypatch.setattr(signer_client.HTTPProvider, "make_request", make_request)
+    return seen
+
+
+def test_connect_disarms_the_middleware_that_broke_contract_calls(
+    monkeypatch,
+) -> None:
+    """Two failures cost real transactions: local gas estimation, and PoA blocks.
+
+    web3 estimates gas for a send with `from` unset — the node then simulates
+    from the zero address and an approve reverts before anything is sent — and
+    its block formatter refuses Polygon's oversized extraData, which the fee
+    middleware reads on the way to every send.
+    """
+    w3, _ = _connected(monkeypatch, {"rpc": "http://127.0.0.1:9", "safe": SAFE_ADDR})
+    installed = [name for _, name in w3.middleware_onion.middleware]
+    assert "gas_estimate" not in installed
+    assert "gas_price_strategy" not in installed
+    assert ExtraDataToPOAMiddleware in [
+        entry[0] for entry in w3.middleware_onion.middleware
+    ]
+    # the safe makes the call, so it is the `from` a simulation should assume
+    assert w3.eth.default_account == SAFE_ADDR
+
+
+def test_a_contract_send_reaches_the_signer_without_estimating_locally(
+    monkeypatch,
+) -> None:
+    """The behaviour the middleware removal is for, watched at the RPC layer.
+
+    An approve is what reverted in the field. Here the only chain traffic a
+    send may cause is web3's own chain-id read: an ``eth_estimateGas`` (the
+    call that reverted from the zero address) or an ``eth_getBlockByNumber``
+    (the fee lookup) appearing again fails this, whatever the middleware
+    happens to be called by then.
+    """
+    seen = _record_chain_rpc(monkeypatch, {"eth_chainId": hex(137)})
+    sent: list = []
+    monkeypatch.setattr(
+        signer_client.SignerClient,
+        "_post",
+        lambda self, path, payload: sent.append((path, payload))
+        or {"tx_hash": "0x" + "ab" * 32},
+    )
+    w3, _ = _connected(monkeypatch, {"rpc": "http://127.0.0.1:9", "safe": SAFE_ADDR})
+    token = w3.eth.contract(address=ADDR_A, abi=ERC20_APPROVE_ABI)
+    token.functions.approve(ADDR_B, 10**6).transact()
+
+    assert "eth_estimateGas" not in seen
+    assert "eth_getBlockByNumber" not in seen
+    ((path, payload),) = sent
+    assert path == "/safe-transaction"  # made by the safe, not the EOA
+    assert payload["to"] == ADDR_A
+    assert payload["data"].startswith("0x095ea7b3")  # approve(address,uint256)
+
+
+def test_connect_reads_a_block_whose_extradata_is_oversized(monkeypatch) -> None:
+    """Polygon's extraData must not blow up a block read (it once did).
+
+    web3's default formatter rejects extraData past 32 bytes, so without the
+    PoA middleware this read raises and takes every receipt wait with it.
+    """
+    block = {"number": "0x1", "extraData": "0x" + "ab" * 97}
+    _record_chain_rpc(monkeypatch, {"eth_getBlockByNumber": block})
+    w3, _ = _connected(monkeypatch, {"rpc": "http://127.0.0.1:9", "safe": SAFE_ADDR})
+    assert w3.eth.get_block("latest")["number"] == 1
+
+    plain = Web3(provider=signer_client.HTTPProvider("http://127.0.0.1:9"))
+    with pytest.raises(ExtraDataLengthError):  # the same read, unprotected
+        plain.eth.get_block("latest")
+
+
+def test_connect_reports_a_middleware_it_could_not_remove(monkeypatch, capsys) -> None:
+    """A web3 that renamed one leaves the client doing work it meant to skip.
+
+    Nothing breaks — the send still goes — so the stderr note is the only
+    sign, and a silent version of this would be a slow regression nobody
+    notices.
+    """
+    monkeypatch.setattr(signer_client, "UNUSED_SEND_MIDDLEWARE", ("no_such_layer",))
+    w3, _ = _connected(monkeypatch, {"rpc": "http://127.0.0.1:9", "safe": SAFE_ADDR})
+    assert "no_such_layer" in capsys.readouterr().err
+    # the un-stripped middlewares are still installed, and still harmless
+    # because the estimate they make now carries a real sender
+    installed = [name for _, name in w3.middleware_onion.middleware]
+    assert "gas_estimate" in installed
+    assert w3.eth.default_account == SAFE_ADDR
+
+
+def test_connect_says_so_when_there_is_no_safe_to_read_as(monkeypatch, capsys) -> None:
+    """No safe: reads fall back to no sender, which can answer wrongly in silence."""
+    w3, _ = _connected(monkeypatch, {"rpc": "http://127.0.0.1:9", "safe": None})
+    assert not w3.eth.default_account  # nothing to point `from` at, and no crash
+    assert "no service safe" in capsys.readouterr().err
+
+
+# --- the published constants table ----------------------------------------------
+
+
+def test_contracts_table_covers_every_address_constant_exactly_once() -> None:
+    """A constant missing from the table is one the next reader mislabels.
+
+    The declared set is read out of the module rather than restated here, so
+    a new address constant fails this until it is named in the table — a
+    hand-kept list would just be a third copy to forget.
+    """
+    tabled = {address for _, address, _ in pm.CONTRACTS}
+    declared = {
+        value
+        for name, value in vars(pm).items()
+        if not name.startswith("_") and isinstance(value, str) and is_address(value)
+    }
+    assert tabled == declared
+    names = [name for name, _, _ in pm.CONTRACTS]
+    assert len(names) == len(set(names)) == len(pm.CONTRACTS)
+    assert all(role for _, _, role in pm.CONTRACTS)
+
+
+def test_contract_label_names_the_two_that_were_confused() -> None:
+    """The CTF and the collateral onramp are the pair that got swapped."""
+    assert pm.contract_label(pm.CTF) == "CTF"
+    assert pm.contract_label(pm.COLLATERAL_ONRAMP) == "CollateralOnramp"
+    assert pm.contract_label(pm.CTF.lower()) == "CTF"  # however it is cased
+    assert pm.contract_label(ADDR_A) == ADDR_A  # unknown: echoed, never guessed
+    assert pm.labelled([pm.CTF, ADDR_A]) == {pm.CTF: "CTF", ADDR_A: ADDR_A}
+
+
+def test_constants_report_publishes_the_addresses_and_hosts() -> None:
+    """`python pm_common.py` must answer without a network or a signer."""
+    report = pm.constants_report()
+    assert report["chain"] == {"name": pm.CHAIN, "chain_id": pm.CHAIN_ID}
+    assert [entry["address"] for entry in report["contracts"]] == [
+        address for _, address, _ in pm.CONTRACTS
+    ]
+    assert pm.CLOB_HOST in report["api_hosts"].values()
+    # the approval set, named — the DW's three venues, not the two adapters
+    assert set(report["dw_trading_approvals"]["pusd_allowances"].values()) == {
+        "CTFExchange",
+        "NegRiskCTFExchange",
+        "NegRiskAdapter",
+    }
+
+
+def test_status_prints_the_labels_beside_the_approvals(monkeypatch, capsys) -> None:
+    """The one production caller: names must actually reach the printed report.
+
+    ``approval_contracts`` being right is no use if ``status`` drops it, and
+    the two maps are only readable together — a name in one, its flag in the
+    other, under the same key.
+    """
+    monkeypatch.setattr(deposit_wallet, "_resolve_dw", lambda cs: DW_ADDR)
+    monkeypatch.setattr(deposit_wallet, "RelayerProxyClient", lambda cs: _StubProxy())
+    monkeypatch.setattr(pm, "contract_owner", lambda w3, a: _StubCS.agent_eoa)
+    monkeypatch.setattr(pm, "_eth_call", lambda w3, to, data: bytes(32))
+    deposit_wallet.cmd_status(_StubCS())
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["approval_contracts"] == pm.approval_contracts()
+    for section, names in report["approval_contracts"].items():
+        assert names.keys() == report["approvals"][section].keys()
+
+
+def test_approval_labels_are_keyed_like_the_approval_status(monkeypatch) -> None:
+    """The names must land beside the flags they describe, at every level.
+
+    ``deposit_wallet.py status`` prints both maps side by side; if their keys
+    or addresses drifted apart the reader would match a name to the wrong
+    flag — worse than no name at all.
+    """
+    monkeypatch.setattr(pm, "_eth_call", lambda w3, to, data: bytes(32))
+    status = pm.approvals_status(None, ADDR_A)
+    labels = pm.approval_contracts()
+    assert labels.keys() == status.keys()
+    assert all(labels[key].keys() == status[key].keys() for key in status)
 
 
 # --- .mcp.json base URL: the trailing slash that 404'd a whole live run ----------

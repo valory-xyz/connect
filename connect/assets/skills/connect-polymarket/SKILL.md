@@ -61,6 +61,7 @@ Run them from anywhere in the workspace (they locate `.mcp.json` upwards).
 | `trade.py buy\|sell\|limit\|order\|cancel` | CLOB orders (POLY_1271, DW-funded); market orders take `--order-type fok\|fak`, limit orders `gtc\|gtd --expires-in` |
 | `positions.py positions\|trades` | Portfolio reads (public) |
 | `redeem.py list\|approve\|redeem\|all` | Redeem resolved positions from the safe |
+| `pm_common.py` | Print every contract and API host this skill uses, named (reference only, no network) |
 
 ### Python environment — use a virtualenv, don't touch system Python
 

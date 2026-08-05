@@ -112,6 +112,27 @@ receipt = w3.eth.wait_for_transaction_receipt(tx_hash)   # plain RPC read
 signature = signer.sign_digest("0x" + "11" * 32)          # raw digest signing
 ```
 
+Contract calls go the same way, through a normal web3 contract object —
+`connect()` points `w3.eth.default_account` at the safe, so a simulation sees
+the sender the send will really have:
+
+```python
+token = w3.eth.contract(address=usdc, abi=ERC20_ABI)
+token.functions.balanceOf(w3.eth.default_account).call()        # read
+tx_hash = token.functions.approve(spender, amount).transact()   # sent by the safe
+```
+
+`signer.send_transaction({...})` is the same send one layer down, and the one
+to reach for when you need to pass a `request_id` (below).
+
+Two things `connect()` handles that hand-rolled web3 code gets wrong: PoA
+chains (Polygon above all) pad `extraData` past 32 bytes and break every block
+read unless the PoA middleware is injected, and web3's own gas estimator would
+otherwise simulate the call with `from` unset — i.e. from the zero address —
+so a contract call reverts (`ERC20: approve from the zero address`) before
+anything is sent. Build the web3 with `connect()`, not `Web3(...)`, and
+neither happens.
+
 Reads (balances, gas estimation, receipts) go straight to the chain RPC;
 only sending passes through the signer. The client mints a `request_id` per
 logical transaction and retries client-side timeouts with the same id, so a

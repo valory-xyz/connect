@@ -64,9 +64,9 @@ CHAIN_ID = 137
 # --- Polymarket contracts (Polygon mainnet, CLOB v2) ---------------------------
 PUSD = to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
 USDC_E = to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-# Circle's USDC. The onramp does NOT accept it, but a safe funded
-# through Pearl routinely holds it, so every balance read must show it —
-# omitting it reads as "no USDC" and looks like a funding blocker.
+# Declared even though no flow here can spend it: a safe funded through Pearl
+# routinely holds it, so every balance read must show it — omitting it reads
+# as "no USDC" and looks like a funding blocker.
 USDC = to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
 COLLATERAL_ONRAMP = to_checksum_address("0x93070a847efEf7F70739046A929D47a521F5B8ee")
 CTF = to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
@@ -81,13 +81,90 @@ CTF_COLLATERAL_ADAPTER = to_checksum_address(
 NEG_RISK_CTF_COLLATERAL_ADAPTER = to_checksum_address(
     "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
 )
-# Polymarket DepositWallet factory. All relayer mutations target the factory
-# (which dispatches to the per-owner DW), never the DW directly.
 DW_FACTORY = to_checksum_address("0x00000000000Fb5C9ADea0298D729A0CB3823Cc07")
 
 MAX_UINT256 = 2**256 - 1
 PARENT_COLLECTION_ID = b"\x00" * 32
 PUSD_DECIMALS = 6
+
+# --- the labelled table of the above ------------------------------------------
+
+
+class Contract(t.NamedTuple):
+    """One contract, named. Fields are read by name, never by position.
+
+    All three are strings, so a positional table would let a name and a role
+    swap places unnoticed — the exact mistake this table exists to prevent.
+    """
+
+    name: str
+    address: str
+    role: str
+
+
+# The one place each address above is described, so a role is never restated
+# (and never drifts) elsewhere. It exists because the roles are close enough
+# to swap by accident — the CTF holds the outcome shares, the onramp mints the
+# collateral — and a wrong label reads exactly like a right one.
+CONTRACTS: tuple[Contract, ...] = (
+    Contract(
+        "pUSD", PUSD, "Polymarket v2 collateral token (6 decimals) — what buys spend"
+    ),
+    Contract("USDC.e", USDC_E, "Bridged USDC — the only asset the onramp wraps"),
+    Contract(
+        "USDC", USDC, "Circle's native USDC — NOT wrappable; swap to USDC.e first"
+    ),
+    Contract(
+        "CollateralOnramp",
+        COLLATERAL_ONRAMP,
+        "wrap(USDC.e) -> pUSD, called by the safe; wrap-only, there is no unwrap",
+    ),
+    Contract(
+        "CTF",
+        CTF,
+        "Gnosis ConditionalTokens — the ERC-1155 holding every outcome share",
+    ),
+    Contract("CTFExchange", CTF_EXCHANGE, "CLOB settlement for ordinary markets"),
+    Contract(
+        "NegRiskCTFExchange",
+        NEG_RISK_CTF_EXCHANGE,
+        "CLOB settlement for neg-risk (multi-outcome) markets",
+    ),
+    Contract(
+        "NegRiskAdapter",
+        NEG_RISK_ADAPTER,
+        "Wraps neg-risk positions; third holder of the DW's trading approvals",
+    ),
+    Contract(
+        "CtfCollateralAdapter",
+        CTF_COLLATERAL_ADAPTER,
+        "redeemPositions for ordinary markets",
+    ),
+    Contract(
+        "NegRiskCtfCollateralAdapter",
+        NEG_RISK_CTF_COLLATERAL_ADAPTER,
+        "redeemPositions for neg-risk markets",
+    ),
+    Contract(
+        "DepositWalletFactory",
+        DW_FACTORY,
+        "Deploys and dispatches to the per-owner DW; every relayer mutation "
+        "targets it, never a DW directly",
+    ),
+)
+
+_CONTRACTS_BY_ADDRESS = {c.address.lower(): c.name for c in CONTRACTS}
+
+
+def contract_label(address: str) -> str:
+    """Name a known Polymarket contract; an unknown one comes back unchanged."""
+    return _CONTRACTS_BY_ADDRESS.get(str(address).lower(), str(address))
+
+
+def labelled(addresses: t.Iterable[str]) -> dict:
+    """Map each address to its contract name, for address-keyed reports."""
+    return {address: contract_label(address) for address in addresses}
+
 
 # --- API hosts -----------------------------------------------------------------
 CLOB_HOST = "https://clob.polymarket.com"
@@ -555,6 +632,18 @@ APPROVAL_OPERATORS_CTF = (
 )
 
 
+def approval_contracts() -> dict:
+    """Name the canonical set's contracts, keyed like ``approvals_status``.
+
+    So a caller printing the status can print what each address is beside it,
+    without either side listing the venues a second time.
+    """
+    return {
+        "pusd_allowances": labelled(APPROVAL_SPENDERS_PUSD),
+        "ctf_operators": labelled(APPROVAL_OPERATORS_CTF),
+    }
+
+
 def approvals_status(w3: Web3, owner: str) -> dict:
     """Read the on-chain approval state for `owner` against the canonical set."""
     return {
@@ -645,3 +734,24 @@ def fetch_all_positions(
 def print_json(payload: t.Any) -> None:
     """Print a JSON result for the calling agent to read."""
     print(json.dumps(payload, indent=2, default=str))
+
+
+def constants_report() -> dict:
+    """Return the published reference: every address and host, named."""
+    return {
+        "chain": {"name": CHAIN, "chain_id": CHAIN_ID},
+        "contracts": [c._asdict() for c in CONTRACTS],
+        "api_hosts": {
+            "clob": CLOB_HOST,
+            "gamma": GAMMA_API,
+            "data": DATA_API,
+            "relayer_proxy": DEFAULT_RELAYER_PROXY_URL,
+        },
+        "dw_trading_approvals": approval_contracts(),
+    }
+
+
+if __name__ == "__main__":
+    # Reference only — no network, no signer, no workspace. Run it before
+    # quoting an address anywhere.
+    print_json(constants_report())

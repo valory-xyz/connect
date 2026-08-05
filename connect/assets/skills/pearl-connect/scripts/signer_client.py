@@ -31,6 +31,7 @@ Usage:
 
 import http.client
 import json
+import sys
 import typing as t
 import urllib.error
 import urllib.request
@@ -38,9 +39,20 @@ import uuid
 from pathlib import Path
 
 from web3 import HTTPProvider, Web3
+from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 
 MCP_SERVER_NAME = "pearl-connect"
 SEND_ATTEMPTS = 3
+
+# web3 middlewares that only earn their place when the sending process also
+# prices and signs the transaction. Here the connect server does both, so
+# their output is discarded — and one of them actively breaks the documented
+# send path: the gas estimator runs eth_estimateGas on a transaction whose
+# `from` web3 never filled, so the node simulates the call from the zero
+# address and a plain approve reverts with "ERC20: approve from the zero
+# address" before anything is sent. The fee middleware is merely wasteful: an
+# extra eth_getBlockByNumber per send, for fields the server replaces.
+UNUSED_SEND_MIDDLEWARE = ("gas_estimate", "gas_price_strategy")
 
 
 class SignerRequestError(RuntimeError):
@@ -223,10 +235,48 @@ def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
     return base_url, token
 
 
+def _strip_unused_send_middleware(w3: Web3) -> None:
+    """Drop the middlewares that make `w3.eth.send_transaction` estimate locally.
+
+    See UNUSED_SEND_MIDDLEWARE for why. A web3 that has renamed or dropped
+    them says so on stderr rather than silently: sends keep working, because
+    the default account `connect` sets below gives the estimator a real
+    `from` — but only on a chain that has a safe, and only at the cost of the
+    round trips this client means to avoid. Both are worth seeing.
+    """
+    for name in UNUSED_SEND_MIDDLEWARE:
+        try:
+            w3.middleware_onion.remove(name)
+        except ValueError:  # web3.exceptions.Web3ValueError is a ValueError
+            print(
+                f"NOTE: web3 {w3.api} has no '{name}' middleware to remove; "
+                "sends still work but do needless client-side work",
+                file=sys.stderr,
+            )
+
+
 def connect(chain: str) -> tuple[Web3, SignerClient]:
     """Web3 instance whose sends go through the signer, plus the raw client."""
     base_url, token = load_mcp_config()
     signer = SignerClient(base_url, token, chain)
-    rpc_url = signer.chain_info(chain)["rpc"]
-    w3 = Web3(provider=SignerProvider(rpc_url, signer))
+    entry = signer.chain_info(chain)
+    w3 = Web3(provider=SignerProvider(entry["rpc"], signer))
+    # PoA chains (Polygon above all) pad extraData past 32 bytes, which web3's
+    # default block formatter refuses — and every block read fails with it,
+    # including the one web3 makes on the way to a send. Injected here, once,
+    # rather than rediscovered by every script; a no-op on non-PoA chains.
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    _strip_unused_send_middleware(w3)
+    # The safe is what makes every call sent through this client, so it is
+    # also the `from` reads should default to: an eth_call, an explicit
+    # estimate_gas or a contract .call() then simulates the real sender.
+    safe = entry.get("safe")
+    if safe:
+        w3.eth.default_account = Web3.to_checksum_address(safe)
+    else:
+        print(
+            f"NOTE: no service safe on '{chain}', so reads default to no sender; "
+            "pass an explicit 'from' to anything sender-dependent",
+            file=sys.stderr,
+        )
     return w3, signer
