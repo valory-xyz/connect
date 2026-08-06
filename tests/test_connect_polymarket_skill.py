@@ -1333,6 +1333,31 @@ def test_an_rpc_failure_does_not_discard_the_portfolio(
     assert "held" not in out["onchain_check"]  # never reads as "checked, none"
 
 
+def test_a_failed_read_never_calls_a_token_gone(monkeypatch, capsys, tmp_path) -> None:
+    """The error path must not contradict itself.
+
+    With the token ALSO listed by the indexer, marking ids checked before the
+    reads ran let the reverse direction report "already gone on-chain" in the
+    same response whose onchain_check.error says nothing could be read.
+    """
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    monkeypatch.setattr(
+        pm, "http_get_json", lambda url, params=None: [{"asset": "77", "size": 5.0}]
+    )
+
+    def boom(_cs):
+        raise SystemExit("persisted DepositWallet has no readable owner()")
+
+    monkeypatch.setattr(positions, "_resolve_dw", boom)
+
+    positions.cmd_positions(cs, "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert "could not confirm on-chain" in out["onchain_check"]["error"]
+    assert "warning" not in out  # nothing was read, so nothing can be "gone"
+
+
 def test_positions_no_onchain_flag_trusts_the_indexer(
     monkeypatch, capsys, tmp_path
 ) -> None:
@@ -2647,6 +2672,14 @@ requires_posix_shell = pytest.mark.skipif(
 )
 
 
+def _fake_pip(venv: Path, exit_code: int = 0) -> Path:
+    """Put a stub pip in the venv so no real install is attempted."""
+    pip = venv / "bin" / "pip"
+    pip.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
+    pip.chmod(0o755)
+    return pip
+
+
 def _fake_venv(root: Path, complete: bool = True) -> Path:
     """Build a venv stub whose python answers the certifi query.
 
@@ -2658,17 +2691,10 @@ def _fake_venv(root: Path, complete: bool = True) -> Path:
     python = venv / "bin" / "python"
     python.write_text("#!/bin/sh\necho /fake/cacert.pem\n", encoding="utf-8")
     python.chmod(0o755)
+    _fake_pip(venv)  # creation is gated on pip, so the stub needs one
     if complete:
         (venv / ".bootstrap-complete").touch()
     return venv
-
-
-def _fake_pip(venv: Path, exit_code: int = 0) -> Path:
-    """Put a stub pip in the venv so no real install is attempted."""
-    pip = venv / "bin" / "pip"
-    pip.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
-    pip.chmod(0o755)
-    return pip
 
 
 def _run_bootstrap(cwd: Path, env_extra: dict | None = None):
@@ -2737,6 +2763,24 @@ def test_bootstrap_retries_a_venv_whose_install_died_partway(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     assert "installing dependencies" in result.stderr
     assert (venv / ".bootstrap-complete").is_file()
+
+
+@requires_posix_shell
+@requires_posix_shell
+def test_a_venv_without_pip_is_rebuilt_not_reused(tmp_path) -> None:
+    """An interpreter alone does not prove a venv works.
+
+    A `python3 -m venv` that dies at ensurepip leaves bin/python behind; if
+    that satisfied the gate, every later run would report only "bin/pip: No
+    such file" and bury the actionable error the first attempt printed.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _fake_venv(tmp_path)
+    (venv / "bin" / "pip").unlink()
+
+    result = _run_bootstrap(tmp_path)
+
+    assert "creating venv" in result.stderr
 
 
 @requires_posix_shell

@@ -286,9 +286,10 @@ def cmd_positions(  # pylint: disable=too-many-arguments
         # (see _indexer_disagrees); filtering those would silently no-op an
         # explicit --token-ids, the one command INDEXER_LAG_NOTE recommends.
         try:
-            candidates = checked_ids = _candidate_token_ids(cs, list(token_ids or []))
+            candidates = _candidate_token_ids(cs, list(token_ids or []))
             checked_at = _check_addresses(cs, address)
             held = _onchain_holdings(cs, checked_at, candidates)
+            checked_ids = candidates  # only once the reads succeeded
             result["onchain_check"] = {
                 "addresses": checked_at,
                 "checked_token_ids": [str(token_id) for token_id in candidates],
