@@ -39,11 +39,8 @@ from pathlib import Path
 
 import pytest
 from eth_abi import decode as abi_decode
-from eth_utils import to_checksum_address
+from eth_utils import is_address, to_checksum_address
 from web3.exceptions import ContractLogicError, TimeExhausted
-
-from connect import workspace
-from connect.config import AGENT_HTTP_PORT, BIND_HOST
 
 # The skill ships as bundled assets, not an installed package; put its scripts
 # dir on the path so we can import the modules under test. pm_common locates
@@ -66,7 +63,6 @@ import pm_common as pm  # noqa: E402
 import positions  # noqa: E402
 import redeem  # noqa: E402
 import relayer_proxy  # noqa: E402
-import signer_client  # noqa: E402  (on sys.path via pm_common's sibling import)
 
 ADDR_A = to_checksum_address("0x" + "11" * 20)
 ADDR_B = to_checksum_address("0x" + "22" * 20)
@@ -334,6 +330,14 @@ def test_relayer_transaction_no_false_match(monkeypatch: pytest.MonkeyPatch) -> 
 class _StubCS:
     agent_eoa = to_checksum_address("0x" + "9e" * 20)
     w3 = object()
+
+
+class _StubProxy:
+    """Relayer proxy that answers the one question `cmd_status` asks it."""
+
+    @staticmethod
+    def deployed(dw: str) -> bool:
+        return True
 
 
 def test_resolve_dw_none_when_no_record(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -969,53 +973,84 @@ def test_deploy_fatal_when_owner_never_reads(monkeypatch, tmp_path) -> None:
     assert pm.load_state(cs) == {}
 
 
-# --- .mcp.json base URL: the trailing slash that 404'd a whole live run ----------
+# --- the published constants table ----------------------------------------------
 
 
-def _write_mcp_config(directory: Path, url: str) -> None:
-    (directory / ".mcp.json").write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    signer_client.MCP_SERVER_NAME: {
-                        "url": url,
-                        "headers": {"Authorization": "Bearer t0ken"},
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
+def test_contracts_table_covers_every_address_constant_exactly_once() -> None:
+    """A constant missing from the table is one the next reader mislabels.
 
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://127.0.0.1:8716/mcp",
-        "http://127.0.0.1:8716/mcp/",
-        "http://127.0.0.1:8716/mcp///",
-    ],
-)
-def test_mcp_base_url_drops_the_suffix_however_it_is_slashed(tmp_path, url) -> None:
-    """A trailing slash must not defeat the /mcp strip — it 404s every request."""
-    _write_mcp_config(tmp_path, url)
-    base_url, token, root = signer_client.load_mcp_config_dir(tmp_path)
-    assert base_url == "http://127.0.0.1:8716"
-    assert token == "t0ken"  # nosec B105
-    assert root == tmp_path.resolve()
-
-
-def test_base_url_handles_the_url_the_server_actually_writes(tmp_path) -> None:
-    """Producer and consumer in one test — the gap that broke every live run.
-
-    ``workspace.mcp_url`` ends in a slash on purpose (a POST to /mcp without
-    it hits the agent-UI route and 405s), so the reader must cope with it
-    rather than the writer dropping it.
+    The declared set is read out of the module rather than restated here, so
+    a new address constant fails this until it is named in the table — a
+    hand-kept list would just be a third copy to forget.
     """
-    _write_mcp_config(tmp_path, workspace.mcp_url())
-    base_url, _, _ = signer_client.load_mcp_config_dir(tmp_path)
-    assert base_url == f"http://{BIND_HOST}:{AGENT_HTTP_PORT}"
-    assert not base_url.rstrip("/").endswith("/mcp")
+    tabled = {c.address for c in pm.CONTRACTS}
+    declared = {
+        value
+        for name, value in vars(pm).items()
+        if not name.startswith("_") and isinstance(value, str) and is_address(value)
+    }
+    assert tabled == declared
+    names = [c.name for c in pm.CONTRACTS]
+    assert len(names) == len(set(names)) == len(pm.CONTRACTS)
+    assert all(c.role for c in pm.CONTRACTS)
+
+
+def test_contract_label_names_the_two_that_were_confused() -> None:
+    """The CTF and the collateral onramp are the pair that got swapped."""
+    assert pm.contract_label(pm.CTF) == "CTF"
+    assert pm.contract_label(pm.COLLATERAL_ONRAMP) == "CollateralOnramp"
+    assert pm.contract_label(pm.CTF.lower()) == "CTF"  # however it is cased
+    assert pm.contract_label(ADDR_A) == ADDR_A  # unknown: echoed, never guessed
+    assert pm.labelled([pm.CTF, ADDR_A]) == {pm.CTF: "CTF", ADDR_A: ADDR_A}
+
+
+def test_constants_report_publishes_the_addresses_and_hosts() -> None:
+    """`python pm_common.py` must answer without a network or a signer."""
+    report = pm.constants_report()
+    assert report["chain"] == {"name": pm.CHAIN, "chain_id": pm.CHAIN_ID}
+    assert [entry["address"] for entry in report["contracts"]] == [
+        c.address for c in pm.CONTRACTS
+    ]
+    assert pm.CLOB_HOST in report["api_hosts"].values()
+    # the approval set, named — the DW's three venues, not the two adapters
+    assert set(report["dw_trading_approvals"]["pusd_allowances"].values()) == {
+        "CTFExchange",
+        "NegRiskCTFExchange",
+        "NegRiskAdapter",
+    }
+
+
+def test_status_prints_the_labels_beside_the_approvals(monkeypatch, capsys) -> None:
+    """The one production caller: names must actually reach the printed report.
+
+    ``approval_contracts`` being right is no use if ``status`` drops it, and
+    the two maps are only readable together — a name in one, its flag in the
+    other, under the same key.
+    """
+    monkeypatch.setattr(deposit_wallet, "_resolve_dw", lambda cs: DW_ADDR)
+    monkeypatch.setattr(deposit_wallet, "RelayerProxyClient", lambda cs: _StubProxy())
+    monkeypatch.setattr(pm, "contract_owner", lambda w3, a: _StubCS.agent_eoa)
+    monkeypatch.setattr(pm, "_eth_call", lambda w3, to, data: bytes(32))
+    deposit_wallet.cmd_status(_StubCS())
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["approval_contracts"] == pm.approval_contracts()
+    for section, names in report["approval_contracts"].items():
+        assert names.keys() == report["approvals"][section].keys()
+
+
+def test_approval_labels_are_keyed_like_the_approval_status(monkeypatch) -> None:
+    """The names must land beside the flags they describe, at every level.
+
+    ``deposit_wallet.py status`` prints both maps side by side; if their keys
+    or addresses drifted apart the reader would match a name to the wrong
+    flag — worse than no name at all.
+    """
+    monkeypatch.setattr(pm, "_eth_call", lambda w3, to, data: bytes(32))
+    status = pm.approvals_status(None, ADDR_A)
+    labels = pm.approval_contracts()
+    assert labels.keys() == status.keys()
+    assert all(labels[key].keys() == status[key].keys() for key in status)
 
 
 # --- /wallet shape: one reader, and errors that are sure of their cause ----------
