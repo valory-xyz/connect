@@ -978,7 +978,8 @@ def test_positions_confirms_a_fill_the_indexer_has_not_caught_up_to(
         DW_HELD,
     ]
     assert out["onchain_check"]["held"][0]["address"] == DW_HELD
-    assert "disagree with the indexer" in out["warning"]
+    assert "held in another wallet" in out["warning"]  # not lag: it is in the DW
+    assert "funds.py sweep" in out["warning"]
     # the lag note is for a genuinely empty portfolio, not this one
     assert "note" not in out
 
@@ -1067,7 +1068,7 @@ def test_a_repeat_buy_is_confirmed_even_though_the_indexer_lists_the_token(
     assert out["onchain_check"]["held"][0]["location"] == "deposit_wallet"
     # the indexer listed this token, but at the pre-buy size — a caller gating
     # on `warning` must still be told its 3.0 is stale against the chain's 9.0
-    assert "different size" in out["warning"]
+    assert "held in another wallet" in out["warning"]
 
 
 def test_no_warning_when_the_indexer_and_the_chain_agree(
@@ -1149,6 +1150,43 @@ def test_an_unusable_indexer_size_counts_as_a_disagreement(bad_size) -> None:
     assert positions._indexer_disagrees(
         [{"token_id": "77", "size": bad_size}], held, ["77"]  # nosec B105
     ) == {"77"}
+
+
+def test_the_warning_names_the_cause_that_actually_applies(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """Held-in-the-DW is not indexer lag, and must not be reported as it.
+
+    The default read asks the indexer about the safe, but an unswept buy is in
+    the DW — so the indexer is correct about the address it was asked about.
+    Calling that "the API has not caught up" states a false thing as fact,
+    which is the failure this whole command exists to remove.
+    """
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    _positions_mocks(monkeypatch, indexed=[], chain_balances={(DW_HELD, 77): 5_000_000})
+
+    positions.cmd_positions(cs, "safe", False)
+
+    warning = json.loads(capsys.readouterr().out)["warning"]
+    assert "held in another wallet" in warning
+    assert "not lag" in warning
+    assert "has not caught up" not in warning  # the false cause is gone
+
+
+def test_a_genuine_lag_is_still_called_lag(monkeypatch, capsys, tmp_path) -> None:
+    """When the requested wallet really does hold it, the indexer IS behind."""
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    _positions_mocks(
+        monkeypatch, indexed=[], chain_balances={(SAFE_ADDR, 77): 5_000_000}
+    )
+
+    positions.cmd_positions(cs, "safe", False)
+
+    warning = json.loads(capsys.readouterr().out)["warning"]
+    assert "the indexer has not caught up on" in warning
+    assert "another wallet" not in warning
 
 
 def test_a_position_gone_on_chain_but_still_listed_is_flagged(

@@ -201,6 +201,45 @@ def _indexer_disagrees(indexed: list, held: list, checked: list) -> set:
     return disagreeing
 
 
+def _disagreement_warning(disagreeing: set, held: list, address: str) -> str:
+    """Name the cause that actually applies — it is not always indexer lag.
+
+    The default read asks the indexer about the SAFE, but an unswept buy sits
+    in the DepositWallet. The indexer is then not behind at all: it is right
+    about the address it was asked about, and the shares are simply somewhere
+    else. Blaming lag there states a false thing as fact, which is the whole
+    problem this command exists to fix.
+    """
+    by_token: dict = {}
+    for hit in held:
+        by_token.setdefault(hit["token_id"], []).append(hit)
+    lagging, elsewhere, gone = [], [], []
+    for token_id in disagreeing:
+        hits = by_token.get(token_id, [])
+        if not hits:
+            gone.append(token_id)
+        elif any(hit["address"] == address for hit in hits):
+            lagging.append(token_id)
+        else:
+            elsewhere.append(token_id)
+    causes = []
+    if lagging:
+        causes.append(f"{len(lagging)} the indexer has not caught up on")
+    if elsewhere:
+        causes.append(
+            f"{len(elsewhere)} held in another wallet — not lag; an unswept "
+            "buy stays in the DepositWallet until `funds.py sweep` runs"
+        )
+    if gone:
+        causes.append(f"{len(gone)} already gone on-chain")
+    return (
+        f"chain and indexer disagree on {len(disagreeing)} position(s): "
+        + "; ".join(causes)
+        + ". The chain is authoritative — read onchain_check.held, whose "
+        "`location` names the wallet holding each one"
+    )
+
+
 def cmd_positions(  # pylint: disable=too-many-arguments
     cs: pm.ConnectSigner,
     wallet: str,
@@ -260,12 +299,7 @@ def cmd_positions(  # pylint: disable=too-many-arguments
             }
     disagreeing = _indexer_disagrees(indexed, held, checked_ids)
     if disagreeing:
-        result["warning"] = (
-            f"{len(disagreeing)} position(s) disagree with the indexer — "
-            "missing from it, listed at a different size, or already gone "
-            "on-chain; the chain is right and the API has not caught up, so "
-            "treat onchain_check as the authoritative reading"
-        )
+        result["warning"] = _disagreement_warning(disagreeing, held, address)
     if not indexed and not held:
         result["note"] = INDEXER_LAG_NOTE
     pm.print_json(result)

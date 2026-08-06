@@ -76,7 +76,13 @@ PY="$VENV/bin/python"
 # idempotent) instead of being reused forever with missing imports.
 READY="$VENV/.bootstrap-complete"
 
-if [ ! -x "$PY" ]; then
+# Gate on pip, not just the interpreter. A `python3 -m venv` that dies at the
+# ensurepip step (Debian/Ubuntu ship it as a separate python3-venv package)
+# still leaves an executable bin/python behind, so checking the interpreter
+# alone skips this branch forever after, and every later run reports only
+# "bin/pip: No such file or directory" — burying the actionable error the
+# first attempt printed. Re-running the create is what keeps that message.
+if [ ! -x "$PY" ] || [ ! -x "$VENV/bin/pip" ]; then
   echo "connect-polymarket: creating venv at $VENV" >&2
   python3 -m venv "$VENV" >&2
 fi
