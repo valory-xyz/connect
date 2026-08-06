@@ -2449,6 +2449,34 @@ def test_skill_ships_the_scripts_its_docs_reference() -> None:
 BOOTSTRAP = _SCRIPTS / "bootstrap_env.sh"
 
 
+def _posix_shell_available() -> bool:
+    """Whether `bash` on this machine is actually a POSIX shell.
+
+    Windows has a `bash` on PATH, but it is the WSL launcher: with no
+    distribution installed it answers every invocation with an error message
+    instead of running the script. Probing beats checking sys.platform, so
+    these still run on a Windows box that does have a real bash.
+    """
+    try:
+        probe = subprocess.run(  # nosec B603 B607 - fixed argv
+            ["bash", "-c", "printf ok"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.stdout.strip() == "ok"
+
+
+requires_posix_shell = pytest.mark.skipif(
+    not _posix_shell_available(),
+    reason="bootstrap_env.sh is a POSIX shell script and this `bash` is not a "
+    "POSIX shell (on Windows CI it is the WSL launcher, no distribution)",
+)
+
+
 def _fake_venv(root: Path, complete: bool = True) -> Path:
     """Build a venv stub whose python answers the certifi query.
 
@@ -2484,6 +2512,7 @@ def _run_bootstrap(cwd: Path, env_extra: dict | None = None):
     )
 
 
+@requires_posix_shell
 def test_bootstrap_puts_the_venv_in_the_workspace(tmp_path) -> None:
     """`.venv` at the workspace root — persistent, and beside the skill state."""
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -2498,6 +2527,7 @@ def test_bootstrap_puts_the_venv_in_the_workspace(tmp_path) -> None:
     assert "reusing venv" in result.stderr
 
 
+@requires_posix_shell
 def test_bootstrap_finds_the_root_from_a_nested_directory(tmp_path) -> None:
     """The scripts are run from anywhere in the workspace, so this must be too."""
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -2511,6 +2541,7 @@ def test_bootstrap_finds_the_root_from_a_nested_directory(tmp_path) -> None:
     assert f"export PY={venv / 'bin' / 'python'}" in result.stdout
 
 
+@requires_posix_shell
 def test_bootstrap_refuses_when_there_is_no_workspace(tmp_path) -> None:
     """Guessing a location would strand the venv somewhere nothing looks."""
     result = _run_bootstrap(tmp_path)
@@ -2520,6 +2551,7 @@ def test_bootstrap_refuses_when_there_is_no_workspace(tmp_path) -> None:
     assert not (tmp_path / ".venv").exists()
 
 
+@requires_posix_shell
 def test_bootstrap_retries_a_venv_whose_install_died_partway(tmp_path) -> None:
     """An interpreter without the sentinel is a half-built venv, not a ready one.
 
@@ -2537,6 +2569,7 @@ def test_bootstrap_retries_a_venv_whose_install_died_partway(tmp_path) -> None:
     assert (venv / ".bootstrap-complete").is_file()
 
 
+@requires_posix_shell
 def test_bootstrap_failure_makes_the_callers_eval_fail(tmp_path) -> None:
     """`eval "$(...)"` discards the exit status, so stdout has to carry it.
 
@@ -2565,6 +2598,7 @@ def test_bootstrap_failure_makes_the_callers_eval_fail(tmp_path) -> None:
     assert "bootstrap FAILED" in evaled.stderr
 
 
+@requires_posix_shell
 def test_bootstrap_override_wins_over_the_workspace(tmp_path) -> None:
     """CONNECT_POLYMARKET_VENV stays the escape hatch, workspace or not."""
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -2582,6 +2616,7 @@ def test_bootstrap_override_wins_over_the_workspace(tmp_path) -> None:
     assert f"export PY={python}" in result.stdout
 
 
+@requires_posix_shell
 def test_bootstrap_emits_only_shell_assignments_on_stdout(tmp_path) -> None:
     """The stdout is eval'd, so a stray log line there would be executed."""
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
