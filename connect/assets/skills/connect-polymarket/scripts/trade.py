@@ -170,12 +170,9 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
             if quote["blocked"]:
                 raise SystemExit(
                     f"a ${usd:.2f} buy against a {balance:.6f} pUSD balance "
-                    f"would be fee-shrunk to ${quote['spendable_now_usd']:.2f}, "
-                    f"below the CLOB's ${pm.MIN_MARKETABLE_USD:.0f} marketable "
-                    f"minimum — top the DW up by {quote['shortfall_usd']:.4f} "
-                    f"pUSD (to {quote['required_dw_balance_usd']:.4f} total), "
-                    "or raise the bet; `trade.py quote` shows these numbers "
-                    "without placing anything"
+                    f"would be rejected: {quote['blocked_reason']}. "
+                    "`trade.py quote` shows these numbers without placing "
+                    "anything"
                 )
         except SystemExit:
             raise

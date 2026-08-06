@@ -46,7 +46,13 @@ HOSTS = (
 TIMEOUT = 15
 
 # Only used to explain a shared address in the output, never to fail a host.
-CLOUDFLARE_PREFIXES = ("172.64.", "104.16.", "104.17.", "104.18.", "2606:4700")
+# 104.16.0.0/13 is 104.16-104.23 and 172.64.0.0/13 is 172.64-172.71; spelling
+# out a partial range would just pick the vaguer of two "this is normal" notes.
+CLOUDFLARE_PREFIXES = (
+    *(f"104.{octet}." for octet in range(16, 24)),
+    *(f"172.{octet}." for octet in range(64, 72)),
+    "2606:4700",
+)
 
 ESCALATE_TO_OPERATOR = (
     "report it to the operator; it is theirs to fix, and nothing in this "

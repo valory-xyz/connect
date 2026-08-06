@@ -512,7 +512,10 @@ class _QuoteSdkClient:
         return 0.5
 
     def _adjust_buy_amount_for_balance(self, token_id, amount, price, balance, _):
-        return min(amount, balance / 1.03)
+        # mirrors py_clob_client_v2 fees.py: the fee is charged on
+        # min(amount, balance) and SUBTRACTED from the balance
+        fee = 0.03 * min(amount, balance)
+        return min(amount, max(balance - fee, 0.0))
 
 
 class _QuoteCS:

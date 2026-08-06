@@ -109,20 +109,24 @@ def _check_addresses(cs: pm.ConnectSigner, wallet_address: str) -> list:
     """Which wallets the on-chain confirmation reads: the one asked about + the DW.
 
     An unswept buy sits in the DepositWallet, a swept one in the safe, and the
-    caller rarely knows which. Since `--wallet` defaults to the safe, reading
-    only that would return zero for the fresh fill this check exists to
-    confirm — while `INDEXER_LAG_NOTE` and SKILL.md both send the caller here
-    with a bare `--token-ids`.
+    caller rarely knows which — `INDEXER_LAG_NOTE` and SKILL.md both send them
+    here with a bare `--token-ids`. So both are read whichever was asked for:
+    checking only the requested wallet answers "is it here?" when the question
+    is "does it exist?", and gets a zero in either direction.
     """
     dw = _resolve_dw(cs)
+    safe = cs.safe_address
+
+    def location(address: str) -> str:
+        if dw and address == dw:
+            return "deposit_wallet"
+        if address == safe:
+            return "service_safe"
+        return "requested_wallet"
+
     return [
-        {
-            "address": address,
-            "location": (
-                "deposit_wallet" if dw and address == dw else "requested_wallet"
-            ),
-        }
-        for address in dict.fromkeys([wallet_address, *([dw] if dw else [])])
+        {"address": address, "location": location(address)}
+        for address in dict.fromkeys([wallet_address, *([dw] if dw else []), safe])
     ]
 
 
@@ -151,12 +155,19 @@ def _onchain_holdings(cs: pm.ConnectSigner, addresses: list, token_ids: list) ->
     return held
 
 
-def _indexer_disagrees(indexed: list, held: list) -> set:
+def _indexer_disagrees(indexed: list, held: list, checked: list) -> set:
     """Token ids where the chain and the indexer tell different stories.
 
     Presence alone is not enough: buying more of a position you already hold
     leaves the token id listed at its OLD size, so a membership-only check
     stays silent on exactly the case this exists for.
+
+    It runs both ways. A token the chain says is GONE while the indexer still
+    lists it is the post-sell mirror of the post-buy lag, and the zero reading
+    that proves it was already taken — dropped on the floor because
+    `_onchain_holdings` only keeps hits. Left unflagged, the agent can try to
+    sell shares it no longer has. Only `checked` ids can be judged: a token
+    nobody read on-chain is unknown, not absent.
 
     Balances are summed across wallets first — a half-swept position is one
     holding in two places, and comparing each leg alone would cry wolf.
@@ -180,6 +191,12 @@ def _indexer_disagrees(indexed: list, held: list) -> set:
                 reported, chain_size, rel_tol=1e-6, abs_tol=SIZE_EPSILON
             )
         ):
+            disagreeing.add(token_id)
+    for token_id in {str(token) for token in checked} - set(on_chain):
+        if token_id not in indexed_sizes:
+            continue  # neither source has it: agreement, not a discrepancy
+        reported = pm.price_or_none(indexed_sizes[token_id])
+        if reported is None or not math.isfinite(reported) or reported > SIZE_EPSILON:
             disagreeing.add(token_id)
     return disagreeing
 
@@ -216,12 +233,13 @@ def cmd_positions(  # pylint: disable=too-many-arguments
         "positions": indexed,
     }
     held: list = []
+    checked_ids: list = []
     if onchain:
         # Every candidate is read, including ones the indexer already listed
         # (see _indexer_disagrees); filtering those would silently no-op an
         # explicit --token-ids, the one command INDEXER_LAG_NOTE recommends.
         try:
-            candidates = _candidate_token_ids(cs, list(token_ids or []))
+            candidates = checked_ids = _candidate_token_ids(cs, list(token_ids or []))
             checked_at = _check_addresses(cs, address)
             held = _onchain_holdings(cs, checked_at, candidates)
             result["onchain_check"] = {
@@ -240,13 +258,13 @@ def cmd_positions(  # pylint: disable=too-many-arguments
                     "positions above are the indexer's word alone, and it lags"
                 )
             }
-    disagreeing = _indexer_disagrees(indexed, held)
+    disagreeing = _indexer_disagrees(indexed, held, checked_ids)
     if disagreeing:
         result["warning"] = (
-            f"{len(disagreeing)} position(s) are missing from the indexer's "
-            "answer or listed there at a different size — the chain is right "
-            "and the API has not caught up; treat onchain_check.held as the "
-            "authoritative reading"
+            f"{len(disagreeing)} position(s) disagree with the indexer — "
+            "missing from it, listed at a different size, or already gone "
+            "on-chain; the chain is right and the API has not caught up, so "
+            "treat onchain_check as the authoritative reading"
         )
     if not indexed and not held:
         result["note"] = INDEXER_LAG_NOTE

@@ -668,6 +668,27 @@ MIN_MARKETABLE_USD = 1.0
 BUY_SIDE = "BUY"
 
 
+def _blocked_reason(usd: float, spendable: float, shortfall: float) -> str | None:
+    """Why the CLOB would refuse this buy — the two causes need opposite fixes.
+
+    A bet under the minimum has to be raised; one the fee shrinks under it has
+    to be funded. Saying "top up" for the first would send the caller to add
+    pUSD it already has.
+    """
+    if spendable >= MIN_MARKETABLE_USD:
+        return None
+    if usd < MIN_MARKETABLE_USD:
+        return (
+            f"the bet itself is under the CLOB's ${MIN_MARKETABLE_USD:.0f} "
+            "marketable minimum — raise it; more pUSD will not help"
+        )
+    return (
+        f"the taker fee shrinks this to ${spendable:.2f}, under the CLOB's "
+        f"${MIN_MARKETABLE_USD:.0f} marketable minimum — add "
+        f"{max(0.0, shortfall):.4f} pUSD, or raise the bet"
+    )
+
+
 def quote_buy(  # pylint: disable=protected-access
     client: t.Any, token_id: str, usd: float, balance: float, order_type: t.Any
 ) -> dict:
@@ -688,6 +709,11 @@ def quote_buy(  # pylint: disable=protected-access
         token_id, usd, price, balance, None
     )
     required = usd + fee
+    # What the order is actually worth: the spend, or what the balance leaves
+    # of it after the fee. Comparing only the fee-shrunk figure to the minimum
+    # passes a bet that was under it to begin with — a $0.50 quote against a
+    # fat balance is affordable in full and still bounced by the venue.
+    spendable = min(affordable, usd)
     return {
         "token_id": token_id,
         "side": "buy",
@@ -700,7 +726,8 @@ def quote_buy(  # pylint: disable=protected-access
         "dw_balance_usd": round(balance, 6),
         "shortfall_usd": round(max(0.0, required - balance), 6),
         "spendable_now_usd": round(affordable, 6),
-        "blocked": affordable < usd and affordable < MIN_MARKETABLE_USD,
+        "blocked": spendable < MIN_MARKETABLE_USD,
+        "blocked_reason": _blocked_reason(usd, spendable, required - balance),
         "note": (
             "fill_price is the average price this size would pay at the "
             "current book, not the top of book; the book moves, so a quote is "

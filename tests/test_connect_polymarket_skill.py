@@ -972,7 +972,7 @@ def test_positions_confirms_a_fill_the_indexer_has_not_caught_up_to(
         DW_HELD,
     ]
     assert out["onchain_check"]["held"][0]["address"] == DW_HELD
-    assert "missing from the indexer" in out["warning"]
+    assert "disagree with the indexer" in out["warning"]
     # the lag note is for a genuinely empty portfolio, not this one
     assert "note" not in out
 
@@ -1014,7 +1014,7 @@ def test_onchain_check_is_present_whenever_verification_ran(
     out = json.loads(capsys.readouterr().out)
     assert out["onchain_check"] == {
         "addresses": [
-            {"address": SAFE_ADDR, "location": "requested_wallet"},
+            {"address": SAFE_ADDR, "location": "service_safe"},
             {"address": DW_HELD, "location": "deposit_wallet"},
         ],
         "checked_token_ids": [],
@@ -1117,6 +1117,7 @@ def test_indexer_rounding_is_not_a_disagreement(chain_size, indexer_size) -> Non
         positions._indexer_disagrees(
             [{"token_id": "77", "size": indexer_size}],  # nosec B105
             [{"token_id": "77", "size": chain_size}],  # nosec B105
+            ["77"],
         )
         == set()
     )
@@ -1127,6 +1128,7 @@ def test_a_real_size_change_still_disagrees() -> None:
     assert positions._indexer_disagrees(
         [{"token_id": "77", "size": 3.0}],  # nosec B105
         [{"token_id": "77", "size": 9.0}],  # nosec B105
+        ["77"],
     ) == {"77"}
 
 
@@ -1139,8 +1141,45 @@ def test_an_unusable_indexer_size_counts_as_a_disagreement(bad_size) -> None:
     """
     held = [{"token_id": "77", "size": 9.0}]  # nosec B105
     assert positions._indexer_disagrees(
-        [{"token_id": "77", "size": bad_size}], held  # nosec B105
+        [{"token_id": "77", "size": bad_size}], held, ["77"]  # nosec B105
     ) == {"77"}
+
+
+def test_a_position_gone_on_chain_but_still_listed_is_flagged(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """The post-sell mirror of the post-buy lag.
+
+    After a sell or redeem the chain reads zero while the indexer still lists
+    the position. Only hits survive `_onchain_holdings`, so that zero was
+    already read and then dropped — leaving the agent free to try selling
+    shares it no longer holds.
+    """
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    _positions_mocks(
+        monkeypatch,
+        indexed=[{"asset": "77", "size": 5.0}],
+        chain_balances={},  # sold: nothing left anywhere
+    )
+
+    positions.cmd_positions(cs, "safe", False)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["onchain_check"]["held"] == []
+    assert "already gone on-chain" in out["warning"]
+
+
+def test_a_token_nobody_checked_is_not_called_a_disagreement() -> None:
+    """Unknown is not absent — only checked ids can be judged."""
+    assert (
+        positions._indexer_disagrees(
+            [{"token_id": "99", "size": 5.0}],  # nosec B105
+            [],
+            [],  # never read on-chain
+        )
+        == set()
+    )
 
 
 def test_explicit_token_ids_are_never_filtered_by_the_indexer(
@@ -2206,8 +2245,10 @@ class _QuoteClient:
         return self.price
 
     def _adjust_buy_amount_for_balance(self, token_id, amount, price, balance, _):
-        # the SDK spends at most what the balance covers once the fee is held
-        return min(amount, balance / (1 + self.fee_rate))
+        # mirrors py_clob_client_v2 fees.py: the fee is charged on
+        # min(amount, balance) and SUBTRACTED from the balance
+        fee = self.fee_rate * min(amount, balance)
+        return min(amount, max(balance - fee, 0.0))
 
 
 def test_quote_surfaces_price_fee_shares_and_topup() -> None:
@@ -2216,8 +2257,8 @@ def test_quote_surfaces_price_fee_shares_and_topup() -> None:
 
     assert quote["fill_price"] == 0.5
     assert quote["estimated_shares"] == 20.0
-    assert quote["estimated_fee_usd"] == pytest.approx(0.291262, abs=1e-6)
-    assert quote["required_dw_balance_usd"] == pytest.approx(10.291262, abs=1e-6)
+    assert quote["estimated_fee_usd"] == pytest.approx(0.30, abs=1e-6)
+    assert quote["required_dw_balance_usd"] == pytest.approx(10.30, abs=1e-6)
     assert quote["shortfall_usd"] == 0.0
     assert quote["blocked"] is False
 
@@ -2226,7 +2267,7 @@ def test_quote_names_the_exact_topup_when_the_balance_is_short() -> None:
     """shortfall_usd goes straight to `funds.py top-up --amount`."""
     quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 4.0, "FOK")
     assert quote["dw_balance_usd"] == 4.0
-    assert quote["shortfall_usd"] == pytest.approx(6.291262, abs=1e-6)
+    assert quote["shortfall_usd"] == pytest.approx(6.30, abs=1e-6)
 
 
 def test_quote_flags_the_dollar_minimum_that_breaks_small_bets() -> None:
@@ -2235,6 +2276,37 @@ def test_quote_flags_the_dollar_minimum_that_breaks_small_bets() -> None:
     assert quote["spendable_now_usd"] < 1.0
     assert quote["blocked"] is True
     assert quote["shortfall_usd"] > 0
+
+
+def test_a_bet_under_the_minimum_is_blocked_even_with_a_fat_balance() -> None:
+    """A $0.50 order is affordable in full and still bounced by the venue.
+
+    Comparing only the fee-shrunk figure to the minimum called this "fine":
+    affordable == usd, so the old `affordable < usd` guard was false and the
+    quote published a verdict the CLOB would reject.
+    """
+    quote = pm.quote_buy(_QuoteClient(), "7", 0.50, 100.0, "FOK")
+
+    assert quote["shortfall_usd"] == 0.0  # money is not the problem
+    assert quote["blocked"] is True
+    assert "raise it" in quote["blocked_reason"]
+    assert "more pUSD will not help" in quote["blocked_reason"]
+
+
+def test_a_fee_shrunk_bet_is_told_to_add_funds_not_to_raise_the_bet() -> None:
+    """The two block causes need opposite fixes, so they must read differently."""
+    quote = pm.quote_buy(_QuoteClient(), "7", 1.0, 1.0, "FOK")
+
+    assert quote["blocked"] is True
+    assert "taker fee shrinks" in quote["blocked_reason"]
+    assert f"{quote['shortfall_usd']:.4f}" in quote["blocked_reason"]
+
+
+def test_a_healthy_quote_has_no_blocked_reason() -> None:
+    """`blocked_reason` is None exactly when the order would go through."""
+    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 100.0, "FOK")
+    assert quote["blocked"] is False
+    assert quote["blocked_reason"] is None
 
 
 def test_quote_works_against_an_empty_deposit_wallet() -> None:

@@ -329,23 +329,25 @@ def _resolve_event(
     )
 
 
-def _first_outcome_price(slim: dict) -> float | None:
-    """Read the live (else indicative) price of a market's first outcome.
+def _first_outcome_price(slim: dict) -> tuple:
+    """Return the first outcome's price and whether it came from the live book.
 
     Live first: the sum it feeds is only a sanity check if the numbers are
-    current.
+    current. The source travels with the price because a sibling with a
+    one-sided book falls back to the cache inside the same total, and a sum
+    that is quietly part-cache should not read as "live and complete".
     """
     outcomes = slim.get("outcomes")
     outcomes = outcomes if isinstance(outcomes, list) else []
     if not outcomes:
-        return None
+        return None, False
     live = (slim.get("live_prices") or {}).get(str(outcomes[0])) or {}
     if live.get("mid") is not None:
-        return float(live["mid"])
+        return float(live["mid"]), True
     indicative = slim.get("outcome_prices_indicative")
     if isinstance(indicative, list) and indicative:
-        return pm.price_or_none(indicative[0])
-    return None
+        return pm.price_or_none(indicative[0]), False
+    return None, False
 
 
 def cmd_group(
@@ -363,11 +365,13 @@ def cmd_group(
     """
     event = _resolve_event(slug, condition_id, event_slug)
     siblings = _attach_live_prices([_slim(m) for m in event.get("markets") or []], live)
-    prices = [
-        price
-        for price in (_first_outcome_price(sibling) for sibling in siblings)
+    priced = [
+        (price, is_live)
+        for price, is_live in (_first_outcome_price(s) for s in siblings)
         if price is not None
     ]
+    prices = [price for price, _ in priced]
+    from_live = sum(1 for _, is_live in priced if is_live)
     pm.print_json(
         {
             "event": event.get("title"),
@@ -375,11 +379,14 @@ def cmd_group(
             "neg_risk": event.get("negRisk"),
             "markets": len(siblings),
             "priced_markets": len(prices),
+            "priced_from_live_book": from_live,
+            "priced_from_cache": len(prices) - from_live,
             "first_outcome_price_sum": round(sum(prices), 4) if prices else None,
             "sum_note": (
                 "a neg-risk group's first-outcome prices should sum to ~1.0; "
                 "a sum well off 1.0 means the set is incomplete or the prices "
-                "are not live"
+                "are not live. Any priced_from_cache > 0 means the sum is "
+                "partly the indicative snapshot, so it is not a live check"
             ),
             "siblings": siblings,
         }
