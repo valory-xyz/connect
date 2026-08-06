@@ -1169,9 +1169,32 @@ def test_the_warning_names_the_cause_that_actually_applies(
     positions.cmd_positions(cs, "safe", False)
 
     warning = json.loads(capsys.readouterr().out)["warning"]
-    assert "held in another wallet" in warning
+    assert "held in another wallet (deposit_wallet)" in warning
     assert "not lag" in warning
+    assert "funds.py sweep" in warning  # the hint fits this direction
     assert "has not caught up" not in warning  # the false cause is gone
+
+
+def test_an_already_swept_position_is_not_told_to_sweep(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """The mirror: queried the DW, found it in the safe — already swept.
+
+    The sweep hint only fits the unswept direction, and a trailing clause that
+    assumes a direction is the same false-cause bug one level down.
+    """
+    cs = _ChainCS(tmp_path)
+    pm.record_dw_token(cs, 77)
+    _positions_mocks(
+        monkeypatch, indexed=[], chain_balances={(SAFE_ADDR, 77): 5_000_000}
+    )
+    monkeypatch.setattr(positions, "dw_or_exit", lambda cs: DW_HELD)
+
+    positions.cmd_positions(cs, "dw", False)
+
+    warning = json.loads(capsys.readouterr().out)["warning"]
+    assert "held in another wallet (service_safe)" in warning
+    assert "funds.py sweep" not in warning  # it is already swept
 
 
 def test_a_genuine_lag_is_still_called_lag(monkeypatch, capsys, tmp_path) -> None:

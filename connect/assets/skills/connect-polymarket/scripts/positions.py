@@ -226,9 +226,17 @@ def _disagreement_warning(disagreeing: set, held: list, address: str) -> str:
     if lagging:
         causes.append(f"{len(lagging)} the indexer has not caught up on")
     if elsewhere:
+        locations = sorted(
+            {hit["location"] for token in elsewhere for hit in by_token[token]}
+        )
         causes.append(
-            f"{len(elsewhere)} held in another wallet — not lag; an unswept "
-            "buy stays in the DepositWallet until `funds.py sweep` runs"
+            f"{len(elsewhere)} held in another wallet ({' and '.join(locations)})"
+            " — not lag"
+            + (
+                "; an unswept buy stays there until `funds.py sweep` runs"
+                if "deposit_wallet" in locations
+                else ""
+            )
         )
     if gone:
         causes.append(f"{len(gone)} already gone on-chain")
