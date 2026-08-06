@@ -155,6 +155,7 @@ def cmd_status(cs: pm.ConnectSigner) -> None:
         result["owner"] = pm.contract_owner(cs.w3, dw)
         result["relayer_registered"] = proxy.deployed(dw)
         result["approvals"] = pm.approvals_status(cs.w3, dw)
+        result["approval_contracts"] = pm.approval_contracts()
         result["pusd_balance"] = pm.units_to_usd(
             pm.erc20_balance_of(cs.w3, pm.PUSD, dw)
         )

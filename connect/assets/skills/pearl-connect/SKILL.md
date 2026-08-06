@@ -97,7 +97,11 @@ composing a prompt:
 Spawned processes cannot call MCP tools. For web3.py code, use the bundled
 client, which routes `eth_sendTransaction` through the service safe
 (`POST /safe-transaction`, same token as the MCP config) — so a send from a
-script is a call made *by the safe*, exactly as `safe_transaction` is:
+script is a call made *by the safe*, exactly as `safe_transaction` is.
+
+The client needs **`web3>=7.15,<8`**; install that into whatever venv runs
+your script. On web3 6 it fails at import (the middleware moved in 7), so an
+`ImportError` from `signer_client` is the venv's version, not a missing file:
 
 ```python
 from signer_client import connect
@@ -111,6 +115,27 @@ tx_hash = w3.eth.send_transaction({   # intercepted: signer fills nonce/gas, sig
 receipt = w3.eth.wait_for_transaction_receipt(tx_hash)   # plain RPC read
 signature = signer.sign_digest("0x" + "11" * 32)          # raw digest signing
 ```
+
+Contract calls go the same way, through a normal web3 contract object —
+`connect()` points `w3.eth.default_account` at the safe, so a simulation sees
+the sender the send will really have:
+
+```python
+token = w3.eth.contract(address=usdc, abi=ERC20_ABI)
+token.functions.balanceOf(w3.eth.default_account).call()        # read
+tx_hash = token.functions.approve(spender, amount).transact()   # sent by the safe
+```
+
+`signer.send_transaction({...})` is the same send one layer down, and the one
+to reach for when you need to pass a `request_id` (below).
+
+Two things `connect()` handles that hand-rolled web3 code gets wrong: PoA
+chains (Polygon above all) pad `extraData` past 32 bytes and break every block
+read unless the PoA middleware is injected, and web3's own gas estimator would
+otherwise simulate the call with `from` unset — i.e. from the zero address —
+so a contract call reverts (`ERC20: approve from the zero address`) before
+anything is sent. Build the web3 with `connect()`, not `Web3(...)`, and
+neither happens.
 
 Reads (balances, gas estimation, receipts) go straight to the chain RPC;
 only sending passes through the signer. The client mints a `request_id` per
