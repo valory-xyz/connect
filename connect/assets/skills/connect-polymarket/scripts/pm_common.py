@@ -683,9 +683,10 @@ def _blocked_reason(usd: float, spendable: float, shortfall: float) -> str | Non
             "marketable minimum — raise it; more pUSD will not help"
         )
     return (
-        f"the taker fee shrinks this to ${spendable:.2f}, under the CLOB's "
-        f"${MIN_MARKETABLE_USD:.0f} marketable minimum — add "
-        f"{max(0.0, shortfall):.4f} pUSD, or raise the bet"
+        f"only ${spendable:.2f} of this ${usd:.2f} buy can be funded once the "
+        f"taker fee is held back, under the CLOB's ${MIN_MARKETABLE_USD:.0f} "
+        f"marketable minimum — add {max(0.0, shortfall):.4f} pUSD, or raise "
+        "the bet"
     )
 
 

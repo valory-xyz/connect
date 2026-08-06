@@ -2298,7 +2298,7 @@ def test_a_fee_shrunk_bet_is_told_to_add_funds_not_to_raise_the_bet() -> None:
     quote = pm.quote_buy(_QuoteClient(), "7", 1.0, 1.0, "FOK")
 
     assert quote["blocked"] is True
-    assert "taker fee shrinks" in quote["blocked_reason"]
+    assert "can be funded once the taker fee is held back" in quote["blocked_reason"]
     assert f"{quote['shortfall_usd']:.4f}" in quote["blocked_reason"]
 
 
