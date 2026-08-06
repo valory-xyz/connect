@@ -44,6 +44,8 @@ from eth_abi import decode as abi_decode
 from eth_utils import is_address, to_checksum_address
 from web3.exceptions import ContractLogicError, TimeExhausted
 
+from connect import workspace
+
 # The skill ships as bundled assets, not an installed package; put its scripts
 # dir on the path so we can import the modules under test. pm_common locates
 # its sibling pearl-connect client relative to its own __file__, so that works
