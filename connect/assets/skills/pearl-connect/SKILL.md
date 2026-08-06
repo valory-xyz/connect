@@ -97,7 +97,11 @@ composing a prompt:
 Spawned processes cannot call MCP tools. For web3.py code, use the bundled
 client, which routes `eth_sendTransaction` through the service safe
 (`POST /safe-transaction`, same token as the MCP config) — so a send from a
-script is a call made *by the safe*, exactly as `safe_transaction` is:
+script is a call made *by the safe*, exactly as `safe_transaction` is.
+
+The client needs **`web3>=7.15,<8`**; install that into whatever venv runs
+your script. On web3 6 it fails at import (the middleware moved in 7), so an
+`ImportError` from `signer_client` is the venv's version, not a missing file:
 
 ```python
 from signer_client import connect

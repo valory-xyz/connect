@@ -91,11 +91,7 @@ PUSD_DECIMALS = 6
 
 
 class Contract(t.NamedTuple):
-    """One contract, named. Fields are read by name, never by position.
-
-    All three are strings, so a positional table would let a name and a role
-    swap places unnoticed — the exact mistake this table exists to prevent.
-    """
+    """One contract: what it is called, where it is, and what it does."""
 
     name: str
     address: str
@@ -106,50 +102,68 @@ class Contract(t.NamedTuple):
 # (and never drifts) elsewhere. It exists because the roles are close enough
 # to swap by accident — the CTF holds the outcome shares, the onramp mints the
 # collateral — and a wrong label reads exactly like a right one.
+#
+# Every address and role below was checked against Polymarket's published
+# deployments on 2026-08-06 (docs.polymarket.com/resources/contracts).
+# Rows are written with keywords: all three fields are strings, so a positional
+# row would let a name and a role swap as silently as the mistake this table
+# exists to prevent.
 CONTRACTS: tuple[Contract, ...] = (
     Contract(
-        "pUSD", PUSD, "Polymarket v2 collateral token (6 decimals) — what buys spend"
-    ),
-    Contract("USDC.e", USDC_E, "Bridged USDC — the only asset the onramp wraps"),
-    Contract(
-        "USDC", USDC, "Circle's native USDC — NOT wrappable; swap to USDC.e first"
+        name="pUSD",
+        address=PUSD,
+        role="Polymarket v2 collateral token (6 decimals) — what buys spend",
     ),
     Contract(
-        "CollateralOnramp",
-        COLLATERAL_ONRAMP,
-        "wrap(USDC.e) -> pUSD, called by the safe; wrap-only, there is no unwrap",
+        name="USDC.e",
+        address=USDC_E,
+        role="Bridged USDC — the only asset the onramp wraps",
     ),
     Contract(
-        "CTF",
-        CTF,
-        "Gnosis ConditionalTokens — the ERC-1155 holding every outcome share",
-    ),
-    Contract("CTFExchange", CTF_EXCHANGE, "CLOB settlement for ordinary markets"),
-    Contract(
-        "NegRiskCTFExchange",
-        NEG_RISK_CTF_EXCHANGE,
-        "CLOB settlement for neg-risk (multi-outcome) markets",
+        name="USDC",
+        address=USDC,
+        role="Circle's native USDC — NOT wrappable; swap to USDC.e first",
     ),
     Contract(
-        "NegRiskAdapter",
-        NEG_RISK_ADAPTER,
-        "Wraps neg-risk positions; third holder of the DW's trading approvals",
+        name="CollateralOnramp",
+        address=COLLATERAL_ONRAMP,
+        role="wrap(USDC.e) -> pUSD, called by the safe; wrap-only, no unwrap",
     ),
     Contract(
-        "CtfCollateralAdapter",
-        CTF_COLLATERAL_ADAPTER,
-        "redeemPositions for ordinary markets",
+        name="CTF",
+        address=CTF,
+        role="Gnosis ConditionalTokens — the ERC-1155 holding every outcome share",
     ),
     Contract(
-        "NegRiskCtfCollateralAdapter",
-        NEG_RISK_CTF_COLLATERAL_ADAPTER,
-        "redeemPositions for neg-risk markets",
+        name="CTFExchange",
+        address=CTF_EXCHANGE,
+        role="CLOB settlement for ordinary markets",
     ),
     Contract(
-        "DepositWalletFactory",
-        DW_FACTORY,
-        "Deploys and dispatches to the per-owner DW; every relayer mutation "
-        "targets it, never a DW directly",
+        name="NegRiskCTFExchange",
+        address=NEG_RISK_CTF_EXCHANGE,
+        role="CLOB settlement for neg-risk (multi-outcome) markets",
+    ),
+    Contract(
+        name="NegRiskAdapter",
+        address=NEG_RISK_ADAPTER,
+        role="Wraps neg-risk positions; third holder of the DW's trading approvals",
+    ),
+    Contract(
+        name="CtfCollateralAdapter",
+        address=CTF_COLLATERAL_ADAPTER,
+        role="redeemPositions for ordinary markets",
+    ),
+    Contract(
+        name="NegRiskCtfCollateralAdapter",
+        address=NEG_RISK_CTF_COLLATERAL_ADAPTER,
+        role="redeemPositions for neg-risk markets",
+    ),
+    Contract(
+        name="DepositWalletFactory",
+        address=DW_FACTORY,
+        role="Deploys and dispatches to the per-owner DW; every relayer "
+        "mutation targets it, never a DW directly",
     ),
 )
 
