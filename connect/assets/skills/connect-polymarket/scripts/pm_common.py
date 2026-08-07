@@ -788,8 +788,7 @@ def _blocked_reason(usd: float, spendable: float, shortfall: float) -> str | Non
     return (
         f"only ${spendable:.2f} of this ${usd:.2f} buy can be funded once the "
         f"taker fee is held back, under the CLOB's ${MIN_MARKETABLE_USD:.0f} "
-        f"marketable minimum — add {max(0.0, shortfall):.4f} pUSD, or lower "
-        "the bet to leave the fee room"
+        f"marketable minimum — add {max(0.0, shortfall):.4f} pUSD"
     )
 
 
