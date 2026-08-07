@@ -24,8 +24,9 @@ connect server owns — don't hand-edit them:
   fields are integrity-checked — any hand-edit is detected and reset to safe
   defaults; the `harness` preference is stored alongside without integrity
   checks and survives such a reset
-- `.gitignore` / `.claude/settings.json` — the server re-adds its token-hygiene
-  entries (never commit or Read `.mcp.json`) if they go missing
+- `.gitignore` / `.claude/settings.json` — the server re-adds its hygiene
+  entries if they go missing: never commit or Read `.mcp.json`, and never
+  commit `.venv/`
 - this `CLAUDE.md` itself
 
 The connect server that launched this session runs on

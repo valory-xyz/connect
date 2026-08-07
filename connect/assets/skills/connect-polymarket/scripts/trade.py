@@ -24,11 +24,15 @@ the pUSD the buy will spend. After trading, ALWAYS `funds.py sweep` — the
 funds-flow contract keeps persistent assets in the recoverable service safe.
 
 Usage:
+    python trade.py quote --token-id 123... --usd 10.0     # price a buy first
     python trade.py buy   --token-id 123... --usd 10.0     # market buy (default FOK)
     python trade.py sell  --token-id 123... --shares 12.5  # market sell (default FAK)
     python trade.py limit --token-id 123... --side buy --price 0.42 --size 20
     python trade.py order --id 0x...                       # order status
     python trade.py cancel --id 0x...                      # cancel a resting order
+
+`quote` places nothing — it is `buy`'s preflight, readable before committing
+rather than only as a rejected order's error message (see `pm.quote_buy`).
 
 Market orders take --order-type fok|fak (defaults match the production
 trader: FOK buys, FAK sells). Limit orders take --order-type gtc|gtd
@@ -159,27 +163,16 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
             raise SystemExit(
                 "the DepositWallet holds no pUSD — run `funds.py top-up` first"
             )
-        # The CLOB rejects marketable buys under $1, and when the DW balance
-        # is at/near the order amount the SDK shrinks the order by the
-        # market's taker-fee reserve (fee = shares × rate × (p·(1-p))^exp;
-        # rate is per-market, 0–7%) — a $1.00 bet on a $1.00 balance bounces
-        # (verified live; the same mechanism breaks $1 bets in the trader).
-        # Preflight with the SDK's own sizing so the error is exact.
+        # Preflight with the SDK's own sizing (see pm.MIN_MARKETABLE_USD) so
+        # the error names the exact top-up, not just the CLOB's bare refusal.
         try:
-            price = client.calculate_market_price(token_id, BUY, usd, ot)
-            adjusted = client._adjust_buy_amount_for_balance(
-                token_id, usd, price, balance, None
-            )
-            if adjusted < usd and adjusted < 1.0:
-                # fee at full size = what a balance of exactly `usd` can't cover
-                fee = usd - client._adjust_buy_amount_for_balance(
-                    token_id, usd, price, usd, None
-                )
+            quote = pm.quote_buy(client, token_id, usd, balance, ot)
+            if quote["blocked"]:
                 raise SystemExit(
                     f"a ${usd:.2f} buy against a {balance:.6f} pUSD balance "
-                    f"would be fee-shrunk to ${adjusted:.2f}, below the CLOB's "
-                    f"$1 marketable minimum — top the DW up to at least "
-                    f"{usd + fee:.4f} pUSD, or raise the bet"
+                    f"would be rejected: {quote['blocked_reason']}. "
+                    "`trade.py quote` shows these numbers without placing "
+                    "anything"
                 )
         except SystemExit:
             raise
@@ -199,6 +192,22 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
         return _post_buy_with_recovery_hint(client, cs, token_id, order, ot)
 
     _run_client(cs, op, retry_auth=False)
+
+
+def cmd_quote(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) -> None:
+    """Price a buy against the live book without placing anything.
+
+    Deliberately tolerates an empty DW: "how much do I need to top up?" is
+    the question a quote is usually asked, and refusing on a zero balance
+    the way `buy` does would withhold the answer exactly when it is needed.
+    """
+    ot = _order_type(order_type)
+
+    def op(client, dw):
+        balance = pm.units_to_usd(pm.erc20_balance_of(cs.w3, pm.PUSD, dw))
+        return pm.quote_buy(client, token_id, usd, balance, ot)
+
+    _run_client(cs, op)
 
 
 def cmd_sell(
@@ -287,6 +296,10 @@ def main() -> None:
     """CLI entrypoint."""
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    quote = sub.add_parser("quote")
+    quote.add_argument("--token-id", required=True)
+    quote.add_argument("--usd", type=float, required=True)
+    quote.add_argument("--order-type", choices=["fok", "fak"], default="fok")
     buy = sub.add_parser("buy")
     buy.add_argument("--token-id", required=True)
     buy.add_argument("--usd", type=float, required=True)
@@ -308,7 +321,9 @@ def main() -> None:
     cancel.add_argument("--id", required=True)
     args = parser.parse_args()
     cs = pm.ConnectSigner.from_workspace()
-    if args.command == "buy":
+    if args.command == "quote":
+        cmd_quote(cs, args.token_id, args.usd, args.order_type)
+    elif args.command == "buy":
         cmd_buy(cs, args.token_id, args.usd, args.order_type)
     elif args.command == "sell":
         cmd_sell(cs, args.token_id, args.shares, args.order_type)

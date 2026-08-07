@@ -502,6 +502,113 @@ def test_abort_if_open_orders_blocks_when_unverifiable(monkeypatch) -> None:
     assert "could not verify" in str(exc.value)
 
 
+# --- trade.py quote (OPE-1862 #4) ----------------------------------------------
+
+
+class _QuoteSdkClient:
+    """Stands in for the SDK's sizing calls, with a flat 3% taker fee."""
+
+    def calculate_market_price(self, token_id, side, amount, order_type):
+        return 0.5
+
+    def _adjust_buy_amount_for_balance(self, token_id, amount, price, balance, _):
+        # mirrors py_clob_client_v2 fees.py: the fee is charged on
+        # min(amount, balance) and SUBTRACTED from the balance
+        fee = 0.03 * min(amount, balance)
+        return min(amount, max(balance - fee, 0.0))
+
+
+class _QuoteCS:
+    """A connect-signer stand-in: the quote only needs a web3 for the balance."""
+
+    w3 = object()
+
+
+def _mock_quote(monkeypatch, balance_units) -> None:
+    monkeypatch.setattr(trade, "dw_or_exit", lambda cs: "0xdw")
+    monkeypatch.setattr(trade, "make_clob_client", lambda cs, dw: _QuoteSdkClient())
+    monkeypatch.setattr(
+        trade.pm, "erc20_balance_of", lambda w3, token, owner: balance_units
+    )
+
+
+def test_cmd_quote_prices_a_buy_without_placing_it(monkeypatch, capsys) -> None:
+    """The whole point: the numbers, with no order behind them."""
+    _mock_quote(monkeypatch, 100_000_000)
+    monkeypatch.setattr(
+        trade.pm,
+        "record_dw_buy_intent",
+        lambda cs, tid: pytest.fail("a quote must not touch order state"),
+    )
+
+    trade.cmd_quote(_QuoteCS(), "12345", 10.0, "fok")
+
+    quote = json.loads(capsys.readouterr().out)
+    assert quote["fill_price"] == 0.5
+    assert quote["estimated_shares"] == 20.0
+    assert quote["shortfall_usd"] == 0.0
+    assert quote["blocked"] is False
+
+
+def test_cmd_quote_answers_on_an_empty_deposit_wallet(monkeypatch, capsys) -> None:
+    """`buy` refuses a zero balance; a quote is how you learn the top-up."""
+    _mock_quote(monkeypatch, 0)
+
+    trade.cmd_quote(_QuoteCS(), "12345", 10.0, "fok")
+
+    quote = json.loads(capsys.readouterr().out)
+    assert quote["dw_balance_usd"] == 0.0
+    assert quote["shortfall_usd"] == quote["required_dw_balance_usd"]
+
+
+def test_quote_keeps_the_auth_retry(monkeypatch) -> None:
+    """A quote places nothing, so a credentials refresh cannot double-spend."""
+    retry_modes = []
+    monkeypatch.setattr(
+        trade,
+        "_run_client",
+        lambda cs, op, retry_auth=True: retry_modes.append(retry_auth),
+    )
+
+    trade.cmd_quote(_QuoteCS(), "12345", 10.0, "fok")
+
+    assert retry_modes == [True]
+
+
+def test_buy_preflight_and_quote_agree(monkeypatch, capsys) -> None:
+    """The blocked-buy error must quote the same numbers `quote` reports.
+
+    They share pm.quote_buy precisely so a preflight refusal and a quote can
+    never disagree about the top-up needed.
+    """
+    _mock_quote(monkeypatch, 1_000_000)  # a $1.00 balance against a $1.00 bet
+    monkeypatch.setattr(trade, "clear_cached_creds", lambda cs: None)
+
+    trade.cmd_quote(_QuoteCS(), "12345", 1.0, "fok")
+    quote = json.loads(capsys.readouterr().out)
+    assert quote["blocked"] is True
+
+    with pytest.raises(SystemExit) as exc:
+        trade.cmd_buy(_QuoteCS(), "12345", 1.0, "fok")
+    assert f"{quote['shortfall_usd']:.4f}" in str(exc.value)
+    assert "trade.py quote" in str(exc.value)
+
+
+def test_main_wires_the_quote_subcommand(monkeypatch, capsys) -> None:
+    """The CLI is the only way this runs in production, so parse it for real."""
+    _mock_quote(monkeypatch, 100_000_000)
+    monkeypatch.setattr(
+        trade.pm.ConnectSigner, "from_workspace", classmethod(lambda cls: _QuoteCS())
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["trade.py", "quote", "--token-id", "12345", "--usd", "10"]
+    )
+
+    trade.main()
+
+    assert json.loads(capsys.readouterr().out)["requested_usd"] == 10.0
+
+
 class _EmptyDwCS:
     """A connect-signer stand-in whose DW reads as empty."""
 
