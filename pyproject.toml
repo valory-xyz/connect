@@ -12,6 +12,7 @@ dependencies = [
     "eth-account==0.13.7",
     "mcp==1.28.1",
     "mech-client==0.21.3",
+    "open-aea-ledger-ethereum==2.2.9",
 ]
 
 [project.scripts]

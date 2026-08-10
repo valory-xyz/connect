@@ -28,6 +28,7 @@ import threading
 import typing as t
 from dataclasses import dataclass
 
+from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider, parse_rpc_urls
 from eth_account.signers.local import LocalAccount
 from eth_typing import Hash32
 from web3 import Web3
@@ -74,7 +75,10 @@ class _ChainPool:
         # round-trip and must not stall first use of unrelated chains
         chain_config = self._config.chain(chain)  # raises on unknown chain
         w3 = Web3(
-            Web3.HTTPProvider(chain_config.rpc_url, request_kwargs={"timeout": 30})
+            RotatingHTTPProvider(
+                parse_rpc_urls(chain_config.rpc_url),
+                request_kwargs={"timeout": 30},
+            )
         )
         # PoA chains (Polygon above all) pad extraData past 32 bytes, which
         # web3's default block formatter refuses — making every send there

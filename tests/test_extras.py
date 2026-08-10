@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 import uvicorn
+from aea_ledger_ethereum import rpc_rotation
+from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from web3 import Web3
@@ -957,8 +959,6 @@ class TestSignerExtras:
         class FakeWeb3Factory:
             """Web3 replacement returning the fake client."""
 
-            HTTPProvider = staticmethod(lambda url, request_kwargs=None: url)
-
             def __new__(cls, provider: object) -> t.Any:
                 """Return the fake w3."""
                 return fake_w3
@@ -966,6 +966,55 @@ class TestSignerExtras:
         monkeypatch.setattr(signer_module, "Web3", FakeWeb3Factory)
         assert test_signer.w3("otherchain") is fake_w3
         assert test_signer.w3("otherchain") is fake_w3  # cached
+
+    def test_rpc_pool_is_built_without_a_chain_id(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app_config: AppConfig,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+    ) -> None:
+        """Chainlist enrichment would route our traffic through endpoints we never chose.
+
+        Given a chain_id, RotatingHTTPProvider appends public endpoints from
+        chainlist.org as fallbacks. Rotation is sticky, so the first transport
+        error moves us onto one for good, and it then sees every balance and
+        price the agent decides on plus every signed transaction before it is
+        public. Building the provider without a chain_id is what keeps them out.
+
+        Asserting the pool size alone would not catch a regression: enrichment
+        swallows its own failures, so it silently no-ops wherever there is no
+        egress to chainlist.org and the assertion passes for the wrong reason.
+        Stubbing it is what makes this hermetic.
+        """
+        app_config.chains["enriched"] = ChainConfig(rpc_url="https://rpc.example.test")
+        fake_w3.eth.chain_id = 4242  # type: ignore[attr-defined]
+        seen_chain_ids: list[int | None] = []
+        captured: list[object] = []
+
+        def fake_enrich(
+            urls: list[str], chain_id: int | None = None, **_: object
+        ) -> list[str]:
+            """Record the chain_id, and enrich only when one was passed."""
+            seen_chain_ids.append(chain_id)
+            if chain_id is None:
+                return urls
+            return [*urls, "https://chainlist.example"]
+
+        def fake_web3(provider: object) -> t.Any:
+            """Capture the provider and return the fake client."""
+            captured.append(provider)
+            return fake_w3
+
+        monkeypatch.setattr(rpc_rotation, "enrich_rpc_urls", fake_enrich)
+        monkeypatch.setattr(signer_module, "Web3", fake_web3)
+        test_signer.w3("enriched")
+
+        assert seen_chain_ids == [None]
+        provider = captured[0]
+        assert isinstance(provider, RotatingHTTPProvider)
+        assert provider.rpc_count == 1
+        assert provider.current_rpc_url == "https://rpc.example.test"
 
     def test_broadcast_failure(
         self,
