@@ -39,7 +39,10 @@ the payment type is auto_deposit disarmed there, surfacing mech-client's
 actionable HTTP 402 error instead of a mid-flow guard denial.
 """
 
+# pylint: disable=too-many-lines
+
 import asyncio
+import hashlib
 import logging
 import os
 import threading
@@ -72,6 +75,7 @@ from web3 import Web3
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
+from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.safe import ZERO_ADDRESS, safe_message_hash
 from connect.settings import MODE_RESTRICTED
 from connect.signer import Signer, SignerError
@@ -105,6 +109,19 @@ class MechError(Exception):
     """A mech request failure with an agent-facing message."""
 
 
+class MechUnknownRequest(MechError):
+    """No delivery is being awaited for this request id.
+
+    Distinct from a failed read: this id will never become pending again,
+    where a failed read says nothing about whether the mech answered.
+    """
+
+
+# Marks a stored report whose request reached the paying call and then failed,
+# so the outcome — and the spend — is genuinely unknown to this server.
+SPEND_UNCERTAIN = "uncertain"
+
+
 class PricedMech(t.NamedTuple):
     """The mech a request will pay, with the price the cap must bind."""
 
@@ -114,6 +131,22 @@ class PricedMech(t.NamedTuple):
     # native mechs, token base units for OLAS/USDC ones)
     rate: int
     payment_type: str
+
+
+class _RequestPlan(t.NamedTuple):
+    """Everything a request needs, settled before any payment can happen.
+
+    Its existence is the payment boundary: a failure with no plan spent
+    nothing, a failure with one may have spent funds.
+    """
+
+    chain: str
+    service: MarketplaceService
+    priced: PricedMech
+    extra_attributes: dict | None
+    auto_deposit: bool
+    legacy_on_chain: bool
+    tool: str
 
 
 class PendingDelivery(t.NamedTuple):
@@ -135,6 +168,25 @@ class PendingDelivery(t.NamedTuple):
 def _request_key(request_id: object) -> str:
     """Normalize a request id: the two flows disagree about the 0x prefix."""
     return str(request_id).lower().removeprefix("0x")
+
+
+def _request_stamp(
+    prompt: str,
+    tool: str,
+    chain: str | None,
+    priority_mech: str | None,
+    legacy_on_chain: bool,
+) -> str:
+    """Fingerprint what a request asked.
+
+    A ledger keyed on the caller's id alone would answer a new question with
+    an old answer if that id were reused — and the caller acts on the answer,
+    so the mistake would be silent and expensive.
+    """
+    raw = "\x1f".join(
+        (prompt, tool, chain or "", priority_mech or "", str(legacy_on_chain))
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 class MetadataRead(t.NamedTuple):
@@ -328,6 +380,7 @@ class MechService:
         # requests that returned without a delivery, keyed by request id, so
         # mech_result can resume the watch a paid-for request deserves
         self._pending: dict[str, PendingDelivery] = {}
+        self._requests = RequestLedger()
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
@@ -537,6 +590,7 @@ class MechService:
         auto_deposit: bool = True,
         timeout: float = DEFAULT_DELIVERY_TIMEOUT,
         max_payment: int = DEFAULT_MAX_PAYMENT,
+        request_id: str | None = None,
     ) -> dict:
         """Send one mech request and wait for its delivery.
 
@@ -545,11 +599,153 @@ class MechService:
         mech's per-request price must not exceed ``max_payment``, in the
         mech's payment asset base units.
 
+        Pass a ``request_id`` to make an attempt replayable — see README,
+        "Mech requests", for what that covers and what it deliberately does
+        not.
+        """
+        timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
+        planned: list[_RequestPlan] = []
+
+        def attempt() -> dict:
+            plan = self._prepare(
+                prompt,
+                tool,
+                chain=chain,
+                legacy_on_chain=legacy_on_chain,
+                priority_mech=priority_mech,
+                auto_deposit=auto_deposit,
+                max_payment=max_payment,
+            )
+            # a plan here means the paying call was entered: past this point a
+            # failure cannot be reported as "nothing was spent"
+            planned.append(plan)
+            return self._dispatch(
+                plan,
+                prompt,
+                timeout=timeout,
+                max_payment=max_payment,
+                request_id=request_id,
+            )
+
+        if request_id is None:
+            return attempt()
+        stamp = _request_stamp(prompt, tool, chain, priority_mech, legacy_on_chain)
+        try:
+            entry = self._requests.reserve(request_id)
+        except InFlightError:
+            raise MechError(
+                f"mech request '{request_id}' is already in flight; retry shortly"
+            ) from None
+        try:
+            if entry is not None:
+                merged = self._replay(request_id, entry, stamp, timeout=timeout)
+                self._requests.complete(request_id, merged, stamp)
+                self._activity.record(
+                    "mech_request_replayed",
+                    request_id=request_id,
+                    pending_request_ids=merged.get("pending_request_ids") or [],
+                )
+                return merged
+            payload = attempt()
+        except Exception as e:
+            if planned:
+                self._requests.complete(
+                    request_id, self._uncertain(planned[0], e, request_id), stamp
+                )
+            else:
+                self._requests.release(request_id)
+            raise
+        self._requests.complete(request_id, payload, stamp)
+        return payload
+
+    def _uncertain(self, plan: _RequestPlan, error: Exception, request_id: str) -> dict:
+        """Record that a request was sent and its outcome is unknown.
+
+        Releasing the id here would be the friendly-looking mistake: the
+        caller would retry, and mech-client pays before it watches, so the
+        retry would buy a second answer to a question already paid for.
+        """
+        self._activity.record(
+            "mech_request_uncertain",
+            chain=plan.chain,
+            tool=plan.tool,
+            request_id=request_id,
+            error=str(error),
+        )
+        return {"chain": plan.chain, "spend": SPEND_UNCERTAIN, "error": str(error)}
+
+    def _replay(
+        self, request_id: str, entry: LedgerEntry, stamp: str, *, timeout: float
+    ) -> dict:
+        """Re-answer a request already sent, collecting any late delivery.
+
+        Handing back the stored report unchanged would be the cheap thing and
+        the wrong one: the first call may have returned before the mech
+        answered, and the answer may have landed since. So this resumes each
+        outstanding watch. What it must never do is send again.
+        """
+        if entry.stamp is not None and entry.stamp != stamp:
+            raise MechError(
+                f"request id '{request_id}' was already used for a different "
+                "prompt, tool or mech; choose a new id rather than replaying "
+                "this one, which would answer the wrong question"
+            )
+        payload = entry.payload
+        if payload.get("spend") == SPEND_UNCERTAIN:
+            raise MechError(
+                f"request '{request_id}' reached the paying call and then "
+                f"failed ({payload.get('error')}), so this server cannot tell "
+                "whether it was paid for. Sending it again risks a second "
+                "payment — use a new id only if you accept that."
+            )
+        waiting = list(payload.get("pending_request_ids") or [])
+        if not waiting:
+            return {**payload, "replayed": True}
+        delivered = dict(payload.get("delivery_results") or {})
+        still_waiting: list[str] = []
+        unrecoverable: list[str] = []
+        errors: dict[str, str] = {}
+        for key in waiting:
+            try:
+                report = self.result(key, timeout=timeout)
+            except MechUnknownRequest:
+                unrecoverable.append(key)
+            except MechError as e:
+                logger.warning("replay could not read delivery for %s: %s", key, e)
+                errors[key] = str(e)
+                still_waiting.append(key)
+            else:
+                if report.get("delivered"):
+                    delivered[key] = report["result"]
+                else:
+                    still_waiting.append(key)
+        merged = {**payload, "delivery_results": delivered, "replayed": True}
+        merged.pop("pending_request_ids", None)
+        if still_waiting:
+            merged["pending_request_ids"] = still_waiting
+        if unrecoverable:
+            merged["unrecoverable_request_ids"] = unrecoverable
+        if errors:
+            merged["replay_errors"] = errors
+        return merged
+
+    def _prepare(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        prompt: str,
+        tool: str,
+        *,
+        chain: str | None,
+        legacy_on_chain: bool,
+        priority_mech: str | None,
+        auto_deposit: bool,
+        max_payment: int,
+    ) -> _RequestPlan:
+        """Settle everything a request needs before any payment can happen.
+
         Each refusal below is audited before it raises: the activity log is
         what an operator reconstructs an incident from, and a request blocked
         by policy must not look identical there to one never attempted.
         """
-        timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
         chain = self._resolve_chain(chain)
         service = self._service(chain)
         priced = self._priced_mech(service, chain, priority_mech)
@@ -594,15 +790,39 @@ class MechService:
                 auto_deposit = self._arm_auto_deposit(chain, priced)
         else:
             extra_attributes = None
+        return _RequestPlan(
+            chain=chain,
+            service=service,
+            priced=priced,
+            extra_attributes=extra_attributes,
+            auto_deposit=auto_deposit,
+            legacy_on_chain=legacy_on_chain,
+            tool=tool,
+        )
+
+    def _dispatch(
+        self,
+        plan: _RequestPlan,
+        prompt: str,
+        *,
+        timeout: float,
+        max_payment: int,
+        request_id: str | None,
+    ) -> dict:
+        """Pay for the planned request, send it, and wait out its delivery.
+
+        Everything here is past the point of no return: mech-client pays
+        before it watches, so a failure below may still have spent funds.
+        """
         try:
             result = asyncio.run(
-                service.send_request(
+                plan.service.send_request(
                     prompts=(prompt,),
-                    tools=(tool,),
-                    priority_mech=priority_mech,
-                    use_offchain=not legacy_on_chain,
-                    auto_deposit=auto_deposit,
-                    extra_attributes=extra_attributes,
+                    tools=(plan.tool,),
+                    priority_mech=plan.priced.mech,
+                    use_offchain=not plan.legacy_on_chain,
+                    auto_deposit=plan.auto_deposit,
+                    extra_attributes=plan.extra_attributes,
                     timeout=timeout,
                 )
             )
@@ -610,24 +830,29 @@ class MechService:
             raise
         except Exception as e:
             self._activity.record(
-                "mech_request_failed", chain=chain, tool=tool, error=str(e)
+                "mech_request_failed",
+                chain=plan.chain,
+                tool=plan.tool,
+                request_id=request_id,
+                error=str(e),
             )
             raise MechError(f"mech request failed: {e}") from e
         self._activity.record(
             "mech_request",
-            chain=chain,
-            tool=tool,
-            offchain=not legacy_on_chain,
-            rate=str(rate),
+            chain=plan.chain,
+            tool=plan.tool,
+            request_id=request_id,
+            offchain=not plan.legacy_on_chain,
+            rate=str(plan.priced.rate),
             max_payment=str(max_payment),
             request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
         return self._with_pending(
             dict(result),
-            chain=chain,
-            mech=priority_mech,
-            service_id=service_id,
-            offchain=not legacy_on_chain,
+            chain=plan.chain,
+            mech=plan.priced.mech,
+            service_id=plan.priced.service_id,
+            offchain=not plan.legacy_on_chain,
         )
 
     def _with_pending(
@@ -689,7 +914,7 @@ class MechService:
         with self._lock:
             pending = self._pending.get(key)
         if pending is None:
-            raise MechError(
+            raise MechUnknownRequest(
                 f"nothing is awaiting delivery for request {key}; mech_result "
                 "polls the ids mech_request reported as pending, and a restart "
                 "of this service clears them"

@@ -197,6 +197,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         auto_deposit: bool = True,
         timeout: float = 300,
         max_payment: int = DEFAULT_MAX_PAYMENT,
+        request_id: str | None = None,
     ) -> dict:
         """Send a request to an Olas mech (AI service) and wait for its delivery.
 
@@ -207,6 +208,12 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         Refused before paying if the mech's price exceeds max_payment
         (base units of the mech's payment asset).
         On timeout the ids come back as `pending_request_ids` for mech_result.
+        `request_id` is an id you invent before sending (not one of the
+        `request_ids` that come back): repeating it never sends again — it
+        resumes that request and returns its report marked `replayed`. Choose
+        one whenever you would not want to pay twice to find out what
+        happened; a request that failed after payment refuses replay and says
+        so, since only you can decide to risk a second payment.
         """
         # mech-client manages its own event loops (asyncio.run + sync gql):
         # it must run in a worker thread, never on the server loop
@@ -220,6 +227,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             auto_deposit=auto_deposit,
             timeout=timeout,
             max_payment=max_payment,
+            request_id=request_id,
         )
 
     @mcp.tool()

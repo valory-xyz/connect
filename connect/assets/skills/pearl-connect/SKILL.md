@@ -33,8 +33,12 @@ cannot tell you is which to reach for:
   address.
 - `send_transaction` — the same call made by the **EOA**, whose funds are for
   gas. Rarely what you want.
-- For either: if you are unsure whether a send landed, retry with the same
-  `request_id` rather than issuing a new one.
+- For either — and for `mech_request` — **choose a `request_id` before you
+  send**: it is what lets you retry safely if you never learn whether the call
+  landed, and it cannot be added afterwards. Invent it; it is not one of the
+  `request_ids` that come back. A repeated mech request resumes the first
+  one's delivery instead of paying again — except where the first attempt
+  failed after paying, which it refuses and explains rather than guessing.
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
