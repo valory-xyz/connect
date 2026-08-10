@@ -11,6 +11,18 @@ signature type 3 (`POLY_1271`). For this agent, the DW is owned by the agent
 EOA and every signature (CLOB auth, orders, DW batches, relayer challenges,
 safe transactions) is produced by the connect signer. You compose; it signs.
 
+## Step zero — before researching anything
+
+Call `wallet_info` and confirm `polygon` is in `actionable_chains`. Do this
+before looking at a single market: the answer costs one call, and if it is no,
+every bit of research after it is wasted.
+
+Nothing here is a setting anyone turns on — the Polygon RPC always ships. Read
+`not_actionable_because` for the reason rather than guessing it: no Polygon
+safe and no POL for gas are the operator's to fix, so report them and stop,
+but an unreadable-balances reason is a failing RPC — retry that one before
+telling anybody the chain is unavailable.
+
 ## The funds flow — follow it exactly
 
 This mirrors the Olas Polystrat agent, and it exists for one
@@ -144,9 +156,7 @@ yet", never "no position".
   operator's guardrail settings, with the violated rule named. You cannot
   lift a restriction — the operator changes it in the agent UI with their
   keystore password; never ask for the password in chat.
-- **Polygon configured.** `wallet_info` must list a `polygon` RPC and safe,
-  and the EOA needs POL for the safe legs' gas. If missing, tell the
-  operator — nothing here can add a chain.
+- **Polygon actionable.** The step-zero check above.
 - **Funding.** The operator funds the safe (USDC.e or pUSD) through Pearl.
 - **Relayer proxy reachable.** DW operations go through Valory's predict-api
   proxy (Polymarket's DW relayer needs a Builder key that can't ship in a
