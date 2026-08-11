@@ -24,11 +24,13 @@ through Signer.send(); off-chain mech requests use Signer.sign_digest(). The
 key never leaves this module's LocalAccount.
 """
 
+import logging
 import threading
 import typing as t
 from dataclasses import dataclass
 
 from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider, parse_rpc_urls
+from eth_abi.exceptions import EncodingError
 from eth_account.signers.local import LocalAccount
 from eth_typing import Hash32
 from web3 import Web3
@@ -39,6 +41,8 @@ from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
+
+logger = logging.getLogger("agent")
 
 GAS_ESTIMATE_BUFFER = 1.2
 
@@ -216,6 +220,33 @@ class Signer:
             return broadcast()
         return self._requests.run(request_id, broadcast)
 
+    def _compose_safe_call(
+        self, chain: str, target: str, value: int, data: str
+    ) -> tuple[str, str]:
+        """Wrap one inner call for the safe; returns (safe address, calldata).
+
+        One home for the composition so the send and the dry run cannot answer
+        about different bytes, and one home for the two refusals so their
+        wording cannot drift apart.
+
+        :raises SignerError: no safe on this chain, or the call cannot encode.
+        """
+        safe = self._config.chain(chain).safe_address
+        if safe is None:
+            raise SignerError(
+                f"no service safe is configured for chain '{chain}', so the "
+                "agent cannot act there"
+            )
+        try:
+            calldata = safe_module.exec_transaction(
+                target=target, value=value, data=data, owner=self.address
+            )
+        except (EncodingError, ValueError, TypeError, OverflowError) as e:
+            # composition fails on the caller's input, not the chain — a 400, the
+            # same answer send() gives for a malformed EOA transaction, not a 500
+            raise SignerError(f"cannot compose the safe call: {e}") from e
+        return safe, calldata
+
     def send_via_safe(  # pylint: disable=too-many-arguments
         self,
         chain: str,
@@ -236,20 +267,7 @@ class Signer:
         The composed transaction goes back through send(), so it meets the same
         guard as anything else — a caller of the gate, not a way around it.
         """
-        safe = self._config.chain(chain).safe_address
-        if safe is None:
-            raise SignerError(
-                f"no service safe is configured for chain '{chain}', so the "
-                "agent cannot act there"
-            )
-        try:
-            calldata = safe_module.exec_transaction(
-                target=target, value=value, data=data, owner=self.address
-            )
-        except Exception as e:  # eth_abi rejects a bad address or an oversized value
-            # composition fails on the caller's input, not the chain — a 400, the
-            # same answer send() gives for a malformed EOA transaction, not a 500
-            raise SignerError(f"cannot compose the safe call: {e}") from e
+        safe, calldata = self._compose_safe_call(chain, target, value, data)
         return self.send(
             chain,
             safe,
@@ -260,6 +278,68 @@ class Signer:
             request_id=None if request_id is None else f"safe:{request_id}",
             gas=gas,
         )
+
+    def refusal_reason(
+        self,
+        chain: str,
+        target: str,
+        *,
+        value: int = 0,
+        data: str = "0x",
+        via_safe: bool = True,
+    ) -> str | None:
+        """Say why the guardrail would refuse this call, or None if it passes.
+
+        The answer has to be about the bytes the send would really produce, so
+        this composes through _compose_safe_call exactly as send_via_safe does
+        rather than checking the inner call on its own — the floor rules are
+        about the wrapper, and an unwrapped guess would answer a different
+        question.
+
+        Nothing is signed or broadcast, and no single-use allowance is consumed:
+        asking must never cost anything or change what a later send is allowed
+        to do. It is recorded as `checked`, never as `blocked` — a request that
+        was actually stopped and a question about one are different events, and
+        an operator reconstructing an incident needs to tell them apart.
+        """
+        try:
+            if via_safe:
+                target, data = self._compose_safe_call(chain, target, value, data)
+                value = 0
+            elif value < 0:
+                # send() rejects this before the guard ever sees it, and the dry
+                # run must not answer "allowed" for a call that cannot be sent
+                raise SignerError("value must be a non-negative amount in wei")
+            reason = self._refused_by_guard(chain, target, value, data)
+        except SignerError as e:
+            reason = str(e)
+        except ValueError as e:  # an unknown chain, which config.chain() raises on
+            reason = str(e)
+        self._activity.record(
+            "checked",
+            chain=chain,
+            to=target,
+            value=str(value),
+            allowed=reason is None,
+            reason=reason,
+        )
+        return reason
+
+    def _refused_by_guard(
+        self, chain: str, to: str, value: int, data: str
+    ) -> str | None:
+        """Ask the guardrail about a composed transaction, consuming nothing."""
+        if self._guard is None:
+            logger.error(
+                "the signing choke point has no guardrail attached; every "
+                "request would be permitted"
+            )
+            return None
+        try:
+            self._guard.check_transaction(chain, to, value, data, consume=False)
+        except GuardError as e:
+            return str(e)
+        return None
 
     def _send(  # pylint: disable=too-many-arguments
         self,

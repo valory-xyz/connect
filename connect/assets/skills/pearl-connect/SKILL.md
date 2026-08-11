@@ -39,6 +39,10 @@ cannot tell you is which to reach for:
   `request_ids` that come back. A repeated mech request with **identical arguments**
   resumes the first one's delivery instead of paying again — except where the
   first attempt failed after paying, which it refuses and explains rather than guessing.
+- `preflight_transaction` — ask whether a call would be permitted before you
+  build on it. Reach for it when a plan depends on a call being allowed: a
+  refusal here costs nothing, one discovered mid-flow can leave a
+  half-finished position.
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
