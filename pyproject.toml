@@ -11,7 +11,7 @@ dependencies = [
     "web3==7.16.0",
     "eth-account==0.13.7",
     "mcp==1.28.1",
-    "mech-client @ git+https://github.com/valory-xyz/mech-client@215635a78b3a97163de5c4ea0947bbd92fe70a66",
+    "mech-client==0.22.0",
     "open-aea-ledger-ethereum==2.2.9",
 ]
 
@@ -34,9 +34,6 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["connect"]
