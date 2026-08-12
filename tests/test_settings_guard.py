@@ -2049,7 +2049,7 @@ class TestMech:
         so a stale reply routed to a new market costs real money.
         """
         self._job(mech_service, "job-8", prompt="will it rain")
-        with pytest.raises(MechError, match="different prompt, tool or mech"):
+        with pytest.raises(MechError, match="different prompt, tool, chain"):
             self._job(mech_service, "job-8", prompt="will it snow")
         assert len(patched_mech.calls) == 1
         assert [
@@ -2057,6 +2057,27 @@ class TestMech:
             for e in audit_entries(store_path)
             if e["kind"] == "mech_request_refused"
         ] == [("job-8", "stamp-mismatch")]
+
+    def test_reusing_an_id_for_the_other_flow_is_refused(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """The same question down the other flow is still a second purchase.
+
+        The two flows pay differently — off-chain spends prepaid balance, the
+        legacy one sends a transaction — so a replay that switched flow would
+        buy the answer again while looking like a resumed watch.
+        """
+        self._job(mech_service, "job-9")
+        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=False,
+                priority_mech=OTHER,
+                request_id="job-9",
+            )
+        assert len(patched_mech.calls) == 1
 
     def test_concurrent_callers_of_one_id_reach_the_payment_once(
         self,

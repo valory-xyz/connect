@@ -561,8 +561,8 @@ class MechService:
             self._refused(request_id, "stamp-mismatch", "reused for a different ask")
             raise MechError(
                 f"request id '{request_id}' was already used for a different "
-                "prompt, tool or mech; choose a new id rather than replaying "
-                "this one, which would answer the wrong question"
+                "prompt, tool, chain, mech or flow; choose a new id rather "
+                "than replaying this one, which would answer the wrong question"
             )
         payload = entry.payload
         if payload.get("spend") == SPEND_UNCERTAIN:
