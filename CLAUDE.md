@@ -79,5 +79,6 @@ Other trees:
 ## Dependency quirks
 
 - `open-aea-ledger-ethereum` is pinned direct, though mech-client already resolved it at the same version. Importing mech-client already loads the `aea` core and this plugin, so the pin costs no modules in the process or the bundle; it only stops a transitive bump from moving it. The mypy env silences the import rather than installing it: the package ships `py.typed`, but installing it drags in a real `web3` too, which un-silences `[mypy-web3.*]` across the whole tree.
+- `mech-client` is pinned to a **commit**, not a release: `connect/mech.py` reads its `deliveries`/`DeliveryResult` shape, which no tagged version ships yet. That needs `[tool.hatch.metadata] allow-direct-references = true` — hatchling rejects a direct git reference without it. Move the pin back to a version once the change is released.
 - `[tool.uv] override-dependencies` pins fastapi past mech-client's transitive `fastapi<0.118` pin (operate paths in mech-client never run here). This is why the pylint/test tox envs use `uv sync` in `commands_pre` instead of a normal package install — pip can't honor the override.
 - pytest runs with `-p no:anchorpy` (a transitive plugin whose own deps aren't installed).
