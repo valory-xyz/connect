@@ -36,7 +36,7 @@ cannot tell you is which to reach for:
 - For either — and for `mech_request` — **choose a `request_id` before you
   send**: it is what lets you retry safely if you never learn whether the call
   landed, and it cannot be added afterwards. Invent it; it is not one of the
-  `request_ids` that come back. A repeated mech request with with **identical arguments**
+  `request_ids` that come back. A repeated mech request with **identical arguments**
   resumes the first one's delivery instead of paying again — except where the
   first attempt failed after paying, which it refuses and explains rather than guessing.
 - `transaction_status` — settle a hash you already hold.
