@@ -99,6 +99,12 @@ composing a prompt:
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with
   `mech_tools(priority_mech=...)` (`max_delivery_rate`).
+- `delivery_results[request_id]` is normally the result file
+  (`{schema_version, requestId, result, tool, …}`), but a mech that answers
+  inline off-chain returns its envelope instead, with the answer under
+  `response` — check for that key before assuming.
+- `delivery_urls[request_id]` is the result file's URL, absent for an inline
+  answer, where the envelope's `content_cid` names the document instead.
 
 ## Python scripts: scripts/signer_client.py
 

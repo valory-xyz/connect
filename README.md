@@ -229,8 +229,8 @@ server can only promise what it can actually know:
 Two bounds worth knowing: the ledger is in memory, so a restart clears it,
 exactly as it clears `mech_result`'s pending ids; and it keeps the last 1024
 ids, so an id replayed long after that many others pays again. An id is also
-bound to what it asked — reusing one for a different prompt, tool or mech is
-refused rather than answering the wrong question.
+bound to what it asked — reusing one for a different prompt, tool, chain, mech
+or flow is refused rather than answering the wrong question.
 
 ## Development
 

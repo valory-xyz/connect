@@ -36,6 +36,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client.domain.delivery.models import DeliveryResult
 from mech_client.infrastructure.config import PaymentType
 from mech_client.infrastructure.ipfs import metadata as ipfs_metadata
 from web3 import Web3
@@ -1588,7 +1589,9 @@ class FakeMarketplaceService:
         self.result: dict = {
             "tx_hash": "0x" + "11" * 32,
             "request_ids": ["ab"],
-            "delivery_results": {"ab": {"answer": "42"}},
+            "deliveries": {
+                "ab": DeliveryResult(request_id="ab", data={"answer": "42"}, url=None)
+            },
         }
         self.raises: Exception | None = None
         self.mech_info = native_mech_info(10**16)
@@ -1754,7 +1757,9 @@ class TestMech:
         )
         # the resolved chain travels with the result, so a caller that omitted
         # it can still tell which chain was paid
-        assert result == {"chain": "testchain", **patched_mech.result}
+        assert result["chain"] == "testchain"
+        assert result["tx_hash"] == patched_mech.result["tx_hash"]
+        assert result["delivery_results"] == {"ab": {"answer": "42"}}
         call = patched_mech.calls[0]
         assert call["prompts"] == ("what is the answer",)
         assert call["tools"] == ("prediction",)
@@ -1798,7 +1803,7 @@ class TestMech:
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
             "request_ids": ["0xAB"],
-            "delivery_results": {},
+            "deliveries": {},
             # AttributeDict, not a dict literal: that is what web3 really
             # hands back, and it is NOT a dict subclass — stubbing a plain
             # dict hid a bug that left from_block None on every live request
@@ -1817,7 +1822,7 @@ class TestMech:
             service: object, pending: PendingDelivery, key: str, timeout: float
         ) -> dict:
             watched.update(pending=pending, key=key, timeout=timeout)
-            return {"ab": {"answer": "42"}}
+            return {"ab": DeliveryResult("ab", {"answer": "42"}, None)}
 
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         delivery = mech_service.result("0xAB")
@@ -1870,7 +1875,7 @@ class TestMech:
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
             "request_ids": ["0xAB"],
-            "delivery_results": {},
+            "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
         first = self._job(mech_service, "job-2")
@@ -1882,7 +1887,7 @@ class TestMech:
             service: object, pending: PendingDelivery, key: str, timeout: float
         ) -> dict:
             watched["timeout"] = timeout
-            return {"ab": {"answer": "42"}}
+            return {"ab": DeliveryResult("ab", {"answer": "42"}, None)}
 
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         again = self._job(mech_service, "job-2")
@@ -1898,6 +1903,31 @@ class TestMech:
             "ab": {"answer": "42"}
         }
 
+    def test_a_resumed_delivery_keeps_the_url_it_came_from(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A replayed id is exactly the case that needs the answer locatable."""
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "deliveries": {},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+        assert self._job(mech_service, "job-url")["pending_request_ids"] == ["ab"]
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {"ab": DeliveryResult("ab", {"answer": "42"}, "ipfs://somewhere")}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        again = self._job(mech_service, "job-url")
+        assert again["delivery_results"] == {"ab": {"answer": "42"}}
+        assert again["delivery_urls"] == {"ab": "ipfs://somewhere"}
+
     def test_replay_keeps_waiting_while_the_mech_stays_silent(
         self,
         mech_service: MechService,
@@ -1908,7 +1938,7 @@ class TestMech:
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
             "request_ids": ["ab"],
-            "delivery_results": {},
+            "deliveries": {},
         }
         self._job(mech_service, "job-3")
 
@@ -1938,14 +1968,14 @@ class TestMech:
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
             "request_ids": ["ab"],
-            "delivery_results": {},
+            "deliveries": {},
         }
         self._job(mech_service, "job-4")
 
         async def _watch(
             service: object, pending: PendingDelivery, key: str, timeout: float
         ) -> dict:
-            return {"ab": {"answer": "42"}}
+            return {"ab": DeliveryResult("ab", {"answer": "42"}, None)}
 
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         assert mech_service.result("ab")["delivered"] is True
@@ -1969,7 +1999,7 @@ class TestMech:
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
             "request_ids": ["ab"],
-            "delivery_results": {},
+            "deliveries": {},
         }
         self._job(mech_service, "job-5")
 
@@ -2044,7 +2074,7 @@ class TestMech:
         so a stale reply routed to a new market costs real money.
         """
         self._job(mech_service, "job-8", prompt="will it rain")
-        with pytest.raises(MechError, match="different prompt, tool or mech"):
+        with pytest.raises(MechError, match="different prompt, tool, chain"):
             self._job(mech_service, "job-8", prompt="will it snow")
         assert len(patched_mech.calls) == 1
         assert [
@@ -2052,6 +2082,27 @@ class TestMech:
             for e in audit_entries(store_path)
             if e["kind"] == "mech_request_refused"
         ] == [("job-8", "stamp-mismatch")]
+
+    def test_reusing_an_id_for_the_other_flow_is_refused(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """The same question down the other flow is still a second purchase.
+
+        The two flows pay differently — off-chain spends prepaid balance, the
+        legacy one sends a transaction — so a replay that switched flow would
+        buy the answer again while looking like a resumed watch.
+        """
+        self._job(mech_service, "job-9")
+        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=False,
+                priority_mech=OTHER,
+                request_id="job-9",
+            )
+        assert len(patched_mech.calls) == 1
 
     def test_concurrent_callers_of_one_id_reach_the_payment_once(
         self,
@@ -2135,6 +2186,36 @@ class TestMech:
         assert entry is not None
         assert entry.payload == {"id": "a-replayed"}
 
+    def test_a_delivery_is_unwrapped_to_its_content_and_url(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """mech-client answers with content now, not a directory URL.
+
+        The delivered result file is what the caller acts on; the URL it came
+        from travels alongside rather than in its place, so an unreadable
+        gateway leaves the answer locatable instead of unrecoverable.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "deliveries": {
+                "0xAB": DeliveryResult(
+                    request_id="0xAB",
+                    data={"result": '{"p_yes": 0.38}'},
+                    url="https://gateway.example/ipfs/f0170122ab/42",
+                )
+            },
+        }
+        report = mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert report["delivery_results"] == {"ab": {"result": '{"p_yes": 0.38}'}}
+        assert report["delivery_urls"] == {
+            "ab": "https://gateway.example/ipfs/f0170122ab/42"
+        }
+        assert "deliveries" not in report
+        assert "pending_request_ids" not in report
+
     def test_every_id_in_one_response_is_spelled_the_same_way(
         self,
         store_path: Path,
@@ -2152,7 +2233,9 @@ class TestMech:
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
             "request_ids": ["0xAB", "0xCD"],
-            "delivery_results": {"ab": {"answer": "42"}},
+            "deliveries": {
+                "ab": DeliveryResult(request_id="ab", data={"answer": "42"}, url=None)
+            },
         }
         result = mech_service.request(
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
@@ -2173,7 +2256,7 @@ class TestMech:
         patched_mech.result = {
             "tx_hash": None,
             "request_ids": ["ab"],
-            "delivery_results": {},
+            "deliveries": {},
         }
         mech_service.request(
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
@@ -2198,7 +2281,7 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A watcher blow-up becomes a MechError; the timeout stays bounded."""
-        patched_mech.result = {"request_ids": ["ab"], "delivery_results": {}}
+        patched_mech.result = {"request_ids": ["ab"], "deliveries": {}}
         mech_service.request(
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
@@ -2275,7 +2358,9 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
         )
-        assert result == {"chain": "testchain", **patched_mech.result}
+        assert result["chain"] == "testchain"
+        assert result["tx_hash"] == patched_mech.result["tx_hash"]
+        assert result["delivery_results"] == {"ab": {"answer": "42"}}
 
     @staticmethod
     def _restricted_mech_service(
@@ -2323,7 +2408,9 @@ class TestMech:
             account, app_config, activity, settings_store
         )
         result = service.request("q", "tool", chain="testchain", priority_mech=OTHER)
-        assert result == {"chain": "testchain", **patched_mech.result}
+        assert result["chain"] == "testchain"
+        assert result["tx_hash"] == patched_mech.result["tx_hash"]
+        assert result["delivery_results"] == {"ab": {"answer": "42"}}
         call = patched_mech.calls[0]
         assert call["use_offchain"] is True
         assert call["auto_deposit"] is False
@@ -3967,7 +4054,9 @@ class TestMcpGuardrailTools:
         result = await tools["mech_request"](
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
-        assert result == {"chain": "testchain", **fake.result}
+        assert result["chain"] == "testchain"
+        assert result["tx_hash"] == fake.result["tx_hash"]
+        assert result["delivery_results"] == {"ab": {"answer": "42"}}
 
     async def test_mech_result_tool_polls_off_the_event_loop(
         self,

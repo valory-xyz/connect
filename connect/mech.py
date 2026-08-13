@@ -340,8 +340,6 @@ class MechService:
                 # race the env var and construct against each other's RPC.
                 # First use of one chain therefore stalls the others; the fix
                 # is a constructor arg upstream (valory-xyz/mech-client#247).
-                # The exact ==0.21.3 pin keeps the construction-time-read
-                # behavior from drifting underneath this lock.
                 os.environ["MECHX_CHAIN_RPC"] = chain_config.rpc_url
                 service = MarketplaceService(
                     chain_config=chain,
@@ -547,7 +545,7 @@ class MechService:
         )
         return {"chain": plan.chain, "spend": SPEND_UNCERTAIN, "error": str(error)}
 
-    def _replay(
+    def _replay(  # pylint: disable=too-many-locals
         self, request_id: str, entry: LedgerEntry, stamp: str, *, timeout: float
     ) -> dict:
         """Re-answer a request already sent, collecting any late delivery.
@@ -561,8 +559,8 @@ class MechService:
             self._refused(request_id, "stamp-mismatch", "reused for a different ask")
             raise MechError(
                 f"request id '{request_id}' was already used for a different "
-                "prompt, tool or mech; choose a new id rather than replaying "
-                "this one, which would answer the wrong question"
+                "prompt, tool, chain, mech or flow; choose a new id rather "
+                "than replaying this one, which would answer the wrong question"
             )
         payload = entry.payload
         if payload.get("spend") == SPEND_UNCERTAIN:
@@ -579,6 +577,7 @@ class MechService:
         if not waiting:
             return {**payload, "replayed": True}
         delivered = dict(payload.get("delivery_results") or {})
+        urls = dict(payload.get("delivery_urls") or {})
         still_waiting: list[str] = []
         unrecoverable: list[str] = []
         errors: dict[str, str] = {}
@@ -594,9 +593,13 @@ class MechService:
             else:
                 if report.get("delivered"):
                     delivered[key] = report["result"]
+                    if report.get("url"):
+                        urls[key] = report["url"]
                 else:
                     still_waiting.append(key)
         merged = {**payload, "delivery_results": delivered, "replayed": True}
+        if urls:
+            merged["delivery_urls"] = urls
         merged.pop("pending_request_ids", None)
         if still_waiting:
             merged["pending_request_ids"] = still_waiting
@@ -732,7 +735,7 @@ class MechService:
             offchain=not plan.legacy_on_chain,
         )
 
-    def _with_pending(
+    def _with_pending(  # pylint: disable=too-many-locals
         self,
         result: dict,
         *,
@@ -747,9 +750,12 @@ class MechService:
         may still answer. Remembering where to look is what lets mech_result
         pick it up instead of the answer being stranded.
         """
-        delivered = {
-            _request_key(rid): answer
-            for rid, answer in (result.get("delivery_results") or {}).items()
+        deliveries = result.get("deliveries") or {}
+        delivered = {_request_key(rid): d.data for rid, d in deliveries.items()}
+        urls = {
+            _request_key(rid): d.url
+            for rid, d in deliveries.items()
+            if d.url is not None
         }
         ids = [_request_key(rid) for rid in result.get("request_ids") or []]
         receipt = result.get("receipt")
@@ -769,10 +775,13 @@ class MechService:
         # request_ids but not the delivery_results keys, so a caller handed
         # both raw sees one id spelled two ways and cannot match them up.
         payload = {"chain": chain, **result}
+        payload.pop("deliveries", None)
         if "request_ids" in result:
             payload["request_ids"] = ids
-        if "delivery_results" in result:
+        if "deliveries" in result:
             payload["delivery_results"] = delivered
+        if urls:
+            payload["delivery_urls"] = urls
         if waiting:
             payload["pending_request_ids"] = waiting
         return payload
@@ -801,7 +810,8 @@ class MechService:
             delivered = asyncio.run(self._watch(service, pending, key, timeout))
         except Exception as e:
             raise MechError(f"could not read delivery for request {key}: {e}") from e
-        data = {_request_key(k): v for k, v in (delivered or {}).items()}
+        split = {_request_key(k): v for k, v in (delivered or {}).items()}
+        data = {k: d.data for k, d in split.items()}
         report = {
             "request_id": key,
             "chain": pending.chain,
@@ -817,7 +827,8 @@ class MechService:
         with self._lock:
             self._pending.pop(key, None)
         self._activity.record("mech_result", chain=pending.chain, request_id=key)
-        return {**report, "result": data[key]}
+        url = split[key].url
+        return {**report, "result": data[key], **({"url": url} if url else {})}
 
     @staticmethod
     async def _watch(
