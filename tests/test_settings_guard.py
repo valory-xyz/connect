@@ -1903,6 +1903,31 @@ class TestMech:
             "ab": {"answer": "42"}
         }
 
+    def test_a_resumed_delivery_keeps_the_url_it_came_from(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A replayed id is exactly the case that needs the answer locatable."""
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "deliveries": {},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+        assert self._job(mech_service, "job-url")["pending_request_ids"] == ["ab"]
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {"ab": DeliveryResult("ab", {"answer": "42"}, "ipfs://somewhere")}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        again = self._job(mech_service, "job-url")
+        assert again["delivery_results"] == {"ab": {"answer": "42"}}
+        assert again["delivery_urls"] == {"ab": "ipfs://somewhere"}
+
     def test_replay_keeps_waiting_while_the_mech_stays_silent(
         self,
         mech_service: MechService,

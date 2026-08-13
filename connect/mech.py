@@ -340,8 +340,6 @@ class MechService:
                 # race the env var and construct against each other's RPC.
                 # First use of one chain therefore stalls the others; the fix
                 # is a constructor arg upstream (valory-xyz/mech-client#247).
-                # The exact commit pin keeps the construction-time-read
-                # behavior from drifting underneath this lock.
                 os.environ["MECHX_CHAIN_RPC"] = chain_config.rpc_url
                 service = MarketplaceService(
                     chain_config=chain,
@@ -547,7 +545,7 @@ class MechService:
         )
         return {"chain": plan.chain, "spend": SPEND_UNCERTAIN, "error": str(error)}
 
-    def _replay(
+    def _replay(  # pylint: disable=too-many-locals
         self, request_id: str, entry: LedgerEntry, stamp: str, *, timeout: float
     ) -> dict:
         """Re-answer a request already sent, collecting any late delivery.
@@ -579,6 +577,7 @@ class MechService:
         if not waiting:
             return {**payload, "replayed": True}
         delivered = dict(payload.get("delivery_results") or {})
+        urls = dict(payload.get("delivery_urls") or {})
         still_waiting: list[str] = []
         unrecoverable: list[str] = []
         errors: dict[str, str] = {}
@@ -594,9 +593,13 @@ class MechService:
             else:
                 if report.get("delivered"):
                     delivered[key] = report["result"]
+                    if report.get("url"):
+                        urls[key] = report["url"]
                 else:
                     still_waiting.append(key)
         merged = {**payload, "delivery_results": delivered, "replayed": True}
+        if urls:
+            merged["delivery_urls"] = urls
         merged.pop("pending_request_ids", None)
         if still_waiting:
             merged["pending_request_ids"] = still_waiting
