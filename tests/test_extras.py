@@ -1082,21 +1082,34 @@ class TestSignerExtras:
         )
         assert len(fake_w3.eth.sent) == 1
 
+    def test_a_request_id_reused_for_another_call_is_refused(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Returning the first hash would report a send that never happened."""
+        first = test_signer.send("testchain", to="0x" + "aa" * 20, request_id="reuse")
+        with pytest.raises(SignerError, match="used for a different call"):
+            test_signer.send("testchain", to="0x" + "bb" * 20, request_id="reuse")
+        assert len(fake_w3.eth.sent) == 1
+        assert (
+            test_signer.send("testchain", to="0x" + "aa" * 20, request_id="reuse")
+            == first
+        )
+
     def test_idempotency_cache_returns_cached_inside_run(self) -> None:
         """run() itself replays a completed key (guards the racing-caller path)."""
         cache = _IdempotencyCache()
-        assert cache.run("k", lambda: "0xaaa") == "0xaaa"
-        assert cache.run("k", lambda: "0xbbb") == "0xaaa"  # action not re-run
+        assert cache.run("k", "s", lambda: "0xaaa") == "0xaaa"
+        assert cache.run("k", "s", lambda: "0xbbb") == "0xaaa"  # action not re-run
 
     def test_idempotency_cache_evicts_oldest(self) -> None:
         """The result cache is bounded; the oldest replays are dropped first."""
         cache = _IdempotencyCache(max_results=2)
-        cache.run("a", lambda: "0xa")
-        cache.run("b", lambda: "0xb")
-        cache.run("c", lambda: "0xc")
-        assert cache.cached("a") is None  # evicted; a very late retry re-runs
-        assert cache.cached("b") == "0xb"
-        assert cache.cached("c") == "0xc"
+        cache.run("a", "s", lambda: "0xa")
+        cache.run("b", "s", lambda: "0xb")
+        cache.run("c", "s", lambda: "0xc")
+        assert cache.cached("a", "s") is None  # evicted; a very late retry re-runs
+        assert cache.cached("b", "s") == "0xb"
+        assert cache.cached("c", "s") == "0xc"
 
     def test_failed_send_releases_request_id(
         self, test_signer: Signer, fake_w3: FakeW3

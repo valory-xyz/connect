@@ -17,20 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""What the mech flow pre-authorizes with the guard before it signs or spends.
-
-Restricted mode allows neither raw digest signing nor a safe call to an
-address outside the whitelist, and an off-chain mech request needs both: the
-safe's ERC-1271 wrap of a request id, and possibly one deposit to a balance
-tracker. Rather than widen the mode, the flow registers exactly the digest and
-exactly the payment it is about to make, single-use, moments before making it.
-
-That makes this the module where the guardrail's carve-outs are earned, which
-is why it is its own file: the reasoning is dense, it is the part a reviewer
-must read most carefully, and none of it belongs to driving a request. The
-derivations here trust no RPC for anything that gets signed — see
-`request_digest`.
-"""
+"""The single-use grants the mech flow registers with the guard."""
 
 import logging
 

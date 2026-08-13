@@ -1928,6 +1928,162 @@ class TestMech:
         assert again["delivery_results"] == {"ab": {"answer": "42"}}
         assert again["delivery_urls"] == {"ab": "ipfs://somewhere"}
 
+    def test_a_replay_drops_the_previous_round_s_failures(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An id cannot be both delivered and reported as a failed read."""
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "deliveries": {},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+        self._job(mech_service, "job-stale")
+
+        async def _broken(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            raise RuntimeError("gateway timed out")
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_broken))
+        second = self._job(mech_service, "job-stale")
+        assert "ab" in second["replay_errors"]
+
+        async def _answers(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {"ab": DeliveryResult("ab", {"answer": "42"}, None)}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_answers))
+        third = self._job(mech_service, "job-stale")
+        assert third["delivery_results"] == {"ab": {"answer": "42"}}
+        assert "replay_errors" not in third
+
+    def test_a_delivery_that_could_not_be_read_is_not_an_answer(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mech-client says delivered-but-unreadable; that is not a null answer."""
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "deliveries": {"0xAB": DeliveryResult("0xAB", None, "ipfs://later")},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+        first = self._job(mech_service, "job-unreadable")
+        assert first["delivery_results"] == {}
+        assert first["pending_request_ids"] == ["ab"]
+        assert first["delivery_urls"] == {"ab": "ipfs://later"}
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {"ab": DeliveryResult("ab", {"answer": "42"}, "ipfs://later")}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        assert self._job(mech_service, "job-unreadable")["delivery_results"] == {
+            "ab": {"answer": "42"}
+        }
+
+    def test_polling_an_unreadable_delivery_keeps_it_pollable(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Popping it here would strand a request its payment already bought."""
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "deliveries": {},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+        self._job(mech_service, "job-poll")
+
+        async def _unreadable(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {"ab": DeliveryResult("ab", None, "ipfs://later")}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_unreadable))
+        report = mech_service.result("ab")
+        assert report["delivered"] is False
+        assert report["url"] == "ipfs://later"
+        assert "could not be read" in report["note"]
+
+        async def _readable(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {"ab": DeliveryResult("ab", {"answer": "42"}, "ipfs://later")}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_readable))
+        assert mech_service.result("ab")["result"] == {"answer": "42"}
+
+    def test_the_stamp_covers_the_chain_and_the_mech(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Every field the refusal names has to be one the stamp really binds."""
+        self._job(mech_service, "job-chain")
+        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+            mech_service.request(
+                "q",
+                "t",
+                chain="other",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                request_id="job-chain",
+            )
+        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=WHITELISTED,
+                request_id="job-chain",
+            )
+        assert len(patched_mech.calls) == 1
+
+    def test_the_stamp_ignores_how_the_caller_spelled_the_same_request(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """The retry the tool's own defaults produce must not read as a new ask.
+
+        `chain` defaults to None, so omitting it first and naming it on the
+        retry is the likeliest sequence there is — and the refusal tells the
+        caller to use a new id, which pays again.
+        """
+        first = mech_service.request(
+            "q", "t", legacy_on_chain=True, priority_mech=OTHER, request_id="job-spell"
+        )
+        again = mech_service.request(
+            "q",
+            "t",
+            chain="TestChain",
+            legacy_on_chain=True,
+            priority_mech=OTHER.upper(),
+            request_id="job-spell",
+        )
+        assert again.get("replayed") is True
+        assert again["request_ids"] == first["request_ids"]
+        assert len(patched_mech.calls) == 1
+
+    def test_a_refused_replay_leaves_the_id_usable(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A refusal must release the claim, or the id is stuck in flight."""
+        self._job(mech_service, "job-release", prompt="will it rain")
+        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+            self._job(mech_service, "job-release", prompt="will it snow")
+        again = self._job(mech_service, "job-release", prompt="will it rain")
+        assert again.get("replayed") is True
+        assert len(patched_mech.calls) == 1
+
     def test_replay_keeps_waiting_while_the_mech_stays_silent(
         self,
         mech_service: MechService,
@@ -2159,7 +2315,7 @@ class TestMech:
         ledger = RequestLedger(max_results=2)
         for key in ("a", "b", "c"):
             assert ledger.reserve(key) is None
-            ledger.complete(key, {"id": key})
+            ledger.complete(key, {"id": key}, "stamp")
         assert ledger.reserve("a") is None  # evicted, so this claims it afresh
         ledger.release("a")
         entry = ledger.reserve("b")
@@ -2175,11 +2331,11 @@ class TestMech:
         ledger = RequestLedger(max_results=2)
         for key in ("a", "b"):
             ledger.reserve(key)
-            ledger.complete(key, {"id": key})
+            ledger.complete(key, {"id": key}, "stamp")
         ledger.reserve("a")
-        ledger.complete("a", {"id": "a-replayed"})
+        ledger.complete("a", {"id": "a-replayed"}, "stamp")
         ledger.reserve("c")
-        ledger.complete("c", {"id": "c"})
+        ledger.complete("c", {"id": "c"}, "stamp")
         assert ledger.reserve("b") is None  # oldest once "a" was refreshed
         ledger.release("b")
         entry = ledger.reserve("a")

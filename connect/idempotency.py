@@ -17,13 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""At-most-once execution of paid actions, keyed by caller-chosen request ids.
-
-The signer keeps its own cache mapping an id to a tx hash. An action that is
-paid for before it is answered has no single equivalent, so entries here hold
-a whole report, plus a stamp of what was asked — without which a reused id
-would answer a question its caller never posed.
-"""
+"""At-most-once execution keyed by caller-chosen request ids."""
 
 import threading
 import typing as t
@@ -39,7 +33,8 @@ class LedgerEntry(t.NamedTuple):
     """What one settled attempt produced, and a stamp of what it was asked."""
 
     payload: dict
-    stamp: str | None
+    stamp: str
+    spend_uncertain: bool = False
 
 
 class RequestLedger:
@@ -68,12 +63,14 @@ class RequestLedger:
             self._in_flight.add(key)
             return self._results.get(key)
 
-    def complete(self, key: str, payload: dict, stamp: str | None = None) -> None:
+    def complete(
+        self, key: str, payload: dict, stamp: str, *, spend_uncertain: bool = False
+    ) -> None:
         """Store what the key produced and release its claim."""
         with self._lock:
             # re-insert so recency tracks use: eviction costs a second payment
             self._results.pop(key, None)
-            self._results[key] = LedgerEntry(payload, stamp)
+            self._results[key] = LedgerEntry(payload, stamp, spend_uncertain)
             self._in_flight.discard(key)
             while len(self._results) > self._max_results:
                 del self._results[next(iter(self._results))]

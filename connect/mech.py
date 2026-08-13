@@ -121,6 +121,11 @@ class PendingDelivery(t.NamedTuple):
     from_block: int | None
 
 
+def _clamp_timeout(timeout: float) -> float:
+    """Clamp a caller-supplied wait to [1, MAX_DELIVERY_TIMEOUT] seconds."""
+    return min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
+
+
 def _request_key(request_id: object) -> str:
     """Normalize a request id: the two flows disagree about the 0x prefix."""
     return str(request_id).lower().removeprefix("0x")
@@ -129,7 +134,7 @@ def _request_key(request_id: object) -> str:
 def _request_stamp(
     prompt: str,
     tool: str,
-    chain: str | None,
+    chain: str,
     priority_mech: str | None,
     legacy_on_chain: bool,
 ) -> str:
@@ -140,7 +145,13 @@ def _request_stamp(
     so the mistake would be silent and expensive.
     """
     raw = "\x1f".join(
-        (prompt, tool, chain or "", priority_mech or "", str(legacy_on_chain))
+        (
+            prompt,
+            tool,
+            chain.lower(),
+            (priority_mech or "").lower(),
+            str(legacy_on_chain),
+        )
     )
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -244,8 +255,6 @@ class MechService:
         self._signer = signer
         self._config = config
         self._activity = activity
-        # no self._guard: the guard's whole relationship with this flow is the
-        # single-use grants MechAllowances registers on its behalf
         self._allowances = MechAllowances(config, guard, activity)
         self._lock = threading.Lock()
         self._services: dict[str, MarketplaceService] = {}
@@ -473,10 +482,11 @@ class MechService:
         "Mech requests", for what that covers and what it deliberately does
         not.
         """
-        timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
-        planned: list[_RequestPlan] = []
+        timeout = _clamp_timeout(timeout)
+        planned: _RequestPlan | None = None
 
         def attempt() -> dict:
+            nonlocal planned
             plan = self._prepare(
                 prompt,
                 tool,
@@ -486,9 +496,8 @@ class MechService:
                 auto_deposit=auto_deposit,
                 max_payment=max_payment,
             )
-            # a plan here means the paying call was entered: past this point a
-            # failure cannot be reported as "nothing was spent"
-            planned.append(plan)
+            # past this point a failure cannot be reported as "nothing was spent"
+            planned = plan
             return self._dispatch(
                 plan,
                 prompt,
@@ -499,7 +508,13 @@ class MechService:
 
         if request_id is None:
             return attempt()
-        stamp = _request_stamp(prompt, tool, chain, priority_mech, legacy_on_chain)
+        stamp = _request_stamp(
+            prompt,
+            tool,
+            self._resolve_chain(chain),
+            priority_mech,
+            legacy_on_chain,
+        )
         try:
             entry = self._requests.reserve(request_id)
         except InFlightError:
@@ -519,9 +534,12 @@ class MechService:
                 return merged
             payload = attempt()
         except Exception as e:
-            if planned:
+            if planned is not None:
                 self._requests.complete(
-                    request_id, self._uncertain(planned[0], e, request_id), stamp
+                    request_id,
+                    self._uncertain(planned, e, request_id),
+                    stamp,
+                    spend_uncertain=True,
                 )
             else:
                 self._requests.release(request_id)
@@ -563,7 +581,7 @@ class MechService:
                 "than replaying this one, which would answer the wrong question"
             )
         payload = entry.payload
-        if payload.get("spend") == SPEND_UNCERTAIN:
+        if entry.spend_uncertain:
             self._refused(
                 request_id, "spend-uncertain", str(payload.get("error") or "")
             )
@@ -591,16 +609,18 @@ class MechService:
                 errors[key] = str(e)
                 still_waiting.append(key)
             else:
+                if report.get("url"):
+                    urls[key] = report["url"]
                 if report.get("delivered"):
                     delivered[key] = report["result"]
-                    if report.get("url"):
-                        urls[key] = report["url"]
                 else:
                     still_waiting.append(key)
         merged = {**payload, "delivery_results": delivered, "replayed": True}
         if urls:
             merged["delivery_urls"] = urls
         merged.pop("pending_request_ids", None)
+        merged.pop("unrecoverable_request_ids", None)
+        merged.pop("replay_errors", None)
         if still_waiting:
             merged["pending_request_ids"] = still_waiting
         if unrecoverable:
@@ -609,7 +629,7 @@ class MechService:
             merged["replay_errors"] = errors
         return merged
 
-    def _prepare(  # pylint: disable=too-many-arguments,too-many-locals
+    def _prepare(  # pylint: disable=too-many-arguments
         self,
         prompt: str,
         tool: str,
@@ -751,7 +771,11 @@ class MechService:
         pick it up instead of the answer being stranded.
         """
         deliveries = result.get("deliveries") or {}
-        delivered = {_request_key(rid): d.data for rid, d in deliveries.items()}
+        delivered = {
+            _request_key(rid): d.data
+            for rid, d in deliveries.items()
+            if d.data is not None
+        }
         urls = {
             _request_key(rid): d.url
             for rid, d in deliveries.items()
@@ -795,7 +819,7 @@ class MechService:
         need the flow, the chain and the request's own block to look in the
         right place, and none of that survives a restart.
         """
-        timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
+        timeout = _clamp_timeout(timeout)
         key = _request_key(request_id)
         with self._lock:
             pending = self._pending.get(key)
@@ -811,7 +835,7 @@ class MechService:
         except Exception as e:
             raise MechError(f"could not read delivery for request {key}: {e}") from e
         split = {_request_key(k): v for k, v in (delivered or {}).items()}
-        data = {k: d.data for k, d in split.items()}
+        data = {k: d.data for k, d in split.items() if d.data is not None}
         report = {
             "request_id": key,
             "chain": pending.chain,
@@ -819,10 +843,19 @@ class MechService:
             "delivered": key in data,
         }
         if key not in data:
-            report["note"] = (
-                "no delivery yet — the mech may still answer, or may never; "
-                "poll again or treat the payment as spent"
-            )
+            unreadable = split.get(key)
+            if unreadable is None:
+                report["note"] = (
+                    "no delivery yet — the mech may still answer, or may never; "
+                    "poll again or treat the payment as spent"
+                )
+            else:
+                report["note"] = (
+                    "delivered, but its result file could not be read yet — "
+                    "poll again; the answer is at the url below"
+                )
+                if unreadable.url:
+                    report["url"] = unreadable.url
             return report
         with self._lock:
             self._pending.pop(key, None)
@@ -847,14 +880,7 @@ class MechService:
         return await watcher.watch([key], from_block=pending.from_block)
 
     def _refused(self, request_id: str, reason: str, detail: str) -> None:
-        """Audit a replay refused on its id, before raising it to the caller.
-
-        Separate from _blocked because no chain is resolved yet and no payment
-        was contemplated: what an operator reconstructing a run of failed
-        retries needs is which id was refused and why, not where it would have
-        spent. Without these, two `mech_request` entries sit next to each
-        other with nothing between them to explain the gap.
-        """
+        """Audit a replay refused on its id, before raising it to the caller."""
         self._activity.record(
             "mech_request_refused",
             request_id=request_id,

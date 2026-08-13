@@ -17,16 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""The vocabulary the mech flow's modules share.
-
-`mech.py` drives the flow and `mech_allowances.py` pre-authorizes what it will
-sign; both raise the same error and speak about the same priced mech, so these
-live here rather than in either one — importing them from `mech.py` would make
-the pair circular. Nothing here has behavior; it is names and shapes only.
-
-`from connect.mech import MechError` keeps working: `mech.py` imports these,
-so they remain attributes of that module for every existing caller.
-"""
+"""Shared between connect/mech.py and connect/mech_allowances.py."""
 
 import typing as t
 

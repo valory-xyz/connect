@@ -104,7 +104,10 @@ composing a prompt:
   inline off-chain returns its envelope instead, with the answer under
   `response` — check for that key before assuming.
 - `delivery_urls[request_id]` is the result file's URL, absent for an inline
-  answer, where the envelope's `content_cid` names the document instead.
+  answer, where the envelope's `content_cid` names the document instead. An id
+  whose file the mech delivered but nobody could read yet stays in
+  `pending_request_ids` with its url here — poll it again rather than reading
+  the delivery as an empty answer.
 
 ## Python scripts: scripts/signer_client.py
 

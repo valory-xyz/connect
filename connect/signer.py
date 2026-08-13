@@ -24,6 +24,7 @@ through Signer.send(); off-chain mech requests use Signer.sign_digest(). The
 key never leaves this module's LocalAccount.
 """
 
+import hashlib
 import logging
 import threading
 import typing as t
@@ -98,6 +99,24 @@ class _ChainPool:
 MAX_CACHED_RESULTS = 1024
 
 
+def _same_call(key: str, cached: tuple[str, str], stamp: str) -> str:
+    """Return the cached tx hash, or :raises SignerError: on a different call."""
+    tx_hash, seen = cached
+    if seen != stamp:
+        raise SignerError(
+            f"request id '{key}' was already used for a different call; "
+            "choose a new id rather than replaying this one, which would "
+            "report a transaction that was never sent for it"
+        )
+    return tx_hash
+
+
+def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
+    """Fingerprint the call a request id stands for."""
+    raw = "\x1f".join((chain.lower(), to.lower(), str(value), (data or "0x").lower()))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 def _decode_calldata(data: str) -> bytes:
     """Return the calldata bytes, or :raises SignerError: on malformed hex."""
     try:
@@ -113,33 +132,39 @@ class _IdempotencyCache:
         """Initialize."""
         self._lock = threading.Lock()
         self._max_results = max_results
-        self._results: dict[str, str] = {}  # request_id -> tx_hash, insertion-ordered
+        self._results: dict[str, tuple[str, str]] = {}  # id -> (tx_hash, stamp)
         self._in_flight: set[str] = set()  # request_ids currently executing
 
-    def run(self, key: str, action: t.Callable[[], str]) -> str:
+    def run(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
         """Run action at most once per key.
 
         A completed key returns its cached result; a key whose action is still
         executing raises (the caller retries after the original settles); a
         failed attempt releases the key so a retry can run the action again.
+
+        :raises SignerError: when the key was used for a different call.
         """
         with self._lock:
             cached = self._results.get(key)
-            if cached:
-                return cached
+            if cached is not None:
+                return _same_call(key, cached, stamp)
             if key in self._in_flight:
                 raise SignerError(
                     f"request '{key}' is already in flight; retry shortly"
                 )
             self._in_flight.add(key)
-        return self._execute(key, action)
+        return self._execute(key, stamp, action)
 
-    def cached(self, key: str) -> str | None:
-        """Return the result of a completed run of this key, if any."""
+    def cached(self, key: str, stamp: str) -> str | None:
+        """Return the result of a completed run of this key, if any.
+
+        :raises SignerError: when the key was used for a different call.
+        """
         with self._lock:
-            return self._results.get(key)
+            cached = self._results.get(key)
+        return None if cached is None else _same_call(key, cached, stamp)
 
-    def _execute(self, key: str, action: t.Callable[[], str]) -> str:
+    def _execute(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
         try:
             result = action()
         except Exception:
@@ -149,7 +174,7 @@ class _IdempotencyCache:
         # cache the result and release the reservation atomically, so no retry
         # can observe "not cached and not in flight" after a success
         with self._lock:
-            self._results[key] = result
+            self._results[key] = (result, stamp)
             self._in_flight.discard(key)
             # bound memory over a long run: a request_id evicted here and
             # retried much later re-broadcasts, which is the right trade at
@@ -205,11 +230,12 @@ class Signer:
         With a request_id the call is idempotent: repeating a completed send
         returns the original tx hash without rebroadcasting.
         """
+        stamp = _call_stamp(chain, to, value, data)
         if request_id is not None:
             # a completed send stays answerable even if the guardrail has
             # tightened since — the transaction already happened; nothing
             # new is signed by returning its hash again
-            cached = self._requests.cached(request_id)
+            cached = self._requests.cached(request_id, stamp)
             if cached is not None:
                 return cached
         self._check_transaction(chain=chain, to=to, value=value, data=data)
@@ -226,7 +252,7 @@ class Signer:
 
         if request_id is None:
             return broadcast()
-        return self._requests.run(request_id, broadcast)
+        return self._requests.run(request_id, stamp, broadcast)
 
     def _compose_safe_call(
         self, chain: str, target: str, value: int, data: str
@@ -296,20 +322,7 @@ class Signer:
         data: str = "0x",
         via_safe: bool = True,
     ) -> str | None:
-        """Say why the guardrail would refuse this call, or None if it passes.
-
-        The answer has to be about the bytes the send would really produce, so
-        this composes through _compose_safe_call exactly as send_via_safe does
-        rather than checking the inner call on its own — the floor rules are
-        about the wrapper, and an unwrapped guess would answer a different
-        question.
-
-        Nothing is signed or broadcast, and no single-use allowance is consumed:
-        asking must never cost anything or change what a later send is allowed
-        to do. It is recorded as `checked`, never as `blocked` — a request that
-        was actually stopped and a question about one are different events, and
-        an operator reconstructing an incident needs to tell them apart.
-        """
+        """Say why the guardrail would refuse this call, or None if it passes."""
         probed_target, probed_value = target, value
         try:
             self._config.chain(chain)
