@@ -127,7 +127,11 @@ Asking is not a new capability: a refused send never reached the chain either,
 because the gate runs before signing. What asking avoids is the audit entry, so
 a dry run is recorded as `checked` rather than `blocked` — an operator can
 still see a session probing for what it can get away with, without a request
-that was never sent being logged as one the guardrail stopped.
+that was never sent being logged as one the guardrail stopped. The entry
+carries the call as it was *asked about* (`probed_target`, `probed_value`,
+`via_safe`) beside the composed transaction it would have become, since on the
+safe path the composed target is the safe itself and an allowed probe would
+otherwise record nothing about what was probed.
 
 Funding the safe is the operator's job, through Pearl — the agent has no
 EOA→safe sweep, because it never needed one.

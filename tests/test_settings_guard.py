@@ -1228,6 +1228,29 @@ class TestSignerGuardIntegration:
         assert entry["allowed"] is False
         assert "guardrail settings" in entry["reason"]
 
+    def test_a_check_records_what_was_probed_not_only_the_wrapper(
+        self, store_path: Path, test_signer: Signer
+    ) -> None:
+        """An allowed probe must not be forensically blank."""
+        assert test_signer.refusal_reason("testchain", OTHER, value=50) is None
+        entry = audit_entries(store_path)[0]
+        assert entry["to"] == SAFE
+        assert entry["value"] == "0"
+        assert entry["probed_target"] == OTHER
+        assert entry["probed_value"] == "50"
+        assert entry["via_safe"] is True
+
+    def test_a_dry_run_refuses_malformed_calldata_on_the_eoa_path(
+        self, store_path: Path, restricted_signer: Signer
+    ) -> None:
+        """The EOA path has no composition to catch this, so the check does."""
+        reason = restricted_signer.refusal_reason(
+            "testchain", OTHER, data="0xZZ", via_safe=False
+        )
+        assert reason is not None
+        assert "calldata" in reason
+        assert audit_entries(store_path)[0]["allowed"] is False
+
     def test_dry_run_answers_for_the_eoa_path_too(
         self, restricted_signer: Signer
     ) -> None:

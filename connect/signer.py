@@ -98,6 +98,14 @@ class _ChainPool:
 MAX_CACHED_RESULTS = 1024
 
 
+def _decode_calldata(data: str) -> bytes:
+    """Return the calldata bytes, or :raises SignerError: on malformed hex."""
+    try:
+        return bytes.fromhex((data or "0x").removeprefix("0x"))
+    except ValueError as e:
+        raise SignerError(f"cannot decode the calldata: {e}") from e
+
+
 class _IdempotencyCache:
     """At-most-once execution of actions keyed by caller-chosen request ids."""
 
@@ -302,19 +310,23 @@ class Signer:
         was actually stopped and a question about one are different events, and
         an operator reconstructing an incident needs to tell them apart.
         """
+        probed_target, probed_value = target, value
         try:
-            if via_safe:
-                target, data = self._compose_safe_call(chain, target, value, data)
-                value = 0
-            elif value < 0:
-                # send() rejects this before the guard ever sees it, and the dry
-                # run must not answer "allowed" for a call that cannot be sent
-                raise SignerError("value must be a non-negative amount in wei")
-            reason = self._refused_by_guard(chain, target, value, data)
-        except SignerError as e:
-            reason = str(e)
-        except ValueError as e:  # an unknown chain, which config.chain() raises on
-            reason = str(e)
+            self._config.chain(chain)
+        except ValueError as e:  # an unknown chain
+            reason: str | None = str(e)
+        else:
+            try:
+                if via_safe:
+                    target, data = self._compose_safe_call(chain, target, value, data)
+                    value = 0
+                else:
+                    if value < 0:
+                        raise SignerError("value must be a non-negative amount in wei")
+                    _decode_calldata(data)
+                reason = self._refused_by_guard(chain, target, value, data)
+            except SignerError as e:
+                reason = str(e)
         self._activity.record(
             "checked",
             chain=chain,
@@ -322,6 +334,9 @@ class Signer:
             value=str(value),
             allowed=reason is None,
             reason=reason,
+            probed_target=probed_target,
+            probed_value=str(probed_value),
+            via_safe=via_safe,
         )
         return reason
 
