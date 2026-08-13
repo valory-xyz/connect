@@ -26,20 +26,14 @@ same guardrail as any other signing request. In restricted mode the on-chain
 flow works because the mech system contracts ship in the default whitelist;
 the off-chain flow signs the safe's ERC-1271 SafeMessage wrap of the
 request id (the safe is the requester of record in agent mode), which
-restricted mode allows only through a scoped allowance: this module
-recomputes the request id locally from inputs it already validated (see
-_request_digest), wraps it with safe_message_hash, and registers exactly
-that value with the guard before mech-client asks for the signature. The
-prepaid top-up (auto_deposit) moves funds safe -> balance tracker; before the
-send, the flow pre-authorizes that one deposit the same way — tracker address
-from the pinned mech-client's constants, amount capped by the same bound
-mech-client enforces on the 402 shortfall — so a short prepaid balance tops
-itself up in restricted mode too. Only when no tracker can be resolved for
-the payment type is auto_deposit disarmed there, surfacing mech-client's
-actionable HTTP 402 error instead of a mid-flow guard denial.
+restricted mode allows only through a scoped allowance, as does the prepaid
+top-up (auto_deposit) that moves funds safe -> balance tracker. Both grants
+are registered by `connect/mech_allowances.py`, which this drives at the two
+points a request needs them; the reasoning for each lives there.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import threading
@@ -47,33 +41,27 @@ import typing as t
 import uuid
 from collections.abc import Mapping
 
-from eth_abi import encode as abi_encode
 from eth_typing import URI
 from mech_client.domain.delivery import (
     OffchainDeliveryWatcher,
     OnchainDeliveryWatcher,
 )
-from mech_client.infrastructure.config import (
-    CHAIN_TO_NATIVE_BALANCE_TRACKER,
-    CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS,
-    CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC,
-    PaymentType,
-)
-from mech_client.infrastructure.ipfs.metadata import fetch_ipfs_hash
 from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
-from mech_client.services.marketplace_service import (
-    MarketplaceService,
-    _MAX_AUTO_DEPOSIT_RATIO,
-)
-from mech_client.utils.constants import CHAIN_NAME_TO_ID
+from mech_client.services.marketplace_service import MarketplaceService
 from safe_eth.eth import EthereumClient
-from web3 import Web3
 
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.safe import ZERO_ADDRESS, safe_message_hash
-from connect.settings import MODE_RESTRICTED
+from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
+from connect.mech_allowances import MechAllowances
+from connect.mech_types import (
+    MechError,
+    MechUnknownRequest,
+    PricedMech,
+    SPEND_UNCERTAIN,
+)
+from connect.safe import safe_message_hash
 from connect.signer import Signer, SignerError
 
 logger = logging.getLogger("agent")
@@ -101,19 +89,20 @@ MAX_MECH_PAGE_SIZE = 100
 DEFAULT_MAX_PAYMENT = 10**17
 
 
-class MechError(Exception):
-    """A mech request failure with an agent-facing message."""
+class _RequestPlan(t.NamedTuple):
+    """Everything a request needs, settled before any payment can happen.
 
+    Its existence is the payment boundary: a failure with no plan spent
+    nothing, a failure with one may have spent funds.
+    """
 
-class PricedMech(t.NamedTuple):
-    """The mech a request will pay, with the price the cap must bind."""
-
-    mech: str
-    service_id: int
-    # per-request price in the mech's payment asset base units (wei for
-    # native mechs, token base units for OLAS/USDC ones)
-    rate: int
-    payment_type: str
+    chain: str
+    service: MarketplaceService
+    priced: PricedMech
+    extra_attributes: dict | None
+    auto_deposit: bool
+    legacy_on_chain: bool
+    tool: str
 
 
 class PendingDelivery(t.NamedTuple):
@@ -135,6 +124,25 @@ class PendingDelivery(t.NamedTuple):
 def _request_key(request_id: object) -> str:
     """Normalize a request id: the two flows disagree about the 0x prefix."""
     return str(request_id).lower().removeprefix("0x")
+
+
+def _request_stamp(
+    prompt: str,
+    tool: str,
+    chain: str | None,
+    priority_mech: str | None,
+    legacy_on_chain: bool,
+) -> str:
+    """Fingerprint what a request asked.
+
+    A ledger keyed on the caller's id alone would answer a new question with
+    an old answer if that id were reused — and the caller acts on the answer,
+    so the mistake would be silent and expensive.
+    """
+    raw = "\x1f".join(
+        (prompt, tool, chain or "", priority_mech or "", str(legacy_on_chain))
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 class MetadataRead(t.NamedTuple):
@@ -172,92 +180,6 @@ def _offchain_blocker(read: MetadataRead) -> str | None:
     if not isinstance(url, str) or not url.strip():
         return "no 'url' in metadata; this mech serves on-chain requests only"
     return None
-
-
-def _request_digest(  # pylint: disable=too-many-arguments
-    *,
-    domain_separator: bytes,
-    marketplace: str,
-    mech: str,
-    requester: str,
-    data_hash: bytes,
-    delivery_rate: int,
-    payment_type: bytes,
-    nonce: int,
-) -> bytes:
-    r"""Recompute MechMarketplace.getRequestId locally — trusting no RPC for it.
-
-    The id an off-chain request signs is EIP-712-shaped::
-
-        keccak256("\x19\x01" ‖ domainSeparator ‖ keccak256(abi.encode(
-            marketplace, mech, requester, keccak256(data),
-            deliveryRate, paymentType, nonce)))
-
-    (pinned byte-for-byte against the deployed gnosis marketplace by a
-    golden-vector test). Deriving it here is what keeps the RPC out of the
-    signing trust base: mech-client asks the *contract* for the id over
-    eth_call, and were that answer signed on faith, a lying RPC could hand
-    back any 32 bytes — a safe transaction hash included — and collect a
-    signature on it. Locally derived, the digest is always our own keccak
-    over a preimage we assembled, so a lying RPC (domain separator and nonce
-    are still reads) can only produce a mismatch, which is refused.
-    """
-    struct_hash = Web3.keccak(
-        abi_encode(
-            [
-                "address",
-                "address",
-                "address",
-                "bytes32",
-                "uint256",
-                "bytes32",
-                "uint256",
-            ],
-            [
-                marketplace,
-                mech,
-                requester,
-                Web3.keccak(data_hash),
-                delivery_rate,
-                payment_type,
-                nonce,
-            ],
-        )
-    )
-    return bytes(Web3.keccak(b"\x19\x01" + domain_separator + struct_hash))
-
-
-def _deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
-    """Resolve (tracker, is_token) for a payment type; (None, False) otherwise.
-
-    The addresses come from the pinned mech-client's own constants — the same
-    source its deposit path reads — so the allowance armed from this answer
-    names the contract mech-client will actually pay. NVM subscription types
-    resolve to nothing on purpose: mech-client's auto-deposit refuses them
-    too. Malformed constants fail closed to (None, False) — auto-deposit is
-    disarmed rather than a request dying mid-flow. (Unlike the settings-side
-    readers of these tables, a wholly broken mech-client is not survivable
-    here: this module hard-imports it at the top either way.)
-    """
-    try:
-        chain_id = CHAIN_NAME_TO_ID.get(chain.lower())
-        if chain_id is None:
-            return None, False
-        trackers_by_type: dict[str, tuple[dict, bool]] = {
-            PaymentType.NATIVE.value: (CHAIN_TO_NATIVE_BALANCE_TRACKER, False),
-            PaymentType.OLAS_TOKEN.value: (CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS, True),
-            PaymentType.USDC_TOKEN.value: (CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC, True),
-        }
-        entry = trackers_by_type.get(payment_type)
-        if entry is None:
-            return None, False
-        tracker = str(entry[0].get(chain_id) or "").lower()
-        if not tracker or tracker == ZERO_ADDRESS:
-            return None, False
-        return tracker, entry[1]
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        logger.warning("could not resolve the mech balance tracker: %s", e)
-        return None, False
 
 
 class MechSigner:
@@ -322,12 +244,15 @@ class MechService:
         self._signer = signer
         self._config = config
         self._activity = activity
-        self._guard = guard
+        # no self._guard: the guard's whole relationship with this flow is the
+        # single-use grants MechAllowances registers on its behalf
+        self._allowances = MechAllowances(config, guard, activity)
         self._lock = threading.Lock()
         self._services: dict[str, MarketplaceService] = {}
         # requests that returned without a delivery, keyed by request id, so
         # mech_result can resume the watch a paid-for request deserves
         self._pending: dict[str, PendingDelivery] = {}
+        self._requests = RequestLedger()
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
@@ -537,6 +462,7 @@ class MechService:
         auto_deposit: bool = True,
         timeout: float = DEFAULT_DELIVERY_TIMEOUT,
         max_payment: int = DEFAULT_MAX_PAYMENT,
+        request_id: str | None = None,
     ) -> dict:
         """Send one mech request and wait for its delivery.
 
@@ -545,11 +471,158 @@ class MechService:
         mech's per-request price must not exceed ``max_payment``, in the
         mech's payment asset base units.
 
+        Pass a ``request_id`` to make an attempt replayable — see README,
+        "Mech requests", for what that covers and what it deliberately does
+        not.
+        """
+        timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
+        planned: list[_RequestPlan] = []
+
+        def attempt() -> dict:
+            plan = self._prepare(
+                prompt,
+                tool,
+                chain=chain,
+                legacy_on_chain=legacy_on_chain,
+                priority_mech=priority_mech,
+                auto_deposit=auto_deposit,
+                max_payment=max_payment,
+            )
+            # a plan here means the paying call was entered: past this point a
+            # failure cannot be reported as "nothing was spent"
+            planned.append(plan)
+            return self._dispatch(
+                plan,
+                prompt,
+                timeout=timeout,
+                max_payment=max_payment,
+                request_id=request_id,
+            )
+
+        if request_id is None:
+            return attempt()
+        stamp = _request_stamp(prompt, tool, chain, priority_mech, legacy_on_chain)
+        try:
+            entry = self._requests.reserve(request_id)
+        except InFlightError:
+            self._refused(request_id, "in-flight", "another call holds this id")
+            raise MechError(
+                f"mech request '{request_id}' is already in flight; retry shortly"
+            ) from None
+        try:
+            if entry is not None:
+                merged = self._replay(request_id, entry, stamp, timeout=timeout)
+                self._requests.complete(request_id, merged, stamp)
+                self._activity.record(
+                    "mech_request_replayed",
+                    request_id=request_id,
+                    pending_request_ids=merged.get("pending_request_ids") or [],
+                )
+                return merged
+            payload = attempt()
+        except Exception as e:
+            if planned:
+                self._requests.complete(
+                    request_id, self._uncertain(planned[0], e, request_id), stamp
+                )
+            else:
+                self._requests.release(request_id)
+            raise
+        self._requests.complete(request_id, payload, stamp)
+        return payload
+
+    def _uncertain(self, plan: _RequestPlan, error: Exception, request_id: str) -> dict:
+        """Record that a request was sent and its outcome is unknown.
+
+        Releasing the id here would be the friendly-looking mistake: the
+        caller would retry, and mech-client pays before it watches, so the
+        retry would buy a second answer to a question already paid for.
+        """
+        self._activity.record(
+            "mech_request_uncertain",
+            chain=plan.chain,
+            tool=plan.tool,
+            request_id=request_id,
+            error=str(error),
+        )
+        return {"chain": plan.chain, "spend": SPEND_UNCERTAIN, "error": str(error)}
+
+    def _replay(
+        self, request_id: str, entry: LedgerEntry, stamp: str, *, timeout: float
+    ) -> dict:
+        """Re-answer a request already sent, collecting any late delivery.
+
+        Handing back the stored report unchanged would be the cheap thing and
+        the wrong one: the first call may have returned before the mech
+        answered, and the answer may have landed since. So this resumes each
+        outstanding watch. What it must never do is send again.
+        """
+        if entry.stamp is not None and entry.stamp != stamp:
+            self._refused(request_id, "stamp-mismatch", "reused for a different ask")
+            raise MechError(
+                f"request id '{request_id}' was already used for a different "
+                "prompt, tool or mech; choose a new id rather than replaying "
+                "this one, which would answer the wrong question"
+            )
+        payload = entry.payload
+        if payload.get("spend") == SPEND_UNCERTAIN:
+            self._refused(
+                request_id, "spend-uncertain", str(payload.get("error") or "")
+            )
+            raise MechError(
+                f"request '{request_id}' reached the paying call and then "
+                f"failed ({payload.get('error')}), so this server cannot tell "
+                "whether it was paid for. Sending it again risks a second "
+                "payment — use a new id only if you accept that."
+            )
+        waiting = list(payload.get("pending_request_ids") or [])
+        if not waiting:
+            return {**payload, "replayed": True}
+        delivered = dict(payload.get("delivery_results") or {})
+        still_waiting: list[str] = []
+        unrecoverable: list[str] = []
+        errors: dict[str, str] = {}
+        for key in waiting:
+            try:
+                report = self.result(key, timeout=timeout)
+            except MechUnknownRequest:
+                unrecoverable.append(key)
+            except MechError as e:
+                logger.warning("replay could not read delivery for %s: %s", key, e)
+                errors[key] = str(e)
+                still_waiting.append(key)
+            else:
+                if report.get("delivered"):
+                    delivered[key] = report["result"]
+                else:
+                    still_waiting.append(key)
+        merged = {**payload, "delivery_results": delivered, "replayed": True}
+        merged.pop("pending_request_ids", None)
+        if still_waiting:
+            merged["pending_request_ids"] = still_waiting
+        if unrecoverable:
+            merged["unrecoverable_request_ids"] = unrecoverable
+        if errors:
+            merged["replay_errors"] = errors
+        return merged
+
+    def _prepare(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        prompt: str,
+        tool: str,
+        *,
+        chain: str | None,
+        legacy_on_chain: bool,
+        priority_mech: str | None,
+        auto_deposit: bool,
+        max_payment: int,
+    ) -> _RequestPlan:
+        """Settle everything a request needs before any payment can happen.
+
         Each refusal below is audited before it raises: the activity log is
         what an operator reconstructs an incident from, and a request blocked
         by policy must not look identical there to one never attempted.
         """
-        timeout = min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
         chain = self._resolve_chain(chain)
         service = self._service(chain)
         priced = self._priced_mech(service, chain, priority_mech)
@@ -582,7 +655,7 @@ class MechService:
             # matching allowance is registered before the send. Armed in
             # every mode so both leave the same audit trail.
             extra_attributes = {"nonce": str(uuid.uuid4())}
-            self._register_offchain_digest(
+            self._allowances.register_offchain_digest(
                 service,
                 chain=chain,
                 priced=priced,
@@ -591,18 +664,42 @@ class MechService:
                 salt=extra_attributes["nonce"],
             )
             if auto_deposit:
-                auto_deposit = self._arm_auto_deposit(chain, priced)
+                auto_deposit = self._allowances.arm_auto_deposit(chain, priced)
         else:
             extra_attributes = None
+        return _RequestPlan(
+            chain=chain,
+            service=service,
+            priced=priced,
+            extra_attributes=extra_attributes,
+            auto_deposit=auto_deposit,
+            legacy_on_chain=legacy_on_chain,
+            tool=tool,
+        )
+
+    def _dispatch(
+        self,
+        plan: _RequestPlan,
+        prompt: str,
+        *,
+        timeout: float,
+        max_payment: int,
+        request_id: str | None,
+    ) -> dict:
+        """Pay for the planned request, send it, and wait out its delivery.
+
+        Everything here is past the point of no return: mech-client pays
+        before it watches, so a failure below may still have spent funds.
+        """
         try:
             result = asyncio.run(
-                service.send_request(
+                plan.service.send_request(
                     prompts=(prompt,),
-                    tools=(tool,),
-                    priority_mech=priority_mech,
-                    use_offchain=not legacy_on_chain,
-                    auto_deposit=auto_deposit,
-                    extra_attributes=extra_attributes,
+                    tools=(plan.tool,),
+                    priority_mech=plan.priced.mech,
+                    use_offchain=not plan.legacy_on_chain,
+                    auto_deposit=plan.auto_deposit,
+                    extra_attributes=plan.extra_attributes,
                     timeout=timeout,
                 )
             )
@@ -610,24 +707,29 @@ class MechService:
             raise
         except Exception as e:
             self._activity.record(
-                "mech_request_failed", chain=chain, tool=tool, error=str(e)
+                "mech_request_failed",
+                chain=plan.chain,
+                tool=plan.tool,
+                request_id=request_id,
+                error=str(e),
             )
             raise MechError(f"mech request failed: {e}") from e
         self._activity.record(
             "mech_request",
-            chain=chain,
-            tool=tool,
-            offchain=not legacy_on_chain,
-            rate=str(rate),
+            chain=plan.chain,
+            tool=plan.tool,
+            request_id=request_id,
+            offchain=not plan.legacy_on_chain,
+            rate=str(plan.priced.rate),
             max_payment=str(max_payment),
             request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
         return self._with_pending(
             dict(result),
-            chain=chain,
-            mech=priority_mech,
-            service_id=service_id,
-            offchain=not legacy_on_chain,
+            chain=plan.chain,
+            mech=plan.priced.mech,
+            service_id=plan.priced.service_id,
+            offchain=not plan.legacy_on_chain,
         )
 
     def _with_pending(
@@ -689,7 +791,7 @@ class MechService:
         with self._lock:
             pending = self._pending.get(key)
         if pending is None:
-            raise MechError(
+            raise MechUnknownRequest(
                 f"nothing is awaiting delivery for request {key}; mech_result "
                 "polls the ids mech_request reported as pending, and a restart "
                 "of this service clears them"
@@ -733,123 +835,21 @@ class MechService:
         watcher = OnchainDeliveryWatcher(contract, service.ledger_api, timeout)
         return await watcher.watch([key], from_block=pending.from_block)
 
-    def _register_offchain_digest(  # pylint: disable=too-many-arguments,too-many-locals
-        self,
-        service: MarketplaceService,
-        *,
-        chain: str,
-        priced: PricedMech,
-        prompt: str,
-        tool: str,
-        salt: str,
-    ) -> None:
-        """Derive the digest mech-client will sign, and pre-authorize it once.
+    def _refused(self, request_id: str, reason: str, detail: str) -> None:
+        """Audit a replay refused on its id, before raising it to the caller.
 
-        The requester of record is the service safe (mech-client ≥0.21.3
-        binds agent-mode off-chain requests to the safe on every surface),
-        so the request id commits to the safe, the marketplace nonce is the
-        safe's, and what actually gets signed is the ERC-1271 SafeMessage
-        wrap of the request id — the allowance registers that wrapped hash,
-        the same bytes MechSigner.sign_safe_message will produce.
-
-        The request id commits to the metadata CID, which is deterministic
-        here because the salt is pinned: fetch_ipfs_hash generates a random
-        nonce but merges ``extra_attributes`` over it, so this method and
-        mech-client (handed the same ``{"nonce": salt}`` moments later) run
-        the same pure function on the same inputs and get the same CID. The
-        domain separator and the marketplace nonce are RPC reads; a wrong
-        answer makes the derived digest mismatch the one mech-client asks
-        to sign, so the failure mode is a refusal, never a wrong signature.
-
-        Audited: the allowance is what lets funds-adjacent signing happen in
-        restricted mode, so the trail must show each one that was granted,
-        not only the signatures that followed.
+        Separate from _blocked because no chain is resolved yet and no payment
+        was contemplated: what an operator reconstructing a run of failed
+        retries needs is which id was refused and why, not where it would have
+        spent. Without these, two `mech_request` entries sit next to each
+        other with nothing between them to explain the gap.
         """
-        safe = self._config.chain(chain).safe_address
-        if safe is None:
-            # unreachable through request(): _service already refused the
-            # chain — kept as a real error so the invariant is not silent
-            raise MechError(
-                f"no service safe is configured for chain '{chain}'; the "
-                "off-chain requester of record is the safe"
-            )
-        try:
-            # same private-but-pinned helper _watch already leans on
-            # pylint: disable-next=protected-access
-            contract = service._get_marketplace_contract()
-            domain_separator = bytes(contract.functions.domainSeparator().call())
-            nonce = int(
-                contract.functions.mapNonces(Web3.to_checksum_address(safe)).call()
-            )
-            marketplace = str(contract.address)
-        except Exception as e:
-            raise MechError(
-                f"could not derive the off-chain request digest: {e}"
-            ) from e
-        data_hash, _, _ = fetch_ipfs_hash(prompt, tool, {"nonce": salt})
-        request_id = _request_digest(
-            domain_separator=domain_separator,
-            marketplace=marketplace,
-            mech=priced.mech,
-            requester=safe,
-            data_hash=bytes.fromhex(data_hash.removeprefix("0x")),
-            delivery_rate=priced.rate,
-            payment_type=bytes.fromhex(priced.payment_type),
-            nonce=nonce,
-        )
-        # the chain id mech-client passes to sign_safe_message for this chain
-        chain_id = int(service.mech_config.ledger_config.chain_id)
-        digest = safe_message_hash(safe, chain_id, request_id)
-        if self._guard.mode() == MODE_RESTRICTED:
-            self._guard.allow_digest_once(digest)
         self._activity.record(
-            "mech_offchain_digest",
-            chain=chain,
-            mech=priced.mech,
-            request_id="0x" + request_id.hex(),
-            digest="0x" + digest.hex(),
-            nonce=nonce,
+            "mech_request_refused",
+            request_id=request_id,
+            reason=reason,
+            detail=detail,
         )
-
-    def _arm_auto_deposit(self, chain: str, priced: PricedMech) -> bool:
-        """Pre-authorize the one 402 top-up this request may send, and say so.
-
-        Returns whether auto_deposit should stay on. The deposit pays the
-        balance tracker from the safe, which restricted mode only allows
-        through a one-shot allowance bounded by the same cap mech-client
-        itself enforces on the shortfall (ratio x the mech's per-request
-        rate). The audit record is written in every mode; the allowance is
-        armed only while restricted — unrestricted needs none, and one armed
-        there would outlive a switch back to restricted for its TTL.
-        When no tracker resolves for the payment type, restricted mode
-        disarms instead of letting the flow die mid-request on a guard
-        denial; unrestricted stays armed.
-        """
-        restricted = self._guard.mode() == MODE_RESTRICTED
-        tracker, is_token = _deposit_tracker(chain, priced.payment_type)
-        if tracker is None:
-            if restricted:
-                logger.info(
-                    "no balance tracker for payment type %s on %s; auto_deposit "
-                    "disarmed in restricted mode",
-                    priced.payment_type,
-                    chain,
-                )
-                return False
-            return True
-        amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate
-        if restricted:
-            self._guard.allow_safe_deposit_once(
-                chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
-            )
-        self._activity.record(
-            "mech_deposit_allowance",
-            chain=chain,
-            tracker=tracker,
-            amount_cap=str(amount_cap),
-            is_token=is_token,
-        )
-        return True
 
     def _blocked(self, chain: str, tool: str, reason: str, detail: str) -> None:
         """Audit a request refused by policy, before raising it to the caller."""

@@ -41,12 +41,15 @@ from web3 import Web3
 from web3.datastructures import AttributeDict
 
 from connect import mech as mech_module
+from connect import mech_allowances as allowances_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import ALLOWANCE_TTL, Guard, GuardError
+from connect.idempotency import RequestLedger
 from connect.mech import (
+    DEFAULT_DELIVERY_TIMEOUT,
     DEFAULT_MECH_CHAIN,
     MAX_DELIVERY_TIMEOUT,
     MechError,
@@ -54,9 +57,11 @@ from connect.mech import (
     MechSigner,
     PendingDelivery,
     PricedMech,
+)
+from connect.mech_allowances import (
     _MAX_AUTO_DEPOSIT_RATIO,
-    _deposit_tracker,
-    _request_digest,
+    deposit_tracker,
+    request_digest,
 )
 from connect.safe import (
     APPROVE_SELECTOR,
@@ -1348,7 +1353,7 @@ class FakeMarketplaceContract:
         """Answer as the deployed contract would — or lie, if told to."""
         if self.request_id_override is not None:
             return self.request_id_override
-        return _request_digest(
+        return request_digest(
             domain_separator=self.domain_separator,
             marketplace=self.address,
             mech=mech,
@@ -1625,6 +1630,309 @@ class TestMech:
         with pytest.raises(MechError, match="nothing is awaiting delivery"):
             mech_service.result("ab")
 
+    def _job(
+        self, mech_service: MechService, request_id: str, prompt: str = "q"
+    ) -> dict:
+        """Send the standard on-chain request under a caller-chosen id."""
+        return mech_service.request(
+            prompt,
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            request_id=request_id,
+        )
+
+    def test_replaying_a_request_id_does_not_pay_twice(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A caller who lost the response must not have to buy a second answer.
+
+        Payment happens before the answer, so a lost response leaves the caller
+        unable to tell a spent request from an unsent one — and without an id,
+        the only way to find out is to pay again.
+        """
+        first = self._job(mech_service, "job-1")
+        again = self._job(mech_service, "job-1")
+        assert len(patched_mech.calls) == 1
+        assert again["replayed"] is True
+        assert again["delivery_results"] == first["delivery_results"]
+
+    def test_replaying_resumes_a_delivery_that_landed_later(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Picking up the answer the first call gave up on is the point."""
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "delivery_results": {},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+        first = self._job(mech_service, "job-2")
+        assert first["pending_request_ids"] == ["ab"]
+
+        watched: dict = {}
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            watched["timeout"] = timeout
+            return {"ab": {"answer": "42"}}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        again = self._job(mech_service, "job-2")
+        assert len(patched_mech.calls) == 1
+        assert again["replayed"] is True
+        assert again["delivery_results"] == {"ab": {"answer": "42"}}
+        assert "pending_request_ids" not in again
+        # the caller's own timeout, not mech_result's short polling default
+        assert watched["timeout"] == DEFAULT_DELIVERY_TIMEOUT
+        # the stored report moved with the delivery: a further replay must not
+        # re-poll an id mech_result has already retired
+        assert self._job(mech_service, "job-2")["delivery_results"] == {
+            "ab": {"answer": "42"}
+        }
+
+    def test_replay_keeps_waiting_while_the_mech_stays_silent(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A replay that finds no answer says so, and stays resumable."""
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["ab"],
+            "delivery_results": {},
+        }
+        self._job(mech_service, "job-3")
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        again = self._job(mech_service, "job-3")
+        assert again["pending_request_ids"] == ["ab"]
+        assert again["delivery_results"] == {}
+        assert "unrecoverable_request_ids" not in again
+
+    def test_replay_reports_an_answer_another_poll_already_took(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A retired id is not pending, and saying so would loop the caller.
+
+        mech_result keeps no copy of what it delivered, so the answer is gone
+        from here. Reporting it as still coming would send the caller back to
+        mech_result, which refuses the id outright.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["ab"],
+            "delivery_results": {},
+        }
+        self._job(mech_service, "job-4")
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {"ab": {"answer": "42"}}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        assert mech_service.result("ab")["delivered"] is True
+        again = self._job(mech_service, "job-4")
+        assert again["unrecoverable_request_ids"] == ["ab"]
+        assert "pending_request_ids" not in again
+        assert again["delivery_results"] == {}
+
+    def test_replay_surfaces_a_failed_read_without_claiming_delivery(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A broken watch and a retired id mean opposite things.
+
+        The id is still genuinely pending, so it stays listed — but the read
+        that failed has to travel with it, or the caller reads silence as the
+        mech being slow.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["ab"],
+            "delivery_results": {},
+        }
+        self._job(mech_service, "job-5")
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            raise RuntimeError("gateway timed out")
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        again = self._job(mech_service, "job-5")
+        assert again["pending_request_ids"] == ["ab"]
+        assert "gateway timed out" in again["replay_errors"]["ab"]
+        assert "unrecoverable_request_ids" not in again
+
+    def test_a_failure_before_the_paying_call_frees_its_id(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A refusal reached before any payment must not burn the id."""
+        with pytest.raises(MechError, match="above max_payment"):
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                request_id="job-6",
+                max_payment=0,
+            )
+        assert not patched_mech.calls
+        assert self._job(mech_service, "job-6")["delivery_results"] == {
+            "ab": {"answer": "42"}
+        }
+
+    def test_a_failure_after_the_paying_call_refuses_to_replay(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """Once the paying call is entered, "retry freely" is a lie.
+
+        mech-client pays before it watches, so a failure here may sit on
+        either side of the spend. Freeing the id would invite the retry the
+        agent is told to make, and buy a second answer.
+        """
+        patched_mech.raises = RuntimeError("gateway fell over")
+        with pytest.raises(MechError, match="gateway fell over"):
+            self._job(mech_service, "job-7")
+        patched_mech.raises = None
+        with pytest.raises(MechError, match="cannot tell whether it was paid"):
+            self._job(mech_service, "job-7")
+        assert len(patched_mech.calls) == 1
+        # the operator reconstructs a run of failed retries from the log; an
+        # unaudited refusal leaves nothing between two mech_request entries
+        refusals = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request_refused"
+        ]
+        assert [(e["request_id"], e["reason"]) for e in refusals] == [
+            ("job-7", "spend-uncertain")
+        ]
+        assert "gateway fell over" in refusals[0]["detail"]
+
+    def test_reusing_an_id_for_a_different_question_is_refused(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """Answering the wrong question silently is worse than refusing.
+
+        The caller acts on the answer — the bundled venue skills trade on it —
+        so a stale reply routed to a new market costs real money.
+        """
+        self._job(mech_service, "job-8", prompt="will it rain")
+        with pytest.raises(MechError, match="different prompt, tool or mech"):
+            self._job(mech_service, "job-8", prompt="will it snow")
+        assert len(patched_mech.calls) == 1
+        assert [
+            (e["request_id"], e["reason"])
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_request_refused"
+        ] == [("job-8", "stamp-mismatch")]
+
+    def test_concurrent_callers_of_one_id_reach_the_payment_once(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        store_path: Path,
+    ) -> None:
+        """The claim is taken under a lock because two threads really do race.
+
+        Single-threaded re-entrancy would pass with no lock at all: reserve is
+        a read-modify-write, so both threads can miss the in-flight check and
+        both pay.
+        """
+        entered = threading.Event()
+        proceed = threading.Event()
+        real_dispatch = mech_service._dispatch  # pylint: disable=protected-access
+
+        def gated(*args: t.Any, **kwargs: t.Any) -> dict:
+            entered.set()
+            proceed.wait(timeout=10)
+            return t.cast(dict, real_dispatch(*args, **kwargs))
+
+        monkeypatch.setattr(mech_service, "_dispatch", gated)
+        done: list[dict] = []
+        refused: list[str] = []
+
+        def run() -> None:
+            try:
+                done.append(self._job(mech_service, "race"))
+            except MechError as e:
+                refused.append(str(e))
+
+        winner = threading.Thread(target=run)
+        winner.start()
+        assert entered.wait(timeout=10)
+        loser = threading.Thread(target=run)
+        loser.start()
+        loser.join(timeout=10)
+        proceed.set()
+        winner.join(timeout=10)
+
+        assert len(patched_mech.calls) == 1
+        assert len(done) == 1
+        assert "already in flight" in refused[0]
+        assert [
+            (e["request_id"], e["reason"])
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_request_refused"
+        ] == [("race", "in-flight")]
+
+    def test_the_ledger_forgets_its_oldest_ids(self) -> None:
+        """A very late replay pays again, which is the trade the bound makes."""
+        ledger = RequestLedger(max_results=2)
+        for key in ("a", "b", "c"):
+            assert ledger.reserve(key) is None
+            ledger.complete(key, {"id": key})
+        assert ledger.reserve("a") is None  # evicted, so this claims it afresh
+        ledger.release("a")
+        entry = ledger.reserve("b")
+        assert entry is not None
+        assert entry.payload == {"id": "b"}
+
+    def test_replaying_an_id_defers_its_eviction(self) -> None:
+        """Eviction here costs a second payment, so recency must track use.
+
+        A plain re-assignment would keep the id's original position, evicting
+        the very entry a caller is still replaying.
+        """
+        ledger = RequestLedger(max_results=2)
+        for key in ("a", "b"):
+            ledger.reserve(key)
+            ledger.complete(key, {"id": key})
+        ledger.reserve("a")
+        ledger.complete("a", {"id": "a-replayed"})
+        ledger.reserve("c")
+        ledger.complete("c", {"id": "c"})
+        assert ledger.reserve("b") is None  # oldest once "a" was refreshed
+        ledger.release("b")
+        entry = ledger.reserve("a")
+        assert entry is not None
+        assert entry.payload == {"id": "a-replayed"}
+
     def test_every_id_in_one_response_is_spelled_the_same_way(
         self,
         store_path: Path,
@@ -1883,8 +2191,8 @@ class TestMech:
         payment mech-client's deposit path would send — once.
         """
         monkeypatch.setattr(
-            mech_module,
-            "_deposit_tracker",
+            allowances_module,
+            "deposit_tracker",
             lambda chain, payment_type: (TRACKER, False),
         )
         service, guard = self._restricted_mech_service(
@@ -1917,22 +2225,22 @@ class TestMech:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """(tracker, is_token) resolves per payment type and fails closed."""
-        native, is_token = _deposit_tracker("gnosis", PaymentType.NATIVE.value)
+        native, is_token = deposit_tracker("gnosis", PaymentType.NATIVE.value)
         assert native is not None
         assert native.startswith("0x")
         assert is_token is False
-        olas, is_token = _deposit_tracker("gnosis", PaymentType.OLAS_TOKEN.value)
+        olas, is_token = deposit_tracker("gnosis", PaymentType.OLAS_TOKEN.value)
         assert olas is not None
         assert is_token is True
         # gnosis configures no USDC tracker: fail closed, not a zero address
-        assert _deposit_tracker("gnosis", PaymentType.USDC_TOKEN.value) == (None, False)
+        assert deposit_tracker("gnosis", PaymentType.USDC_TOKEN.value) == (None, False)
         # NVM subscription types are deliberately unsupported, like mech-client
-        assert _deposit_tracker("gnosis", PaymentType.NATIVE_NVM.value) == (None, False)
-        assert _deposit_tracker("testchain", PaymentType.NATIVE.value) == (None, False)
+        assert deposit_tracker("gnosis", PaymentType.NATIVE_NVM.value) == (None, False)
+        assert deposit_tracker("testchain", PaymentType.NATIVE.value) == (None, False)
         # broken constants fail closed; patched on connect.mech, the binding
         # the function actually reads since the imports were hoisted
-        monkeypatch.setattr("connect.mech.CHAIN_NAME_TO_ID", None)
-        assert _deposit_tracker("gnosis", PaymentType.NATIVE.value) == (None, False)
+        monkeypatch.setattr("connect.mech_allowances.CHAIN_NAME_TO_ID", None)
+        assert deposit_tracker("gnosis", PaymentType.NATIVE.value) == (None, False)
 
     def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
         self,
@@ -1963,8 +2271,8 @@ class TestMech:
     ) -> None:
         """With a tracker resolved, unrestricted still audits and arms nothing."""
         monkeypatch.setattr(
-            mech_module,
-            "_deposit_tracker",
+            allowances_module,
+            "deposit_tracker",
             lambda chain, payment_type: (TRACKER, False),
         )
         mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
@@ -1984,7 +2292,7 @@ class TestMech:
         mech_service._config.chains["testchain"].safe_address = None
         with pytest.raises(MechError, match="no service safe"):
             # pylint: disable-next=protected-access
-            mech_service._register_offchain_digest(
+            mech_service._allowances.register_offchain_digest(
                 t.cast(t.Any, patched_mech),
                 chain="testchain",
                 priced=PricedMech(
@@ -2022,7 +2330,7 @@ class TestMech:
         synthetic inputs; the local derivation must reproduce the contract's
         answer byte for byte, or restricted-mode off-chain requests break.
         """
-        digest = _request_digest(
+        digest = request_digest(
             domain_separator=bytes.fromhex(
                 "58fbb2508b962bcf6e2708fdfc23222115504128df851ae75ef8c66f2e0bdade"
             ),
@@ -3372,12 +3680,20 @@ class TestMcpGuardrailTools:
 
         monkeypatch.setattr(mech_service, "request", fake_request)
         result = await tools["mech_request"](
-            "p", "t", chain="testchain", legacy_on_chain=True, timeout=7
+            "p",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            timeout=7,
+            request_id="job-1",
         )
         assert result == {"ok": True}
         assert calls[0]["legacy_on_chain"] is True
         assert calls[0]["chain"] == "testchain"
         assert calls[0]["timeout"] == 7
+        # MCP is the only caller: unforwarded, request_id would be accepted,
+        # documented, and silently ignored, and every retry would pay again
+        assert calls[0]["request_id"] == "job-1"
 
     async def test_mech_request_tool_runs_off_the_event_loop(
         self, tools: dict[str, t.Callable], monkeypatch: pytest.MonkeyPatch

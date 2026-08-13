@@ -183,6 +183,38 @@ endpoint in its on-chain metadata — few have, so `mech_tools` reports
 refused before any payment. The on-chain path sends through the
 MechMarketplace via the service safe and works for any listed mech.
 
+### Replaying a mech request
+
+A mech request is paid for before it is answered, so a caller whose response
+was lost cannot tell a spent request from an unsent one — and the only way to
+find out costs another payment. `mech_request` therefore takes an optional
+caller-chosen `request_id`; repeating it never sends again, and the report
+comes back marked `replayed`.
+
+What the id covers depends on where the first attempt stopped, because the
+server can only promise what it can actually know:
+
+- **It returned.** The replay resumes each watch still outstanding and picks
+  up whatever landed since — the usual case, since a caller retries precisely
+  because the first call returned before the mech answered. Ids that resolve
+  move into `delivery_results`; ids whose read failed stay in
+  `pending_request_ids` with the cause in `replay_errors`; ids a direct
+  `mech_result` call already collected come back as
+  `unrecoverable_request_ids`, because that answer was handed to another
+  caller and this server keeps no copy.
+- **It failed before the paying call.** The id is released, so a retry is an
+  ordinary first attempt.
+- **It failed after the paying call was entered.** mech-client pays before it
+  watches, so the spend is genuinely unknown. The id is kept and every replay
+  refuses it: sending again is a decision to risk a second payment, and it
+  takes a new id to say so.
+
+Two bounds worth knowing: the ledger is in memory, so a restart clears it,
+exactly as it clears `mech_result`'s pending ids; and it keeps the last 1024
+ids, so an id replayed long after that many others pays again. An id is also
+bound to what it asked — reusing one for a different prompt, tool or mech is
+refused rather than answering the wrong question.
+
 ## Development
 
 ```bash
