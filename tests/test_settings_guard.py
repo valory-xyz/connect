@@ -21,6 +21,7 @@
 
 import asyncio
 import json
+import logging
 import threading
 import time
 import typing as t
@@ -1101,6 +1102,26 @@ class TestGuard:
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, calldata)
 
+    def test_asking_never_spends_a_single_use_allowance(
+        self, store: SettingsStore
+    ) -> None:
+        """A question asked at the wrong instant must not break the real send.
+
+        The allowance is armed for one payment moments before it goes; spending
+        it here would make the check cause the failure it exists to predict.
+        """
+        guard = make_guard(store, MODE_RESTRICTED)
+        deposit = exec_transaction_calldata(TRACKER, value=50)
+        guard.allow_safe_deposit_once(
+            chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
+        )
+        guard.check_transaction("testchain", SAFE, 0, deposit, consume=False)
+        guard.check_transaction("testchain", SAFE, 0, deposit, consume=False)
+        # still there for the send that armed it, and still single-use
+        guard.check_transaction("testchain", SAFE, 0, deposit)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+
 
 class TestSignerGuardIntegration:
     """The guard wired into the signing choke point."""
@@ -1128,6 +1149,187 @@ class TestSignerGuardIntegration:
             _ChainState(w3=t.cast(Web3, fake_w3), lock=threading.Lock(), chain_id=31337)
         )
         return signer
+
+    def test_dry_run_gives_the_reason_the_send_would_have_given(
+        self, restricted_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """The point is that asking and doing answer the same question.
+
+        A dry run that reasoned about the inner call on its own would be a
+        different check: the guardrail's rules are about the composed
+        execTransaction, so the two must be built the same way.
+        """
+        reason = restricted_signer.refusal_reason("testchain", OTHER, value=5)
+        assert reason is not None
+        with pytest.raises(SignerError) as raised:
+            restricted_signer.send_via_safe("testchain", OTHER, value=5)
+        assert str(raised.value) == reason
+        assert not fake_w3.eth.sent
+
+    def test_dry_run_agrees_with_the_send_on_a_floor_rule(
+        self, test_signer: Signer, guard: Guard
+    ) -> None:
+        """The floor holds in every mode, so the dry run must consult it too.
+
+        A dry run that only asked about the operator's settings would answer
+        "allowed" here — the default mode is unrestricted — for a call the
+        send refuses outright.
+        """
+        test_signer.set_guard(guard)
+        reason = test_signer.refusal_reason("testchain", SAFE)
+        assert reason is not None
+        assert "may not call itself" in reason
+        with pytest.raises(SignerError) as raised:
+            test_signer.send_via_safe("testchain", SAFE)
+        assert str(raised.value) == reason
+
+    def test_dry_run_asks_about_the_value_and_data_it_was_given(
+        self, restricted_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """The verdict has to depend on the whole call, not just its target.
+
+        A dry run that dropped `value` or `data` on the way into the wrapper
+        would answer about a bare transfer to the same address — allowed here,
+        where the call actually asked about is not.
+        """
+        guard = restricted_signer._guard  # pylint: disable=protected-access
+        assert guard is not None
+        guard.allow_safe_deposit_once(
+            chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
+        )
+        over_cap = restricted_signer.refusal_reason("testchain", TRACKER, value=101)
+        assert over_cap is not None
+        assert "do not allow the safe to call" in over_cap
+        wrong_shape = restricted_signer.refusal_reason(
+            "testchain", TRACKER, value=50, data="0x0102"
+        )
+        assert wrong_shape is not None
+        assert restricted_signer.refusal_reason("testchain", TRACKER, value=50) is None
+        # every one of those asked the guardrail, and none of them spent the
+        # allowance the mech flow armed for the send it is about to make
+        restricted_signer.send_via_safe("testchain", TRACKER, value=50)
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_dry_run_records_a_check_and_never_a_block(
+        self, store_path: Path, restricted_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Asking and being stopped are different events in the audit trail.
+
+        Probing is how a compromised session finds what it can get away with,
+        so it must leave a trace — but not one that reads as a request the
+        guardrail actually stopped.
+        """
+        restricted_signer.refusal_reason("testchain", OTHER, value=5)
+        restricted_signer.refusal_reason("testchain", OTHER)
+        kinds = audit_kinds(store_path)
+        assert kinds == ["checked", "checked"]
+        assert not fake_w3.eth.sent
+        entry = audit_entries(store_path)[0]
+        assert entry["allowed"] is False
+        assert "guardrail settings" in entry["reason"]
+
+    def test_a_check_records_what_was_probed_not_only_the_wrapper(
+        self, store_path: Path, test_signer: Signer
+    ) -> None:
+        """An allowed probe must not be forensically blank."""
+        assert test_signer.refusal_reason("testchain", OTHER, value=50) is None
+        entry = audit_entries(store_path)[0]
+        assert entry["to"] == SAFE
+        assert entry["value"] == "0"
+        assert entry["probed_target"] == OTHER
+        assert entry["probed_value"] == "50"
+        assert entry["via_safe"] is True
+
+    def test_a_dry_run_refuses_malformed_calldata_on_the_eoa_path(
+        self, store_path: Path, restricted_signer: Signer
+    ) -> None:
+        """The EOA path has no composition to catch this, so the check does."""
+        reason = restricted_signer.refusal_reason(
+            "testchain", OTHER, data="0xZZ", via_safe=False
+        )
+        assert reason is not None
+        assert "calldata" in reason
+        assert audit_entries(store_path)[0]["allowed"] is False
+
+    def test_dry_run_answers_for_the_eoa_path_too(
+        self, restricted_signer: Signer
+    ) -> None:
+        """via_safe=False asks about send_transaction's call, not the safe's."""
+        reason = restricted_signer.refusal_reason(
+            "testchain", OTHER, value=1, via_safe=False
+        )
+        assert reason is not None
+        with pytest.raises(SignerError) as raised:
+            restricted_signer.send("testchain", OTHER, value=1)
+        assert str(raised.value) == reason
+
+    def test_dry_run_refuses_a_negative_value_the_send_would_reject(
+        self, test_signer: Signer, guard: Guard
+    ) -> None:
+        """The guardrail never sees this one, and "allowed" would be a lie."""
+        test_signer.set_guard(guard)
+        reason = test_signer.refusal_reason(
+            "testchain", OTHER, value=-1, via_safe=False
+        )
+        assert reason is not None
+        assert "non-negative" in reason
+
+    def test_dry_run_names_a_chain_with_no_safe(
+        self, app_config: AppConfig, test_signer: Signer
+    ) -> None:
+        """The safe path is unusable there, and saying so beats a guard answer."""
+        app_config.chains["nosafe"] = ChainConfig(rpc_url="http://127.0.0.1:9")
+        reason = test_signer.refusal_reason("nosafe", OTHER)
+        assert reason is not None
+        with pytest.raises(SignerError) as raised:
+            test_signer.send_via_safe("nosafe", OTHER)
+        assert str(raised.value) == reason
+
+    def test_dry_run_reports_a_call_it_cannot_compose(
+        self, test_signer: Signer
+    ) -> None:
+        """A malformed target fails composition, exactly as the send would."""
+        reason = test_signer.refusal_reason("testchain", "not-an-address")
+        assert reason is not None
+        with pytest.raises(SignerError) as raised:
+            test_signer.send_via_safe("testchain", "not-an-address")
+        assert str(raised.value) == reason
+
+    def test_dry_run_reports_an_unknown_chain_rather_than_raising(
+        self, test_signer: Signer
+    ) -> None:
+        """Every "no" this answers has one shape; a typo'd chain is the likeliest."""
+        reason = test_signer.refusal_reason("nosuchchain", OTHER)
+        assert reason is not None
+        assert "unknown chain" in reason
+
+    def test_dry_run_passes_what_the_send_then_sends(
+        self,
+        store_path: Path,
+        test_signer: Signer,
+        guard: Guard,
+        fake_w3: FakeW3,
+    ) -> None:
+        """A consulted guardrail that says yes reports nothing, then it goes."""
+        test_signer.set_guard(guard)
+        assert test_signer.refusal_reason("testchain", OTHER, value=1) is None
+        assert not fake_w3.eth.sent
+        assert audit_kinds(store_path) == ["checked"]
+        test_signer.send_via_safe("testchain", OTHER, value=1)
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_dry_run_without_a_guard_allows_and_says_so(
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A choke point with no gate attached is worth a line in the log."""
+        signer = Signer(account=account, config=app_config, activity=activity)
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            assert signer.refusal_reason("testchain", OTHER, value=1) is None
+        assert "no guardrail attached" in caplog.text
 
     def test_blocked_send_is_audited(
         self,
@@ -3641,6 +3843,61 @@ class TestMcpGuardrailTools:
         settings_store._path.write_text("garbage")  # pylint: disable=protected-access
         after = await tools["settings"]()
         assert after["protected"]["whitelist"] != {}  # reset to the defaults
+
+    async def test_preflight_tool_forwards_every_argument(
+        self,
+        tools: dict[str, t.Callable],
+        test_signer: Signer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """via_safe decides which call is being asked about, so it must arrive."""
+        calls: list[dict] = []
+
+        def fake_reason(chain: str, target: str, **kwargs: object) -> str | None:
+            calls.append({"chain": chain, "target": target, **kwargs})
+            return None
+
+        monkeypatch.setattr(test_signer, "refusal_reason", fake_reason)
+        assert await tools["preflight_transaction"](
+            "testchain", OTHER, 5, "0xab", via_safe=False
+        ) == {"allowed": True}
+        assert calls[0] == {
+            "chain": "testchain",
+            "target": OTHER,
+            "value": 5,
+            "data": "0xab",
+            "via_safe": False,
+        }
+
+    async def test_preflight_tool_carries_the_refusal(
+        self,
+        tools: dict[str, t.Callable],
+        test_signer: Signer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A refusal must arrive verbatim: it is the whole answer."""
+        monkeypatch.setattr(
+            test_signer, "refusal_reason", lambda *a, **k: "the guardrail said no"
+        )
+        assert await tools["preflight_transaction"]("testchain", OTHER) == {
+            "allowed": False,
+            "reason": "the guardrail said no",
+        }
+
+    async def test_preflight_tool_answers_through_the_real_guardrail(
+        self,
+        tools: dict[str, t.Callable],
+        test_signer: Signer,
+        guard: Guard,
+    ) -> None:
+        """End to end, unmocked: the tool, the signer and the gate together."""
+        test_signer.set_guard(guard)
+        assert await tools["preflight_transaction"]("testchain", OTHER) == {
+            "allowed": True
+        }
+        refused = await tools["preflight_transaction"]("testchain", SAFE)
+        assert refused["allowed"] is False
+        assert "may not call itself" in refused["reason"]
 
     async def test_mech_tools_tool_delegates(
         self,

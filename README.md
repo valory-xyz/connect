@@ -37,7 +37,8 @@ other non-aea agent. It:
    - a bearer-authed signing surface: `POST /safe-transaction`,
      `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
-     `safe_transaction`, `send_transaction`, `transaction_status`,
+     `safe_transaction`, `send_transaction`, `preflight_transaction`,
+     `transaction_status`,
      `sign_message`, `mech_tools`, `mech_request`, `mech_result` (plus a
      read-only `settings` tool when `EXPOSE_MODE_TO_AGENT` is on).
 
@@ -115,6 +116,22 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   would permit arbitrary transfers, and the safe only calls trackers for prepaid
   deposits, which restricted mode admits only through the one-shot capped
   deposit allowance described above.
+
+The agent can ask before it spends: `preflight_transaction` composes the same
+bytes the send would and runs them past the same gate, answering `{allowed}`
+plus the refusal the real call would have raised. Nothing is signed or
+broadcast, and no single-use allowance is spent — the reasoning for that is at
+the top of `connect/guard.py`.
+
+Asking is not a new capability: a refused send never reached the chain either,
+because the gate runs before signing. What asking avoids is the audit entry, so
+a dry run is recorded as `checked` rather than `blocked` — an operator can
+still see a session probing for what it can get away with, without a request
+that was never sent being logged as one the guardrail stopped. The entry
+carries the call as it was *asked about* (`probed_target`, `probed_value`,
+`via_safe`) beside the composed transaction it would have become, since on the
+safe path the composed target is the safe itself and an allowed probe would
+otherwise record nothing about what was probed.
 
 Funding the safe is the operator's job, through Pearl — the agent has no
 EOA→safe sweep, because it never needed one.

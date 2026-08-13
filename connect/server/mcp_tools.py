@@ -149,6 +149,35 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         )
 
     @mcp.tool()
+    async def preflight_transaction(
+        chain: str,
+        target: str,
+        value: int = 0,
+        data: str = "0x",
+        *,
+        via_safe: bool = True,
+    ) -> dict:
+        """Ask whether a call would be permitted, before you build on it.
+
+        Takes what safe_transaction takes (or send_transaction's, with
+        via_safe=false) and answers {allowed}, plus the same `reason` the real
+        call would have refused with. Nothing is signed, broadcast or paid for.
+        `allowed` means the guardrail permits these bytes — not that the call
+        will succeed on-chain, which only sending finds out.
+        """
+        reason = await asyncio.to_thread(
+            signer.refusal_reason,
+            chain,
+            target,
+            value=value,
+            data=data,
+            via_safe=via_safe,
+        )
+        if reason is None:
+            return {"allowed": True}
+        return {"allowed": False, "reason": reason}
+
+    @mcp.tool()
     async def transaction_status(chain: str, tx_hash: str) -> dict:
         """Settlement of a transaction: mined / reverted / pending.
 
