@@ -52,7 +52,8 @@ from web3 import Web3
 from connect.activity import ActivityLog
 from connect.config import AGENT_HTTP_PORT, AppConfig, ChainConfig
 from connect.guard import Guard
-from connect.mech import MechError, MechService, _deposit_tracker, _request_digest
+from connect.mech import MechError, MechService
+from connect.mech_allowances import deposit_tracker, request_digest
 from connect.server.app import create_app
 from connect.settings import (
     MODE_UNRESTRICTED,
@@ -772,7 +773,7 @@ def test_offchain_request_digest_matches_contract_on_fork(rpc_url: str) -> None:
     """The locally derived request digest equals the contract's getRequestId.
 
     Restricted-mode off-chain requests sign only the digest the server
-    recomputes itself (connect.mech._request_digest); if the deployed
+    recomputes itself (connect.mech_allowances.request_digest); if the deployed
     marketplace's derivation ever drifts from it — a redeploy, a VERSION
     bump — the allowance would stop matching and every restricted off-chain
     request would be refused. This pins the two against each other on the
@@ -791,7 +792,7 @@ def test_offchain_request_digest_matches_contract_on_fork(rpc_url: str) -> None:
     onchain = contract.functions.getRequestId(
         mech, requester, data_hash, rate, payment_type, nonce
     ).call()
-    local = _request_digest(
+    local = request_digest(
         domain_separator=bytes(contract.functions.domainSeparator().call()),
         marketplace=marketplace,
         mech=mech,
@@ -1002,7 +1003,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     service = mech_service._service("gnosis")  # pylint: disable=protected-access
     # pylint: disable-next=protected-access
     _, service_id, rate = service._fetch_mech_info(mech_address)
-    tracker, is_token = _deposit_tracker("gnosis", PaymentType.NATIVE.value)
+    tracker, is_token = deposit_tracker("gnosis", PaymentType.NATIVE.value)
     assert tracker is not None
     assert is_token is False
 

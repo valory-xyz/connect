@@ -41,6 +41,7 @@ from web3 import Web3
 from web3.datastructures import AttributeDict
 
 from connect import mech as mech_module
+from connect import mech_allowances as allowances_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -56,9 +57,11 @@ from connect.mech import (
     MechSigner,
     PendingDelivery,
     PricedMech,
+)
+from connect.mech_allowances import (
     _MAX_AUTO_DEPOSIT_RATIO,
-    _deposit_tracker,
-    _request_digest,
+    deposit_tracker,
+    request_digest,
 )
 from connect.safe import (
     APPROVE_SELECTOR,
@@ -1350,7 +1353,7 @@ class FakeMarketplaceContract:
         """Answer as the deployed contract would — or lie, if told to."""
         if self.request_id_override is not None:
             return self.request_id_override
-        return _request_digest(
+        return request_digest(
             domain_separator=self.domain_separator,
             marketplace=self.address,
             mech=mech,
@@ -1799,7 +1802,10 @@ class TestMech:
         }
 
     def test_a_failure_after_the_paying_call_refuses_to_replay(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
     ) -> None:
         """Once the paying call is entered, "retry freely" is a lie.
 
@@ -1814,9 +1820,21 @@ class TestMech:
         with pytest.raises(MechError, match="cannot tell whether it was paid"):
             self._job(mech_service, "job-7")
         assert len(patched_mech.calls) == 1
+        # the operator reconstructs a run of failed retries from the log; an
+        # unaudited refusal leaves nothing between two mech_request entries
+        refusals = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request_refused"
+        ]
+        assert [(e["request_id"], e["reason"]) for e in refusals] == [
+            ("job-7", "spend-uncertain")
+        ]
+        assert "gateway fell over" in refusals[0]["detail"]
 
     def test_reusing_an_id_for_a_different_question_is_refused(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
     ) -> None:
         """Answering the wrong question silently is worse than refusing.
 
@@ -1827,12 +1845,18 @@ class TestMech:
         with pytest.raises(MechError, match="different prompt, tool or mech"):
             self._job(mech_service, "job-8", prompt="will it snow")
         assert len(patched_mech.calls) == 1
+        assert [
+            (e["request_id"], e["reason"])
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_request_refused"
+        ] == [("job-8", "stamp-mismatch")]
 
     def test_concurrent_callers_of_one_id_reach_the_payment_once(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
+        store_path: Path,
     ) -> None:
         """The claim is taken under a lock because two threads really do race.
 
@@ -1871,6 +1895,11 @@ class TestMech:
         assert len(patched_mech.calls) == 1
         assert len(done) == 1
         assert "already in flight" in refused[0]
+        assert [
+            (e["request_id"], e["reason"])
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_request_refused"
+        ] == [("race", "in-flight")]
 
     def test_the_ledger_forgets_its_oldest_ids(self) -> None:
         """A very late replay pays again, which is the trade the bound makes."""
@@ -2162,8 +2191,8 @@ class TestMech:
         payment mech-client's deposit path would send — once.
         """
         monkeypatch.setattr(
-            mech_module,
-            "_deposit_tracker",
+            allowances_module,
+            "deposit_tracker",
             lambda chain, payment_type: (TRACKER, False),
         )
         service, guard = self._restricted_mech_service(
@@ -2196,22 +2225,22 @@ class TestMech:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """(tracker, is_token) resolves per payment type and fails closed."""
-        native, is_token = _deposit_tracker("gnosis", PaymentType.NATIVE.value)
+        native, is_token = deposit_tracker("gnosis", PaymentType.NATIVE.value)
         assert native is not None
         assert native.startswith("0x")
         assert is_token is False
-        olas, is_token = _deposit_tracker("gnosis", PaymentType.OLAS_TOKEN.value)
+        olas, is_token = deposit_tracker("gnosis", PaymentType.OLAS_TOKEN.value)
         assert olas is not None
         assert is_token is True
         # gnosis configures no USDC tracker: fail closed, not a zero address
-        assert _deposit_tracker("gnosis", PaymentType.USDC_TOKEN.value) == (None, False)
+        assert deposit_tracker("gnosis", PaymentType.USDC_TOKEN.value) == (None, False)
         # NVM subscription types are deliberately unsupported, like mech-client
-        assert _deposit_tracker("gnosis", PaymentType.NATIVE_NVM.value) == (None, False)
-        assert _deposit_tracker("testchain", PaymentType.NATIVE.value) == (None, False)
+        assert deposit_tracker("gnosis", PaymentType.NATIVE_NVM.value) == (None, False)
+        assert deposit_tracker("testchain", PaymentType.NATIVE.value) == (None, False)
         # broken constants fail closed; patched on connect.mech, the binding
         # the function actually reads since the imports were hoisted
-        monkeypatch.setattr("connect.mech.CHAIN_NAME_TO_ID", None)
-        assert _deposit_tracker("gnosis", PaymentType.NATIVE.value) == (None, False)
+        monkeypatch.setattr("connect.mech_allowances.CHAIN_NAME_TO_ID", None)
+        assert deposit_tracker("gnosis", PaymentType.NATIVE.value) == (None, False)
 
     def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
         self,
@@ -2242,8 +2271,8 @@ class TestMech:
     ) -> None:
         """With a tracker resolved, unrestricted still audits and arms nothing."""
         monkeypatch.setattr(
-            mech_module,
-            "_deposit_tracker",
+            allowances_module,
+            "deposit_tracker",
             lambda chain, payment_type: (TRACKER, False),
         )
         mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
@@ -2263,7 +2292,7 @@ class TestMech:
         mech_service._config.chains["testchain"].safe_address = None
         with pytest.raises(MechError, match="no service safe"):
             # pylint: disable-next=protected-access
-            mech_service._register_offchain_digest(
+            mech_service._allowances.register_offchain_digest(
                 t.cast(t.Any, patched_mech),
                 chain="testchain",
                 priced=PricedMech(
@@ -2301,7 +2330,7 @@ class TestMech:
         synthetic inputs; the local derivation must reproduce the contract's
         answer byte for byte, or restricted-mode off-chain requests break.
         """
-        digest = _request_digest(
+        digest = request_digest(
             domain_separator=bytes.fromhex(
                 "58fbb2508b962bcf6e2708fdfc23222115504128df851ae75ef8c66f2e0bdade"
             ),
