@@ -86,10 +86,8 @@ these or something similar, in their words, and invite them to pick one or ask t
 - **Put funds where a prediction points** — e.g. "Find a liquidity pool with
   strong expected yield and invest in it." A mech request for the forecast,
   then a spend from the service safe.
-- **Trade on prediction markets** — e.g. "Trade on Omen using AI
-  prediction services, and keep notes on each outcome." Mech predictions drive
-  positions on Omen (a Gnosis prediction market); record each outcome to the
-  workspace so the user or agent can learn from them.
+- **Trade on prediction markets** — e.g. "Find a Polymarket market on this
+  week's news, take a position, keep notes on each outcome, and try improving."
 - **Answer a live quantitative question** — e.g. "How many tweets will Elon
   Musk post today?" May take more than one mech request; If mechs provide binary
   answers, you may need to make multiple requests to get a range with probabilities.

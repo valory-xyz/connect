@@ -24,10 +24,14 @@ through Signer.send(); off-chain mech requests use Signer.sign_digest(). The
 key never leaves this module's LocalAccount.
 """
 
+import hashlib
+import logging
 import threading
 import typing as t
 from dataclasses import dataclass
 
+from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider, parse_rpc_urls
+from eth_abi.exceptions import EncodingError
 from eth_account.signers.local import LocalAccount
 from eth_typing import Hash32
 from web3 import Web3
@@ -38,6 +42,8 @@ from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
+
+logger = logging.getLogger("agent")
 
 GAS_ESTIMATE_BUFFER = 1.2
 
@@ -74,7 +80,10 @@ class _ChainPool:
         # round-trip and must not stall first use of unrelated chains
         chain_config = self._config.chain(chain)  # raises on unknown chain
         w3 = Web3(
-            Web3.HTTPProvider(chain_config.rpc_url, request_kwargs={"timeout": 30})
+            RotatingHTTPProvider(
+                parse_rpc_urls(chain_config.rpc_url),
+                request_kwargs={"timeout": 30},
+            )
         )
         # PoA chains (Polygon above all) pad extraData past 32 bytes, which
         # web3's default block formatter refuses — making every send there
@@ -90,6 +99,32 @@ class _ChainPool:
 MAX_CACHED_RESULTS = 1024
 
 
+def _same_call(key: str, cached: tuple[str, str], stamp: str) -> str:
+    """Return the cached tx hash, or :raises SignerError: on a different call."""
+    tx_hash, seen = cached
+    if seen != stamp:
+        raise SignerError(
+            f"request id '{key}' was already used for a different call; "
+            "choose a new id rather than replaying this one, which would "
+            "report a transaction that was never sent for it"
+        )
+    return tx_hash
+
+
+def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
+    """Fingerprint the call a request id stands for."""
+    raw = "\x1f".join((chain.lower(), to.lower(), str(value), (data or "0x").lower()))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _decode_calldata(data: str) -> bytes:
+    """Return the calldata bytes, or :raises SignerError: on malformed hex."""
+    try:
+        return bytes.fromhex((data or "0x").removeprefix("0x"))
+    except ValueError as e:
+        raise SignerError(f"cannot decode the calldata: {e}") from e
+
+
 class _IdempotencyCache:
     """At-most-once execution of actions keyed by caller-chosen request ids."""
 
@@ -97,33 +132,39 @@ class _IdempotencyCache:
         """Initialize."""
         self._lock = threading.Lock()
         self._max_results = max_results
-        self._results: dict[str, str] = {}  # request_id -> tx_hash, insertion-ordered
+        self._results: dict[str, tuple[str, str]] = {}  # id -> (tx_hash, stamp)
         self._in_flight: set[str] = set()  # request_ids currently executing
 
-    def run(self, key: str, action: t.Callable[[], str]) -> str:
+    def run(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
         """Run action at most once per key.
 
         A completed key returns its cached result; a key whose action is still
         executing raises (the caller retries after the original settles); a
         failed attempt releases the key so a retry can run the action again.
+
+        :raises SignerError: when the key was used for a different call.
         """
         with self._lock:
             cached = self._results.get(key)
-            if cached:
-                return cached
+            if cached is not None:
+                return _same_call(key, cached, stamp)
             if key in self._in_flight:
                 raise SignerError(
                     f"request '{key}' is already in flight; retry shortly"
                 )
             self._in_flight.add(key)
-        return self._execute(key, action)
+        return self._execute(key, stamp, action)
 
-    def cached(self, key: str) -> str | None:
-        """Return the result of a completed run of this key, if any."""
+    def cached(self, key: str, stamp: str) -> str | None:
+        """Return the result of a completed run of this key, if any.
+
+        :raises SignerError: when the key was used for a different call.
+        """
         with self._lock:
-            return self._results.get(key)
+            cached = self._results.get(key)
+        return None if cached is None else _same_call(key, cached, stamp)
 
-    def _execute(self, key: str, action: t.Callable[[], str]) -> str:
+    def _execute(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
         try:
             result = action()
         except Exception:
@@ -133,7 +174,7 @@ class _IdempotencyCache:
         # cache the result and release the reservation atomically, so no retry
         # can observe "not cached and not in flight" after a success
         with self._lock:
-            self._results[key] = result
+            self._results[key] = (result, stamp)
             self._in_flight.discard(key)
             # bound memory over a long run: a request_id evicted here and
             # retried much later re-broadcasts, which is the right trade at
@@ -189,11 +230,12 @@ class Signer:
         With a request_id the call is idempotent: repeating a completed send
         returns the original tx hash without rebroadcasting.
         """
+        stamp = _call_stamp(chain, to, value, data)
         if request_id is not None:
             # a completed send stays answerable even if the guardrail has
             # tightened since — the transaction already happened; nothing
             # new is signed by returning its hash again
-            cached = self._requests.cached(request_id)
+            cached = self._requests.cached(request_id, stamp)
             if cached is not None:
                 return cached
         self._check_transaction(chain=chain, to=to, value=value, data=data)
@@ -210,7 +252,34 @@ class Signer:
 
         if request_id is None:
             return broadcast()
-        return self._requests.run(request_id, broadcast)
+        return self._requests.run(request_id, stamp, broadcast)
+
+    def _compose_safe_call(
+        self, chain: str, target: str, value: int, data: str
+    ) -> tuple[str, str]:
+        """Wrap one inner call for the safe; returns (safe address, calldata).
+
+        One home for the composition so the send and the dry run cannot answer
+        about different bytes, and one home for the two refusals so their
+        wording cannot drift apart.
+
+        :raises SignerError: no safe on this chain, or the call cannot encode.
+        """
+        safe = self._config.chain(chain).safe_address
+        if safe is None:
+            raise SignerError(
+                f"no service safe is configured for chain '{chain}', so the "
+                "agent cannot act there"
+            )
+        try:
+            calldata = safe_module.exec_transaction(
+                target=target, value=value, data=data, owner=self.address
+            )
+        except (EncodingError, ValueError, TypeError, OverflowError) as e:
+            # composition fails on the caller's input, not the chain — a 400, the
+            # same answer send() gives for a malformed EOA transaction, not a 500
+            raise SignerError(f"cannot compose the safe call: {e}") from e
+        return safe, calldata
 
     def send_via_safe(  # pylint: disable=too-many-arguments
         self,
@@ -232,20 +301,7 @@ class Signer:
         The composed transaction goes back through send(), so it meets the same
         guard as anything else — a caller of the gate, not a way around it.
         """
-        safe = self._config.chain(chain).safe_address
-        if safe is None:
-            raise SignerError(
-                f"no service safe is configured for chain '{chain}', so the "
-                "agent cannot act there"
-            )
-        try:
-            calldata = safe_module.exec_transaction(
-                target=target, value=value, data=data, owner=self.address
-            )
-        except Exception as e:  # eth_abi rejects a bad address or an oversized value
-            # composition fails on the caller's input, not the chain — a 400, the
-            # same answer send() gives for a malformed EOA transaction, not a 500
-            raise SignerError(f"cannot compose the safe call: {e}") from e
+        safe, calldata = self._compose_safe_call(chain, target, value, data)
         return self.send(
             chain,
             safe,
@@ -256,6 +312,62 @@ class Signer:
             request_id=None if request_id is None else f"safe:{request_id}",
             gas=gas,
         )
+
+    def refusal_reason(
+        self,
+        chain: str,
+        target: str,
+        *,
+        value: int = 0,
+        data: str = "0x",
+        via_safe: bool = True,
+    ) -> str | None:
+        """Say why the guardrail would refuse this call, or None if it passes."""
+        probed_target, probed_value = target, value
+        try:
+            self._config.chain(chain)
+        except ValueError as e:  # an unknown chain
+            reason: str | None = str(e)
+        else:
+            try:
+                if via_safe:
+                    target, data = self._compose_safe_call(chain, target, value, data)
+                    value = 0
+                else:
+                    if value < 0:
+                        raise SignerError("value must be a non-negative amount in wei")
+                    _decode_calldata(data)
+                reason = self._refused_by_guard(chain, target, value, data)
+            except SignerError as e:
+                reason = str(e)
+        self._activity.record(
+            "checked",
+            chain=chain,
+            to=target,
+            value=str(value),
+            allowed=reason is None,
+            reason=reason,
+            probed_target=probed_target,
+            probed_value=str(probed_value),
+            via_safe=via_safe,
+        )
+        return reason
+
+    def _refused_by_guard(
+        self, chain: str, to: str, value: int, data: str
+    ) -> str | None:
+        """Ask the guardrail about a composed transaction, consuming nothing."""
+        if self._guard is None:
+            logger.error(
+                "the signing choke point has no guardrail attached; every "
+                "request would be permitted"
+            )
+            return None
+        try:
+            self._guard.check_transaction(chain, to, value, data, consume=False)
+        except GuardError as e:
+            return str(e)
+        return None
 
     def _send(  # pylint: disable=too-many-arguments
         self,

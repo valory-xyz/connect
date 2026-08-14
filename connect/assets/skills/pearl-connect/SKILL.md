@@ -33,8 +33,16 @@ cannot tell you is which to reach for:
   address.
 - `send_transaction` — the same call made by the **EOA**, whose funds are for
   gas. Rarely what you want.
-- For either: if you are unsure whether a send landed, retry with the same
-  `request_id` rather than issuing a new one.
+- For either — and for `mech_request` — **choose a `request_id` before you
+  send**: it is what lets you retry safely if you never learn whether the call
+  landed, and it cannot be added afterwards. Invent it; it is not one of the
+  `request_ids` that come back. A repeated mech request with **identical arguments**
+  resumes the first one's delivery instead of paying again — except where the
+  first attempt failed after paying, which it refuses and explains rather than guessing.
+- `preflight_transaction` — ask whether a call would be permitted before you
+  build on it. Reach for it when a plan depends on a call being allowed: a
+  refusal here costs nothing, one discovered mid-flow can leave a
+  half-finished position.
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
@@ -91,6 +99,15 @@ composing a prompt:
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with
   `mech_tools(priority_mech=...)` (`max_delivery_rate`).
+- `delivery_results[request_id]` is normally the result file
+  (`{schema_version, requestId, result, tool, …}`), but a mech that answers
+  inline off-chain returns its envelope instead, with the answer under
+  `response` — check for that key before assuming.
+- `delivery_urls[request_id]` is the result file's URL, absent for an inline
+  answer, where the envelope's `content_cid` names the document instead. An id
+  whose file the mech delivered but nobody could read yet stays in
+  `pending_request_ids` with its url here — poll it again rather than reading
+  the delivery as an empty answer.
 
 ## Python scripts: scripts/signer_client.py
 

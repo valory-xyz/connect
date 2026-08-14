@@ -37,7 +37,8 @@ other non-aea agent. It:
    - a bearer-authed signing surface: `POST /safe-transaction`,
      `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
-     `safe_transaction`, `send_transaction`, `transaction_status`,
+     `safe_transaction`, `send_transaction`, `preflight_transaction`,
+     `transaction_status`,
      `sign_message`, `mech_tools`, `mech_request`, `mech_result` (plus a
      read-only `settings` tool when `EXPOSE_MODE_TO_AGENT` is on).
 
@@ -116,6 +117,22 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   deposits, which restricted mode admits only through the one-shot capped
   deposit allowance described above.
 
+The agent can ask before it spends: `preflight_transaction` composes the same
+bytes the send would and runs them past the same gate, answering `{allowed}`
+plus the refusal the real call would have raised. Nothing is signed or
+broadcast, and no single-use allowance is spent — the reasoning for that is at
+the top of `connect/guard.py`.
+
+Asking is not a new capability: a refused send never reached the chain either,
+because the gate runs before signing. What asking avoids is the audit entry, so
+a dry run is recorded as `checked` rather than `blocked` — an operator can
+still see a session probing for what it can get away with, without a request
+that was never sent being logged as one the guardrail stopped. The entry
+carries the call as it was *asked about* (`probed_target`, `probed_value`,
+`via_safe`) beside the composed transaction it would have become, since on the
+safe path the composed target is the safe itself and an allowed probe would
+otherwise record nothing about what was probed.
+
 Funding the safe is the operator's job, through Pearl — the agent has no
 EOA→safe sweep, because it never needed one.
 
@@ -182,6 +199,38 @@ endpoint in its on-chain metadata — few have, so `mech_tools` reports
 `offchain_capable` per mech and a request to one that cannot serve it is
 refused before any payment. The on-chain path sends through the
 MechMarketplace via the service safe and works for any listed mech.
+
+### Replaying a mech request
+
+A mech request is paid for before it is answered, so a caller whose response
+was lost cannot tell a spent request from an unsent one — and the only way to
+find out costs another payment. `mech_request` therefore takes an optional
+caller-chosen `request_id`; repeating it never sends again, and the report
+comes back marked `replayed`.
+
+What the id covers depends on where the first attempt stopped, because the
+server can only promise what it can actually know:
+
+- **It returned.** The replay resumes each watch still outstanding and picks
+  up whatever landed since — the usual case, since a caller retries precisely
+  because the first call returned before the mech answered. Ids that resolve
+  move into `delivery_results`; ids whose read failed stay in
+  `pending_request_ids` with the cause in `replay_errors`; ids a direct
+  `mech_result` call already collected come back as
+  `unrecoverable_request_ids`, because that answer was handed to another
+  caller and this server keeps no copy.
+- **It failed before the paying call.** The id is released, so a retry is an
+  ordinary first attempt.
+- **It failed after the paying call was entered.** mech-client pays before it
+  watches, so the spend is genuinely unknown. The id is kept and every replay
+  refuses it: sending again is a decision to risk a second payment, and it
+  takes a new id to say so.
+
+Two bounds worth knowing: the ledger is in memory, so a restart clears it,
+exactly as it clears `mech_result`'s pending ids; and it keeps the last 1024
+ids, so an id replayed long after that many others pays again. An id is also
+bound to what it asked — reusing one for a different prompt, tool, chain, mech
+or flow is refused rather than answering the wrong question.
 
 ## Development
 

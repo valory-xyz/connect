@@ -55,7 +55,9 @@ allowance is single-use and short-lived. A live allowance is a bounded grant,
 not a promise about the caller: any matching request may consume it — for the
 deposit that means the agent could send the tracker payment itself, moving at
 most the cap into a balance the mech flow spends — which is accepted and
-audited, not prevented.
+audited, not prevented. A dry run (consume=False) makes that window and its
+cap observable rather than only guessable, which widens the odds of hitting
+it, not the grant itself.
 
 The modes are an operator concept, not an agent one: every agent-facing
 refusal names the rule it violated and where the operator can change it, but
@@ -254,11 +256,15 @@ class Guard:
             f"settings; {_ASK_OPERATOR}"
         )
 
-    def check_transaction(self, chain: str, to: str, value: int, data: str) -> None:
+    def check_transaction(
+        self, chain: str, to: str, value: int, data: str, *, consume: bool = True
+    ) -> None:
         """Raise unless the EOA transaction is allowed.
 
         The floor is checked first and holds in every mode; the rest is the
         mode. Decoding happens once, here, so both answer the same bytes.
+        `consume=False` answers without spending a single-use allowance, so
+        asking whether a call would pass cannot break the call that follows.
         """
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
@@ -279,6 +285,7 @@ class Guard:
                 value=value,
                 calldata=calldata,
                 exec_call=exec_call,
+                consume=consume,
             )
 
     def _check_floor(self, target: str, exec_call: "_SafeExec") -> None:
@@ -308,6 +315,7 @@ class Guard:
         value: int,
         calldata: str,
         exec_call: "_SafeExec | None",
+        consume: bool,
     ) -> None:
         """Restricted mode: the safe CALLs a whitelisted address, or nothing."""
         if safe is None:
@@ -357,7 +365,7 @@ class Guard:
             return
         whitelist = self._store.load().protected.whitelist
         if exec_call.to.lower() not in whitelist.get(chain, ()):
-            if self._consume_deposit_allowance(chain, exec_call):
+            if self._consume_deposit_allowance(chain, exec_call, consume=consume):
                 return
             # the whitelist is not editable through the API yet, so pointing at
             # it would send the operator down a path that does not exist
@@ -366,7 +374,9 @@ class Guard:
                 f"call {exec_call.to} on {chain}; {_ASK_OPERATOR}"
             )
 
-    def _consume_deposit_allowance(self, chain: str, exec_call: "_SafeExec") -> bool:
+    def _consume_deposit_allowance(
+        self, chain: str, exec_call: "_SafeExec", *, consume: bool
+    ) -> bool:
         """Consume a deposit allowance this safe call matches, if any.
 
         A non-matching call consumes nothing: an over-cap or wrong-shape
@@ -393,6 +403,7 @@ class Guard:
                         and exec_call.value <= allowance.amount_cap
                     )
                 if matches:
-                    del self._deposit_allowances[index]
+                    if consume:
+                        del self._deposit_allowances[index]
                     return True
         return False
