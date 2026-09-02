@@ -662,7 +662,7 @@ requires-dist = [
 dev = [
     { name = "httpx", specifier = "==0.28.1" },
     { name = "open-aea-cli-ipfs", specifier = ">=2.2.9" },
-    { name = "open-autonomy", specifier = ">=0.21.27" },
+    { name = "open-autonomy", specifier = ">=0.21.28" },
     { name = "pyinstaller", specifier = "==6.22.2" },
     { name = "pytest", specifier = "==9.1.1" },
     { name = "pytest-asyncio", specifier = "==1.4.0" },
@@ -1975,7 +1975,7 @@ wheels = [
 
 [[package]]
 name = "open-autonomy"
-version = "0.21.27"
+version = "0.21.28"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1992,9 +1992,9 @@ dependencies = [
     { name = "requests" },
     { name = "web3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/83/84/8dfbc4fbad9ae172aeefa415ec8bd4eb4b7ed4a61e66e8858d5eb2d62495/open_autonomy-0.21.27.tar.gz", hash = "sha256:1f53ccf5aee47d937c9ffb1030fb041270ca7883279bf89b8a7c0a69f9d2bd4c", size = 1164887, upload-time = "2026-08-13T15:12:20.648Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/3e/72ffb18922f9054bed6882733eaedc6457c4a7faf7ade748b1ce15edb385/open_autonomy-0.21.28.tar.gz", hash = "sha256:ce68c767509fbc7a57c53c0879293ad2f1598569299a3ae33b2da2da7c5f89cd", size = 1165368, upload-time = "2026-08-27T22:07:29.195Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ff/91/c0fc6daf8a8d7f178b9230288dd59a9eb91b6b447af4956c3421a7f4c240/open_autonomy-0.21.27-py3-none-any.whl", hash = "sha256:144a58d98b1fa95da191921c6ce2579a5c7b0d7b7ced35209daafdc8b5e52709", size = 1674639, upload-time = "2026-08-13T15:12:19.005Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/33/ed5280b2f805727ee4c73adec3ef1b977781fba2f2097e7d890e04df006c/open_autonomy-0.21.28-py3-none-any.whl", hash = "sha256:8768048332679baf1b455fa790d412510c6bfb34bc8297ae0bb08065afe82320", size = 1675133, upload-time = "2026-08-27T22:07:27.277Z" },
 ]
 
 [package.optional-dependencies]
