@@ -10,7 +10,7 @@ dependencies = [
     "uvicorn==0.52.4",
     "web3==7.16.0",
     "eth-account==0.13.7",
-    "mcp==1.28.1",
+    "mcp==2.1.1",
     "mech-client==0.22.0",
     "open-aea-ledger-ethereum==2.2.9",
 ]
