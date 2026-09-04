@@ -200,6 +200,14 @@ endpoint in its on-chain metadata — few have, so `mech_tools` reports
 refused before any payment. The on-chain path sends through the
 MechMarketplace via the service safe and works for any listed mech.
 
+An optional `request_context` dict is passed through unmodified as a
+top-level key of the request metadata, for the tool to read; the bundled skill
+documents the keys the predict tools look for. Off-chain it is part of the
+document the request-id digest commits to, so that digest is derived over the
+very bytes mech-client will hash. On-chain the document goes to IPFS with its
+CID in the request event, making the context as public and permanent as the
+prompt beside it.
+
 ### Replaying a mech request
 
 A mech request is paid for before it is answered, so a caller whose response
@@ -229,8 +237,8 @@ server can only promise what it can actually know:
 Two bounds worth knowing: the ledger is in memory, so a restart clears it,
 exactly as it clears `mech_result`'s pending ids; and it keeps the last 1024
 ids, so an id replayed long after that many others pays again. An id is also
-bound to what it asked — reusing one for a different prompt, tool, chain, mech
-or flow is refused rather than answering the wrong question.
+bound to what it asked — reusing one for a different prompt, tool, chain, mech,
+flow or `request_context` is refused rather than answering the wrong question.
 
 ## Development
 

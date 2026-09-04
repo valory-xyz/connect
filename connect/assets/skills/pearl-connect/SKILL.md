@@ -94,6 +94,12 @@ composing a prompt:
   request — it is paid for, and the ids come back as `pending_request_ids`.
   Poll them with `mech_result(request_id)`, which resumes the watch and never
   resends.
+- `request_context` (keys in the tool's own description) is worth choosing
+  deliberately rather than filling in. A tool that gets none of it answers
+  without market context — usually worse; but sending `description` and
+  `market_close_at` without `market_prob` is a useful shape in its own right:
+  the tool sees the resolution rules while its estimate stays free of the
+  market's own price, which is what you want when you mean to compare the two.
 - `max_payment` (base units of the mech's payment asset — wei for native
   mechs; default 10^17 = 0.1 native) caps what one
   request may cost: a mech pricing above it is refused before any payment.

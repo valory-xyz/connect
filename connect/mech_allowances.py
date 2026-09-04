@@ -149,7 +149,7 @@ class MechAllowances:
         priced: PricedMech,
         prompt: str,
         tool: str,
-        salt: str,
+        extra_attributes: dict,
     ) -> None:
         """Derive the digest mech-client will sign, and pre-authorize it once.
 
@@ -163,11 +163,11 @@ class MechAllowances:
         The request id commits to the metadata CID, which is deterministic
         here because the salt is pinned: fetch_ipfs_hash generates a random
         nonce but merges ``extra_attributes`` over it, so this method and
-        mech-client (handed the same ``{"nonce": salt}`` moments later) run
-        the same pure function on the same inputs and get the same CID. The
-        domain separator and the marketplace nonce are RPC reads; a wrong
-        answer makes the derived digest mismatch the one mech-client asks
-        to sign, so the failure mode is a refusal, never a wrong signature.
+        mech-client (handed the same dict moments later) run the same pure
+        function on the same inputs and get the same CID. The domain separator
+        and the marketplace nonce are RPC reads; a wrong answer makes the
+        derived digest mismatch the one mech-client asks to sign, so the
+        failure mode is a refusal, never a wrong signature.
 
         Audited: the allowance is what lets funds-adjacent signing happen in
         restricted mode, so the trail must show each one that was granted,
@@ -194,7 +194,13 @@ class MechAllowances:
             raise MechError(
                 f"could not derive the off-chain request digest: {e}"
             ) from e
-        data_hash, _, _ = fetch_ipfs_hash(prompt, tool, {"nonce": salt})
+        try:
+            data_hash, _, _ = fetch_ipfs_hash(prompt, tool, extra_attributes)
+        except Exception as e:
+            raise MechError(
+                f"request_context could not be encoded into the request "
+                f"metadata: {e}"
+            ) from e
         request_id = request_digest(
             domain_separator=domain_separator,
             marketplace=marketplace,
