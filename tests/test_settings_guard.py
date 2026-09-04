@@ -2029,7 +2029,9 @@ class TestMech:
     ) -> None:
         """Every field the refusal names has to be one the stamp really binds."""
         self._job(mech_service, "job-chain")
-        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+        with pytest.raises(
+            MechError, match="prompt, tool, chain, mech, flow or context"
+        ):
             mech_service.request(
                 "q",
                 "t",
@@ -2038,7 +2040,9 @@ class TestMech:
                 priority_mech=OTHER,
                 request_id="job-chain",
             )
-        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+        with pytest.raises(
+            MechError, match="prompt, tool, chain, mech, flow or context"
+        ):
             mech_service.request(
                 "q",
                 "t",
@@ -2048,6 +2052,93 @@ class TestMech:
                 request_id="job-chain",
             )
         assert len(patched_mech.calls) == 1
+
+    def test_the_stamp_covers_the_request_context(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A context change is a new question, and must not replay the old one."""
+        first = mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            request_id="job-ctx",
+            request_context={"market_prob": 0.4},
+        )
+        assert first.get("replayed") is not True
+        with pytest.raises(
+            MechError, match="prompt, tool, chain, mech, flow or context"
+        ):
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                request_id="job-ctx",
+                request_context={"market_prob": 0.9},
+            )
+        again = mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            request_id="job-ctx",
+            request_context={"market_prob": 0.4},
+        )
+        assert again["replayed"] is True
+        assert len(patched_mech.calls) == 1
+
+    def test_the_stamp_ignores_how_the_caller_ordered_the_context(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """The same context spelled in another key order is the same ask."""
+        mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            request_id="job-ctx-order",
+            request_context={"market_prob": 0.4, "market_id": "m1"},
+        )
+        again = mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            request_id="job-ctx-order",
+            request_context={"market_id": "m1", "market_prob": 0.4},
+        )
+        assert again["replayed"] is True
+        assert len(patched_mech.calls) == 1
+
+    def test_the_onchain_flow_carries_the_context_and_nothing_else(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """On-chain has no digest to pin, so the nonce stays mech-client's."""
+        context = {"market_id": "m1", "description": "resolves at close"}
+        mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            request_context=context,
+        )
+        assert patched_mech.calls[0]["extra_attributes"] == {"request_context": context}
+
+    def test_the_onchain_flow_sends_no_extras_without_a_context(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A context-less on-chain request must not publish a null key."""
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert patched_mech.calls[0]["extra_attributes"] is None
 
     def test_the_stamp_ignores_how_the_caller_spelled_the_same_request(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -2078,7 +2169,9 @@ class TestMech:
     ) -> None:
         """A refusal must release the claim, or the id is stuck in flight."""
         self._job(mech_service, "job-release", prompt="will it rain")
-        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+        with pytest.raises(
+            MechError, match="prompt, tool, chain, mech, flow or context"
+        ):
             self._job(mech_service, "job-release", prompt="will it snow")
         again = self._job(mech_service, "job-release", prompt="will it rain")
         assert again.get("replayed") is True
@@ -2249,7 +2342,9 @@ class TestMech:
         buy the answer again while looking like a resumed watch.
         """
         self._job(mech_service, "job-9")
-        with pytest.raises(MechError, match="prompt, tool, chain, mech or flow"):
+        with pytest.raises(
+            MechError, match="prompt, tool, chain, mech, flow or context"
+        ):
             mech_service.request(
                 "q",
                 "t",
@@ -2595,6 +2690,58 @@ class TestMech:
             entry["digest"] == "0x" + safe_message_hash(SAFE, 31337, request_id).hex()
         )
 
+    def test_offchain_context_travels_inside_the_signed_metadata(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """The context is part of the CID, so both sides must hash one dict."""
+        service, _ = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        context = {"market_prob": 0.4, "market_close_at": "2026-12-31T00:00:00Z"}
+        service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            request_context=context,
+        )
+        extras = patched_mech.calls[0]["extra_attributes"]
+        assert extras.keys() == {"nonce", "request_context"}
+        assert extras["request_context"] == context
+        kinds = audit_kinds(store_path)
+        assert "sign_message" in kinds
+        assert "blocked" not in kinds
+
+    def test_an_unencodable_context_is_a_mech_error(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A context that cannot be encoded is a MechError, not a TypeError."""
+        with pytest.raises(MechError, match="cannot be fingerprinted"):
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                request_id="job-bad-ctx",
+                request_context={"seen": {1, 2}},
+            )
+        with pytest.raises(MechError, match="could not be encoded"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_context={"seen": {1, 2}},
+            )
+        assert not patched_mech.calls
+
     def test_offchain_digest_mismatch_is_refused(  # pylint: disable=too-many-arguments
         self,
         account: LocalAccount,
@@ -2748,7 +2895,7 @@ class TestMech:
                 ),
                 prompt="q",
                 tool="t",
-                salt="s",
+                extra_attributes={"nonce": "s"},
             )
 
     def test_offchain_context_failure_is_a_mech_error(
@@ -4186,6 +4333,7 @@ class TestMcpGuardrailTools:
             legacy_on_chain=True,
             timeout=7,
             request_id="job-1",
+            request_context={"market_prob": 0.4},
         )
         assert result == {"ok": True}
         assert calls[0]["legacy_on_chain"] is True
@@ -4194,6 +4342,7 @@ class TestMcpGuardrailTools:
         # MCP is the only caller: unforwarded, request_id would be accepted,
         # documented, and silently ignored, and every retry would pay again
         assert calls[0]["request_id"] == "job-1"
+        assert calls[0]["request_context"] == {"market_prob": 0.4}
 
     async def test_mech_request_tool_runs_off_the_event_loop(
         self, tools: dict[str, t.Callable], monkeypatch: pytest.MonkeyPatch

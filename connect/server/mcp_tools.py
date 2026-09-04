@@ -227,6 +227,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         timeout: float = 300,
         max_payment: int = DEFAULT_MAX_PAYMENT,
         request_id: str | None = None,
+        request_context: dict | None = None,
     ) -> dict:
         """Send a request to an Olas mech (AI service) and wait for its delivery.
 
@@ -243,6 +244,12 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         one whenever you would not want to pay twice to find out what
         happened; a request that failed after payment refuses replay and says
         so, since only you can decide to risk a second payment.
+        `request_context` is an optional dict handed to the tool alongside the
+        prompt: the predict tools read `market_id`, `type`, `description`,
+        `market_prob` and `market_close_at`, each optional and ignored by a
+        tool that does not read it. It reaches the mech, and
+        legacy_on_chain=true also publishes it to IPFS for good — put nothing
+        private in it.
         """
         # mech-client manages its own event loops (asyncio.run + sync gql):
         # it must run in a worker thread, never on the server loop
@@ -257,6 +264,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             timeout=timeout,
             max_payment=max_payment,
             request_id=request_id,
+            request_context=request_context,
         )
 
     @mcp.tool()
