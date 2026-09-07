@@ -2732,7 +2732,7 @@ class TestMech:
         store_path: Path,
     ) -> None:
         """A context that cannot be encoded is a MechError, not a TypeError."""
-        with pytest.raises(MechError, match="cannot be fingerprinted"):
+        with pytest.raises(MechError, match="could not be encoded"):
             mech_service.request(
                 "q",
                 "t",
@@ -2760,6 +2760,17 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=OTHER,
                 request_context={"seen": {1, 2}},
+            )
+        # mixed-type keys encode as metadata but not as a sorted fingerprint,
+        # and the trail sorts them after the send: refuse before paying
+        with pytest.raises(MechError, match="could not be encoded"):
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                request_context={1: "a", "b": 2},
             )
         assert not patched_mech.calls
         assert "mech_request_failed" not in audit_kinds(store_path)

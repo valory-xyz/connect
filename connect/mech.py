@@ -132,16 +132,17 @@ def _request_key(request_id: object) -> str:
     return str(request_id).lower().removeprefix("0x")
 
 
-def _reject_unencodable(request_context: dict | None) -> None:
-    """Refuse a context the request metadata could not carry."""
-    if request_context is None:
-        return
+def _canonical_context(request_context: dict | None) -> str:
+    """Encode a context as the stamp, the metadata and the trail all read it.
+
+    Sorted, so the fingerprint does not turn key order into a new question —
+    which also refuses the mixed-type keys ``sorted()`` chokes on, before a
+    payment rather than while logging the delivery it bought.
+    """
     try:
-        json.dumps(request_context)
+        return json.dumps(request_context, sort_keys=True)
     except (TypeError, ValueError) as e:
-        raise MechError(
-            f"request_context could not be encoded into the request " f"metadata: {e}"
-        ) from e
+        raise MechError(f"request_context could not be encoded: {e}") from e
 
 
 def _metadata_extras(request_context: dict | None) -> dict:
@@ -167,10 +168,7 @@ def _request_stamp(
     an old answer if that id were reused — and the caller acts on the answer,
     so the mistake would be silent and expensive.
     """
-    try:
-        context = json.dumps(request_context, sort_keys=True)
-    except (TypeError, ValueError) as e:
-        raise MechError(f"request_context cannot be fingerprinted: {e}") from e
+    context = _canonical_context(request_context)
     raw = "\x1f".join(
         (
             prompt,
@@ -679,7 +677,7 @@ class MechService:
         what an operator reconstructs an incident from, and a request blocked
         by policy must not look identical there to one never attempted.
         """
-        _reject_unencodable(request_context)
+        _canonical_context(request_context)
         chain = self._resolve_chain(chain)
         service = self._service(chain)
         priced = self._priced_mech(service, chain, priority_mech)
