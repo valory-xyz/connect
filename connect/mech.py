@@ -34,6 +34,7 @@ points a request needs them; the reasoning for each lives there.
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -131,12 +132,35 @@ def _request_key(request_id: object) -> str:
     return str(request_id).lower().removeprefix("0x")
 
 
+def _canonical_context(request_context: dict | None) -> str:
+    """Encode a context as the stamp, the metadata and the trail all read it.
+
+    Sorted, so the fingerprint does not turn key order into a new question —
+    which also refuses the mixed-type keys ``sorted()`` chokes on, before a
+    payment rather than while logging the delivery it bought.
+    """
+    try:
+        return json.dumps(request_context, sort_keys=True)
+    except (TypeError, ValueError) as e:
+        raise MechError(f"request_context could not be encoded: {e}") from e
+
+
+def _metadata_extras(request_context: dict | None) -> dict:
+    """Build the metadata extras mech-client merges over prompt/tool/nonce."""
+    extras: dict = {"nonce": str(uuid.uuid4())}
+    if request_context is not None:
+        extras["request_context"] = request_context
+    return extras
+
+
 def _request_stamp(
     prompt: str,
     tool: str,
+    *,
     chain: str,
     priority_mech: str | None,
     legacy_on_chain: bool,
+    request_context: dict | None,
 ) -> str:
     """Fingerprint what a request asked.
 
@@ -144,6 +168,7 @@ def _request_stamp(
     an old answer if that id were reused — and the caller acts on the answer,
     so the mistake would be silent and expensive.
     """
+    context = _canonical_context(request_context)
     raw = "\x1f".join(
         (
             prompt,
@@ -151,6 +176,7 @@ def _request_stamp(
             chain.lower(),
             (priority_mech or "").lower(),
             str(legacy_on_chain),
+            context,
         )
     )
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -470,6 +496,7 @@ class MechService:
         timeout: float = DEFAULT_DELIVERY_TIMEOUT,
         max_payment: int = DEFAULT_MAX_PAYMENT,
         request_id: str | None = None,
+        request_context: dict | None = None,
     ) -> dict:
         """Send one mech request and wait for its delivery.
 
@@ -495,6 +522,7 @@ class MechService:
                 priority_mech=priority_mech,
                 auto_deposit=auto_deposit,
                 max_payment=max_payment,
+                request_context=request_context,
             )
             # past this point a failure cannot be reported as "nothing was spent"
             planned = plan
@@ -511,9 +539,10 @@ class MechService:
         stamp = _request_stamp(
             prompt,
             tool,
-            self._resolve_chain(chain),
-            priority_mech,
-            legacy_on_chain,
+            chain=self._resolve_chain(chain),
+            priority_mech=priority_mech,
+            legacy_on_chain=legacy_on_chain,
+            request_context=request_context,
         )
         try:
             entry = self._requests.reserve(request_id)
@@ -577,8 +606,9 @@ class MechService:
             self._refused(request_id, "stamp-mismatch", "reused for a different ask")
             raise MechError(
                 f"request id '{request_id}' was already used for a different "
-                "prompt, tool, chain, mech or flow; choose a new id rather "
-                "than replaying this one, which would answer the wrong question"
+                "prompt, tool, chain, mech, flow or context; choose a new id "
+                "rather than replaying this one, which would answer the wrong "
+                "question"
             )
         payload = entry.payload
         if entry.spend_uncertain:
@@ -639,6 +669,7 @@ class MechService:
         priority_mech: str | None,
         auto_deposit: bool,
         max_payment: int,
+        request_context: dict | None,
     ) -> _RequestPlan:
         """Settle everything a request needs before any payment can happen.
 
@@ -646,6 +677,7 @@ class MechService:
         what an operator reconstructs an incident from, and a request blocked
         by policy must not look identical there to one never attempted.
         """
+        _canonical_context(request_context)
         chain = self._resolve_chain(chain)
         service = self._service(chain)
         priced = self._priced_mech(service, chain, priority_mech)
@@ -661,6 +693,7 @@ class MechService:
                 f"payment asset base units), above max_payment={max_payment}; "
                 "pass a higher max_payment to accept that price"
             )
+        extra_attributes: dict | None
         if not legacy_on_chain:
             # mech-client discovers the endpoint mid-flow and fails there with
             # a message about metadata, which reads as a transient gateway
@@ -677,19 +710,23 @@ class MechService:
             # mech-client will derive and sign — is known here first; the
             # matching allowance is registered before the send. Armed in
             # every mode so both leave the same audit trail.
-            extra_attributes = {"nonce": str(uuid.uuid4())}
+            extra_attributes = _metadata_extras(request_context)
             self._allowances.register_offchain_digest(
                 service,
                 chain=chain,
                 priced=priced,
                 prompt=prompt,
                 tool=tool,
-                salt=extra_attributes["nonce"],
+                extra_attributes=extra_attributes,
             )
             if auto_deposit:
                 auto_deposit = self._allowances.arm_auto_deposit(chain, priced)
         else:
-            extra_attributes = None
+            extra_attributes = (
+                None
+                if request_context is None
+                else {"request_context": request_context}
+            )
         return _RequestPlan(
             chain=chain,
             service=service,
@@ -745,6 +782,9 @@ class MechService:
             offchain=not plan.legacy_on_chain,
             rate=str(plan.priced.rate),
             max_payment=str(max_payment),
+            context_keys=sorted(
+                (plan.extra_attributes or {}).get("request_context") or {}
+            ),
             request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
         return self._with_pending(
