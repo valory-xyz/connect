@@ -94,7 +94,7 @@ composing a prompt:
   request — it is paid for, and the ids come back as `pending_request_ids`.
   Poll them with `mech_result(request_id)`, which resumes the watch and never
   resends.
-- `request_context` (keys in the tool's own description) is worth choosing
+- `request_context` (the keys `mech_request` documents) is worth choosing
   deliberately rather than filling in. A tool that gets none of it answers
   without market context — usually worse; but sending `description` and
   `market_close_at` without `market_prob` is a useful shape in its own right:

@@ -194,13 +194,7 @@ class MechAllowances:
             raise MechError(
                 f"could not derive the off-chain request digest: {e}"
             ) from e
-        try:
-            data_hash, _, _ = fetch_ipfs_hash(prompt, tool, extra_attributes)
-        except Exception as e:
-            raise MechError(
-                f"request_context could not be encoded into the request "
-                f"metadata: {e}"
-            ) from e
+        data_hash, _, _ = fetch_ipfs_hash(prompt, tool, extra_attributes)
         request_id = request_digest(
             domain_separator=domain_separator,
             marketplace=marketplace,

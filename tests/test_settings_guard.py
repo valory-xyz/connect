@@ -2117,7 +2117,10 @@ class TestMech:
         assert len(patched_mech.calls) == 1
 
     def test_the_onchain_flow_carries_the_context_and_nothing_else(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
     ) -> None:
         """On-chain has no digest to pin, so the nonce stays mech-client's."""
         context = {"market_id": "m1", "description": "resolves at close"}
@@ -2130,6 +2133,10 @@ class TestMech:
             request_context=context,
         )
         assert patched_mech.calls[0]["extra_attributes"] == {"request_context": context}
+        entry = next(
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request"
+        )
+        assert entry["context_keys"] == ["description", "market_id"]
 
     def test_the_onchain_flow_sends_no_extras_without_a_context(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -2719,7 +2726,10 @@ class TestMech:
         assert "blocked" not in kinds
 
     def test_an_unencodable_context_is_a_mech_error(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
     ) -> None:
         """A context that cannot be encoded is a MechError, not a TypeError."""
         with pytest.raises(MechError, match="cannot be fingerprinted"):
@@ -2740,7 +2750,19 @@ class TestMech:
                 priority_mech=OTHER,
                 request_context={"seen": {1, 2}},
             )
+        # on-chain without a request id reaches no stamp, so only the plan's
+        # own check stands between a bad context and the payment boundary
+        with pytest.raises(MechError, match="could not be encoded"):
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                request_context={"seen": {1, 2}},
+            )
         assert not patched_mech.calls
+        assert "mech_request_failed" not in audit_kinds(store_path)
 
     def test_offchain_digest_mismatch_is_refused(  # pylint: disable=too-many-arguments
         self,

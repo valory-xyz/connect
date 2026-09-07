@@ -132,6 +132,18 @@ def _request_key(request_id: object) -> str:
     return str(request_id).lower().removeprefix("0x")
 
 
+def _reject_unencodable(request_context: dict | None) -> None:
+    """Refuse a context the request metadata could not carry."""
+    if request_context is None:
+        return
+    try:
+        json.dumps(request_context)
+    except (TypeError, ValueError) as e:
+        raise MechError(
+            f"request_context could not be encoded into the request " f"metadata: {e}"
+        ) from e
+
+
 def _metadata_extras(request_context: dict | None) -> dict:
     """Build the metadata extras mech-client merges over prompt/tool/nonce."""
     extras: dict = {"nonce": str(uuid.uuid4())}
@@ -667,6 +679,7 @@ class MechService:
         what an operator reconstructs an incident from, and a request blocked
         by policy must not look identical there to one never attempted.
         """
+        _reject_unencodable(request_context)
         chain = self._resolve_chain(chain)
         service = self._service(chain)
         priced = self._priced_mech(service, chain, priority_mech)
@@ -771,6 +784,9 @@ class MechService:
             offchain=not plan.legacy_on_chain,
             rate=str(plan.priced.rate),
             max_payment=str(max_payment),
+            context_keys=sorted(
+                (plan.extra_attributes or {}).get("request_context") or {}
+            ),
             request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
         return self._with_pending(
