@@ -1,7 +1,7 @@
 {
     "dev": {
         "agent/valory/connect/0.1.0": "bafybeieuja63vl5hj3a3bsrx5nzqajhnjjr3zx5skc7ldvzrvfoxmtnpf4",
-        "service/valory/connect/0.1.0": "bafybeibue5tquh2yify7upvvlarotk7rbelg3uicd3dctwb4csa5yxkysi"
+        "service/valory/connect/0.1.0": "bafybeihl7bdnhhsh5alvbxv6uajckbjsmcetaexjg246x342qitiw3nfw4"
     },
     "third_party": {
         "protocol/valory/ledger_api/1.0.0": "bafybeiecq56phjfws36rgrefw6niyo4ezesloodsfis647mpm5ygqo4ysi",
