@@ -45,6 +45,11 @@ config:
       chain_id: ${MODE_CHAIN_ID:int:34443}
       poa_chain: ${IS_POA_CHAIN:bool:false}
       default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+    robinhood:
+      address: ${ROBINHOOD_LEDGER_RPC:str:https://rpc.mainnet.chain.robinhood.com}
+      chain_id: ${ROBINHOOD_CHAIN_ID:int:4663}
+      poa_chain: ${IS_POA_CHAIN:bool:false}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
 ---
 public_id: valory/configs:0.1.0
 type: connection
