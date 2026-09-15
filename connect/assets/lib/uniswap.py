@@ -175,7 +175,7 @@ def v4_pool_id(token_a: str, token_b: str, fee: int, spacing: int, hooks: str) -
 def _v2_candidate(
     w3: Web3, chain_id: int, token: str, quote: str
 ) -> t.Optional[PoolV2]:
-    """The v2 pair for a token/quote couple, when the factory has one."""
+    """Find the v2 pair for a token/quote couple, when the factory has one."""
     factory = deployment(chain_id).get("v2_factory")
     if factory is None:
         return None
@@ -335,7 +335,7 @@ def best_route(  # pylint: disable=too-many-positional-arguments
     amount: int,
     candidates: list[Pool],
 ) -> tuple[Pool, int]:
-    """The candidate pool with the best output for this exact size.
+    """Pick the candidate pool with the best output for this exact size.
 
     Raises:
         SwapError: when a candidate was discovered for a different pair, or
@@ -547,7 +547,7 @@ def verify_execute(  # pylint: disable=too-many-arguments,too-many-positional-ar
 
 
 def permit_action_in(calldata: str) -> t.Optional[bytes]:
-    """The PERMIT2_PERMIT input carried by this execute(), when there is one."""
+    """Read the PERMIT2_PERMIT input carried by this execute(), when there is one."""
     commands, inputs, _ = abi_decode(
         ["bytes", "bytes[]", "uint256"], bytes.fromhex(calldata[10:])
     )

@@ -111,7 +111,7 @@ def token_decimals(w3: Web3, token: str) -> int:
 
 
 def balance_of(w3: Web3, token: str, holder: str, decimals: int) -> float:
-    """A holder's token balance in whole units."""
+    """Read a holder's token balance in whole units."""
     data = SEL_BALANCE_OF + abi_encode(["address"], [to_checksum_address(holder)])
     return call_int(w3, token, data) / 10**decimals
 

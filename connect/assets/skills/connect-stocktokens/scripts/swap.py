@@ -42,7 +42,6 @@ import permit  # noqa: E402  pylint: disable=wrong-import-position
 import pools  # noqa: E402  pylint: disable=wrong-import-position
 import stocktokens  # noqa: E402  pylint: disable=wrong-import-position
 import uniswap  # noqa: E402  pylint: disable=wrong-import-position
-from evm import SwapError, connect  # noqa: E402  pylint: disable=wrong-import-position
 
 CHAIN = stocktokens.CHAIN
 USDG = stocktokens.USDG
@@ -100,14 +99,14 @@ def reference_units(  # pylint: disable=too-many-arguments,too-many-positional-a
     decimals_out: int,
     buying: bool,
 ) -> tuple[int, float, float]:
-    """What Robinhood's own price says this trade should return.
+    """Compute what Robinhood's own price says this trade should return.
 
     Raises:
         SwapError: when the ticker is halted at Robinhood.
     """
     bid, ask, halted = stocktokens.reference_price(symbol, multiplier)
     if halted:
-        raise SwapError(f"{symbol} is halted at Robinhood; refusing to trade")
+        raise evm.SwapError(f"{symbol} is halted at Robinhood; refusing to trade")
     whole_in = amount / 10**decimals_in
     reference_out = (whole_in / ask) if buying else (whole_in * bid)
     return int(reference_out * 10**decimals_out), bid, ask
@@ -120,7 +119,7 @@ def plan_swap(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     token_out: str,
     amount: int,
     slippage: float,
-    recipient: str,
+    account: str,
     refresh: bool = False,
     max_gap_bps: float = stocktokens.MAX_PRICE_GAP_BPS,
     signer: t.Any = None,
@@ -128,27 +127,26 @@ def plan_swap(  # pylint: disable=too-many-arguments,too-many-positional-argumen
 ) -> Plan:
     """Pick a pool, price the trade against Robinhood, and build the calls.
 
-    The safe that executes these calls is the one that pays: the router pulls
-    from msg.sender, so only the recipient is free to differ.
+    ``account`` pays and receives, and the two cannot be separated here: the
+    router pulls from msg.sender, and the Permit2 allowance authorising that
+    pull is signed by — and read from the nonce of — the same address.
 
     Raises:
-        SwapError: for an unknown ticker; the helpers raise it for a halted
-            ticker, a dislocated pool, a refused signature or bad calldata.
+        SwapError: for an unknown or untradable ticker; the helpers raise it
+            for a halted ticker, a dislocated pool, a refused signature or bad
+            calldata.
     """
     if not 0 <= slippage <= MAX_SLIPPAGE:
-        raise SwapError(
+        raise evm.SwapError(
             f"slippage of {slippage}% is outside 0..{MAX_SLIPPAGE}%; a floor "
             f"that loose is not slippage protection"
         )
     if not 0 < max_gap_bps <= MAX_GAP_CEILING_BPS:
-        raise SwapError(
+        raise evm.SwapError(
             f"a {max_gap_bps} bps dislocation limit is outside "
             f"0..{MAX_GAP_CEILING_BPS}; widening it that far turns the guard off"
         )
-    registry = stocktokens.asset_registry()
-    if symbol not in registry:
-        raise SwapError(f"unknown ticker {symbol}")
-    asset = registry[symbol]
+    asset = stocktokens.lookup(symbol)
     where = _addresses()
     candidates = pools.cached_discover(w3, asset["address"], "USDG", refresh)
     pool, quoted_out = uniswap.best_route(
@@ -165,32 +163,31 @@ def plan_swap(  # pylint: disable=too-many-arguments,too-many-positional-argumen
 
     spender = where["universal_router"]
     fold = signer is not None and not separate_approvals
+    now = int(time.time())
+    ahead = 1 if fold else 2
+    deadline = now + DEADLINE_S + RECEIPT_TIMEOUT_S * ahead
     action = (
         permit.signed_action(
             w3,
             signer,
-            recipient,
+            account,
             token_in,
             amount,
             stocktokens.CHAIN_ID,
             where["permit2"],
             spender,
+            deadline,
         )
         if fold
         else None
     )
-    now = int(time.time())
-    ahead = 1 if fold else 2
-    deadline = now + DEADLINE_S + RECEIPT_TIMEOUT_S * ahead
     calldata = uniswap.build_execute(
-        pool, token_in, token_out, amount, floor, recipient, deadline, action
+        pool, token_in, token_out, amount, floor, account, deadline, action
     )
-    uniswap.verify_execute(
-        calldata, pool, token_in, token_out, amount, floor, recipient
-    )
+    uniswap.verify_execute(calldata, pool, token_in, token_out, amount, floor, account)
     signed = uniswap.permit_action_in(calldata)
     if fold != (signed is not None):
-        raise SwapError(
+        raise evm.SwapError(
             "a permit was signed but is not in the calldata we would send"
             if fold
             else "the calldata carries a permit nobody asked for"
@@ -200,7 +197,7 @@ def plan_swap(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     calls = (
         [evm.erc20_approval_call(token_in, where["permit2"], amount, "approve Permit2")]
         if fold
-        else approval_calls(token_in, amount, now + permit.APPROVAL_EXPIRY_S)
+        else approval_calls(token_in, amount, deadline)
     )
     calls.append({"to": where["universal_router"], "data": calldata, "what": "swap"})
     shares_out = quoted_out / 10**decimals_out
@@ -244,8 +241,8 @@ def _amount_in_units(w3: Web3, token: str, whole: float) -> int:
 
 def _cmd_quote(args: argparse.Namespace) -> int:
     """Price a buy without building or sending anything."""
-    w3, _ = connect(CHAIN)
-    asset = stocktokens.asset_registry()[args.symbol]
+    w3, _ = evm.connect(CHAIN)
+    asset = stocktokens.lookup(args.symbol)
     amount = _amount_in_units(w3, USDG, args.usdg)
     candidates = pools.cached_discover(w3, asset["address"], "USDG", args.refresh)
     pool, out = uniswap.best_route(
@@ -294,7 +291,7 @@ def send_calls(w3: Web3, signer: t.Any, calls: list[evm.Call]) -> list[str]:
         try:
             tx_hash = signer.send_transaction(dict(call))
         except Exception as exc:  # pylint: disable=broad-except
-            raise SwapError(
+            raise evm.SwapError(
                 f"{call['what']} could not be sent ({exc}); confirmed so far: "
                 f"{landed}. It may still have broadcast - check before resending."
             ) from exc
@@ -303,14 +300,14 @@ def send_calls(w3: Web3, signer: t.Any, calls: list[evm.Call]) -> list[str]:
                 tx_hash, timeout=RECEIPT_TIMEOUT_S, poll_latency=RECEIPT_POLL_S
             )
         except Exception as exc:  # pylint: disable=broad-except
-            raise SwapError(
+            raise evm.SwapError(
                 f"{call['what']} ({tx_hash}) has not confirmed within "
                 f"{RECEIPT_TIMEOUT_S}s ({exc}); its fate is unknown and it may "
                 f"still land, so check that hash before resending anything. "
                 f"Confirmed so far: {landed}"
             ) from exc
         if receipt["status"] != 1:
-            raise SwapError(
+            raise evm.SwapError(
                 f"{call['what']} ({tx_hash}) reverted; confirmed so far: {landed}"
             )
         print(f"{call['what']}: {tx_hash}")
@@ -321,8 +318,12 @@ def send_calls(w3: Web3, signer: t.Any, calls: list[evm.Call]) -> list[str]:
 def _run_plan(
     args: argparse.Namespace, token_in: str, token_out: str, amount: int
 ) -> int:
-    """Build a swap and, unless it is a dry run, send and confirm its calls."""
-    w3, signer = connect(CHAIN)
+    """Build a swap and, unless it is a dry run, send and confirm its calls.
+
+    A dry run builds the same calls a real run would send, permit included —
+    only the sending is skipped, so what is printed is what would broadcast.
+    """
+    w3, signer = evm.connect(CHAIN)
     safe = signer.chain_info(CHAIN)["safe"]
     plan = plan_swap(
         w3,
@@ -334,7 +335,7 @@ def _run_plan(
         safe,
         args.refresh,
         args.max_gap_bps,
-        None if args.dry_run else signer,
+        signer,
         args.separate_approvals,
     )
     print(json.dumps({k: v for k, v in plan.items() if k != "calls"}, indent=2))
@@ -351,16 +352,16 @@ def _run_plan(
 
 def _cmd_buy(args: argparse.Namespace) -> int:
     """Spend USDG on a stock token."""
-    w3, _ = connect(CHAIN)
+    w3, _ = evm.connect(CHAIN)
     amount = _amount_in_units(w3, USDG, args.usdg)
-    token = stocktokens.asset_registry()[args.symbol]["address"]
+    token = stocktokens.lookup(args.symbol)["address"]
     return _run_plan(args, USDG, token, amount)
 
 
 def _cmd_sell(args: argparse.Namespace) -> int:
     """Sell a stock token back into USDG."""
-    w3, _ = connect(CHAIN)
-    token = stocktokens.asset_registry()[args.symbol]["address"]
+    w3, _ = evm.connect(CHAIN)
+    token = stocktokens.lookup(args.symbol)["address"]
     amount = _amount_in_units(w3, token, args.shares)
     return _run_plan(args, token, USDG, amount)
 
@@ -389,7 +390,11 @@ def main() -> int:
     sell.add_argument("--shares", type=float, required=True)
     sell.set_defaults(func=_cmd_sell)
     args = parser.parse_args()
-    result: int = args.func(args)
+    try:
+        result: int = args.func(args)
+    except evm.SwapError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
     return result
 
 

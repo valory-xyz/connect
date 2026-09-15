@@ -48,12 +48,12 @@ MAX_PRICE_GAP_BPS = 150.0
 def get_json(url: str) -> t.Any:
     """GET a JSON document with the User-Agent Robinhood's edge requires."""
     request = urllib.request.Request(url, headers={"user-agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=30) as response:  # nosec B310
         return json.load(response)
 
 
 def _multiplier(asset: dict[str, t.Any]) -> str:
-    """The ticker's corporate-action multiplier, refusing a missing one.
+    """Read the ticker's corporate-action multiplier, refusing a missing one.
 
     Raises:
         SwapError: when the field is absent or unparseable; defaulting it to 1
@@ -65,44 +65,84 @@ def _multiplier(asset: dict[str, t.Any]) -> str:
             raise ValueError(raw)
     except (TypeError, ValueError) as exc:
         raise SwapError(
-            f"{asset.get('tokenSymbol', '?')} has no usable currentMultiplier "
-            f"({raw!r}); refusing to price it"
+            f"no usable currentMultiplier ({raw!r}); refusing to price it"
         ) from exc
     return str(raw)
 
 
+class AssetBook(t.NamedTuple):
+    """The tradable stock tokens, and why every other listed ticker is not."""
+
+    tokens: dict[str, dict[str, t.Any]]
+    excluded: dict[str, str]
+
+
 @functools.lru_cache(maxsize=1)
-def asset_registry() -> dict[str, dict[str, t.Any]]:
-    """Live stock-token registry keyed by ticker, filtered to this chain.
+def asset_book() -> AssetBook:
+    """Live stock-token registry for this chain, tradable tickers separated out.
+
+    An unusable listing excludes its own ticker and nothing else: one suspended
+    or malformed token must not take the other two hundred down with it.
 
     Raises:
-        SwapError: when the registry lists nothing for this chain.
+        SwapError: when the registry lists nothing at all for this chain.
     """
-    registry: dict[str, dict[str, t.Any]] = {}
+    tokens: dict[str, dict[str, t.Any]] = {}
+    excluded: dict[str, str] = {}
     for asset in get_json(ASSETS_URL)["assets"]:
         for deployment in asset.get("deployments", []):
             if deployment.get("chainId") != CHAIN_ID:
                 continue
-            if asset["tokenSymbol"] in registry:
-                raise SwapError(
-                    f"{asset['tokenSymbol']} is listed twice on chain {CHAIN_ID}; "
-                    f"refusing to guess which contract you meant"
+            symbol = asset["tokenSymbol"]
+            if symbol in tokens or symbol in excluded:
+                tokens.pop(symbol, None)
+                excluded[symbol] = (
+                    f"listed twice on chain {CHAIN_ID}; refusing to guess which "
+                    f"contract you meant"
                 )
+                continue
             if asset.get("status") not in TRADABLE_STATUS:
-                raise SwapError(
-                    f"{asset['tokenSymbol']} has status {asset.get('status')!r}; "
-                    f"refusing to trade a token Robinhood does not call active"
+                excluded[symbol] = (
+                    f"status is {asset.get('status')!r}; refusing to trade a token "
+                    f"Robinhood does not call active"
                 )
-            registry[asset["tokenSymbol"]] = {
+                continue
+            try:
+                multiplier = _multiplier(asset)
+            except SwapError as exc:
+                excluded[symbol] = str(exc)
+                continue
+            tokens[symbol] = {
                 "address": to_checksum_address(deployment["contractAddress"]),
                 "name": asset.get("tokenName", ""),
-                "multiplier": _multiplier(asset),
+                "multiplier": multiplier,
                 "pending_multiplier": asset.get("pendingMultiplier", ""),
                 "status": asset.get("status", ""),
             }
-    if not registry:
+    if not tokens and not excluded:
         raise SwapError(f"no stock tokens for chain {CHAIN_ID} in {ASSETS_URL}")
-    return registry
+    return AssetBook(tokens, excluded)
+
+
+def asset_registry() -> dict[str, dict[str, t.Any]]:
+    """Return the tickers this skill will trade, keyed by symbol."""
+    return asset_book().tokens
+
+
+def lookup(symbol: str) -> dict[str, t.Any]:
+    """One ticker's registry entry.
+
+    Raises:
+        SwapError: when the ticker is not listed on this chain, or is listed
+            but was excluded — the reason it was excluded is the refusal.
+    """
+    book = asset_book()
+    entry = book.tokens.get(symbol)
+    if entry is not None:
+        return entry
+    if symbol in book.excluded:
+        raise SwapError(f"{symbol} is not tradable: {book.excluded[symbol]}")
+    raise SwapError(f"unknown ticker {symbol}; {len(book.tokens)} are listed")
 
 
 def reference_price(symbol: str, multiplier: str) -> tuple[float, float, bool]:

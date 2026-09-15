@@ -36,6 +36,7 @@ our swaps as theirs would be a lie, so parity is asserted up to that suffix.
 import argparse
 import json
 import sys
+import time
 import typing as t
 from decimal import Decimal
 from pathlib import Path
@@ -386,7 +387,7 @@ def test_deployment_refuses_an_unknown_chain() -> None:
 
 
 def _typed_permit(details: permit.PermitDetails, spender: str, deadline: int) -> dict:
-    """The same PermitSingle, spelled for an independent EIP-712 encoder."""
+    """Spell the same PermitSingle for an independent EIP-712 encoder."""
     return {
         "types": {
             "EIP712Domain": [
@@ -496,15 +497,15 @@ class _StubW3:
 
 @pytest.fixture(autouse=True)
 def _fresh_registry() -> t.Iterator[None]:
-    """The registry is cached per process; tests must not inherit each other's."""
-    stocktokens.asset_registry.cache_clear()
+    """Clear the per-process registry cache; tests must not inherit each other's."""
+    stocktokens.asset_book.cache_clear()
     yield
-    stocktokens.asset_registry.cache_clear()
+    stocktokens.asset_book.cache_clear()
 
 
 @pytest.fixture(name="traded")
-def _traded(monkeypatch: pytest.MonkeyPatch) -> dict:
-    """A ticker, a pool and a Robinhood price, with no network anywhere."""
+def traded_fixture(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Stage a ticker, a pool and a Robinhood price, with no network anywhere."""
     state = {
         "bid": 249.9,
         "ask": 250.0,
@@ -513,16 +514,19 @@ def _traded(monkeypatch: pytest.MonkeyPatch) -> dict:
     }
     monkeypatch.setattr(
         swap.stocktokens,
-        "asset_registry",
-        lambda: {
-            "NVDA": {
-                "address": NVDA,
-                "multiplier": "1.0",
-                "pending_multiplier": "",
-                "name": "",
-                "status": "",
-            }
-        },
+        "asset_book",
+        lambda: stocktokens.AssetBook(
+            {
+                "NVDA": {
+                    "address": NVDA,
+                    "multiplier": "1.0",
+                    "pending_multiplier": "",
+                    "name": "",
+                    "status": "",
+                }
+            },
+            {},
+        ),
     )
     monkeypatch.setattr(
         swap.stocktokens,
@@ -600,11 +604,17 @@ def test_plan_swap_folds_the_permit_when_a_signer_is_present(
         chain_id: int,
         permit2: str,
         spender: str,
+        expiry: int,
     ) -> bytes:
         """Record what the fold path asks to be signed."""
         del w3, signer, chain_id
         seen.update(
-            owner=owner, token=token, amount=amount, permit2=permit2, spender=spender
+            owner=owner,
+            token=token,
+            amount=amount,
+            permit2=permit2,
+            spender=spender,
+            expiry=expiry,
         )
         return _PERMIT_ACTION
 
@@ -697,6 +707,7 @@ def _signed(w3: object, signer: object) -> bytes:
         CHAIN_ID,
         uniswap.DEPLOYMENTS[CHAIN_ID]["permit2"],
         uniswap.DEPLOYMENTS[CHAIN_ID]["universal_router"],
+        1789473930,
     )
 
 
@@ -806,7 +817,7 @@ def test_quote_pool_scores_a_revert_zero_but_lets_transport_errors_through(
 
 
 @pytest.fixture(name="cache_file")
-def _cache_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def cache_file_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the discovery cache at a throwaway file."""
     path = tmp_path / "stocktokens.pools.json"
     monkeypatch.setattr(pools, "CACHE_FILE", path)
@@ -872,6 +883,54 @@ def test_cached_discover_survives_a_corrupt_cache(
     cache_file.write_text("{not json", encoding="utf-8")
     monkeypatch.setattr(pools, "discover", lambda *a, **k: [V3_POOL])
     assert pools.cached_discover(_BlockW3(), NVDA, "USDG") == [V3_POOL]
+
+
+def _forged(cache_file: Path, pool: dict) -> None:
+    """Write one pool straight into the cache, as an attacker with the cwd would."""
+    cache_file.write_text(
+        json.dumps(
+            {f"{NVDA}:USDG": {"fetched_at": time.time(), "block": 1, "pools": [pool]}}
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_a_cached_v3_pool_with_an_off_tier_fee_is_refused(cache_file: Path) -> None:
+    """A forged fee routes the trade through a pool the operator never picked."""
+    _forged(cache_file, {**V3_POOL, "fee": 1234})
+    with pytest.raises(evm.SwapError, match="cached v3 pool has fee"):
+        pools.cached_discover(_BlockW3(), NVDA, "USDG")
+
+
+def test_a_cached_v4_pool_with_an_off_tier_is_refused(cache_file: Path) -> None:
+    """A tier is a pair; neither half is the caller's to invent."""
+    _forged(cache_file, {**V4_POOL, "tick_spacing": 7})
+    with pytest.raises(evm.SwapError, match="cached v4 pool has tier"):
+        pools.cached_discover(_BlockW3(), NVDA, "USDG")
+
+
+def test_a_cached_v4_pool_with_hooks_is_refused(cache_file: Path) -> None:
+    """Discovery only ever writes hook-less pools."""
+    _forged(cache_file, {**V4_POOL, "hooks": NVDA})
+    with pytest.raises(evm.SwapError, match="carries hooks"):
+        pools.cached_discover(_BlockW3(), NVDA, "USDG")
+
+
+def test_a_cached_v4_pool_id_must_match_its_own_poolkey(cache_file: Path) -> None:
+    """The stored id is re-derived, never trusted."""
+    _forged(cache_file, {**V4_POOL, "pool_id": "0x" + "11" * 32})
+    with pytest.raises(evm.SwapError, match="is not the id its own PoolKey derives"):
+        pools.cached_discover(_BlockW3(), NVDA, "USDG")
+
+
+def test_a_cached_v4_pool_that_derives_its_own_id_is_served(cache_file: Path) -> None:
+    """The honest entry discovery wrote must still survive the check."""
+    real = uniswap.v4_pool_id(NVDA, USDG, 100, 1, uniswap.NO_HOOKS)
+    _forged(cache_file, {**V4_POOL, "pool_id": "0x" + real.hex()})
+    served = t.cast(
+        list[uniswap.PoolV4], pools.cached_discover(_BlockW3(), NVDA, "USDG")
+    )
+    assert served[0]["pool_id"] == "0x" + real.hex()
 
 
 def test_discover_orders_priced_pools_before_the_singleton(
@@ -998,7 +1057,7 @@ class _FakeSigner:
         return "0x" + "cd" * 65
 
     def chain_info(self, _chain: str) -> dict:
-        """The wallet entry the skill reads the safe from."""
+        """Return the wallet entry the skill reads the safe from."""
         return {"safe": self._safe, "rpc": "http://localhost"}
 
     def send_transaction(self, tx: dict) -> str:
@@ -1016,6 +1075,12 @@ class _ReceiptW3:
         self.status = status
         self.waited: list[str] = []
 
+    def call(self, tx: dict) -> bytes:
+        """Permit2 gets the allowance tuple; anything else gets the domain."""
+        if tx["to"] == uniswap.DEPLOYMENTS[CHAIN_ID]["permit2"]:
+            return (0).to_bytes(96, "big")
+        return b"\x11" * 32
+
     def wait_for_transaction_receipt(
         self, tx_hash: str, timeout: float, poll_latency: float = 0.1
     ) -> dict:
@@ -1026,7 +1091,7 @@ class _ReceiptW3:
 
 
 def _plan_args(**over: object) -> argparse.Namespace:
-    """A namespace shaped like the one argparse produces for buy."""
+    """Build a namespace shaped like the one argparse produces for buy."""
     base = {
         "symbol": "NVDA",
         "usdg": 1_000.0,
@@ -1034,7 +1099,7 @@ def _plan_args(**over: object) -> argparse.Namespace:
         "dry_run": False,
         "refresh": False,
         "max_gap_bps": stocktokens.MAX_PRICE_GAP_BPS,
-        "separate_approvals": True,
+        "separate_approvals": False,
     }
     base.update(over)
     return argparse.Namespace(**base)
@@ -1045,7 +1110,7 @@ def test_dry_run_sends_nothing(traded: dict, monkeypatch: pytest.MonkeyPatch) ->
     del traded
     signer = _FakeSigner()
     w3 = _ReceiptW3()
-    monkeypatch.setattr(swap, "connect", lambda _chain: (w3, signer))
+    monkeypatch.setattr(evm, "connect", lambda _chain: (w3, signer))
     monkeypatch.setattr(
         swap.evm, "token_decimals", lambda _w3, token: 6 if token == USDG else 18
     )
@@ -1058,21 +1123,67 @@ def test_dry_run_sends_nothing(traded: dict, monkeypatch: pytest.MonkeyPatch) ->
 def test_a_real_run_confirms_every_call_and_pays_the_safe(
     traded: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each call is sent, waited on, and the tokens are bought for the safe."""
+    """The default path: two calls, the permit folded into the swap itself."""
     del traded
     signer = _FakeSigner()
     w3 = _ReceiptW3()
-    monkeypatch.setattr(swap, "connect", lambda _chain: (w3, signer))
+    monkeypatch.setattr(evm, "connect", lambda _chain: (w3, signer))
     monkeypatch.setattr(
         swap.evm, "token_decimals", lambda _w3, token: 6 if token == USDG else 18
     )
     assert swap._cmd_buy(_plan_args()) == 0  # pylint: disable=protected-access
-    assert len(signer.sent) == 3
-    assert len(w3.waited) == 3
+    assert len(signer.sent) == 2
+    assert len(w3.waited) == 2
+    swap_data = signer.sent[-1]["data"]
+    assert uniswap.permit_action_in(swap_data) is not None
     recipient = uniswap._decode_execute(  # pylint: disable=protected-access
-        signer.sent[-1]["data"], V3_POOL
+        swap_data, V3_POOL
     )[2]
     assert to_checksum_address(recipient) == SAFE
+
+
+def test_separate_approvals_sends_three_calls_and_folds_nothing(
+    traded: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback for a signer that will not sign a permit digest."""
+    del traded
+    signer = _FakeSigner()
+    w3 = _ReceiptW3()
+    monkeypatch.setattr(evm, "connect", lambda _chain: (w3, signer))
+    monkeypatch.setattr(
+        swap.evm, "token_decimals", lambda _w3, token: 6 if token == USDG else 18
+    )
+    args = _plan_args(separate_approvals=True)
+    assert swap._cmd_buy(args) == 0  # pylint: disable=protected-access
+    assert len(signer.sent) == 3
+    assert uniswap.permit_action_in(signer.sent[-1]["data"]) is None
+
+
+def test_a_dry_run_previews_the_calls_a_real_run_would_send(
+    traded: dict, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A preview of a different transaction is worse than no preview.
+
+    The operator signs off on what this prints, so it must be the folded
+    two-call shape a real run broadcasts, not the separate-approvals fallback.
+    """
+    del traded
+    signer = _FakeSigner()
+    monkeypatch.setattr(evm, "connect", lambda _chain: (_ReceiptW3(), signer))
+    monkeypatch.setattr(
+        swap.evm, "token_decimals", lambda _w3, token: 6 if token == USDG else 18
+    )
+    assert (
+        swap._cmd_buy(_plan_args(dry_run=True)) == 0
+    )  # pylint: disable=protected-access
+    printed = capsys.readouterr().out
+    assert signer.sent == []
+    assert '"permit": "signed into the swap"' in printed
+    previewed = [line for line in printed.splitlines() if line.startswith("dry-run ")]
+    assert [line.split(":")[0] for line in previewed] == [
+        "dry-run approve Permit2",
+        "dry-run swap",
+    ]
 
 
 def test_a_reverted_call_stops_the_sequence_and_says_what_landed(
@@ -1082,7 +1193,7 @@ def test_a_reverted_call_stops_the_sequence_and_says_what_landed(
     del traded
     signer = _FakeSigner()
     w3 = _ReceiptW3(status=0)
-    monkeypatch.setattr(swap, "connect", lambda _chain: (w3, signer))
+    monkeypatch.setattr(evm, "connect", lambda _chain: (w3, signer))
     monkeypatch.setattr(
         swap.evm, "token_decimals", lambda _w3, token: 6 if token == USDG else 18
     )
@@ -1094,7 +1205,7 @@ def test_a_reverted_call_stops_the_sequence_and_says_what_landed(
 def _quote_payload(
     bid: str = "212.23", ask: str = "212.34", halt: bool = False
 ) -> dict:
-    """A Robinhood price payload shaped like the live endpoint's."""
+    """Build a Robinhood price payload shaped like the live endpoint's."""
     return {"quotes": [{"bid": bid, "ask": ask, "isTradingHalt": halt}]}
 
 
@@ -1130,7 +1241,7 @@ def test_reference_price_refuses_an_unusable_quote(
 
 
 def _assets_payload(*entries: dict) -> dict:
-    """A registry payload shaped like /rhj/assets."""
+    """Build a registry payload shaped like /rhj/assets."""
     return {"assets": list(entries)}
 
 
@@ -1157,27 +1268,63 @@ def test_asset_registry_keeps_only_this_chain(monkeypatch: pytest.MonkeyPatch) -
     assert sorted(registry) == ["NVDA"]
 
 
-def test_asset_registry_refuses_a_missing_multiplier(
+def test_a_missing_multiplier_excludes_only_that_ticker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Defaulting the multiplier to 1 would misprice every comparison."""
-    broken = _asset()
+    broken = _asset("TSLA")
     del broken["currentMultiplier"]
-    monkeypatch.setattr(stocktokens, "get_json", lambda _url: _assets_payload(broken))
+    monkeypatch.setattr(
+        stocktokens, "get_json", lambda _url: _assets_payload(_asset("NVDA"), broken)
+    )
+    assert sorted(stocktokens.asset_registry()) == ["NVDA"]
     with pytest.raises(evm.SwapError, match="no usable currentMultiplier"):
-        stocktokens.asset_registry()
+        stocktokens.lookup("TSLA")
 
 
-def test_asset_registry_refuses_a_duplicate_ticker(
+def test_a_duplicate_ticker_excludes_only_that_ticker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Last-one-wins would silently pick a contract nobody chose."""
     monkeypatch.setattr(
         stocktokens,
         "get_json",
-        lambda _url: _assets_payload(_asset("NVDA"), _asset("NVDA")),
+        lambda _url: _assets_payload(_asset("NVDA"), _asset("TSLA"), _asset("NVDA")),
     )
+    assert sorted(stocktokens.asset_registry()) == ["TSLA"]
     with pytest.raises(evm.SwapError, match="listed twice"):
+        stocktokens.lookup("NVDA")
+
+
+def test_a_suspended_ticker_excludes_only_that_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One delisted token must not take the other two hundred down with it."""
+    halted = _asset("TSLA")
+    halted["status"] = "ASSET_STATUS_SUSPENDED"
+    monkeypatch.setattr(
+        stocktokens, "get_json", lambda _url: _assets_payload(_asset("NVDA"), halted)
+    )
+    assert sorted(stocktokens.asset_registry()) == ["NVDA"]
+    with pytest.raises(evm.SwapError, match="ASSET_STATUS_SUSPENDED"):
+        stocktokens.lookup("TSLA")
+
+
+def test_lookup_names_an_unknown_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ticker nobody lists is a refusal, not a KeyError."""
+    monkeypatch.setattr(
+        stocktokens, "get_json", lambda _url: _assets_payload(_asset("NVDA"))
+    )
+    with pytest.raises(evm.SwapError, match="unknown ticker FOO"):
+        stocktokens.lookup("FOO")
+
+
+def test_an_empty_chain_still_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing listed at all is a broken feed, not an empty market."""
+    monkeypatch.setattr(
+        stocktokens, "get_json", lambda _url: _assets_payload(_asset("NVDA", chain=1))
+    )
+    with pytest.raises(evm.SwapError, match="no stock tokens for chain"):
         stocktokens.asset_registry()
 
 
@@ -1227,7 +1374,7 @@ def test_token_decimals_refuses_an_implausible_answer(
 
 
 def test_call_int_refuses_an_empty_return() -> None:
-    """ "The node said nothing" is not "the contract said zero"."""
+    """Treat an empty return as unknown, not as a contract saying zero."""
 
     class _W3:
         """Web3 stub answering nothing."""
@@ -1352,15 +1499,14 @@ def test_verify_action_checks_the_token() -> None:
         permit.verify_action(action, NVDA, spender, 1_000)
 
 
-def test_approvals_carry_the_short_expiry() -> None:
-    """The fifteen-minute window is a safety property, so pin it."""
-    now = 1789473030
-    _erc20, permit2 = swap.approval_calls(USDG, 1_000, now + permit.APPROVAL_EXPIRY_S)
+def test_approvals_carry_the_expiry_they_were_given() -> None:
+    """The allowance window is a safety property, so pin it."""
+    expiry = 1789473930
+    _erc20, permit2 = swap.approval_calls(USDG, 1_000, expiry)
     decoded = abi_decode(
         ["address", "address", "uint160", "uint48"], bytes.fromhex(permit2["data"][10:])
     )
-    assert permit.APPROVAL_EXPIRY_S == 900
-    assert decoded[3] == now + 900
+    assert decoded[3] == expiry
 
 
 def test_cached_discover_returns_the_cached_pools_on_a_hit(
@@ -1450,7 +1596,7 @@ def test_sell_sizes_the_amount_in_the_token_being_sold(
     """--shares is denominated in the stock token's 18 decimals, not USDG's 6."""
     traded["quoted"] = int(5 * 249.9 * 10**6)
     signer = _FakeSigner()
-    monkeypatch.setattr(swap, "connect", lambda _chain: (_ReceiptW3(), signer))
+    monkeypatch.setattr(evm, "connect", lambda _chain: (_ReceiptW3(), signer))
     monkeypatch.setattr(
         swap.evm, "token_decimals", lambda _w3, token: 6 if token == USDG else 18
     )
@@ -1459,11 +1605,8 @@ def test_sell_sizes_the_amount_in_the_token_being_sold(
     assert signer.sent == []
 
 
-def test_signed_permit_carries_the_signature_and_a_short_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The signature must reach the action, and the window stays fifteen minutes."""
-    monkeypatch.setattr(permit.time, "time", lambda: 1_789_473_030.0)
+def test_signed_permit_carries_the_signature_and_the_window_it_was_given() -> None:
+    """The allowance must not lapse before the swap it authorises can land."""
 
     class _Signer:
         """Signer stub."""
@@ -1477,5 +1620,5 @@ def test_signed_permit_carries_the_signature_and_a_short_window(
     single, signature = abi_decode([permit.PERMIT_SINGLE_ABI, "bytes"], action)
     (_token, _amount, expiration, _nonce), _spender, sig_deadline = single
     assert signature == bytes.fromhex("ab" * 65)
-    assert expiration == 1_789_473_030 + 900
-    assert sig_deadline == 1_789_473_030 + 900
+    assert expiration == 1789473930
+    assert sig_deadline == 1789473930

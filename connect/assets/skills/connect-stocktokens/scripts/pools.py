@@ -42,8 +42,6 @@ import _bootstrap  # noqa: F401  pylint: disable=unused-import  # isort: split
 import evm  # noqa: E402  pylint: disable=wrong-import-position
 import stocktokens  # noqa: E402  pylint: disable=wrong-import-position
 import uniswap  # noqa: E402  pylint: disable=wrong-import-position
-from evm import SwapError  # noqa: E402  pylint: disable=wrong-import-position
-from evm import connect  # noqa: E402  pylint: disable=wrong-import-position
 
 CACHE_FILE = Path("stocktokens.pools.json")
 CACHE_MAX_AGE_S = 3600.0
@@ -69,39 +67,61 @@ def discover(w3: Web3, token: str, quote_name: str = "USDG") -> list[uniswap.Poo
     return found
 
 
-def _validated(raw: t.Any, quote_name: str) -> list[uniswap.Pool]:
+def _validated(raw: t.Any, token: str, quote_name: str) -> list[uniswap.Pool]:
     """Pools read back from disk, checked before they can reach the router.
 
     The cache is a plain file in the agent's cwd, so an entry is untrusted
-    input: a forged ``hooks`` address would otherwise be encoded into a v4
-    PoolKey and pass verification, which compares the calldata against this
-    same entry.
+    input, and ``verify_execute`` cannot be what validates it: that compares
+    the calldata against this same entry. Every field discovery would have
+    chosen is therefore re-derived or re-checked here — the fee tier as much
+    as the hooks, since a forged tier routes the trade through a pool the
+    operator never picked.
 
     Raises:
         SwapError: when an entry is not a pool discovery wrote.
     """
     if not isinstance(raw, list):
-        raise SwapError(f"cached pools are {type(raw).__name__}, expected a list")
+        raise evm.SwapError(f"cached pools are {type(raw).__name__}, expected a list")
     quote = stocktokens.QUOTE_ASSETS[quote_name]
     for pool in raw:
         version = pool.get("version") if isinstance(pool, dict) else None
         if version not in uniswap.SWAP_COMMANDS:
-            raise SwapError(f"cached pool has version {version!r}")
+            raise evm.SwapError(f"cached pool has version {version!r}")
         if pool.get("quote_address") != quote or pool.get("quote") != quote_name:
-            raise SwapError(f"cached {version} pool is not quoted in {quote_name}")
-        if version == "v4" and pool.get("hooks") != uniswap.NO_HOOKS:
-            raise SwapError(
-                f"cached v4 pool carries hooks {pool.get('hooks')!r}; discovery "
-                f"only ever writes hook-less pools"
+            raise evm.SwapError(f"cached {version} pool is not quoted in {quote_name}")
+        if version == "v3" and pool.get("fee") not in uniswap.V3_FEES:
+            raise evm.SwapError(
+                f"cached v3 pool has fee {pool.get('fee')!r}; discovery only "
+                f"ever writes {uniswap.V3_FEES}"
             )
+        if version == "v4":
+            tier = (pool.get("fee"), pool.get("tick_spacing"))
+            if tier not in uniswap.V4_TIERS:
+                raise evm.SwapError(
+                    f"cached v4 pool has tier {tier!r}; discovery only ever "
+                    f"writes {uniswap.V4_TIERS}"
+                )
+            if pool.get("hooks") != uniswap.NO_HOOKS:
+                raise evm.SwapError(
+                    f"cached v4 pool carries hooks {pool.get('hooks')!r}; discovery "
+                    f"only ever writes hook-less pools"
+                )
+            derived = uniswap.v4_pool_id(
+                token, quote, tier[0], tier[1], uniswap.NO_HOOKS
+            )
+            if pool.get("pool_id") != "0x" + derived.hex():
+                raise evm.SwapError(
+                    f"cached v4 pool_id {pool.get('pool_id')!r} is not the id its "
+                    f"own PoolKey derives"
+                )
         if version != "v4" and not pool.get("address"):
-            raise SwapError(f"cached {version} pool has no address")
+            raise evm.SwapError(f"cached {version} pool has no address")
     pools: list[uniswap.Pool] = raw
     return pools
 
 
 def _load_cache() -> dict[str, t.Any]:
-    """Cached discovery, or an empty book when there is none or it is corrupt."""
+    """Read cached discovery, or an empty book when there is none or it is corrupt."""
     if not CACHE_FILE.exists():
         return {}
     try:
@@ -129,7 +149,7 @@ def cached_discover(
     if not refresh and isinstance(entry, dict):
         age = time.time() - float(entry.get("fetched_at", 0.0))
         if 0 <= age < CACHE_MAX_AGE_S:
-            return _validated(entry.get("pools"), quote_name)
+            return _validated(entry.get("pools"), token, quote_name)
     pools = discover(w3, token, quote_name)
     cache[key] = {
         "fetched_at": time.time(),
@@ -142,12 +162,8 @@ def cached_discover(
 
 def _cmd_list(args: argparse.Namespace) -> int:
     """Print every candidate pool for one ticker."""
-    registry = stocktokens.asset_registry()
-    if args.symbol not in registry:
-        print(f"unknown ticker {args.symbol}; {len(registry)} are listed")
-        return 1
-    asset = registry[args.symbol]
-    w3, _ = connect(stocktokens.CHAIN)
+    asset = stocktokens.lookup(args.symbol)
+    w3, _ = evm.connect(stocktokens.CHAIN)
     print(
         json.dumps(
             {
@@ -169,7 +185,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 def _cmd_census(args: argparse.Namespace) -> int:
     """Walk the registry and report where liquidity actually sits."""
     registry = stocktokens.asset_registry()
-    w3, _ = connect(stocktokens.CHAIN)
+    w3, _ = evm.connect(stocktokens.CHAIN)
     rows = []
     for symbol, asset in list(registry.items())[: args.limit]:
         found = cached_discover(w3, asset["address"], args.quote, args.refresh)
@@ -202,7 +218,11 @@ def main() -> int:
     census.add_argument("--limit", type=int, default=25)
     census.set_defaults(func=_cmd_census)
     args = parser.parse_args()
-    result: int = args.func(args)
+    try:
+        result: int = args.func(args)
+    except evm.SwapError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
     return result
 
 

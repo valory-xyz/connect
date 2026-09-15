@@ -24,7 +24,6 @@ itself: the owner signs ``SafeMessage(abi.encode(permit2Digest))`` under the
 safe's own domain. Sign the raw digest and Permit2 rejects it.
 """
 
-import time
 import typing as t
 
 from eth_abi import decode as abi_decode
@@ -53,8 +52,6 @@ PERMIT_SINGLE_ABI = "((address,uint160,uint48,uint48),address,uint256)"
 SEL_ALLOWANCE = selector("allowance(address,address,address)")
 SEL_DOMAIN_SEPARATOR = selector("domainSeparator()")
 SEL_APPROVE = selector("approve(address,address,uint160,uint48)")
-APPROVAL_EXPIRY_S = 900
-SIGNATURE_DEADLINE_S = 900
 
 
 class PermitDetails(t.NamedTuple):
@@ -118,7 +115,7 @@ def permit_single_digest(
 
 
 def safe_message_digest(domain_separator: bytes, digest: bytes) -> bytes:
-    """What a safe owner must actually sign for the safe to accept a digest."""
+    """Derive what a safe owner must actually sign for the safe to accept a digest."""
     message_hash = keccak(
         abi_encode(
             ["bytes32", "bytes32"],
@@ -200,21 +197,24 @@ def signed_action(  # pylint: disable=too-many-arguments,too-many-positional-arg
     chain_id: int,
     permit2: str,
     spender: str,
+    expiry: int,
 ) -> bytes:
-    """A Permit2 allowance the router carries itself, signed by the owner safe.
+    """Build a Permit2 allowance the router carries itself, signed by the owner safe.
+
+    ``expiry`` bounds both the allowance and the window the signature may be
+    submitted in, so the caller sets them from the same budget it gives the
+    swap's own deadline: an allowance that lapses first would revert a swap
+    the router would still have accepted.
 
     Raises:
         SwapError: when the owner is not a safe, or the signer refuses.
     """
-    now = int(time.time())
     raw = bytes(
         w3.eth.call({"to": permit2, "data": allowance_call(owner, token, spender)})
     )
     _, _, nonce = decode_allowance(raw)
-    details = PermitDetails(
-        token=token, amount=amount, expiration=now + APPROVAL_EXPIRY_S, nonce=nonce
-    )
-    sig_deadline = now + SIGNATURE_DEADLINE_S
+    details = PermitDetails(token=token, amount=amount, expiration=expiry, nonce=nonce)
+    sig_deadline = expiry
     digest = permit_single_digest(chain_id, permit2, details, spender, sig_deadline)
     domain_separator = bytes(w3.eth.call({"to": owner, "data": SEL_DOMAIN_SEPARATOR}))
     if len(domain_separator) != 32:

@@ -9,7 +9,7 @@ Robinhood Chain (chain id 4663) carries many **Stock Tokens**: ERC-20s, 18
 decimals, issued by Robinhood Assets (Jersey) Ltd, each tracking one US
 equity or ETF. They trade 24/7 against **USDG** (Paxos, **6 decimals**) in
 ordinary Uniswap pools. No account, no API key, no order book — a swap is
-three contract calls the service safe makes.
+two contract calls the service safe makes.
 
 ## Step zero — before researching anything
 
@@ -35,8 +35,9 @@ USDG in safe --approve--> Permit2 --approve--> UniversalRouter --execute--> Stoc
    swap as a signed permit rather than costing its own transaction.
 4. `swap.py sell --symbol NVDA --shares 4.7` — the same in reverse.
 
-Add `--dry-run` to print the calls without sending them. Every command takes
-`--refresh` to bypass the hour-long pool cache.
+Add `--dry-run` to print the calls without sending them — it builds exactly
+what a real run would send, permit included, so what it prints is what would
+broadcast. Every command takes `--refresh` to bypass the hour-long pool cache.
 
 **If the signer refuses to sign the permit**, rerun with
 `--separate-approvals`: the allowance then goes on-chain as its own
@@ -77,7 +78,9 @@ floor. Both are the operator's call, not yours: if a trade is refused, report
 the refusal rather than widening the guard that produced it. Every plan records
 the values it ran under.
 
-A halted ticker (`isTradingHalt`) is refused outright.
+A halted ticker (`isTradingHalt`) is refused outright. So is a ticker
+Robinhood no longer lists as active, or lists twice — that one ticker is
+refused with the reason, and every other ticker still trades.
 
 ## Routing, and what it does not do
 
@@ -106,10 +109,11 @@ and `evm.py` (the signer's web3, calls, decimals, ERC-20).
 
 ## Money safety
 
-Approvals are for **this trade's exact amount**. The Permit2 allowance also
-expires in fifteen minutes; the ERC-20 approval to Permit2 that precedes it
-does not expire, so a swap that fails after it lands leaves that allowance
-standing — say so when you report a failure. Never widen either.
+Approvals are for **this trade's exact amount**. The Permit2 allowance
+expires with the swap's own deadline, so it cannot lapse while the swap is
+still sendable; the ERC-20 approval to Permit2 that precedes it does not
+expire, so a swap that fails after it lands leaves that allowance standing —
+say so when you report a failure. Never widen either.
 The amount is known before the call is built, so there is no reason to ask for more.
 
 The signed permit is an EIP-712 message the safe authorises through ERC-1271.
