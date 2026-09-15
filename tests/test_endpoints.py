@@ -55,12 +55,14 @@ def client(
 def _complete_bundle(assets: Path) -> None:
     """Give a fake bundle what the workspace provisions from.
 
-    A bundle is not only a UI: without CLAUDE.md and the skills the workspace
+    A bundle is not only a UI: without CLAUDE.md, the skills and the shared
+    library the workspace
     cannot be provisioned, and the server would report itself unhealthy — which
     is exactly what these tests must NOT be measuring.
     """
     (assets / "CLAUDE.md").write_text("brief")
     (assets / "skills").mkdir(exist_ok=True)
+    (assets / "lib").mkdir(exist_ok=True)
 
 
 def auth(extra: dict | None = None) -> dict:

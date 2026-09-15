@@ -12,7 +12,10 @@ other non-aea agent. It:
    process;
 2. populates the service's persistent workspace (`STORE_PATH`) with a
    `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
-   the agent session, and the bundled `connect` skill;
+   the agent session, the bundled skills (`pearl-connect` for signing,
+   `connect-polymarket` for prediction markets, `connect-stocktokens` for
+   Robinhood Chain Stock Tokens) and the shared modules they import, installed
+   to `.claude/lib/`;
 3. serves on `127.0.0.1:8716`:
    - Pearl SDK contracts: `GET /healthcheck` and `GET /funds-status`.
      `is_healthy` turns true only once the workspace is populated — Pearl

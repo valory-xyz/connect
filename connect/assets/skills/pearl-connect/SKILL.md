@@ -83,7 +83,7 @@ composing a prompt:
   retrying first. Such a request is refused up front, not part-way through.
 
 - `legacy_on_chain=false` (default): no transaction; it signs a request
-  digest and spends prepaid balance held by the mech BalanceTracker. With
+  digest and draws on prepaid balance held by the mech BalanceTracker. With
   `auto_deposit=true` (the default) an insufficient balance is topped up from
   the safe once and the request retried.
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace

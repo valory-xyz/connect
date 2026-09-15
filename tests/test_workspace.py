@@ -99,6 +99,19 @@ def test_a_second_run_rotates_the_token(store_path: Path) -> None:
     assert mcp_entry(store_path)["headers"]["Authorization"] == "Bearer tok-2"
 
 
+def test_lib_installed_and_overwritten(store_path: Path) -> None:
+    """The shared modules land in .claude/lib and are refreshed every boot."""
+    provisioned(store_path)
+    module = store_path / ".claude" / "lib" / "uniswap.py"
+    assert module.exists()
+    module.write_text("tampered", encoding="utf-8")
+    stale = module.parent / "stale.py"
+    stale.write_text("old")
+    provisioned(store_path)
+    assert "tampered" not in module.read_text(encoding="utf-8")
+    assert not stale.exists()
+
+
 def test_skills_installed_and_overwritten(store_path: Path) -> None:
     """Test skills installed and overwritten."""
     provisioned(store_path)

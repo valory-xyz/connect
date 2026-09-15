@@ -69,6 +69,7 @@ MCP_TOOL_TIMEOUT_MS = 2_100_000
 UI_SUBDIR = "ui"
 UI_INDEX = "index.html"
 SKILLS_SUBDIR = Path(".claude") / "skills"
+LIB_SUBDIR = Path(".claude") / "lib"
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harness itself reads .mcp.json; the model never needs to, and reading
 # it would put the bearer token into the session transcript
@@ -323,6 +324,7 @@ class Workspace:
         self._write_claude_settings()
         self._install_claude_md()
         self._install_skills()
+        self._install_lib()
 
     def _install_claude_md(self) -> None:
         """Overwrite CLAUDE.md (the agent's identity/context brief) from assets.
@@ -402,6 +404,14 @@ class Workspace:
                 deny.append(rule)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    def _install_lib(self) -> None:
+        """Overwrite the shared modules our skills import from .claude/lib."""
+        source = assets_dir() / "lib"
+        target = self.path / LIB_SUBDIR
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__"))
 
     def _install_skills(self) -> None:
         """Overwrite our skills from the bundle; user files elsewhere are untouched."""
