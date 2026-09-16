@@ -708,7 +708,6 @@ def test_plan_swap_rejects_a_permit_for_the_wrong_amount(
         )
 
 
-
 class _SigningW3:
     """A web3 that answers the two reads signed_action makes."""
 
