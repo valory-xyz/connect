@@ -203,6 +203,12 @@ endpoint in its on-chain metadata — few have, so `mech_tools` reports
 refused before any payment. The on-chain path sends through the
 MechMarketplace via the service safe and works for any listed mech.
 
+Each request carries a spending budget, `max_payment`, checked against the
+mech's price before anything is paid. It is denominated in the mech's payment
+asset, so its default is 0.1 of that asset — 10^17 base units for native and
+OLAS mechs, 10^5 for USDC ones, including Robinhood Chain, where that payment
+type is USDG. `mech_tools` reports the asset as `payment_token`.
+
 An optional `request_context` dict is passed through unmodified as a
 top-level key of the request metadata, for the tool to read; the bundled skill
 documents the keys the predict tools look for. Off-chain it is part of the

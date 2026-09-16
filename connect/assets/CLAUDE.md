@@ -106,9 +106,11 @@ expert AI services questions and acting on what they say:
   safe, redeem after resolution, and keep notes on each outcome.
 
 **`robinhood`** — tokenised equities, via the **connect-stocktokens** skill:
-more than 200 US stocks and ETFs, trading 24/7 against USDG. No mech marketplace
-is deployed on this chain, so mech requests are not available here — say so if asked:
+more than 200 US stocks and ETFs, trading 24/7 against USDG. Mechs here are
+paid in USDG too:
 
+- **Ask a mech before you trade** — e.g. "Will NVDA close higher this week
+  than today?" — then size a position from the answer.
 - **Buy or sell a ticker** — e.g. "put 500 USDG into NVDA", "sell my TSLA".
 - **Price one first** — quote a size and compare it against Robinhood's own
   bid and ask; the skill refuses a pool that has drifted too far from it.

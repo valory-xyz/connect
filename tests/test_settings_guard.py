@@ -44,6 +44,7 @@ from web3.datastructures import AttributeDict
 
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
+from connect import mech_budget
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -1574,7 +1575,7 @@ NATIVE_PAYMENT_TYPE = "ba699a34be8fe0e7725e93dcbce1701b0211a8ca61330aaeb8a05bf2e
 
 def native_mech_info(rate: int) -> tuple:
     """Canned _fetch_mech_info answer for a native-payment mech."""
-    return (SimpleNamespace(name="NATIVE", value=NATIVE_PAYMENT_TYPE), 42, rate)
+    return (PaymentType(NATIVE_PAYMENT_TYPE), 42, rate)
 
 
 class FakeMarketplaceService:
@@ -3254,6 +3255,8 @@ class TestMech:
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert info["mech"] == OTHER
         assert info["payment_type"] == "NATIVE"
+        assert info["payment_token"] == "native"
+        assert info["default_max_payment"] == str(10**17)
         assert info["service_id"] == 42
         assert info["tools"] == ["prediction-online"]
         # this mech published an endpoint, so nothing bars the default flow
@@ -3454,6 +3457,277 @@ class TestMech:
             max_payment=10**19,
         )
         assert len(patched_mech.calls) == 1
+
+    @pytest.mark.parametrize(
+        ("kind", "budget"),
+        [
+            (PaymentType.NATIVE, 10**17),
+            (PaymentType.NATIVE_NVM, 10**17),
+            (PaymentType.OLAS_TOKEN, 10**17),
+            (PaymentType.USDC_TOKEN, 10**5),
+            (PaymentType.TOKEN_NVM_USDC, 10**5),
+        ],
+    )
+    def test_every_payment_type_has_its_budget(
+        self,
+        kind: PaymentType,
+        budget: int,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """0.1 of the asset, pinned per type: a dropped key must fail here."""
+        assert set(mech_budget.DEFAULT_MAX_PAYMENT) == set(PaymentType)
+        patched_mech.mech_info = (kind, 42, budget + 1)
+        with pytest.raises(MechError, match=f"above max_payment={budget}"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        patched_mech.mech_info = (kind, 42, budget)
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert len(patched_mech.calls) == 1
+
+    @pytest.mark.parametrize(
+        ("kind", "chain", "token"),
+        [
+            (PaymentType.NATIVE, "gnosis", "native"),
+            (PaymentType.NATIVE_NVM, "atlantis", "native"),
+            (
+                PaymentType.USDC_TOKEN,
+                "robinhood",
+                "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+            ),
+            (
+                PaymentType.TOKEN_NVM_USDC,
+                "base",
+                "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            ),
+            (
+                PaymentType.OLAS_TOKEN,
+                "gnosis",
+                "0xcE11e14225575945b8E6Dc0D4F2dD4C570f79d9f",
+            ),
+            (PaymentType.USDC_TOKEN, "gnosis", None),
+            (PaymentType.OLAS_TOKEN, "robinhood", None),
+            (PaymentType.USDC_TOKEN, "atlantis", None),
+        ],
+    )
+    def test_payment_token_never_answers_an_unknown_with_an_empty_string(
+        self, kind: PaymentType, chain: str, token: t.Optional[str]
+    ) -> None:
+        """A known chain without the token and an unknown chain both say None."""
+        assert mech_budget.payment_token(kind, chain) == token
+
+    def test_the_report_keeps_its_keys_when_there_is_no_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing default is reported as None, never as a missing key."""
+        monkeypatch.delitem(mech_budget.DEFAULT_MAX_PAYMENT, PaymentType.OLAS_TOKEN)
+        gnosis_olas = "0xcE11e14225575945b8E6Dc0D4F2dD4C570f79d9f"
+        report = mech_budget.payment_report(PaymentType.OLAS_TOKEN, "gnosis")
+        assert report == dict(payment_token=gnosis_olas, default_max_payment=None)
+
+    def test_the_default_budget_follows_the_payment_asset(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """0.1 of a 6-decimal token is 10**5, not the native 10**17."""
+        usdc = PaymentType.USDC_TOKEN
+        patched_mech.mech_info = (usdc, 42, 10**5 + 1)
+        with pytest.raises(MechError, match="above max_payment=100000"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        patched_mech.mech_info = (usdc, 42, 10**5)
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert len(patched_mech.calls) == 1
+
+    def test_an_asset_with_no_default_budget_needs_an_explicit_one(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A payment type added upstream must not inherit someone else's units."""
+        monkeypatch.delitem(mech_budget.DEFAULT_MAX_PAYMENT, PaymentType.NATIVE)
+        with pytest.raises(MechError, match="no default budget"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        assert not patched_mech.calls
+        mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            max_payment=10**17,
+        )
+        assert len(patched_mech.calls) == 1
+
+    def test_tools_names_the_token_a_mech_is_paid_in(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """On Robinhood the USDC payment type is paid in USDG."""
+        # pylint: disable=protected-access
+        mech_service._config.chains["robinhood"] = ChainConfig(
+            rpc_url="http://127.0.0.1:9", safe_address=SAFE
+        )
+        patched_mech.mech_info = (
+            PaymentType.USDC_TOKEN,
+            1,
+            10000,
+        )
+        info = mech_service.tools(chain="robinhood", priority_mech=OTHER)
+        assert info["payment_type"] == "USDC_TOKEN"
+        assert info["payment_token"] == "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+        assert info["default_max_payment"] == "100000"
+        unknown_chain = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert unknown_chain["payment_token"] is None
+
+    @pytest.mark.parametrize("before", [None, "http://another-chain"])
+    def test_listing_never_touches_the_rpc_variable(
+        self,
+        before: t.Optional[str],
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only a request's own flow may move it; a listing merely reads it."""
+        if before is None:
+            monkeypatch.delenv("MECHX_CHAIN_RPC", raising=False)
+        else:
+            monkeypatch.setenv("MECHX_CHAIN_RPC", before)
+        seen: list[t.Optional[str]] = []
+
+        def _query(chain: str) -> list:
+            """Record what mech-client would read."""
+            seen.append(mech_module.os.environ.get("MECHX_CHAIN_RPC"))
+            return []
+
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
+        mech_service.tools(chain="testchain")
+        assert seen == [before]
+        assert mech_module.os.environ.get("MECHX_CHAIN_RPC") == before
+
+    def test_the_mismatch_warning_is_dropped_only_while_listing(
+        self,
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A stale RPC during a listing is noise; during construction it is a fault."""
+        warner = logging.getLogger(
+            "mech_client.mech_client.infrastructure.config.chain_config"
+        )
+
+        def _query(chain: str) -> list:
+            """Warn the way mech-client does when the variable names another chain."""
+            warner.warning("MECHX_CHAIN_RPC mismatch detected!\n  during listing")
+            warner.warning("an unrelated warning during listing")
+            return []
+
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
+        with caplog.at_level(logging.WARNING, logger=warner.name):
+            mech_service.tools(chain="testchain")
+            warner.warning("MECHX_CHAIN_RPC mismatch detected!\n  outside listing")
+        messages = [r.getMessage() for r in caplog.records if r.name == warner.name]
+        assert messages == [
+            "an unrelated warning during listing",
+            "MECHX_CHAIN_RPC mismatch detected!\n  outside listing",
+        ]
+
+    def test_a_slow_listing_holds_up_no_other_mech_work(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A subgraph query can run for minutes; requests and polls must not wait.
+
+        Both paths below go through _service and the pre-send pin, where the
+        RPC lock is taken, so a listing that held it would stall them.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "deliveries": {},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+
+        async def _watch(*_a: object) -> dict:
+            """Nothing delivered yet."""
+            return {}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        inside = threading.Event()
+        release = threading.Event()
+
+        def _stalled(chain: str) -> list:
+            """Hang like a slow subgraph until the test lets go."""
+            inside.set()
+            release.wait(120)
+            return []
+
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _stalled)
+        listing = threading.Thread(
+            target=mech_service.tools, kwargs={"chain": "testchain"}
+        )
+        listing.start()
+        try:
+            assert inside.wait(5)
+            outcome: dict[str, t.Any] = {}
+
+            def _work() -> None:
+                """Pay for a request, then poll it, while the listing hangs."""
+                try:
+                    outcome["sent"] = mech_service.request(
+                        "q",
+                        "t",
+                        chain="testchain",
+                        legacy_on_chain=True,
+                        priority_mech=OTHER,
+                    )
+                    outcome["polled"] = mech_service.result("ab")
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    outcome["error"] = exc
+
+            worker = threading.Thread(target=_work)
+            worker.start()
+            worker.join(60)
+            assert not worker.is_alive(), "mech work waited on the listing"
+            assert listing.is_alive()
+            assert "error" not in outcome, outcome.get("error")
+            assert outcome["sent"]["pending_request_ids"] == ["ab"]
+            assert outcome["polled"]["delivered"] is False
+        finally:
+            release.set()
+            listing.join(10)
+
+    def test_a_request_points_mech_client_at_its_own_chain(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An auto-deposit rebuilds a mech-client service mid-send and rereads it."""
+        seen: list[str] = []
+        original = patched_mech.send_request
+
+        async def _send(**kwargs: object) -> dict:
+            """Record the RPC visible while the request is in flight."""
+            seen.append(mech_module.os.environ["MECHX_CHAIN_RPC"])
+            return await original(**kwargs)
+
+        monkeypatch.setattr(patched_mech, "send_request", _send)
+        mech_service._service("testchain")  # pylint: disable=protected-access
+        monkeypatch.setenv("MECHX_CHAIN_RPC", "http://a-chain-listed-since")
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        # pylint: disable=protected-access
+        assert seen == [mech_service._config.chain("testchain").rpc_url]
 
     def test_request_wraps_pricing_failures(
         self,

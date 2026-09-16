@@ -37,7 +37,7 @@ from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.mech import DEFAULT_MAX_PAYMENT, DEFAULT_RESULT_TIMEOUT, MechService
+from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
 from connect.settings import SettingsStore
 from connect.signer import Signer
 
@@ -225,7 +225,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         priority_mech: str | None = None,
         auto_deposit: bool = True,
         timeout: float = 300,
-        max_payment: int = DEFAULT_MAX_PAYMENT,
+        max_payment: int | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
     ) -> dict:
@@ -236,7 +236,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         `offchain_capable` with mech_tools first; legacy_on_chain=true goes
         through the marketplace instead.
         Refused before paying if the mech's price exceeds max_payment
-        (base units of the mech's payment asset).
+        (base units of the mech's payment asset, default 0.1 of that asset;
+        mech_tools reports the asset as payment_token).
         On timeout the ids come back as `pending_request_ids` for mech_result.
         `request_id` is an id you invent before sending (not one of the
         `request_ids` that come back): repeating it never sends again — it
