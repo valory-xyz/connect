@@ -3667,7 +3667,7 @@ class TestMech:
         def _stalled(chain: str) -> list:
             """Hang like a slow subgraph until the test lets go."""
             inside.set()
-            release.wait(10)
+            release.wait(120)
             return []
 
         monkeypatch.setattr(mech_module, "query_mm_mechs_info", _stalled)
@@ -3677,25 +3677,28 @@ class TestMech:
         listing.start()
         try:
             assert inside.wait(5)
-            finished = threading.Event()
             outcome: dict[str, t.Any] = {}
 
             def _work() -> None:
                 """Pay for a request, then poll it, while the listing hangs."""
-                outcome["sent"] = mech_service.request(
-                    "q",
-                    "t",
-                    chain="testchain",
-                    legacy_on_chain=True,
-                    priority_mech=OTHER,
-                )
-                outcome["polled"] = mech_service.result("ab")
-                finished.set()
+                try:
+                    outcome["sent"] = mech_service.request(
+                        "q",
+                        "t",
+                        chain="testchain",
+                        legacy_on_chain=True,
+                        priority_mech=OTHER,
+                    )
+                    outcome["polled"] = mech_service.result("ab")
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    outcome["error"] = exc
 
             worker = threading.Thread(target=_work)
             worker.start()
-            assert finished.wait(3), "mech work waited on the listing"
-            worker.join(5)
+            worker.join(60)
+            assert not worker.is_alive(), "mech work waited on the listing"
+            assert listing.is_alive()
+            assert "error" not in outcome, outcome.get("error")
             assert outcome["sent"]["pending_request_ids"] == ["ab"]
             assert outcome["polled"]["delivered"] is False
         finally:
