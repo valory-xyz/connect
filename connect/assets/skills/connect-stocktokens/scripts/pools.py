@@ -73,9 +73,9 @@ def _validated(raw: t.Any, token: str, quote_name: str) -> list[uniswap.Pool]:
     The cache is a plain file in the agent's cwd, so an entry is untrusted
     input, and ``verify_execute`` cannot be what validates it: that compares
     the calldata against this same entry. Every field discovery would have
-    chosen is therefore re-derived or re-checked here — the fee tier as much
-    as the hooks, since a forged tier routes the trade through a pool the
-    operator never picked.
+    chosen is therefore re-derived or re-checked here, and every address is
+    re-derived from this ticker's own pair, so an entry cannot price a pool
+    the trade will not route through.
 
     Raises:
         SwapError: when an entry is not a pool discovery wrote.
@@ -89,10 +89,24 @@ def _validated(raw: t.Any, token: str, quote_name: str) -> list[uniswap.Pool]:
             raise evm.SwapError(f"cached pool has version {version!r}")
         if pool.get("quote_address") != quote or pool.get("quote") != quote_name:
             raise evm.SwapError(f"cached {version} pool is not quoted in {quote_name}")
-        if version == "v3" and pool.get("fee") not in uniswap.V3_FEES:
-            raise evm.SwapError(
-                f"cached v3 pool has fee {pool.get('fee')!r}; discovery only "
-                f"ever writes {uniswap.V3_FEES}"
+        if version == "v2":
+            if pool.get("fee") != uniswap.V2_FEE:
+                raise evm.SwapError(
+                    f"cached v2 pool has fee {pool.get('fee')!r}; discovery only "
+                    f"ever writes {uniswap.V2_FEE}"
+                )
+            _check_address(
+                pool, uniswap.pair_address(stocktokens.CHAIN_ID, token, quote)
+            )
+        if version == "v3":
+            if pool.get("fee") not in uniswap.V3_FEES:
+                raise evm.SwapError(
+                    f"cached v3 pool has fee {pool.get('fee')!r}; discovery only "
+                    f"ever writes {uniswap.V3_FEES}"
+                )
+            _check_address(
+                pool,
+                uniswap.pool_address(stocktokens.CHAIN_ID, token, quote, pool["fee"]),
             )
         if version == "v4":
             tier = (pool.get("fee"), pool.get("tick_spacing"))
@@ -114,10 +128,26 @@ def _validated(raw: t.Any, token: str, quote_name: str) -> list[uniswap.Pool]:
                     f"cached v4 pool_id {pool.get('pool_id')!r} is not the id its "
                     f"own PoolKey derives"
                 )
-        if version != "v4" and not pool.get("address"):
-            raise evm.SwapError(f"cached {version} pool has no address")
     pools: list[uniswap.Pool] = raw
     return pools
+
+
+def _check_address(pool: dict[str, t.Any], derived: str) -> None:
+    """Refuse a cached v2/v3 address that is not the one its pair derives.
+
+    Raises:
+        SwapError: when the address is missing, malformed or someone else's.
+    """
+    raw = pool.get("address")
+    try:
+        cached = Web3.to_checksum_address(raw) if isinstance(raw, str) else None
+    except ValueError:
+        cached = None
+    if cached != derived:
+        raise evm.SwapError(
+            f"cached {pool['version']} pool address {raw!r} is not {derived}, "
+            f"the pool this pair and fee derive"
+        )
 
 
 def _load_cache() -> dict[str, t.Any]:

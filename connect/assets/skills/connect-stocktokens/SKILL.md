@@ -21,23 +21,47 @@ The safe needs **USDG to trade with and ETH for gas**, both on chain 4663. Read
 `not_actionable_because` rather than guessing: no safe and no ETH are the
 operator's to fix, so report them and stop.
 
+## Python environment
+
+The scripts import `web3`, which the system Python usually lacks. Build the
+environment once per shell, then run every script with `$PY`:
+
+```bash
+eval "$(bash scripts/bootstrap_env.sh)"   # sets $PY and the TLS trust store
+"$PY" scripts/pools.py list --symbol NVDA
+```
+
+It creates or reuses `.venv` at the workspace root — the same venv
+connect-polymarket uses, so the two skills share it. `CONNECT_STOCKTOKENS_VENV` moves it.
+Never install into the system Python. A `ModuleNotFoundError` from these scripts
+means this step was skipped, not that a file is missing.
+
 ## The flow
 
 ```
 USDG in safe --approve--> Permit2 --approve--> UniversalRouter --execute--> Stock Token in safe
 ```
 
-1. `pools.py list --symbol NVDA` — what pools exist for this ticker.
-2. `swap.py quote --symbol NVDA --usdg 1000` — what they would fill at, next
-   to Robinhood's own price.
-3. `swap.py buy --symbol NVDA --usdg 1000` — two safe calls: ERC-20 approve to
-   Permit2, then the swap. The router's Permit2 allowance rides inside the
-   swap as a signed permit rather than costing its own transaction.
-4. `swap.py sell --symbol NVDA --shares 4.7` — the same in reverse.
+1. `"$PY" scripts/pools.py list --symbol NVDA` — what pools exist for this
+   ticker.
+2. `"$PY" scripts/swap.py quote --symbol NVDA --usdg 1000` — what they would
+   fill at, next to Robinhood's own price.
+3. `"$PY" scripts/swap.py buy --symbol NVDA --usdg 1000` — two safe calls:
+   ERC-20 approve to Permit2, then the swap. The router's Permit2 allowance
+   rides inside the swap as a signed permit rather than costing its own
+   transaction.
+4. `"$PY" scripts/swap.py sell --symbol NVDA --shares 4.7` — the same in
+   reverse.
 
-Add `--dry-run` to print the calls without sending them — it builds exactly
-what a real run would send, permit included, so what it prints is what would
-broadcast. Every command takes `--refresh` to bypass the hour-long pool cache.
+`"$PY" scripts/pools.py census [--limit 25]` walks the listed tickers and
+ranks them by pool depth — the way to answer "where is the liquidity?". Both
+`pools.py` commands take `--quote USDG|WETH` (default USDG).
+
+Add `--dry-run` to `buy` or `sell` to print the calls without sending them —
+it builds exactly what a real run would send, permit included, so what it
+prints is what would broadcast. `quote` never sends anything and does not
+take the flag. Every command takes `--refresh` to bypass the hour-long pool
+cache.
 
 **If the signer refuses to sign the permit**, rerun with
 `--separate-approvals`: the allowance then goes on-chain as its own
@@ -73,14 +97,16 @@ the gap is reported as `price_gap_bps` on every plan:
 - **no usable price at all** — refused. A missing bid, ask, multiplier or
   halt flag is not a gap of zero; a ticker without a reference does not trade.
 
-`--max-gap-bps` moves that limit and `--slippage` (capped at 5%) moves the
-floor. Both are the operator's call, not yours: if a trade is refused, report
+`--max-gap-bps` moves that limit (up to 1000) and `--slippage` (capped at 5%)
+moves the floor. Both are the operator's call, not yours: if a trade is refused, report
 the refusal rather than widening the guard that produced it. Every plan records
 the values it ran under.
 
-A halted ticker (`isTradingHalt`) is refused outright. So is a ticker
-Robinhood no longer lists as active, or lists twice — that one ticker is
-refused with the reason, and every other ticker still trades.
+A halted ticker (`isTradingHalt`) is refused outright, and so is a quote
+whose halt flag is missing or not a plain true/false. So is a ticker Robinhood
+no longer lists as active, lists twice, or lists malformed — that one ticker
+is refused with the reason, and every other ticker still trades. An
+unreachable or reshaped Robinhood feed is a refusal too.
 
 ## Routing, and what it does not do
 
@@ -121,11 +147,12 @@ The safe's handler expects its own `SafeMessage` wrapper around the Permit2
 digest, not the digest itself — `permit.py` derives both.
 
 The swap calldata is decoded and re-checked before it is handed to the signer:
-token in, token out, recipient, amount, floor and the pool it routes through
-must all match what was planned. The signed permit is re-read from the same calldata and checked the
-same way — token, spender and amount — because the action that authorises
-moving funds should not be the one nobody re-reads. A mismatch raises rather than
-signs.
+token in, token out, recipient, amount, floor, deadline, the pool it routes
+through and that it is a single hop must all match what was planned. The
+signed permit is re-read from the same calldata and checked the same way —
+token, spender, amount and both time bounds — because the action that
+authorises moving funds should not be the one nobody re-reads. A mismatch
+raises rather than signs.
 
 Everything goes through the pearl-connect signer — `send_transaction` makes
 the **safe** the caller, so the tokens land in the safe.

@@ -184,7 +184,9 @@ def plan_swap(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     calldata = uniswap.build_execute(
         pool, token_in, token_out, amount, floor, account, deadline, action
     )
-    uniswap.verify_execute(calldata, pool, token_in, token_out, amount, floor, account)
+    uniswap.verify_execute(
+        calldata, pool, token_in, token_out, amount, floor, account, deadline
+    )
     signed = uniswap.permit_action_in(calldata)
     if fold != (signed is not None):
         raise evm.SwapError(
@@ -193,7 +195,7 @@ def plan_swap(  # pylint: disable=too-many-arguments,too-many-positional-argumen
             else "the calldata carries a permit nobody asked for"
         )
     if signed is not None:
-        permit.verify_action(signed, token_in, spender, amount)
+        permit.verify_action(signed, token_in, spender, amount, deadline)
     calls = (
         [evm.erc20_approval_call(token_in, where["permit2"], amount, "approve Permit2")]
         if fold

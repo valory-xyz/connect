@@ -21,6 +21,7 @@
 
 import functools
 import json
+import math
 import typing as t
 import urllib.request
 
@@ -89,13 +90,8 @@ def _multiplier(asset: dict[str, t.Any]) -> str:
             would misprice every comparison this skill makes.
     """
     raw = asset.get("currentMultiplier")
-    try:
-        if raw is None or float(raw) <= 0:
-            raise ValueError(raw)
-    except (TypeError, ValueError) as exc:
-        raise SwapError(
-            f"no usable currentMultiplier ({raw!r}); refusing to price it"
-        ) from exc
+    if _positive(raw) is None:
+        raise SwapError(f"no usable currentMultiplier ({raw!r}); refusing to price it")
     return str(raw)
 
 
@@ -118,39 +114,62 @@ def asset_book() -> AssetBook:
     """
     tokens: dict[str, dict[str, t.Any]] = {}
     excluded: dict[str, str] = {}
-    for asset in _field(get_json(ASSETS_URL), "assets"):
-        for deployment in asset.get("deployments", []):
-            if deployment.get("chainId") != CHAIN_ID:
-                continue
-            symbol = _field(asset, "tokenSymbol")
-            if symbol in tokens or symbol in excluded:
-                tokens.pop(symbol, None)
-                excluded[symbol] = (
-                    f"listed twice on chain {CHAIN_ID}; refusing to guess which "
-                    f"contract you meant"
-                )
-                continue
-            if asset.get("status") not in TRADABLE_STATUS:
-                excluded[symbol] = (
-                    f"status is {asset.get('status')!r}; refusing to trade a token "
-                    f"Robinhood does not call active"
-                )
-                continue
-            try:
-                multiplier = _multiplier(asset)
-            except SwapError as exc:
-                excluded[symbol] = str(exc)
-                continue
-            tokens[symbol] = {
-                "address": to_checksum_address(deployment["contractAddress"]),
-                "name": asset.get("tokenName", ""),
-                "multiplier": multiplier,
-                "pending_multiplier": asset.get("pendingMultiplier", ""),
-                "status": asset.get("status", ""),
-            }
+    for index, asset in enumerate(_field(get_json(ASSETS_URL), "assets")):
+        symbol = asset.get("tokenSymbol") if isinstance(asset, dict) else None
+        if not isinstance(symbol, str) or not symbol:
+            excluded[f"<listing {index}>"] = "has no tokenSymbol"
+            continue
+        try:
+            entry = _listing(asset)
+        except (SwapError, KeyError, TypeError, ValueError, AttributeError) as exc:
+            tokens.pop(symbol, None)
+            excluded[symbol] = (
+                str(exc)
+                if isinstance(exc, SwapError)
+                else (f"listing is malformed ({type(exc).__name__}: {exc})")
+            )
+            continue
+        if entry is None:
+            continue
+        if symbol in tokens or symbol in excluded:
+            tokens.pop(symbol, None)
+            excluded[symbol] = (
+                f"listed twice on chain {CHAIN_ID}; refusing to guess which "
+                f"contract you meant"
+            )
+            continue
+        tokens[symbol] = entry
     if not tokens and not excluded:
         raise SwapError(f"no stock tokens for chain {CHAIN_ID} in {ASSETS_URL}")
     return AssetBook(tokens, excluded)
+
+
+def _listing(asset: dict[str, t.Any]) -> t.Optional[dict[str, t.Any]]:
+    """Build one listing's entry on this chain, or None when it is not here.
+
+    Raises:
+        SwapError: when the listing is here but cannot be traded.
+    """
+    here = [d for d in asset.get("deployments", []) if d.get("chainId") == CHAIN_ID]
+    if not here:
+        return None
+    if len(here) > 1:
+        raise SwapError(
+            f"listed twice on chain {CHAIN_ID}; refusing to guess which "
+            f"contract you meant"
+        )
+    if asset.get("status") not in TRADABLE_STATUS:
+        raise SwapError(
+            f"status is {asset.get('status')!r}; refusing to trade a token "
+            f"Robinhood does not call active"
+        )
+    return {
+        "address": to_checksum_address(here[0]["contractAddress"]),
+        "name": asset.get("tokenName", ""),
+        "multiplier": _multiplier(asset),
+        "pending_multiplier": asset.get("pendingMultiplier", ""),
+        "status": asset["status"],
+    }
 
 
 def asset_registry() -> dict[str, dict[str, t.Any]]:
@@ -181,23 +200,36 @@ def reference_price(symbol: str, multiplier: str) -> tuple[float, float, bool]:
         SwapError: when the quote or multiplier is not usable.
     """
     quote = _field(get_json(PRICES_URL.format(symbol=symbol)), "quotes", 0)
-    factor = float(multiplier or 1.0)
-    if quote.get("tokenSymbol", symbol) != symbol:
+    if _field(quote, "tokenSymbol") != symbol:
         raise SwapError(
             f"asked for {symbol} and got a quote for {quote.get('tokenSymbol')!r}"
         )
-    if "isTradingHalt" not in quote:
+    halted = _field(quote, "isTradingHalt")
+    if not isinstance(halted, bool):
         raise SwapError(
-            f"{symbol} quote has no isTradingHalt field; refusing to trade "
-            f"against a quote whose shape we no longer recognise"
+            f"{symbol} quote has isTradingHalt {halted!r}; refusing to trade "
+            f"without knowing whether the ticker is halted"
         )
-    bid, ask = float(_field(quote, "bid")), float(_field(quote, "ask"))
-    if factor <= 0 or bid <= 0 or ask <= 0:
+    factor = _positive(multiplier)
+    bid, ask = _positive(_field(quote, "bid")), _positive(_field(quote, "ask"))
+    if None in (factor, bid, ask):
         raise SwapError(
-            f"{symbol} priced at bid {bid} ask {ask} with multiplier {factor}; "
-            f"refusing to trade without a usable reference price"
+            f"{symbol} priced at bid {quote.get('bid')!r} ask {quote.get('ask')!r} "
+            f"with multiplier {multiplier!r}; refusing to trade without a usable "
+            f"reference price"
         )
-    return bid * factor, ask * factor, bool(quote["isTradingHalt"])
+    return bid * factor, ask * factor, halted
+
+
+def _positive(raw: t.Any) -> t.Any:
+    """Parse a finite positive number from a feed value, or return None."""
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 def price_gap_bps(quoted_out: int, reference_out: int) -> float:

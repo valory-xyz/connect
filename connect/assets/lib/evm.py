@@ -30,13 +30,14 @@ from web3 import Web3
 _PEARL_SCRIPTS = (
     Path(__file__).resolve().parents[1] / "skills" / "pearl-connect" / "scripts"
 )
-if str(_PEARL_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_PEARL_SCRIPTS))
+sys.path.insert(0, str(_PEARL_SCRIPTS))
 try:
     from signer_client import (  # noqa: E402  pylint: disable=wrong-import-position
         connect,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - install-shape guard
+    if exc.name != "signer_client":
+        raise
     raise ImportError(
         "connect-stocktokens needs the sibling pearl-connect skill; expected "
         f"signer_client.py under {_PEARL_SCRIPTS}"

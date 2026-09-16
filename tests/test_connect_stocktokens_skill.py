@@ -35,6 +35,10 @@ our swaps as theirs would be a lie, so parity is asserted up to that suffix.
 
 import argparse
 import json
+import os
+import runpy
+import shutil
+import subprocess  # nosec B404 - runs our own bootstrap under test
 import sys
 import time
 import typing as t
@@ -83,10 +87,12 @@ V3_RECIPIENT = "0xc9bebba9f481b12ce6f3ea54c4b182c9636ec421"
 ATTRIBUTION_TAG = b"unix"
 USDG = stocktokens.USDG
 NVDA = "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec"
+LIVE_NVDA_USDG_V3_500 = "0xd4EB21209C4D6093f80B5b84f5C45cc093EA14a3"
+LIVE_NVDA_USDG_V2 = "0xeE6F200063a53Fe9450578d99c0F8eAD4952c97a"
 V3_POOL: uniswap.PoolV3 = {
     "version": "v3",
     "fee": 500,
-    "address": NVDA,
+    "address": LIVE_NVDA_USDG_V3_500,
     "quote": "USDG",
     "quote_address": stocktokens.USDG,
 }
@@ -170,6 +176,7 @@ def test_verify_execute_rejects_a_swapped_recipient() -> None:
             V4_AMOUNT,
             V4_MIN,
             uniswap.DEPLOYMENTS[4663]["permit2"],
+            V4_DEADLINE,
         )
 
 
@@ -180,7 +187,14 @@ def test_verify_execute_rejects_a_lowered_floor() -> None:
     )
     with pytest.raises(evm.SwapError, match="minimum_out"):
         uniswap.verify_execute(
-            calldata, V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN - 1, V4_RECIPIENT
+            calldata,
+            V4_POOL,
+            USDG,
+            NVDA,
+            V4_AMOUNT,
+            V4_MIN - 1,
+            V4_RECIPIENT,
+            V4_DEADLINE,
         )
 
 
@@ -192,7 +206,7 @@ def test_verify_execute_accepts_every_version() -> None:
             pool, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
         )
         uniswap.verify_execute(
-            calldata, pool, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT
+            calldata, pool, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
         )
 
 
@@ -331,7 +345,7 @@ def test_verify_execute_still_checks_the_swap_behind_a_permit() -> None:
         V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE, action
     )
     uniswap.verify_execute(
-        calldata, V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT
+        calldata, V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
     )
     with pytest.raises(evm.SwapError, match="recipient"):
         uniswap.verify_execute(
@@ -342,6 +356,7 @@ def test_verify_execute_still_checks_the_swap_behind_a_permit() -> None:
             V4_AMOUNT,
             V4_MIN,
             uniswap.DEPLOYMENTS[4663]["permit2"],
+            V4_DEADLINE,
         )
 
 
@@ -353,6 +368,10 @@ def test_deployment_addresses_are_checksummed(chain_id: int) -> None:
     routes the trade into whichever pool did answer.
     """
     for name, address in uniswap.deployment(chain_id).items():
+        assert isinstance(address, str), name
+        if name.endswith("_init_code_hash"):
+            assert len(bytes.fromhex(address[2:])) == 32, name
+            continue
         assert address == to_checksum_address(address), name
 
 
@@ -450,13 +469,30 @@ def test_verify_action_rejects_a_tampered_permit() -> None:
     """The allowance we sign is re-read before it is sent."""
     spender = uniswap.DEPLOYMENTS[CHAIN_ID]["universal_router"]
     action = permit.permit_input(
-        permit.PermitDetails(USDG, 1_000_000, 1789473030, 0), spender, 1789473930, b"s"
+        permit.PermitDetails(USDG, 1_000_000, 1789473930, 0), spender, 1789473930, b"s"
     )
-    permit.verify_action(action, USDG, spender, 1_000_000)
+    permit.verify_action(action, USDG, spender, 1_000_000, 1789473930)
     with pytest.raises(evm.SwapError, match="permit amount"):
-        permit.verify_action(action, USDG, spender, 999)
+        permit.verify_action(action, USDG, spender, 999, 1789473930)
     with pytest.raises(evm.SwapError, match="permit spender"):
-        permit.verify_action(action, USDG, PERMIT2, 1_000_000)
+        permit.verify_action(action, USDG, PERMIT2, 1_000_000, 1789473930)
+
+
+def test_verify_action_checks_both_time_bounds() -> None:
+    """A miscomputed expiry would leave the router a standing allowance."""
+    spender = uniswap.DEPLOYMENTS[CHAIN_ID]["universal_router"]
+    for expiration, sig_deadline, field in [
+        (1789473931, 1789473930, "permit expiration"),
+        (1789473930, 1789473931, "permit sig_deadline"),
+    ]:
+        action = permit.permit_input(
+            permit.PermitDetails(USDG, 1_000, expiration, 0),
+            spender,
+            sig_deadline,
+            b"s",
+        )
+        with pytest.raises(evm.SwapError, match=field):
+            permit.verify_action(action, USDG, spender, 1_000, 1789473930)
 
 
 def test_decode_allowance_refuses_a_short_read() -> None:
@@ -616,7 +652,10 @@ def test_plan_swap_folds_the_permit_when_a_signer_is_present(
             spender=spender,
             expiry=expiry,
         )
-        return _PERMIT_ACTION
+        seen["action"] = permit.permit_input(
+            permit.PermitDetails(token, amount, expiry, 0), spender, expiry, b"sig"
+        )
+        return bytes(seen["action"])
 
     monkeypatch.setattr(swap.permit, "signed_action", _capture)
     plan = swap.plan_swap(
@@ -631,7 +670,8 @@ def test_plan_swap_folds_the_permit_when_a_signer_is_present(
     )
     assert [call["what"] for call in plan["calls"]] == ["approve Permit2", "swap"]
     assert plan["permit"] == "signed into the swap"
-    assert uniswap.permit_action_in(plan["calls"][-1]["data"]) == _PERMIT_ACTION
+    assert uniswap.permit_action_in(plan["calls"][-1]["data"]) == seen["action"]
+    assert seen["expiry"] == plan["deadline"]
     assert seen["amount"] == 1_000 * 10**6
     assert seen["token"] == USDG
     assert seen["owner"] == SAFE
@@ -933,6 +973,152 @@ def test_a_cached_v4_pool_that_derives_its_own_id_is_served(cache_file: Path) ->
     assert served[0]["pool_id"] == "0x" + real.hex()
 
 
+@pytest.mark.parametrize(
+    ("chain_id", "version", "token_a", "token_b", "fee", "live"),
+    [
+        (4663, "v2", NVDA, USDG, 0, LIVE_NVDA_USDG_V2),
+        (4663, "v3", NVDA, USDG, 500, LIVE_NVDA_USDG_V3_500),
+        (
+            137,
+            "v2",
+            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+            "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619",
+            0,
+            "0xdE32C9ebdd5f587E0F677d5AdCac593ecFfFD91A",
+        ),
+        (
+            137,
+            "v3",
+            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+            "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619",
+            500,
+            "0x45dDa9cb7c25131DF268515131f647d726f50608",
+        ),
+        (
+            100,
+            "v3",
+            "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d",
+            "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83",
+            100,
+            "0xE9E1793954f32D880Ec0B2186E96d88e2b870e40",
+        ),
+    ],
+)
+def test_derived_pool_addresses_match_the_live_factories(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    chain_id: int, version: str, token_a: str, token_b: str, fee: int, live: str
+) -> None:
+    """Pinned against getPair/getPool answers read from each chain."""
+    derived = (
+        uniswap.pair_address(chain_id, token_a, token_b)
+        if version == "v2"
+        else uniswap.pool_address(chain_id, token_a, token_b, fee)
+    )
+    assert derived == live
+    swapped = (
+        uniswap.pair_address(chain_id, token_b, token_a)
+        if version == "v2"
+        else uniswap.pool_address(chain_id, token_b, token_a, fee)
+    )
+    assert swapped == live
+
+
+def test_a_chain_without_v2_cannot_derive_a_pair() -> None:
+    """Gnosis records no v2 factory, so there is nothing to derive from."""
+    with pytest.raises(evm.SwapError, match="no v2 factory"):
+        uniswap.pair_address(100, USDG, NVDA)
+
+
+@pytest.mark.parametrize(
+    ("pool", "match"),
+    [
+        ({**V3_POOL, "address": NVDA}, "is not 0xd4EB"),
+        ({**V3_POOL, "address": "0xdeadbeef"}, "is not 0xd4EB"),
+        ({**V3_POOL, "address": None}, "is not 0xd4EB"),
+        (
+            {**V3_POOL, "fee": 3000},
+            "is not " + uniswap.pool_address(4663, NVDA, USDG, 3000)[:6],
+        ),
+        (
+            {
+                "version": "v2",
+                "fee": 3000,
+                "address": NVDA,
+                "quote": "USDG",
+                "quote_address": USDG,
+            },
+            "is not 0xeE6F",
+        ),
+        (
+            {
+                "version": "v2",
+                "address": LIVE_NVDA_USDG_V2,
+                "quote": "USDG",
+                "quote_address": USDG,
+            },
+            "cached v2 pool has fee None",
+        ),
+    ],
+)
+def test_a_cached_v2_or_v3_pool_must_be_this_pairs_own(
+    cache_file: Path, pool: dict, match: str
+) -> None:
+    """A forged address would be quoted, and its fake numbers shown."""
+    _forged(cache_file, pool)
+    with pytest.raises(evm.SwapError, match=match):
+        pools.cached_discover(_BlockW3(), NVDA, "USDG")
+
+
+def test_honest_cached_v2_and_v3_pools_are_served(cache_file: Path) -> None:
+    """The entries discovery really writes must survive the check."""
+    v2_pool = {
+        "version": "v2",
+        "fee": 3000,
+        "address": LIVE_NVDA_USDG_V2,
+        "quote": "USDG",
+        "quote_address": USDG,
+    }
+    _forged(cache_file, v2_pool)
+    assert pools.cached_discover(_BlockW3(), NVDA, "USDG") == [v2_pool]
+    _forged(cache_file, dict(V3_POOL))
+    assert pools.cached_discover(_BlockW3(), NVDA, "USDG") == [V3_POOL]
+
+
+def test_discover_output_composes_with_best_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The library's own two functions must work in sequence."""
+    monkeypatch.setattr(uniswap, "_v2_candidate", lambda *a: None)
+    monkeypatch.setattr(uniswap, "_v4_candidates", lambda *a: [])
+    monkeypatch.setattr(
+        uniswap,
+        "_v3_candidates",
+        lambda *a: [{"version": "v3", "fee": 500, "address": LIVE_NVDA_USDG_V3_500}],
+    )
+    monkeypatch.setattr(uniswap, "quote_pool", lambda *a: 42)
+    found = uniswap.discover(None, 4663, NVDA, USDG.lower())
+    assert found[0]["quote_address"] == USDG
+    pool, out = uniswap.best_route(None, 4663, USDG, NVDA, 10, found)
+    assert (pool, out) == (found[0], 42)
+
+
+@pytest.mark.parametrize(
+    ("pool", "match"),
+    [
+        ({"version": "v3", "fee": 500, "address": NVDA}, "carries no quote_address"),
+        (
+            {"version": "v3", "fee": 500, "address": NVDA, "quote_address": PERMIT2},
+            "neither side of this trade",
+        ),
+    ],
+)
+def test_best_route_refuses_a_pool_not_tied_to_this_pair(
+    pool: dict, match: str
+) -> None:
+    """Both guards run before anything is quoted."""
+    with pytest.raises(evm.SwapError, match=match):
+        uniswap.best_route(None, 4663, USDG, NVDA, 10, [t.cast(uniswap.Pool, pool)])
+
+
 def test_discover_orders_priced_pools_before_the_singleton(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1203,10 +1389,15 @@ def test_a_reverted_call_stops_the_sequence_and_says_what_landed(
 
 
 def _quote_payload(
-    bid: str = "212.23", ask: str = "212.34", halt: bool = False
+    bid: t.Any = "212.23", ask: t.Any = "212.34", halt: t.Any = False, **extra: t.Any
 ) -> dict:
     """Build a Robinhood price payload shaped like the live endpoint's."""
-    return {"quotes": [{"bid": bid, "ask": ask, "isTradingHalt": halt}]}
+    quote = {"tokenSymbol": "NVDA", "bid": bid, "ask": ask, "isTradingHalt": halt}
+    quote.update(extra)
+    return {"quotes": [{k: v for k, v in quote.items() if v is not _ABSENT}]}
+
+
+_ABSENT = object()
 
 
 def test_reference_price_multiplies_by_the_multiplier(
@@ -1243,8 +1434,10 @@ def test_a_robinhood_outage_is_a_refusal_not_a_traceback(
     [
         ({}, "quotes"),
         ({"quotes": []}, "quotes -> 0"),
-        ({"quotes": [{"ask": "212", "isTradingHalt": False}]}, "bid"),
-        ({"quotes": [{"bid": "212", "isTradingHalt": False}]}, "ask"),
+        (_quote_payload(bid=_ABSENT), "bid"),
+        (_quote_payload(ask=_ABSENT), "ask"),
+        (_quote_payload(tokenSymbol=_ABSENT), "tokenSymbol"),
+        (_quote_payload(halt=_ABSENT), "isTradingHalt"),
     ],
 )
 def test_a_quote_missing_a_field_is_a_refusal(
@@ -1265,19 +1458,49 @@ def test_a_registry_missing_its_assets_is_a_refusal(
         stocktokens.asset_registry()
 
 
-def test_reference_price_refuses_an_unusable_quote(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("bid", "multiplier"),
+    [
+        ("0", "1.0"),
+        ("-1", "1.0"),
+        ("nan", "1.0"),
+        ("inf", "1.0"),
+        ("abc", "1.0"),
+        (None, "1.0"),
+        (True, "1.0"),
+        ("212", ""),
+        ("212", None),
+        ("212", "0"),
+        ("212", "nan"),
+    ],
+)
+def test_reference_price_refuses_an_unusable_number(
+    bid: t.Any, multiplier: t.Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A zero bid is not a price; neither is a quote without a halt flag."""
+    """No price or multiplier is ever defaulted, including an empty multiplier."""
     monkeypatch.setattr(
-        stocktokens, "get_json", lambda _url: _quote_payload("0", "212")
+        stocktokens, "get_json", lambda _url: _quote_payload(bid, "212")
     )
     with pytest.raises(evm.SwapError, match="without a usable reference price"):
+        stocktokens.reference_price("NVDA", multiplier)
+
+
+@pytest.mark.parametrize("halt", [None, "false", 0, 1, "true"])
+def test_a_halt_flag_that_is_not_a_boolean_is_refused(
+    halt: t.Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A null halt flag must never read as "not halted"."""
+    monkeypatch.setattr(stocktokens, "get_json", lambda _url: _quote_payload(halt=halt))
+    with pytest.raises(evm.SwapError, match="without knowing whether"):
         stocktokens.reference_price("NVDA", "1.0")
+
+
+def test_a_quote_for_another_ticker_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The symbol check has to fire, not default itself to the one we asked for."""
     monkeypatch.setattr(
-        stocktokens, "get_json", lambda _url: {"quotes": [{"bid": "1", "ask": "2"}]}
+        stocktokens, "get_json", lambda _url: _quote_payload(tokenSymbol="TSLA")
     )
-    with pytest.raises(evm.SwapError, match="no isTradingHalt"):
+    with pytest.raises(evm.SwapError, match="got a quote for 'TSLA'"):
         stocktokens.reference_price("NVDA", "1.0")
 
 
@@ -1349,6 +1572,54 @@ def test_a_suspended_ticker_excludes_only_that_ticker(
     assert sorted(stocktokens.asset_registry()) == ["NVDA"]
     with pytest.raises(evm.SwapError, match="ASSET_STATUS_SUSPENDED"):
         stocktokens.lookup("TSLA")
+
+
+def _broken(kind: str) -> dict:
+    """One TSLA listing, broken in the named way."""
+    asset = _asset("TSLA")
+    if kind == "no contract":
+        del asset["deployments"][0]["contractAddress"]
+    elif kind == "short contract":
+        asset["deployments"][0]["contractAddress"] = "0xdeadbeef"
+    elif kind == "deployments not a list":
+        asset["deployments"] = "4663"
+    elif kind == "two deployments here":
+        asset["deployments"].append(dict(asset["deployments"][0]))
+    return asset
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["no contract", "short contract", "deployments not a list", "two deployments here"],
+)
+def test_a_malformed_listing_excludes_only_that_ticker(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every failure path in the loop is isolated to its own listing."""
+    monkeypatch.setattr(
+        stocktokens,
+        "get_json",
+        lambda _url: _assets_payload(_asset("NVDA"), _broken(kind)),
+    )
+    assert sorted(stocktokens.asset_registry()) == ["NVDA"]
+    with pytest.raises(evm.SwapError, match="TSLA is not tradable"):
+        stocktokens.lookup("TSLA")
+
+
+def test_a_listing_without_a_symbol_excludes_only_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listing with no name cannot be refused by name, but cannot sink the rest."""
+    nameless = _asset("TSLA")
+    del nameless["tokenSymbol"]
+    monkeypatch.setattr(
+        stocktokens,
+        "get_json",
+        lambda _url: {"assets": [_asset("NVDA"), nameless, "not a dict"]},
+    )
+    book = stocktokens.asset_book()
+    assert sorted(book.tokens) == ["NVDA"]
+    assert sorted(book.excluded) == ["<listing 1>", "<listing 2>"]
 
 
 def test_lookup_names_an_unknown_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1514,7 +1785,7 @@ def test_decode_execute_refuses_an_extra_command() -> None:
     )
     with pytest.raises(evm.SwapError, match="expected one swap command"):
         uniswap.verify_execute(
-            tampered, V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT
+            tampered, V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
         )
 
 
@@ -1526,7 +1797,7 @@ def test_verify_execute_checks_the_pool_the_quote_came_from() -> None:
     other: uniswap.PoolV4 = {**V4_POOL, "fee": 3000}  # type: ignore[typeddict-item]
     with pytest.raises(evm.SwapError, match="venue"):
         uniswap.verify_execute(
-            calldata, other, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT
+            calldata, other, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
         )
 
 
@@ -1537,7 +1808,7 @@ def test_verify_action_checks_the_token() -> None:
         permit.PermitDetails(USDG, 1_000, 1789473030, 0), spender, 1789473930, b"s"
     )
     with pytest.raises(evm.SwapError, match="permit token"):
-        permit.verify_action(action, NVDA, spender, 1_000)
+        permit.verify_action(action, NVDA, spender, 1_000, 1789473930)
 
 
 def test_approvals_carry_the_expiry_they_were_given() -> None:
@@ -1592,7 +1863,165 @@ def test_command_byte_must_match_the_pool_version() -> None:
     )
     with pytest.raises(evm.SwapError, match="exact-input swap is 0x00"):
         uniswap.verify_execute(
-            tampered, V3_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT
+            tampered, V3_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
+        )
+
+
+def _reencode(
+    calldata: str, swap_input: bytes, deadline: t.Optional[int] = None
+) -> str:
+    """Rebuild an execute() call around a replaced swap input."""
+    commands, _inputs, old_deadline = abi_decode(
+        ["bytes", "bytes[]", "uint256"], bytes.fromhex(calldata[10:])
+    )
+    body = abi_encode(
+        ["bytes", "bytes[]", "uint256"],
+        [commands, [swap_input], old_deadline if deadline is None else deadline],
+    )
+    return "0x" + (uniswap.SEL_UR_EXECUTE + body).hex()
+
+
+def _v4_input(calldata: str) -> tuple[bytes, list[bytes]]:
+    """Unpack the v4 actions and params inside a one-command execute()."""
+    _c, inputs, _d = abi_decode(
+        ["bytes", "bytes[]", "uint256"], bytes.fromhex(calldata[10:])
+    )
+    actions, params = abi_decode(["bytes", "bytes[]"], inputs[0])
+    return actions, list(params)
+
+
+def test_verify_execute_checks_the_deadline() -> None:
+    """A stale swap window is exactly what the deadline exists to bound."""
+    calldata = uniswap.build_execute(
+        V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
+    )
+    with pytest.raises(evm.SwapError, match="calldata deadline"):
+        uniswap.verify_execute(
+            calldata,
+            V4_POOL,
+            USDG,
+            NVDA,
+            V4_AMOUNT,
+            V4_MIN,
+            V4_RECIPIENT,
+            V4_DEADLINE + 1,
+        )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "settle currency",
+        "take currency",
+        "settle amount",
+        "payer",
+        "min hop",
+        "two hops",
+        "hook data",
+        "extra param",
+    ],
+)
+def test_verify_execute_checks_every_v4_leg(tamper: str) -> None:
+    """Settle and take must move the planned currencies, over one hop."""
+    calldata = uniswap.build_execute(
+        V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
+    )
+    actions, params = _v4_input(calldata)
+    swap_t = [uniswap.V4_EXACT_INPUT_PARAMS]
+    cin, path, hop, amt, floor = abi_decode(swap_t, params[0])[0]
+    path = [tuple(k) for k in path]
+    if tamper == "settle currency":
+        params[1] = abi_encode(["address", "uint256", "bool"], [PERMIT2, 0, True])
+    elif tamper == "take currency":
+        params[2] = abi_encode(
+            ["address", "address", "uint256"], [PERMIT2, V4_RECIPIENT, 0]
+        )
+    elif tamper == "settle amount":
+        params[1] = abi_encode(["address", "uint256", "bool"], [USDG, 5, True])
+    elif tamper == "payer":
+        params[1] = abi_encode(["address", "uint256", "bool"], [USDG, 0, False])
+    elif tamper == "min hop":
+        params[0] = abi_encode(swap_t, [(cin, path, [1], amt, floor)])
+    elif tamper == "two hops":
+        params[0] = abi_encode(swap_t, [(cin, path + path, list(hop), amt, floor)])
+    elif tamper == "hook data":
+        path[0] = (*path[0][:4], b"\x01")
+        params[0] = abi_encode(swap_t, [(cin, path, list(hop), amt, floor)])
+    else:
+        params.append(b"")
+    tampered = _reencode(calldata, abi_encode(["bytes", "bytes[]"], [actions, params]))
+    with pytest.raises(evm.SwapError, match="legs|one-hop|three v4 action"):
+        uniswap.verify_execute(
+            tampered,
+            V4_POOL,
+            USDG,
+            NVDA,
+            V4_AMOUNT,
+            V4_MIN,
+            V4_RECIPIENT,
+            V4_DEADLINE,
+        )
+
+
+def test_verify_execute_refuses_a_multi_hop_v3_path() -> None:
+    """A longer path would otherwise verify against its first hop alone."""
+    calldata = uniswap.build_execute(
+        V3_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
+    )
+    fields = ["address", "uint256", "uint256", "bytes", "bool", "uint256[]"]
+    _c, inputs, _d = abi_decode(
+        ["bytes", "bytes[]", "uint256"], bytes.fromhex(calldata[10:])
+    )
+    to, amt, floor, path, payer, hop = abi_decode(fields, inputs[0])
+    longer = path + (500).to_bytes(3, "big") + bytes.fromhex(PERMIT2[2:])
+    tampered = _reencode(
+        calldata, abi_encode(fields, [to, amt, floor, longer, payer, list(hop)])
+    )
+    with pytest.raises(evm.SwapError, match="one-hop v3 path"):
+        uniswap.verify_execute(
+            tampered,
+            V3_POOL,
+            USDG,
+            NVDA,
+            V4_AMOUNT,
+            V4_MIN,
+            V4_RECIPIENT,
+            V4_DEADLINE,
+        )
+
+
+@pytest.mark.parametrize("tamper", ["three tokens", "payer", "min hop"])
+def test_verify_execute_checks_the_v2_legs(tamper: str) -> None:
+    """The v2 path is exactly two tokens, paid by the caller, unlimited per hop."""
+    v2_pool: uniswap.PoolV2 = {"version": "v2", "fee": 3000, "address": NVDA}
+    calldata = uniswap.build_execute(
+        v2_pool, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
+    )
+    fields = ["address", "uint256", "uint256", "address[]", "bool", "uint256[]"]
+    _c, inputs, _d = abi_decode(
+        ["bytes", "bytes[]", "uint256"], bytes.fromhex(calldata[10:])
+    )
+    to, amt, floor, path, payer, hop = abi_decode(fields, inputs[0])
+    path, hop = list(path), list(hop)
+    if tamper == "three tokens":
+        path = [path[0], PERMIT2, path[1]]
+    elif tamper == "payer":
+        payer = False
+    else:
+        hop = [7]
+    tampered = _reencode(
+        calldata, abi_encode(fields, [to, amt, floor, path, payer, hop])
+    )
+    with pytest.raises(evm.SwapError, match="legs|one-hop v2 path"):
+        uniswap.verify_execute(
+            tampered,
+            v2_pool,
+            USDG,
+            NVDA,
+            V4_AMOUNT,
+            V4_MIN,
+            V4_RECIPIENT,
+            V4_DEADLINE,
         )
 
 
@@ -1627,12 +2056,19 @@ def test_verify_execute_checks_every_field_it_claims(field: str) -> None:
     }[field]
     with pytest.raises(evm.SwapError, match=field):
         uniswap.verify_execute(
-            calldata, V3_POOL, wrong[0], wrong[1], wrong[2], V4_MIN, V4_RECIPIENT
+            calldata,
+            V3_POOL,
+            wrong[0],
+            wrong[1],
+            wrong[2],
+            V4_MIN,
+            V4_RECIPIENT,
+            V4_DEADLINE,
         )
 
 
 def test_sell_sizes_the_amount_in_the_token_being_sold(
-    traded: dict, monkeypatch: pytest.MonkeyPatch
+    traded: dict, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
     """--shares is denominated in the stock token's 18 decimals, not USDG's 6."""
     traded["quoted"] = int(5 * 249.9 * 10**6)
@@ -1643,7 +2079,69 @@ def test_sell_sizes_the_amount_in_the_token_being_sold(
     )
     args = _plan_args(shares=5.0, dry_run=True)
     assert swap._cmd_sell(args) == 0  # pylint: disable=protected-access
+    printed = capsys.readouterr().out
+    plan = json.loads(printed[: printed.index("\ndry-run ")])
+    assert plan["amount_in"] == 5 * 10**18
     assert signer.sent == []
+
+
+class _QuoterW3:
+    """Records the one quoter call and answers with a fixed output."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.eth = self
+        self.data = b""
+        self.to = ""
+
+    def call(self, tx: dict) -> bytes:
+        """Record the request."""
+        self.to, self.data = tx["to"], bytes(tx["data"])
+        return (77).to_bytes(32, "big")
+
+
+@pytest.mark.parametrize(
+    ("token_in", "token_out", "zero_for_one"),
+    [(USDG, NVDA, True), (NVDA, USDG, False)],
+)
+def test_quote_v4_sets_the_direction_from_the_sorted_key(
+    token_in: str, token_out: str, zero_for_one: bool
+) -> None:
+    """A reversed flag would price every v4 trade backwards."""
+    w3 = _QuoterW3()
+    out = uniswap._quote_v4(  # pylint: disable=protected-access
+        w3, CHAIN_ID, V4_POOL, token_in, token_out, 123
+    )
+    assert out == 77
+    assert w3.to == uniswap.DEPLOYMENTS[CHAIN_ID]["v4_quoter"]
+    assert w3.data[:4] == uniswap.SEL_QUOTE_V4
+    ((key, direction, amount, hook_data),) = abi_decode(
+        ["((address,address,uint24,int24,address),bool,uint128,bytes)"], w3.data[4:]
+    )
+    assert int(key[0], 16) < int(key[1], 16)
+    assert {to_checksum_address(key[0]), to_checksum_address(key[1])} == {
+        to_checksum_address(USDG),
+        to_checksum_address(NVDA),
+    }
+    assert (key[2], key[3], to_checksum_address(key[4])) == (100, 1, uniswap.NO_HOOKS)
+    assert (direction, amount, hook_data) == (zero_for_one, 123, b"")
+
+
+def test_quote_v3_asks_for_this_trade_at_this_fee() -> None:
+    """Transposed tokens or a dropped fee would quote a different trade."""
+    w3 = _QuoterW3()
+    out = uniswap._quote_v3(  # pylint: disable=protected-access
+        w3, CHAIN_ID, V3_POOL, NVDA, USDG, 456
+    )
+    assert out == 77
+    assert w3.to == uniswap.DEPLOYMENTS[CHAIN_ID]["quoter_v2"]
+    assert w3.data[:4] == uniswap.SEL_QUOTE_V3
+    (params,) = abi_decode(["(address,address,uint256,uint24,uint160)"], w3.data[4:])
+    assert (to_checksum_address(params[0]), to_checksum_address(params[1])) == (
+        to_checksum_address(NVDA),
+        to_checksum_address(USDG),
+    )
+    assert params[2:] == (456, 500, 0)
 
 
 def test_signed_permit_carries_the_signature_and_the_window_it_was_given() -> None:
@@ -1663,3 +2161,285 @@ def test_signed_permit_carries_the_signature_and_the_window_it_was_given() -> No
     assert signature == bytes.fromhex("ab" * 65)
     assert expiration == 1789473930
     assert sig_deadline == 1789473930
+
+
+BOOTSTRAP = SKILL / "bootstrap_env.sh"
+
+
+def _bash_works() -> bool:
+    """Whether `bash` here is a POSIX shell rather than the Windows WSL stub."""
+    try:
+        probe = subprocess.run(  # nosec B603 B607 - fixed argv
+            ["bash", "-c", "printf ok"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.stdout.strip() == "ok"
+
+
+needs_bash = pytest.mark.skipif(not _bash_works(), reason="no POSIX bash here")
+
+
+def _venv_with_pip_log(root: Path, sentinels: tuple[str, ...] = ()) -> Path:
+    """Build a venv stub whose pip records its arguments instead of installing."""
+    venv = root / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    python = venv / "bin" / "python"
+    python.write_text("#!/bin/sh\necho /fake/cacert.pem\n", encoding="utf-8")
+    pip = venv / "bin" / "pip"
+    pip.write_text(f'#!/bin/sh\necho "$@" >> {venv}/pip.log\n', encoding="utf-8")
+    python.chmod(0o755)
+    pip.chmod(0o755)
+    for sentinel in sentinels:
+        (venv / sentinel).touch()
+    return venv
+
+
+def _bootstrap(cwd: Path, script: Path = BOOTSTRAP, **env: str) -> t.Any:
+    """Run a bootstrap wrapper the way SKILL.md tells the agent to."""
+    return subprocess.run(  # nosec B603 B607 - fixed argv, test-controlled paths
+        ["bash", str(script)],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"], "HOME": str(cwd), **env},
+        check=False,
+    )
+
+
+@needs_bash
+def test_bootstrap_installs_what_these_scripts_import(tmp_path: Path) -> None:
+    """web3 at the pin pearl-connect names, and certifi for the trust store."""
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _venv_with_pip_log(tmp_path)
+    result = _bootstrap(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert f"export PY={venv / 'bin' / 'python'}" in result.stdout
+    assert "export SSL_CERT_FILE=/fake/cacert.pem" in result.stdout
+    installed = (venv / "pip.log").read_text(encoding="utf-8")
+    assert "web3>=7.15,<8 certifi" in installed
+    assert (venv / ".bootstrap-connect-stocktokens").is_file()
+
+
+@needs_bash
+def test_a_venv_polymarket_finished_still_gets_these_packages(tmp_path: Path) -> None:
+    """The venv is shared, so one skill's sentinel says nothing about the other's."""
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    _venv_with_pip_log(tmp_path, sentinels=(".bootstrap-complete",))
+    result = _bootstrap(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "installing dependencies" in result.stderr
+    reused = _bootstrap(tmp_path)
+    assert "reusing venv" in reused.stderr
+
+
+@needs_bash
+def test_the_venv_location_can_be_overridden(tmp_path: Path) -> None:
+    """CONNECT_STOCKTOKENS_VENV names the venv, as the polymarket variable does."""
+    elsewhere = tmp_path / "elsewhere"
+    venv = _venv_with_pip_log(elsewhere, sentinels=(".bootstrap-connect-stocktokens",))
+    result = _bootstrap(tmp_path, CONNECT_STOCKTOKENS_VENV=str(venv))
+    assert result.returncode == 0, result.stderr
+    assert f"export PY={venv / 'bin' / 'python'}" in result.stdout
+
+
+@needs_bash
+def test_a_missing_shared_bootstrap_fails_the_callers_eval(tmp_path: Path) -> None:
+    """Without the shared script, eval must fail rather than leave $PY unset."""
+    scripts = tmp_path / "skills" / "connect-stocktokens" / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy(BOOTSTRAP, scripts / "bootstrap_env.sh")
+    result = _bootstrap(tmp_path, scripts / "bootstrap_env.sh")
+    assert result.returncode != 0
+    assert "shared bootstrap missing" in result.stdout
+    assert result.stdout.rstrip().endswith("false")
+
+
+def _stage_bootstrap(root: Path, with_lib: bool) -> Path:
+    """Lay out .claude/{lib,skills} the way the server installs them."""
+    scripts = root / ".claude" / "skills" / "connect-stocktokens" / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy(SKILL / "_bootstrap.py", scripts / "_bootstrap.py")
+    if with_lib:
+        (root / ".claude" / "lib").mkdir()
+        (root / ".claude" / "lib" / "evm.py").write_text("", encoding="utf-8")
+    return scripts / "_bootstrap.py"
+
+
+def test_the_path_shim_names_a_missing_lib_tree(tmp_path: Path) -> None:
+    """A bare "No module named evm" hides that the server installs this tree."""
+    shim = _stage_bootstrap(tmp_path, with_lib=False)
+    with pytest.raises(ImportError, match="installs into .claude/lib"):
+        runpy.run_path(str(shim))
+
+
+def test_the_path_shim_names_a_missing_web3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first command on a clean install must say what to install and where."""
+    shim = _stage_bootstrap(tmp_path, with_lib=True)
+    real = __import__("importlib.util").util.find_spec
+    monkeypatch.setattr(
+        "importlib.util.find_spec",
+        lambda name, *a: None if name == "web3" else real(name, *a),
+    )
+    with pytest.raises(ImportError, match="web3>=7.15,<8"):
+        runpy.run_path(str(shim))
+
+
+def test_the_path_shim_puts_the_lib_tree_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With both present, the shared modules become importable."""
+    shim = _stage_bootstrap(tmp_path, with_lib=True)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    runpy.run_path(str(shim))
+    assert sys.path[0] == str((tmp_path / ".claude" / "lib").resolve())
+
+
+class _AnsweringW3:
+    """A web3 whose eth_call answers from a selector -> bytes table."""
+
+    def __init__(self, answers: dict[bytes, bytes]) -> None:
+        """Answer each selector with its bytes; anything else is empty."""
+        self.eth = self
+        self.answers = answers
+
+    def call(self, tx: dict) -> bytes:
+        """Look the selector up."""
+        return self.answers.get(bytes(tx["data"])[:4], b"")
+
+
+def _word(value: int) -> bytes:
+    """One ABI word."""
+    return value.to_bytes(32, "big")
+
+
+def test_token_decimals_and_balance_read_the_chain() -> None:
+    """Both are read, never assumed."""
+    w3 = _AnsweringW3(
+        {evm.SEL_DECIMALS: _word(6), evm.SEL_BALANCE_OF: _word(2_500_000)}
+    )
+    assert evm.token_decimals(w3, USDG) == 6
+    assert evm.balance_of(w3, USDG, SAFE, 6) == 2.5
+
+
+def test_discover_keeps_a_v2_pair_the_factory_names() -> None:
+    """A pair the factory returns is a candidate, stamped with its quote."""
+    w3 = _AnsweringW3(
+        {
+            uniswap.SEL_GET_PAIR: bytes(12) + bytes.fromhex(LIVE_NVDA_USDG_V2[2:]),
+            uniswap.SEL_GET_POOL: _word(0),
+            uniswap.SEL_GET_LIQUIDITY: _word(0),
+        }
+    )
+    found = uniswap.discover(w3, 4663, NVDA, USDG)
+    assert found == [
+        {
+            "version": "v2",
+            "fee": uniswap.V2_FEE,
+            "address": LIVE_NVDA_USDG_V2,
+            "quote_address": USDG,
+        }
+    ]
+
+
+def test_missing_factories_and_quoters_are_handled_per_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No v3 factory means no v3 candidates; no quoter is a refusal, not a zero."""
+    bare: uniswap.Deployment = {"universal_router": PERMIT2, "permit2": PERMIT2}
+    monkeypatch.setitem(uniswap.DEPLOYMENTS, 999, bare)
+    assert (
+        uniswap._v3_candidates(None, 999, USDG, NVDA) == []
+    )  # pylint: disable=protected-access
+    with pytest.raises(evm.SwapError, match="no quoter_v2"):
+        uniswap._quote_v3(
+            None, 999, V3_POOL, USDG, NVDA, 1
+        )  # pylint: disable=protected-access
+    with pytest.raises(evm.SwapError, match="no v4_quoter"):
+        uniswap._quote_v4(
+            None, 999, V4_POOL, USDG, NVDA, 1
+        )  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize(
+    ("reserves", "token0", "match"),
+    [
+        (_word(1)[:31], bytes(12) + bytes.fromhex(USDG[2:]), "bytes of reserves"),
+        (_word(1) + _word(1), b"", "did not answer token0"),
+        (_word(1) + _word(1), bytes(12) + bytes.fromhex(PERMIT2[2:]), "neither side"),
+    ],
+)
+def test_a_v2_pair_that_answers_badly_is_refused(
+    reserves: bytes, token0: bytes, match: str
+) -> None:
+    """A short or foreign answer must not be read as reserves."""
+    w3 = _AnsweringW3({uniswap.SEL_GET_RESERVES: reserves, uniswap.SEL_TOKEN0: token0})
+    pair: uniswap.PoolV2 = {"version": "v2", "fee": 3000, "address": NVDA}
+    with pytest.raises(evm.SwapError, match=match):
+        uniswap._quote_v2(w3, pair, USDG, NVDA, 10)  # pylint: disable=protected-access
+
+
+def test_an_empty_v2_pair_quotes_zero_and_the_other_side_orients() -> None:
+    """Zero reserves fill nothing; token0 on the output side flips the reserves."""
+    token0 = bytes(12) + bytes.fromhex(NVDA[2:])
+    pair: uniswap.PoolV2 = {"version": "v2", "fee": 3000, "address": NVDA}
+    empty = _AnsweringW3(
+        {uniswap.SEL_GET_RESERVES: _word(0) + _word(5), uniswap.SEL_TOKEN0: token0}
+    )
+    assert (
+        uniswap._quote_v2(empty, pair, USDG, NVDA, 10) == 0
+    )  # pylint: disable=protected-access
+    full = _AnsweringW3(
+        {uniswap.SEL_GET_RESERVES: _word(100) + _word(1000), uniswap.SEL_TOKEN0: token0}
+    )
+    assert uniswap._quote_v2(
+        full, pair, USDG, NVDA, 10
+    ) == (  # pylint: disable=protected-access
+        10 * 997 * 100 // (1000 * 1000 + 10 * 997)
+    )
+
+
+def test_quote_pool_dispatches_every_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each version reaches its own quoter."""
+    monkeypatch.setattr(uniswap, "_quote_v3", lambda *a: 3)
+    monkeypatch.setattr(uniswap, "_quote_v4", lambda *a: 4)
+    monkeypatch.setattr(uniswap, "_quote_v2", lambda *a: 2)
+    v2_pool: uniswap.PoolV2 = {"version": "v2", "fee": 3000, "address": NVDA}
+    got = [
+        uniswap.quote_pool(None, 4663, pool, USDG, NVDA, 1)
+        for pool in (V3_POOL, V4_POOL, v2_pool)
+    ]
+    assert got == [3, 4, 2]
+
+
+def test_decode_execute_refuses_mismatched_commands_and_foreign_actions() -> None:
+    """Commands without inputs, and v4 actions we never write, are refused."""
+    body = abi_encode(["bytes", "bytes[]", "uint256"], [bytes([0x10]), [], 1])
+    with pytest.raises(evm.SwapError, match="malformed commands"):
+        uniswap.verify_execute(
+            "0x" + (uniswap.SEL_UR_EXECUTE + body).hex(),
+            V4_POOL,
+            USDG,
+            NVDA,
+            1,
+            1,
+            V4_RECIPIENT,
+            1,
+        )
+    calldata = uniswap.build_execute(
+        V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
+    )
+    _actions, params = _v4_input(calldata)
+    foreign = _reencode(
+        calldata, abi_encode(["bytes", "bytes[]"], [bytes([0x07, 0x0B, 0x0F]), params])
+    )
+    with pytest.raises(evm.SwapError, match="unexpected v4 actions"):
+        uniswap.verify_execute(
+            foreign, V4_POOL, USDG, NVDA, V4_AMOUNT, V4_MIN, V4_RECIPIENT, V4_DEADLINE
+        )

@@ -407,11 +407,7 @@ class Workspace:
 
     def _install_lib(self) -> None:
         """Overwrite the shared modules our skills import from .claude/lib."""
-        source = assets_dir() / "lib"
-        target = self.path / LIB_SUBDIR
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__"))
+        _replace_tree(assets_dir() / "lib", self.path / LIB_SUBDIR)
 
     def _install_skills(self) -> None:
         """Overwrite our skills from the bundle; user files elsewhere are untouched."""
@@ -424,12 +420,21 @@ class Workspace:
                     "skipping non-directory %s under bundled skills", skill_dir
                 )
                 continue
-            target = target_root / skill_dir.name
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.copytree(
-                skill_dir, target, ignore=shutil.ignore_patterns("__pycache__")
-            )
+            _replace_tree(skill_dir, target_root / skill_dir.name)
+
+
+def _remove(target: Path) -> None:
+    """Delete whatever is at target; a link is unlinked, never followed."""
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+
+
+def _replace_tree(source: Path, target: Path) -> None:
+    """Replace target, whatever it currently is, with a copy of source."""
+    _remove(target)
+    shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__"))
 
 
 def harness_env() -> dict[str, str]:

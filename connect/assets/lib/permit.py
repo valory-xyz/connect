@@ -248,16 +248,20 @@ def decode_action(action: bytes) -> tuple[PermitDetails, str, int]:
     )
 
 
-def verify_action(action: bytes, token: str, spender: str, amount: int) -> None:
+def verify_action(
+    action: bytes, token: str, spender: str, amount: int, expiry: int
+) -> None:
     """Check the allowance we signed is the one we meant to grant.
 
     Raises:
         SwapError: when any field disagrees with what was planned.
     """
-    details, signed_spender, _ = decode_action(action)
+    details, signed_spender, sig_deadline = decode_action(action)
     checks: dict[str, tuple[t.Any, t.Any]] = {
         "token": (details.token, to_checksum_address(token)),
         "spender": (signed_spender, to_checksum_address(spender)),
         "amount": (details.amount, amount),
+        "expiration": (details.expiration, expiry),
+        "sig_deadline": (sig_deadline, expiry),
     }
     check_fields("permit", checks)

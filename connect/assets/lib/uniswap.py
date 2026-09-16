@@ -43,7 +43,16 @@ class Deployment(t.TypedDict, total=False):
     v4_quoter: str
     universal_router: str
     permit2: str
+    v2_init_code_hash: str
+    v3_init_code_hash: str
 
+
+V2_CANONICAL_INIT_CODE_HASH = (
+    "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
+)
+V3_CANONICAL_INIT_CODE_HASH = (
+    "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54"
+)
 
 DEPLOYMENTS: dict[int, Deployment] = {
     4663: {
@@ -54,6 +63,8 @@ DEPLOYMENTS: dict[int, Deployment] = {
         "v4_quoter": "0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94",
         "universal_router": "0x8876789976dEcBfCbBbe364623C63652db8C0904",
         "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        "v2_init_code_hash": V2_CANONICAL_INIT_CODE_HASH,
+        "v3_init_code_hash": V3_CANONICAL_INIT_CODE_HASH,
     },
     137: {
         "v2_factory": "0x9e5A52f57b3038F1B8EeE45F28b3C1967e22799C",
@@ -63,12 +74,15 @@ DEPLOYMENTS: dict[int, Deployment] = {
         "v4_quoter": "0xb3d5c3Dfc3a7aEbFF71895A7191796BFFc2c81b9",
         "universal_router": "0x1095692A6237d83C6a72F3F5eFEdb9A670C49223",
         "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        "v2_init_code_hash": V2_CANONICAL_INIT_CODE_HASH,
+        "v3_init_code_hash": V3_CANONICAL_INIT_CODE_HASH,
     },
     100: {
         "v3_factory": "0xe32F7dD7e3f098D518ff19A22d5f028e076489B1",
         "quoter_v2": "0x7E9cB3499A6cee3baBe5c8a3D328EA7FD36578f4",
         "universal_router": "0x75FC67473A91335B5b8F8821277262a13B38c9b3",
         "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        "v3_init_code_hash": V3_CANONICAL_INIT_CODE_HASH,
     },
 }
 
@@ -172,6 +186,69 @@ def v4_pool_id(token_a: str, token_b: str, fee: int, spacing: int, hooks: str) -
     )
 
 
+def _sorted_pair(token_a: str, token_b: str) -> tuple[str, str]:
+    """Order two tokens the way every Uniswap version keys them."""
+    first, second = sorted(
+        (to_checksum_address(token_a), to_checksum_address(token_b)),
+        key=lambda a: int(a, 16),
+    )
+    return first, second
+
+
+def _create2(factory: str, salt: bytes, init_code_hash: str) -> str:
+    """Compute the address a factory deploys to for this salt and init code."""
+    digest = keccak(
+        b"\xff" + bytes.fromhex(factory[2:]) + salt + bytes.fromhex(init_code_hash[2:])
+    )
+    return to_checksum_address(digest[12:])
+
+
+def _factory_and_hash(chain_id: int, version: str) -> tuple[str, str]:
+    """Look up a version's factory and init-code hash on a chain.
+
+    Raises:
+        SwapError: when the chain has no such factory, or no recorded hash.
+    """
+    where = deployment(chain_id)
+    if version == "v2":
+        factory, init_code_hash = where.get("v2_factory"), where.get(
+            "v2_init_code_hash"
+        )
+    else:
+        factory, init_code_hash = where.get("v3_factory"), where.get(
+            "v3_init_code_hash"
+        )
+    if factory is None or init_code_hash is None:
+        raise SwapError(
+            f"no {version} factory and init-code hash recorded for chain {chain_id}"
+        )
+    return factory, init_code_hash
+
+
+def pair_address(chain_id: int, token_a: str, token_b: str) -> str:
+    """Derive the v2 pair address for a token couple without a call.
+
+    Raises:
+        SwapError: when the chain has no v2 factory recorded.
+    """
+    factory, init_code_hash = _factory_and_hash(chain_id, "v2")
+    first, second = _sorted_pair(token_a, token_b)
+    salt = keccak(bytes.fromhex(first[2:]) + bytes.fromhex(second[2:]))
+    return _create2(factory, salt, init_code_hash)
+
+
+def pool_address(chain_id: int, token_a: str, token_b: str, fee: int) -> str:
+    """Derive the v3 pool address for a token couple at one fee without a call.
+
+    Raises:
+        SwapError: when the chain has no v3 factory recorded.
+    """
+    factory, init_code_hash = _factory_and_hash(chain_id, "v3")
+    first, second = _sorted_pair(token_a, token_b)
+    salt = keccak(abi_encode(["address", "address", "uint24"], [first, second, fee]))
+    return _create2(factory, salt, init_code_hash)
+
+
 def _v2_candidate(
     w3: Web3, chain_id: int, token: str, quote: str
 ) -> t.Optional[PoolV2]:
@@ -234,6 +311,8 @@ def discover(w3: Web3, chain_id: int, token: str, quote: str) -> list[Pool]:
         pairs.append(pair)
     pairs.extend(_v3_candidates(w3, chain_id, token, quote))
     pairs.extend(_v4_candidates(w3, chain_id, token, quote))
+    for pool in pairs:
+        pool["quote_address"] = to_checksum_address(quote)
     return pairs
 
 
@@ -345,8 +424,8 @@ def best_route(  # pylint: disable=too-many-positional-arguments
         pair = pool.get("quote_address")
         if pair is None:
             raise SwapError(
-                f"{pool['version']} pool carries no quote_address; it did not come "
-                f"from discovery and cannot be matched to this trade"
+                f"{pool['version']} pool carries no quote_address, so nothing ties "
+                f"it to this trade's pair; pass pools as discover() returns them"
             )
         if to_checksum_address(pair) not in (
             to_checksum_address(token_in),
@@ -456,16 +535,29 @@ def build_execute(  # pylint: disable=too-many-arguments,too-many-positional-arg
     return "0x" + calldata.hex()
 
 
+class DecodedSwap(t.NamedTuple):
+    """What one execute() call actually asks the router to do."""
+
+    token_in: str
+    token_out: str
+    recipient: str
+    amount_in: int
+    minimum_out: int
+    venue: tuple[int, int, str]
+    deadline: int
+    legs: tuple[t.Any, ...]
+
+
 def _decode_execute(  # pylint: disable=too-many-locals
     calldata: str, pool: Pool
-) -> tuple[str, str, str, int, int, tuple[int, int, str]]:
-    """Read back token in, token out, recipient, amount and floor.
+) -> DecodedSwap:
+    """Read back every field of one swap, optionally permitted.
 
     Raises:
         SwapError: when the calldata is not one swap, optionally permitted.
     """
     body = bytes.fromhex(calldata[10:])
-    commands, inputs, _ = abi_decode(["bytes", "bytes[]", "uint256"], body)
+    commands, inputs, deadline = abi_decode(["bytes", "bytes[]", "uint256"], body)
     if len(commands) != len(inputs) or not commands:
         raise SwapError(f"malformed commands {commands.hex()!r}")
     if commands[0] == COMMAND_PERMIT2_PERMIT:
@@ -478,31 +570,70 @@ def _decode_execute(  # pylint: disable=too-many-locals
             f"calldata carries command 0x{commands[0]:02x}, but a {pool['version']} "
             f"exact-input swap is 0x{expected:02x}"
         )
+    legs: tuple[t.Any, ...]
     if pool["version"] == "v4":
         actions, params = abi_decode(["bytes", "bytes[]"], inputs[0])
         if actions != bytes([ACTION_SWAP_EXACT_IN, ACTION_SETTLE, ACTION_TAKE]):
             raise SwapError(f"unexpected v4 actions {actions.hex()}")
-        currency_in, path, _, amount_in, minimum_out = abi_decode(
+        if len(params) != 3:
+            raise SwapError(f"expected three v4 action params, got {len(params)}")
+        currency_in, path, min_hop, amount_in, minimum_out = abi_decode(
             [V4_EXACT_INPUT_PARAMS], params[0]
         )[0]
-        recipient = abi_decode(["address", "address", "uint256"], params[2])[1]
+        if len(path) != 1:
+            raise SwapError(f"expected a one-hop v4 path, got {len(path)} hops")
+        settle_currency, settle_amount, payer = abi_decode(
+            ["address", "uint256", "bool"], params[1]
+        )
+        take_currency, recipient, take_amount = abi_decode(
+            ["address", "address", "uint256"], params[2]
+        )
         token_out_seen = path[0][0]
         venue = (int(path[0][1]), int(path[0][2]), to_checksum_address(path[0][3]))
+        legs = (
+            1,
+            payer,
+            list(min_hop),
+            to_checksum_address(settle_currency),
+            settle_amount,
+            to_checksum_address(take_currency),
+            take_amount,
+            bytes(path[0][4]),
+        )
     elif pool["version"] == "v3":
-        recipient, amount_in, minimum_out, path_bytes, _, _ = abi_decode(
+        recipient, amount_in, minimum_out, path_bytes, payer, min_hop = abi_decode(
             ["address", "uint256", "uint256", "bytes", "bool", "uint256[]"], inputs[0]
         )
+        if len(path_bytes) != 43:
+            raise SwapError(
+                f"expected a one-hop v3 path of 43 bytes, got {len(path_bytes)}"
+            )
         currency_in = "0x" + path_bytes[:20].hex()
         token_out_seen = "0x" + path_bytes[23:43].hex()
         venue = (int.from_bytes(path_bytes[20:23], "big"), 0, NO_HOOKS)
+        legs = (1, payer, list(min_hop))
     else:
-        recipient, amount_in, minimum_out, path_list, _, _ = abi_decode(
+        recipient, amount_in, minimum_out, path_list, payer, min_hop = abi_decode(
             ["address", "uint256", "uint256", "address[]", "bool", "uint256[]"],
             inputs[0],
         )
-        currency_in, token_out_seen = path_list[0], path_list[-1]
+        if len(path_list) != 2:
+            raise SwapError(
+                f"expected a one-hop v2 path of two tokens, got {len(path_list)}"
+            )
+        currency_in, token_out_seen = path_list[0], path_list[1]
         venue = (V2_FEE, 0, NO_HOOKS)
-    return currency_in, token_out_seen, recipient, amount_in, minimum_out, venue
+        legs = (1, payer, list(min_hop))
+    return DecodedSwap(
+        to_checksum_address(currency_in),
+        to_checksum_address(token_out_seen),
+        to_checksum_address(recipient),
+        amount_in,
+        minimum_out,
+        venue,
+        deadline,
+        legs,
+    )
 
 
 def verify_execute(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
@@ -513,35 +644,32 @@ def verify_execute(  # pylint: disable=too-many-arguments,too-many-positional-ar
     amount: int,
     minimum: int,
     to: str,
+    deadline: int,
 ) -> None:
     """Decode our own calldata and check it says what we meant.
 
     Raises:
         SwapError: when any field disagrees with what was planned.
     """
-    (
-        currency_in,
-        token_out_seen,
-        recipient,
-        amount_in,
-        minimum_out,
-        venue,
-    ) = _decode_execute(calldata, pool)
-    planned = (
+    seen = _decode_execute(calldata, pool)
+    planned_venue = (
         int(pool["fee"]),
         int(pool["tick_spacing"]) if pool["version"] == "v4" else 0,
         pool["hooks"] if pool["version"] == "v4" else NO_HOOKS,
     )
+    token_in, token_out = to_checksum_address(token_in), to_checksum_address(token_out)
+    planned_legs: tuple[t.Any, ...] = (1, PAYER_IS_USER, NO_HOP_PRICE_LIMIT)
+    if pool["version"] == "v4":
+        planned_legs += (token_in, OPEN_DELTA, token_out, OPEN_DELTA, b"")
     checks: dict[str, tuple[t.Any, t.Any]] = {
-        "token_in": (to_checksum_address(currency_in), to_checksum_address(token_in)),
-        "token_out": (
-            to_checksum_address(token_out_seen),
-            to_checksum_address(token_out),
-        ),
-        "recipient": (to_checksum_address(recipient), to_checksum_address(to)),
-        "amount_in": (amount_in, amount),
-        "minimum_out": (minimum_out, minimum),
-        "venue": (venue, planned),
+        "token_in": (seen.token_in, token_in),
+        "token_out": (seen.token_out, token_out),
+        "recipient": (seen.recipient, to_checksum_address(to)),
+        "amount_in": (seen.amount_in, amount),
+        "minimum_out": (seen.minimum_out, minimum),
+        "venue": (seen.venue, planned_venue),
+        "deadline": (seen.deadline, deadline),
+        "legs": (seen.legs, planned_legs),
     }
     check_fields("calldata", checks)
 
