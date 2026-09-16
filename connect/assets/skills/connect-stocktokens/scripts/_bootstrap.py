@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
 # ------------------------------------------------------------------------------
 #
 #   Copyright 2026 Valory AG
@@ -16,14 +16,23 @@
 #   limitations under the License.
 #
 # ------------------------------------------------------------------------------
-#
-#   eval "$(bash scripts/bootstrap_env.sh)"
-#   "$PY" scripts/markets.py list
 
-SHARED="$(dirname "${BASH_SOURCE[0]}")/../../../lib/bootstrap_env.sh"
-if [ ! -f "$SHARED" ]; then
-  echo "echo \"connect-polymarket: shared bootstrap missing at $SHARED\" >&2; false"
-  exit 1
-fi
-exec bash "$SHARED" connect-polymarket CONNECT_POLYMARKET_VENV .bootstrap-complete \
-  "py-clob-client-v2==1.0.2" "web3>=7.15,<8" requests certifi
+"""Put .claude/lib on the path; import this before any shared module."""
+
+import importlib.util
+import sys
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[3] / "lib"
+if not (LIB / "evm.py").is_file():
+    raise ImportError(
+        f"connect-stocktokens needs the shared modules the connect server installs "
+        f"into .claude/lib; expected evm.py under {LIB}"
+    )
+if importlib.util.find_spec("web3") is None:
+    raise ImportError(
+        "connect-stocktokens needs web3>=7.15,<8 in the interpreter running it; "
+        "see the Environment section of SKILL.md"
+    )
+if str(LIB) not in sys.path:
+    sys.path.insert(0, str(LIB))

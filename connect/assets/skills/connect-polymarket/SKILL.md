@@ -38,7 +38,7 @@ USDC.e in safe --wrap--> pUSD in safe --top-up--> DW --buy--> position in DW
 
 1. `funds.py wrap` — the safe wraps its USDC.e into pUSD (the v2 collateral).
 2. `funds.py top-up --amount X` — the safe sends the DW exactly what the
-   next buy spends.
+   next buy needs.
 3. `trade.py buy/sell/limit` — trade on the CLOB, funded by the DW.
 4. `funds.py sweep` — **always, after trading**: returns the DW's pUSD *and*
    bought positions to the safe. Cancel any resting limit orders first —
@@ -186,7 +186,7 @@ yet", never "no position".
 - `polymarket/state.json` caches the DW address and CLOB API creds
   (revocable API credentials, never key material). Don't commit it; don't
   hand-edit it.
-- Amount semantics: buys spend pUSD (`--usd`), sells move shares
+- Amount semantics: buys use pUSD (`--usd`), sells move shares
   (`--shares`) — same as the Polystrat agent.
 - Taker fees are per-market: `fee = shares × rate × (p·(1-p))^exponent`,
   where the rate is 0.07 for crypto, 0.05 for sports/culture, 0.04 for

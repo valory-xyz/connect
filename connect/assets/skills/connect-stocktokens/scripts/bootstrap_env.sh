@@ -18,12 +18,12 @@
 # ------------------------------------------------------------------------------
 #
 #   eval "$(bash scripts/bootstrap_env.sh)"
-#   "$PY" scripts/markets.py list
+#   "$PY" scripts/swap.py quote --symbol NVDA --usdg 100
 
 SHARED="$(dirname "${BASH_SOURCE[0]}")/../../../lib/bootstrap_env.sh"
 if [ ! -f "$SHARED" ]; then
-  echo "echo \"connect-polymarket: shared bootstrap missing at $SHARED\" >&2; false"
+  echo "echo \"connect-stocktokens: shared bootstrap missing at $SHARED\" >&2; false"
   exit 1
 fi
-exec bash "$SHARED" connect-polymarket CONNECT_POLYMARKET_VENV .bootstrap-complete \
-  "py-clob-client-v2==1.0.2" "web3>=7.15,<8" requests certifi
+exec bash "$SHARED" connect-stocktokens CONNECT_STOCKTOKENS_VENV .bootstrap-connect-stocktokens \
+  "web3>=7.15,<8" certifi

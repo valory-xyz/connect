@@ -463,6 +463,7 @@ class TestMain:
         """
         assets = boot_env / "fake-assets"
         (assets / "skills").mkdir(parents=True)  # no CLAUDE.md: populate raises
+        (assets / "lib").mkdir()
         monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         assert served[0].config.app.state.workspace.reason is not None
@@ -1415,6 +1416,7 @@ class TestWorkspaceExtras:
         """
         assets = tmp_path / "assets"
         (assets / "skills").mkdir(parents=True)
+        (assets / "lib").mkdir()
         monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
         agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
         assert agent_workspace.ensure() is False
@@ -1433,6 +1435,7 @@ class TestWorkspaceExtras:
         """Non-directory entries under assets/skills are ignored."""
         skills = tmp_path / "assets" / "skills"
         (skills / "my-skill").mkdir(parents=True)
+        (tmp_path / "assets" / "lib").mkdir()
         (skills / "my-skill" / "SKILL.md").write_text("hi")
         (skills / "stray.txt").write_text("not a skill")
         (tmp_path / "assets" / "CLAUDE.md").write_text("brief")  # populate requires it

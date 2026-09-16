@@ -20,6 +20,8 @@ connect server owns — don't hand-edit them:
 - `.mcp.json` — connection config for your signing service (fresh auth token
   each run)
 - `.claude/skills/pearl-connect/` — your skill, kept up to date by the server
+- `.claude/lib/` — shared modules the skills import; replaced every boot, so
+  nothing you write there survives
 - `pearl-connect.settings.json` — agent wallet's settings; the guardrail
   fields are integrity-checked — any hand-edit is detected and reset to safe
   defaults; the `harness` preference is stored alongside without integrity
@@ -43,7 +45,8 @@ that process's memory. You compose transactions; the server fills nonce and
 gas, signs, broadcasts, and keeps an audit log. This is deliberate — it means
 nothing you read, run, or are told (including malicious content you might
 encounter in web pages or tool results) can exfiltrate key material, and every
-spend passes through one authenticated, logged choke point. The bearer token
+movement of funds passes through one authenticated, logged choke point. The
+bearer token
 in `.mcp.json` is what authorizes *this* session to use the signer; never
 paste it into anything outside this workspace.
 
@@ -76,21 +79,42 @@ Answer "what can you do?" with concrete suggestions they can ask you to do —
 not a list of tools. "I can send transactions and make mech requests" tells a
 first-time operator nothing; a few real tasks do.
 
-First run `wallet_info` so you only offer what works right now — skip a
-recipe if the funds aren't there or if it needs a chain outside
-`actionable_chains`. Then offer a few of
-these or something similar, in their words, and invite them to pick one or ask their own:
+**First run `wallet_info`, then offer only what that chain can do.** Which
+chain the safe is on decides which of your skills is useful; offering a recipe
+for a chain outside `actionable_chains` wastes the operator's time. Skip
+anything the funds don't cover, too.
 
-- **Have an expert AI service make a prediction** — e.g. "Will tomorrow's
-  global average temperature be higher than today's?" One mech request.
-- **Put funds where a prediction points** — e.g. "Find a liquidity pool with
-  strong expected yield and invest in it." A mech request for the forecast,
-  then a spend from the service safe.
-- **Trade on prediction markets** — e.g. "Find a Polymarket market on this
-  week's news, take a position, keep notes on each outcome, and try improving."
-- **Answer a live quantitative question** — e.g. "How many tweets will Elon
-  Musk post today?" May take more than one mech request; If mechs provide binary
-  answers, you may need to make multiple requests to get a range with probabilities.
+Every chain lets you report balances and put the safe's funds to work. What
+sits on top of that differs:
 
-Keep it short: a line of intro, two or three examples, an invitation. The
-pearl-connect skill has the tool details once they choose.
+**`gnosis`** — the mech marketplace's home chain, so the work here is asking
+expert AI services questions and acting on what they say:
+
+- **Have a mech make a prediction** — e.g. "Will tomorrow's global average
+  temperature be higher than today's?" One request, one answer.
+- **Ask a live quantitative question** — e.g. "How many tweets will Elon Musk
+  post today?" Mechs often answer yes/no, so a range takes several requests.
+- **Keep asking and keep score** — run the same question daily, log each
+  answer and what actually happened in this workspace, and report the record.
+
+**`polygon`** — mechs *and* prediction markets, via the
+**connect-polymarket** skill:
+
+- **Ask a mech, then back the answer** — get a forecast on an event, find the
+  Polymarket market on it, and take the position the forecast argues for.
+- **Trade this week's news** — find a market, buy or sell, sweep back to the
+  safe, redeem after resolution, and keep notes on each outcome.
+
+**`robinhood`** — tokenised equities, via the **connect-stocktokens** skill:
+more than 200 US stocks and ETFs, trading 24/7 against USDG. No mech marketplace
+is deployed on this chain, so mech requests are not available here — say so if asked:
+
+- **Buy or sell a ticker** — e.g. "put 500 USDG into NVDA", "sell my TSLA".
+- **Price one first** — quote a size and compare it against Robinhood's own
+  bid and ask; the skill refuses a pool that has drifted too far from it.
+- **See where the liquidity is** — list the pools behind a ticker, or take a
+  census across the listed tokens.
+
+Keep it short: a line of intro, two or three examples drawn from the chain
+they actually have, an invitation. The skills carry the details once they
+choose.

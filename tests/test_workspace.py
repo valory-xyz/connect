@@ -99,6 +99,19 @@ def test_a_second_run_rotates_the_token(store_path: Path) -> None:
     assert mcp_entry(store_path)["headers"]["Authorization"] == "Bearer tok-2"
 
 
+def test_lib_installed_and_overwritten(store_path: Path) -> None:
+    """The shared modules land in .claude/lib and are refreshed every boot."""
+    provisioned(store_path)
+    module = store_path / ".claude" / "lib" / "uniswap.py"
+    assert module.exists()
+    module.write_text("tampered", encoding="utf-8")
+    stale = module.parent / "stale.py"
+    stale.write_text("old")
+    provisioned(store_path)
+    assert "tampered" not in module.read_text(encoding="utf-8")
+    assert not stale.exists()
+
+
 def test_skills_installed_and_overwritten(store_path: Path) -> None:
     """Test skills installed and overwritten."""
     provisioned(store_path)
@@ -109,6 +122,34 @@ def test_skills_installed_and_overwritten(store_path: Path) -> None:
     stale.write_text("old")
     provisioned(store_path)
     assert not stale.exists()
+
+
+def test_a_file_in_place_of_a_tree_is_replaced(store_path: Path) -> None:
+    """Not a directory must not wedge provisioning on every health poll."""
+    lib = store_path / ".claude" / "lib"
+    lib.parent.mkdir(parents=True)
+    lib.write_text("not a directory", encoding="utf-8")
+    provisioned(store_path)
+    assert (lib / "uniswap.py").is_file()
+
+
+def test_a_link_in_place_of_a_tree_is_unlinked_not_followed(
+    store_path: Path, tmp_path: Path
+) -> None:
+    """Whatever the link pointed at is left alone."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("keep", encoding="utf-8")
+    skills = store_path / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    try:
+        (skills / "pearl-connect").symlink_to(elsewhere, target_is_directory=True)
+    except OSError:
+        pytest.skip("this platform will not create a symlink for us")
+    provisioned(store_path)
+    assert (skills / "pearl-connect" / "SKILL.md").is_file()
+    assert not (skills / "pearl-connect").is_symlink()
+    assert (elsewhere / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_claude_md_installed_and_overwritten(store_path: Path) -> None:
