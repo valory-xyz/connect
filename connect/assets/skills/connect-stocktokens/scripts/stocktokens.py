@@ -46,10 +46,39 @@ MAX_PRICE_GAP_BPS = 150.0
 
 
 def get_json(url: str) -> t.Any:
-    """GET a JSON document with the User-Agent Robinhood's edge requires."""
+    """GET a JSON document with the User-Agent Robinhood's edge requires.
+
+    Raises:
+        SwapError: when the endpoint is unreachable or does not answer with
+            JSON. The agent is told to report a refusal, so a Robinhood outage
+            has to arrive as one rather than as a traceback.
+    """
     request = urllib.request.Request(url, headers={"user-agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=30) as response:  # nosec B310
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # nosec B310
+            return json.load(response)
+    except (OSError, ValueError) as exc:
+        raise SwapError(f"could not read {url} ({type(exc).__name__}: {exc})") from exc
+
+
+def _field(doc: t.Any, *path: t.Any) -> t.Any:
+    """Walk a Robinhood document, refusing a shape it no longer has.
+
+    Raises:
+        SwapError: when any step is missing; a feed that changed shape must
+            not be indexed into and reported as a price.
+    """
+    here: t.Any = doc
+    for step in path:
+        try:
+            here = here[step]
+        except (KeyError, IndexError, TypeError) as exc:
+            where = " -> ".join(str(p) for p in path)
+            raise SwapError(
+                f"Robinhood answered with a document this skill does not "
+                f"recognise; no {where}"
+            ) from exc
+    return here
 
 
 def _multiplier(asset: dict[str, t.Any]) -> str:
@@ -89,11 +118,11 @@ def asset_book() -> AssetBook:
     """
     tokens: dict[str, dict[str, t.Any]] = {}
     excluded: dict[str, str] = {}
-    for asset in get_json(ASSETS_URL)["assets"]:
+    for asset in _field(get_json(ASSETS_URL), "assets"):
         for deployment in asset.get("deployments", []):
             if deployment.get("chainId") != CHAIN_ID:
                 continue
-            symbol = asset["tokenSymbol"]
+            symbol = _field(asset, "tokenSymbol")
             if symbol in tokens or symbol in excluded:
                 tokens.pop(symbol, None)
                 excluded[symbol] = (
@@ -146,12 +175,12 @@ def lookup(symbol: str) -> dict[str, t.Any]:
 
 
 def reference_price(symbol: str, multiplier: str) -> tuple[float, float, bool]:
-    """Robinhood's own bid/ask for a ticker, divided by its multiplier.
+    """Robinhood's own bid/ask for a ticker, scaled to one token.
 
     Raises:
         SwapError: when the quote or multiplier is not usable.
     """
-    quote = get_json(PRICES_URL.format(symbol=symbol))["quotes"][0]
+    quote = _field(get_json(PRICES_URL.format(symbol=symbol)), "quotes", 0)
     factor = float(multiplier or 1.0)
     if quote.get("tokenSymbol", symbol) != symbol:
         raise SwapError(
@@ -162,13 +191,13 @@ def reference_price(symbol: str, multiplier: str) -> tuple[float, float, bool]:
             f"{symbol} quote has no isTradingHalt field; refusing to trade "
             f"against a quote whose shape we no longer recognise"
         )
-    bid, ask = float(quote["bid"]), float(quote["ask"])
+    bid, ask = float(_field(quote, "bid")), float(_field(quote, "ask"))
     if factor <= 0 or bid <= 0 or ask <= 0:
         raise SwapError(
             f"{symbol} priced at bid {bid} ask {ask} with multiplier {factor}; "
             f"refusing to trade without a usable reference price"
         )
-    return bid / factor, ask / factor, bool(quote["isTradingHalt"])
+    return bid * factor, ask * factor, bool(quote["isTradingHalt"])
 
 
 def price_gap_bps(quoted_out: int, reference_out: int) -> float:

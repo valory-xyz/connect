@@ -56,10 +56,10 @@ Two prices, and they do not agree:
 - **Robinhood's REST price** — `GET api.robinhood.com/rhj/prices/{symbol}`,
   the underlying equity's bid/ask, keyless and unauthenticated.
 
-They are in different units. REST quotes the **equity**; a Stock Token is
-`currentMultiplier` of it, from `GET /rhj/assets`, and that multiplier is not
-always 1. `swap.py` divides REST prices by the multiplier before comparing.
-If you mix the two yourself, apply it or your numbers are silently wrong.
+They are in different units. REST quotes the **equity**; one Stock Token is
+`currentMultiplier` *shares* of it, from `GET /rhj/assets`, and that multiplier
+is not always 1. `swap.py` multiplies REST prices by the multiplier before comparing.
+If you mix the two yourself, apply it the same way or your numbers are silently wrong.
 
 The minimum output is a fraction of **the quote you were shown**, less
 slippage — never of the reference, which would hand back the difference

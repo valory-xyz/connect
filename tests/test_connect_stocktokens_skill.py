@@ -1209,10 +1209,10 @@ def _quote_payload(
     return {"quotes": [{"bid": bid, "ask": ask, "isTradingHalt": halt}]}
 
 
-def test_reference_price_divides_by_the_multiplier(
+def test_reference_price_multiplies_by_the_multiplier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A token is the multiplier's worth of the equity, so REST prices divide.
+    """One token is `currentMultiplier` shares, so REST prices multiply.
 
     Every other test uses a multiplier of 1, where divide and multiply are
     indistinguishable; this is the one that pins the direction.
@@ -1221,7 +1221,48 @@ def test_reference_price_divides_by_the_multiplier(
         stocktokens, "get_json", lambda _url: _quote_payload("100", "200")
     )
     bid, ask, halted = stocktokens.reference_price("NVDA", "4.0")
-    assert (bid, ask, halted) == (25.0, 50.0, False)
+    assert (bid, ask, halted) == (400.0, 800.0, False)
+
+
+def test_a_robinhood_outage_is_a_refusal_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent is told to report refusals, so transport failure must be one."""
+
+    def _down(*_a: object, **_k: object) -> t.Any:
+        """Stand in for an unreachable Robinhood edge."""
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(stocktokens.urllib.request, "urlopen", _down)
+    with pytest.raises(evm.SwapError, match="could not read"):
+        stocktokens.get_json(stocktokens.ASSETS_URL)
+
+
+@pytest.mark.parametrize(
+    ("payload", "missing"),
+    [
+        ({}, "quotes"),
+        ({"quotes": []}, "quotes -> 0"),
+        ({"quotes": [{"ask": "212", "isTradingHalt": False}]}, "bid"),
+        ({"quotes": [{"bid": "212", "isTradingHalt": False}]}, "ask"),
+    ],
+)
+def test_a_quote_missing_a_field_is_a_refusal(
+    payload: dict, missing: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A feed that changed shape must not be indexed into and priced."""
+    monkeypatch.setattr(stocktokens, "get_json", lambda _url: payload)
+    with pytest.raises(evm.SwapError, match=f"no {missing}"):
+        stocktokens.reference_price("NVDA", "1.0")
+
+
+def test_a_registry_missing_its_assets_is_a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registry drives every command; an unrecognised shape stops it."""
+    monkeypatch.setattr(stocktokens, "get_json", lambda _url: {"data": []})
+    with pytest.raises(evm.SwapError, match="no assets"):
+        stocktokens.asset_registry()
 
 
 def test_reference_price_refuses_an_unusable_quote(
