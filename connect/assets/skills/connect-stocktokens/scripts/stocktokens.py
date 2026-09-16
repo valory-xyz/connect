@@ -24,12 +24,18 @@ import json
 import math
 import typing as t
 import urllib.request
+from decimal import Decimal
 
 from eth_utils import to_checksum_address
+from web3 import Web3
 
 import _bootstrap  # noqa: F401  pylint: disable=unused-import  # isort: split
 
-from evm import SwapError  # noqa: E402  pylint: disable=wrong-import-position
+from evm import (  # noqa: E402  pylint: disable=wrong-import-position
+    SwapError,
+    call_int,
+    selector,
+)
 
 CHAIN = "robinhood"
 CHAIN_ID = 4663
@@ -42,6 +48,8 @@ WETH = to_checksum_address("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73")
 QUOTE_ASSETS = {"USDG": USDG, "WETH": WETH}
 
 TRADABLE_STATUS = frozenset({"ASSET_STATUS_ACTIVE"})
+SEL_UI_MULTIPLIER = selector("uiMultiplier()")
+MULTIPLIER_SCALE = Decimal(10**18)
 WARN_PRICE_GAP_BPS = 50.0
 MAX_PRICE_GAP_BPS = 150.0
 
@@ -82,17 +90,17 @@ def _field(doc: t.Any, *path: t.Any) -> t.Any:
     return here
 
 
-def _multiplier(asset: dict[str, t.Any]) -> str:
-    """Read the ticker's corporate-action multiplier, refusing a missing one.
+def token_multiplier(w3: Web3, token: str) -> str:
+    """Read how many shares one token represents from the token contract.
 
     Raises:
-        SwapError: when the field is absent or unparseable; defaulting it to 1
-            would misprice every comparison this skill makes.
+        SwapError: when the token does not answer, or answers zero; defaulting
+            it to 1 would misprice every comparison this skill makes.
     """
-    raw = asset.get("currentMultiplier")
-    if _positive(raw) is None:
-        raise SwapError(f"no usable currentMultiplier ({raw!r}); refusing to price it")
-    return str(raw)
+    raw = call_int(w3, token, SEL_UI_MULTIPLIER)
+    if raw <= 0:
+        raise SwapError(f"{token} reports uiMultiplier {raw}; refusing to price it")
+    return str(Decimal(raw) / MULTIPLIER_SCALE)
 
 
 class AssetBook(t.NamedTuple):
@@ -166,7 +174,6 @@ def _listing(asset: dict[str, t.Any]) -> t.Optional[dict[str, t.Any]]:
     return {
         "address": to_checksum_address(here[0]["contractAddress"]),
         "name": asset.get("tokenName", ""),
-        "multiplier": _multiplier(asset),
         "pending_multiplier": asset.get("pendingMultiplier", ""),
         "status": asset["status"],
     }

@@ -21,6 +21,13 @@ The safe needs **USDG to trade with and ETH for gas**, both on chain 4663. Read
 `not_actionable_because` rather than guessing: no safe and no ETH are the
 operator's to fix, so report them and stop.
 
+**Before the first trade, ask once.** Robinhood does not offer Stock Tokens
+to US, UK, Canadian or Swiss persons; it enforces that in its own app, not in
+the token contracts. Ask the operator whether they are one, and record the
+answer in `stocktokens.eligibility.json` in the workspace so you never ask
+again. If they are, say that Stock Tokens are not offered to them and do not
+trade. Quotes and pool lookups need no answer; only `buy` and `sell` do.
+
 ## Python environment
 
 The scripts import `web3`, which the system Python usually lacks. Build the
@@ -81,9 +88,11 @@ Two prices, and they do not agree:
   the underlying equity's bid/ask, keyless and unauthenticated.
 
 They are in different units. REST quotes the **equity**; one Stock Token is
-`currentMultiplier` *shares* of it, from `GET /rhj/assets`, and that multiplier
-is not always 1. `swap.py` multiplies REST prices by the multiplier before comparing.
-If you mix the two yourself, apply it the same way or your numbers are silently wrong.
+some number of *shares* of it, read from the token contract's `uiMultiplier()`
+at trade time, and that multiplier is not always 1. `swap.py` multiplies REST
+prices by it before comparing, and every plan reports it as `multiplier`. If
+you mix the two yourself, apply it the same way or your numbers are silently
+wrong.
 
 The minimum output is a fraction of **the quote you were shown**, less
 slippage — never of the reference, which would hand back the difference
@@ -165,7 +174,3 @@ the **safe** the caller, so the tokens land in the safe.
   untouched. Report it; there is nothing to retry.
 - The public RPC rate-limits aggressively. Pool discovery is cached for an
   hour in `stocktokens.pools.json`; do not loop `--refresh`.
-- Stock Tokens are not offered to US, UK, Canadian or Swiss persons. That
-  restriction is Robinhood's and it is enforced at their interface, not in the
-  token contract. If the operator tells you they are in one of those places,
-  stop and say why.

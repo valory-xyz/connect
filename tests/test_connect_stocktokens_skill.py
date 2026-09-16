@@ -542,11 +542,13 @@ def _fresh_registry() -> t.Iterator[None]:
 @pytest.fixture(name="traded")
 def traded_fixture(monkeypatch: pytest.MonkeyPatch) -> dict:
     """Stage a ticker, a pool and a Robinhood price, with no network anywhere."""
-    state = {
+    state: dict[str, t.Any] = {
         "bid": 249.9,
         "ask": 250.0,
         "halted": False,
         "quoted": 3_970_000_000_000_000_000,
+        "multiplier": "1.0",
+        "multiplier_asked": [],
     }
     monkeypatch.setattr(
         swap.stocktokens,
@@ -555,7 +557,6 @@ def traded_fixture(monkeypatch: pytest.MonkeyPatch) -> dict:
             {
                 "NVDA": {
                     "address": NVDA,
-                    "multiplier": "1.0",
                     "pending_multiplier": "",
                     "name": "",
                     "status": "",
@@ -566,9 +567,16 @@ def traded_fixture(monkeypatch: pytest.MonkeyPatch) -> dict:
     )
     monkeypatch.setattr(
         swap.stocktokens,
-        "reference_price",
-        lambda _s, _m: (state["bid"], state["ask"], state["halted"]),
+        "token_multiplier",
+        lambda _w3, token: state["multiplier"],
     )
+
+    def _reference(_symbol: str, multiplier: str) -> tuple:
+        """Record the multiplier the reference was scaled by."""
+        state["multiplier_asked"].append(multiplier)
+        return state["bid"], state["ask"], state["halted"]
+
+    monkeypatch.setattr(swap.stocktokens, "reference_price", _reference)
     monkeypatch.setattr(swap.pools, "cached_discover", lambda *a, **k: [V3_POOL])
     monkeypatch.setattr(
         swap.uniswap, "best_route", lambda *a, **k: (V3_POOL, state["quoted"])
@@ -1524,18 +1532,76 @@ def test_asset_registry_keeps_only_this_chain(monkeypatch: pytest.MonkeyPatch) -
     assert sorted(registry) == ["NVDA"]
 
 
-def test_a_missing_multiplier_excludes_only_that_ticker(
+class _MultiplierW3:
+    """Answers uiMultiplier() with a fixed word, or nothing."""
+
+    def __init__(self, answer: bytes) -> None:
+        """Answer every call with these bytes."""
+        self.eth = self
+        self.answer = answer
+        self.asked: list[dict] = []
+
+    def call(self, tx: dict) -> bytes:
+        """Record the call and answer."""
+        self.asked.append(tx)
+        return self.answer
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (4 * 10**18, "4"),
+        (1000775159164630595, "1.000775159164630595"),
+    ],
+)
+def test_token_multiplier_reads_the_token_contract(raw: int, expected: str) -> None:
+    """The chain, not the REST registry, says how many shares a token is."""
+    w3 = _MultiplierW3(raw.to_bytes(32, "big"))
+    assert stocktokens.token_multiplier(w3, NVDA) == expected
+    assert w3.asked[0]["data"] == stocktokens.SEL_UI_MULTIPLIER
+    assert w3.asked[0]["to"] == to_checksum_address(NVDA)
+
+
+@pytest.mark.parametrize(
+    ("answer", "match"),
+    [(bytes(32), "uiMultiplier 0"), (b"", "returned 0 bytes")],
+)
+def test_token_multiplier_refuses_nothing_or_zero(answer: bytes, match: str) -> None:
+    """Defaulting the multiplier to 1 would misprice every comparison."""
+    with pytest.raises(evm.SwapError, match=match):
+        stocktokens.token_multiplier(_MultiplierW3(answer), NVDA)
+
+
+def test_a_missing_rest_multiplier_no_longer_excludes_a_ticker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Defaulting the multiplier to 1 would misprice every comparison."""
-    broken = _asset("TSLA")
-    del broken["currentMultiplier"]
+    """The registry no longer carries the multiplier, so it cannot gate on it."""
+    listed = _asset("TSLA")
+    del listed["currentMultiplier"]
     monkeypatch.setattr(
-        stocktokens, "get_json", lambda _url: _assets_payload(_asset("NVDA"), broken)
+        stocktokens, "get_json", lambda _url: _assets_payload(_asset("NVDA"), listed)
     )
-    assert sorted(stocktokens.asset_registry()) == ["NVDA"]
-    with pytest.raises(evm.SwapError, match="no usable currentMultiplier"):
-        stocktokens.lookup("TSLA")
+    assert sorted(stocktokens.asset_registry()) == ["NVDA", "TSLA"]
+    assert "multiplier" not in stocktokens.lookup("TSLA")
+
+
+def test_plan_swap_scales_the_reference_by_the_chains_multiplier(
+    traded: dict,
+) -> None:
+    """The multiplier read at trade time is the one the price is checked with."""
+    traded["multiplier"] = "4"
+    plan = swap.plan_swap(
+        _StubW3(),
+        "NVDA",
+        USDG,
+        NVDA,
+        1_000 * 10**6,
+        0.5,
+        SAFE,
+        separate_approvals=True,
+    )
+    assert traded["multiplier_asked"] == ["4"]
+    assert plan["multiplier"] == "4"
 
 
 def test_a_duplicate_ticker_excludes_only_that_ticker(

@@ -199,7 +199,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             {
                 "symbol": args.symbol,
                 "token": asset["address"],
-                "multiplier": asset["multiplier"],
+                "multiplier": stocktokens.token_multiplier(w3, asset["address"]),
                 "pending_multiplier": asset["pending_multiplier"],
                 "quote": args.quote,
                 "pools": cached_discover(

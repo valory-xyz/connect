@@ -69,6 +69,7 @@ class Plan(t.TypedDict):
     slippage: float
     max_gap_bps: float
     token: str
+    multiplier: str
     pending_multiplier: str
     permit: str
     deadline: int
@@ -155,8 +156,9 @@ def plan_swap(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     decimals_in = evm.token_decimals(w3, token_in)
     decimals_out = evm.token_decimals(w3, token_out)
     buying = token_out == asset["address"]
+    multiplier = stocktokens.token_multiplier(w3, asset["address"])
     reference, bid, ask = reference_units(
-        symbol, asset["multiplier"], amount, decimals_in, decimals_out, buying
+        symbol, multiplier, amount, decimals_in, decimals_out, buying
     )
     gap = stocktokens.check_price_gap(quoted_out, reference, max_gap_bps)
     floor = int(quoted_out * (1 - Decimal(str(slippage)) / 100))
@@ -218,6 +220,7 @@ def plan_swap(  # pylint: disable=too-many-arguments,too-many-positional-argumen
         "slippage": slippage,
         "max_gap_bps": max_gap_bps,
         "token": asset["address"],
+        "multiplier": multiplier,
         "pending_multiplier": asset["pending_multiplier"],
         "price_warning": (
             f"pool is {gap:.0f} bps worse than Robinhood's price; say so before "
@@ -251,9 +254,10 @@ def _cmd_quote(args: argparse.Namespace) -> int:
         w3, stocktokens.CHAIN_ID, USDG, asset["address"], amount, candidates
     )
     decimals = evm.token_decimals(w3, asset["address"])
+    multiplier = stocktokens.token_multiplier(w3, asset["address"])
     reference, bid, ask = reference_units(
         args.symbol,
-        asset["multiplier"],
+        multiplier,
         amount,
         evm.token_decimals(w3, USDG),
         decimals,
@@ -269,6 +273,7 @@ def _cmd_quote(args: argparse.Namespace) -> int:
                 "implied_price": args.usdg / shares if shares else None,
                 "robinhood_bid": bid,
                 "robinhood_ask": ask,
+                "multiplier": multiplier,
                 "price_gap_bps": round(stocktokens.price_gap_bps(out, reference), 1),
                 "pool": pool,
                 "candidates": len(candidates),

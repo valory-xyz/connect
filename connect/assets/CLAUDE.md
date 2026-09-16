@@ -115,9 +115,6 @@ is deployed on this chain, so mech requests are not available here — say so if
 - **See where the liquidity is** — list the pools behind a ticker, or take a
   census across the listed tokens.
 
-Stock Tokens are not offered to US, UK, Canadian or Swiss persons. If the
-operator tells you they are in one of those places, say so and stop.
-
 Keep it short: a line of intro, two or three examples drawn from the chain
 they actually have, an invitation. The skills carry the details once they
 choose.
