@@ -708,13 +708,6 @@ def test_plan_swap_rejects_a_permit_for_the_wrong_amount(
         )
 
 
-_PERMIT_ACTION = permit.permit_input(
-    permit.PermitDetails(USDG, 1_000 * 10**6, 1789473030, 0),
-    uniswap.DEPLOYMENTS[CHAIN_ID]["universal_router"],
-    1789473930,
-    b"signature",
-)
-
 
 class _SigningW3:
     """A web3 that answers the two reads signed_action makes."""
