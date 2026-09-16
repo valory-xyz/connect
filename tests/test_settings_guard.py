@@ -44,6 +44,7 @@ from web3.datastructures import AttributeDict
 
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
+from connect import mech_budget
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -3254,6 +3255,8 @@ class TestMech:
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert info["mech"] == OTHER
         assert info["payment_type"] == "NATIVE"
+        assert info["payment_token"] == "native"
+        assert info["default_max_payment"] == str(10**17)
         assert info["service_id"] == 42
         assert info["tools"] == ["prediction-online"]
         # this mech published an endpoint, so nothing bars the default flow
@@ -3454,6 +3457,82 @@ class TestMech:
             max_payment=10**19,
         )
         assert len(patched_mech.calls) == 1
+
+    def test_the_default_budget_follows_the_payment_asset(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """0.1 of a 6-decimal token is 10**5, not the native 10**17."""
+        usdc = SimpleNamespace(name="USDC_TOKEN", value=PaymentType.USDC_TOKEN.value)
+        patched_mech.mech_info = (usdc, 42, 10**5 + 1)
+        with pytest.raises(MechError, match="above max_payment=100000"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        patched_mech.mech_info = (usdc, 42, 10**5)
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert len(patched_mech.calls) == 1
+
+    def test_an_asset_with_no_default_budget_needs_an_explicit_one(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A payment type added upstream must not inherit someone else's units."""
+        monkeypatch.delitem(mech_budget.DEFAULT_MAX_PAYMENT, PaymentType.NATIVE)
+        with pytest.raises(MechError, match="no default budget"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        assert not patched_mech.calls
+        mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            max_payment=10**17,
+        )
+        assert len(patched_mech.calls) == 1
+
+    def test_tools_names_the_token_a_mech_is_paid_in(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """On Robinhood the USDC payment type is paid in USDG."""
+        # pylint: disable=protected-access
+        mech_service._config.chains["robinhood"] = ChainConfig(
+            rpc_url="http://127.0.0.1:9", safe_address=SAFE
+        )
+        patched_mech.mech_info = (
+            SimpleNamespace(name="USDC_TOKEN", value=PaymentType.USDC_TOKEN.value),
+            1,
+            10000,
+        )
+        info = mech_service.tools(chain="robinhood", priority_mech=OTHER)
+        assert info["payment_type"] == "USDC_TOKEN"
+        assert info["payment_token"] == "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+        assert info["default_max_payment"] == "100000"
+        unknown_chain = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert unknown_chain["payment_token"] == ""
+
+    def test_listing_points_mech_client_at_this_chains_rpc(
+        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mech-client reads a process-global RPC; another chain's must not linger."""
+        seen: list[str] = []
+
+        def _query(chain: str) -> list:
+            """Record the RPC mech-client would read."""
+            seen.append(mech_module.os.environ["MECHX_CHAIN_RPC"])
+            return []
+
+        monkeypatch.setenv("MECHX_CHAIN_RPC", "http://another-chain")
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
+        mech_service.tools(chain="testchain")
+        # pylint: disable=protected-access
+        assert seen == [mech_service._config.chain("testchain").rpc_url]
 
     def test_request_wraps_pricing_failures(
         self,

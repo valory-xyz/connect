@@ -652,7 +652,7 @@ requires-dist = [
     { name = "eth-account", specifier = "==0.13.7" },
     { name = "fastapi", specifier = "==0.139.2" },
     { name = "mcp", specifier = "==1.28.1" },
-    { name = "mech-client", specifier = "==0.22.0" },
+    { name = "mech-client", specifier = "==0.23.0" },
     { name = "open-aea-ledger-ethereum", specifier = "==2.2.9" },
     { name = "uvicorn", specifier = "==0.52.4" },
     { name = "web3", specifier = "==7.16.0" },
@@ -1614,7 +1614,7 @@ name = "macholib"
 version = "1.16.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "altgraph" },
+    { name = "altgraph", marker = "sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/10/2f/97589876ea967487978071c9042518d28b958d87b17dceb7cdc1d881f963/macholib-1.16.4.tar.gz", hash = "sha256:f408c93ab2e995cd2c46e34fe328b130404be143469e41bc366c807448979362", size = 59427, upload-time = "2025-11-22T08:28:38.373Z" }
 wheels = [
@@ -1722,7 +1722,7 @@ wheels = [
 
 [[package]]
 name = "mech-client"
-version = "0.22.0"
+version = "0.23.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -1737,9 +1737,9 @@ dependencies = [
     { name = "setuptools" },
     { name = "tabulate" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ed/d8/2cbd1c08fbb9be288cfbcc091e2662ebca6e1008660da297783d2465a43b/mech_client-0.22.0.tar.gz", hash = "sha256:5e6a4570d3efed35b9d45adfe0e53f1b621e4f96e57ce314f083b7e84d4afdf9", size = 223483, upload-time = "2026-08-12T20:39:17.208Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/af/64/d26d016932fc3c337342f688da68d63cd5ee37fbcc22e9b4a048f999dc0f/mech_client-0.23.0.tar.gz", hash = "sha256:c8884063fa4b04db5ed6c905c12e257701bb21f809cf12d9362c41937957547c", size = 225718, upload-time = "2026-09-16T09:26:31.218Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/12/e3/cf60738a67dd396afa05395171ef1fdee055584fe14709ca45b2b96cd297/mech_client-0.22.0-py3-none-any.whl", hash = "sha256:d69bd0407c54faf0b2d0297c2a0c82d3b497b04a63f5cd290c0959b4643bb2ab", size = 312228, upload-time = "2026-08-12T20:39:15.97Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/28/729ba3b4e30c3f03a5263702e07a6df51a73c6534c7a02a5b4613428c5cb/mech_client-0.23.0-py3-none-any.whl", hash = "sha256:bfae7b3d30e80ebec7e5c9099662832f3b4c86e871e5bbfd6d1b1cfff01686bd", size = 314178, upload-time = "2026-09-16T09:26:29.931Z" },
 ]
 
 [[package]]
@@ -1869,7 +1869,7 @@ wheels = [
 
 [[package]]
 name = "olas-operate-middleware"
-version = "0.15.31"
+version = "0.15.38"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1889,9 +1889,9 @@ dependencies = [
     { name = "uvicorn" },
     { name = "werkzeug" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/90/85/1061a21bb15bef5b16840cd03cc8ea7970de047cdb5dc38b5e7ad04f8a6e/olas_operate_middleware-0.15.31.tar.gz", hash = "sha256:fc8ab10cea416bc49ef202bc080175e59ff73982a055c74a5daa12eab67db7c9", size = 293905, upload-time = "2026-06-24T14:29:49.978Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/74/8d/69ca70306c86f8b698ad12916d8a0753db1484855b6436919462b90cf136/olas_operate_middleware-0.15.38.tar.gz", hash = "sha256:6346ffa30dd5cbf972b1793011a26d3ca68e04faa061a12047ecb23a10640b52", size = 299370, upload-time = "2026-09-14T18:09:31.986Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/37/7a547b2a1ae540670480b018939b244617b9beebcf9f708bfe0d53a621b7/olas_operate_middleware-0.15.31-py3-none-any.whl", hash = "sha256:543313b4fcb06c00e7c5ccb7c7defff74638c493726911b186d8faeb94ae667d", size = 352798, upload-time = "2026-06-24T14:29:48.391Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/44/e5404bbb84503be0609cc848a6bf5f5f4485f9c4aabfa25e2888b25f5063/olas_operate_middleware-0.15.38-py3-none-any.whl", hash = "sha256:0d0d118cd8cd3fde6f5928891df60eee915a13600753dc9aeab5f49d4887dc61", size = 358401, upload-time = "2026-09-14T18:09:30.398Z" },
 ]
 
 [[package]]
@@ -1931,14 +1931,14 @@ wheels = [
 
 [[package]]
 name = "open-aea-helpers"
-version = "0.21.26"
+version = "0.21.29"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "open-autonomy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ba/76/60c31f9757505d84ee14392077eb6f804b0f3150f282a97de58c27f9c3c9/open_aea_helpers-0.21.26.tar.gz", hash = "sha256:c76c328c3147ea6c7318c4968cfa465f987162fd4bc377c43db8f86fd82384dc", size = 41116, upload-time = "2026-07-03T12:36:13.798Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/69/13/a1fe3d49a6e123e2d673bbd61a94a8fdab0ef0f88bf9dacdc68eeeeb5564/open_aea_helpers-0.21.29.tar.gz", hash = "sha256:c8066e54fb056e2e30b6016a538c80647c1905a3132bc12b3764e19a67c54764", size = 41193, upload-time = "2026-09-14T13:45:08.991Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7c/a0/993a7abaab4520706fc54d5bfd16164d54aec45d1ccc3efcf5f3deed6a16/open_aea_helpers-0.21.26-py3-none-any.whl", hash = "sha256:f6039f3f0fad3abbcc6862c7d416373e6c6d98e620174b394eba611389d3152e", size = 44415, upload-time = "2026-07-03T12:36:12.861Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/1c/cb59b615548b56db3577d42ca6f373deef89357e030e906e26aa0a6fa2c8/open_aea_helpers-0.21.29-py3-none-any.whl", hash = "sha256:c79f86e417bb4c300706086241ab2697cf645307bee540508388d7ab31b545ff", size = 44435, upload-time = "2026-09-14T13:45:07.946Z" },
 ]
 
 [[package]]
@@ -1975,7 +1975,7 @@ wheels = [
 
 [[package]]
 name = "open-autonomy"
-version = "0.21.28"
+version = "0.21.29"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1992,9 +1992,9 @@ dependencies = [
     { name = "requests" },
     { name = "web3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/50/3e/72ffb18922f9054bed6882733eaedc6457c4a7faf7ade748b1ce15edb385/open_autonomy-0.21.28.tar.gz", hash = "sha256:ce68c767509fbc7a57c53c0879293ad2f1598569299a3ae33b2da2da7c5f89cd", size = 1165368, upload-time = "2026-08-27T22:07:29.195Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/78/c2/7396f77eebf75a2feb32a824df3da253c34c31bc420ba3f2ffd20a06e241/open_autonomy-0.21.29.tar.gz", hash = "sha256:6cc576959fdfb3e97668d1de2e6733a16d1547fc1b0c359c729e7bee35366d5e", size = 1165620, upload-time = "2026-09-14T13:44:59.919Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/33/ed5280b2f805727ee4c73adec3ef1b977781fba2f2097e7d890e04df006c/open_autonomy-0.21.28-py3-none-any.whl", hash = "sha256:8768048332679baf1b455fa790d412510c6bfb34bc8297ae0bb08065afe82320", size = 1675133, upload-time = "2026-08-27T22:07:27.277Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/be/34143853bbcc55995d225821688a9b58dc4b5d3b114ec2f7387ca82b95eb/open_autonomy-0.21.29-py3-none-any.whl", hash = "sha256:1dc5d8c0d4cd434aebdd2328ed99281bc3239cd34d264c004000d7304e783123", size = 1675356, upload-time = "2026-09-14T13:44:58.23Z" },
 ]
 
 [package.optional-dependencies]

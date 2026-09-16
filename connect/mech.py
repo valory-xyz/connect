@@ -47,6 +47,7 @@ from mech_client.domain.delivery import (
     OffchainDeliveryWatcher,
     OnchainDeliveryWatcher,
 )
+from mech_client.infrastructure.config.payment_config import PaymentType
 from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
 from mech_client.services.marketplace_service import MarketplaceService
 from safe_eth.eth import EthereumClient
@@ -56,6 +57,7 @@ from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances
+from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
 from connect.mech_types import (
     MechError,
     MechUnknownRequest,
@@ -81,13 +83,6 @@ MAX_DELIVERY_TIMEOUT = 900.0
 DEFAULT_RESULT_TIMEOUT = 30.0
 DEFAULT_MECH_PAGE_SIZE = 20
 MAX_MECH_PAGE_SIZE = 100
-# The agent's per-request spending budget, not a guardrail: the caller picks
-# max_payment per call and the server does not clamp it — the guardrail only
-# checks *where* payments go. A mech pricing above the budget is refused
-# before payment, and the accepted price is audited on success. Denominated
-# in the mech's payment asset base units (wei for native mechs, token base
-# units for OLAS/USDC ones); the default is 0.1 of a native unit.
-DEFAULT_MAX_PAYMENT = 10**17
 
 
 class _RequestPlan(t.NamedTuple):
@@ -104,6 +99,7 @@ class _RequestPlan(t.NamedTuple):
     auto_deposit: bool
     legacy_on_chain: bool
     tool: str
+    max_payment: int
 
 
 class PendingDelivery(t.NamedTuple):
@@ -419,6 +415,7 @@ class MechService:
             "chain": chain,
             "mech": priority_mech,
             "payment_type": payment_type.name,
+            **payment_report(payment_type.value, chain),
             "service_id": service_id,
             "max_delivery_rate": str(max_delivery_rate),
         }
@@ -456,8 +453,12 @@ class MechService:
         """
         limit = max(1, min(limit, MAX_MECH_PAGE_SIZE))
         offset = max(0, offset)
+        rpc_url = self._config.chain(chain).rpc_url
         try:
-            mechs = query_mm_mechs_info(chain) or []
+            with self._lock:
+                # get_mech_config probes MECHX_CHAIN_RPC; see _service
+                os.environ["MECHX_CHAIN_RPC"] = rpc_url
+                mechs = query_mm_mechs_info(chain) or []
             # inside the try: a malformed subgraph entry must surface as the
             # structured MechError this method promises, not a raw KeyError
             page = [
@@ -494,7 +495,7 @@ class MechService:
         priority_mech: str | None = None,
         auto_deposit: bool = True,
         timeout: float = DEFAULT_DELIVERY_TIMEOUT,
-        max_payment: int = DEFAULT_MAX_PAYMENT,
+        max_payment: int | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
     ) -> dict:
@@ -503,7 +504,7 @@ class MechService:
         ``legacy_on_chain=False`` (default) uses the off-chain prepaid flow;
         ``True`` sends the request on-chain through the marketplace. The
         mech's per-request price must not exceed ``max_payment``, in the
-        mech's payment asset base units.
+        mech's payment asset base units; left out, it is 0.1 of that asset.
 
         Pass a ``request_id`` to make an attempt replayable — see README,
         "Mech requests", for what that covers and what it deliberately does
@@ -530,7 +531,6 @@ class MechService:
                 plan,
                 prompt,
                 timeout=timeout,
-                max_payment=max_payment,
                 request_id=request_id,
             )
 
@@ -668,7 +668,7 @@ class MechService:
         legacy_on_chain: bool,
         priority_mech: str | None,
         auto_deposit: bool,
-        max_payment: int,
+        max_payment: int | None,
         request_context: dict | None,
     ) -> _RequestPlan:
         """Settle everything a request needs before any payment can happen.
@@ -686,6 +686,16 @@ class MechService:
             priced.service_id,
             priced.rate,
         )
+        if max_payment is None:
+            max_payment = DEFAULT_MAX_PAYMENT.get(PaymentType(priced.payment_type))
+            if max_payment is None:
+                self._blocked(
+                    chain, tool, "no-default-max-payment", priced.payment_type
+                )
+                raise MechError(
+                    f"mech {priority_mech} is paid in an asset this server has no "
+                    "default budget for; pass max_payment to set one"
+                )
         if rate > max_payment:
             self._blocked(chain, tool, "over-max-payment", f"{rate} > {max_payment}")
             raise MechError(
@@ -735,6 +745,7 @@ class MechService:
             auto_deposit=auto_deposit,
             legacy_on_chain=legacy_on_chain,
             tool=tool,
+            max_payment=max_payment,
         )
 
     def _dispatch(
@@ -743,7 +754,6 @@ class MechService:
         prompt: str,
         *,
         timeout: float,
-        max_payment: int,
         request_id: str | None,
     ) -> dict:
         """Pay for the planned request, send it, and wait out its delivery.
@@ -781,7 +791,7 @@ class MechService:
             request_id=request_id,
             offchain=not plan.legacy_on_chain,
             rate=str(plan.priced.rate),
-            max_payment=str(max_payment),
+            max_payment=str(plan.max_payment),
             context_keys=sorted(
                 (plan.extra_attributes or {}).get("request_context") or {}
             ),
