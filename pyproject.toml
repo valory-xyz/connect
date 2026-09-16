@@ -26,7 +26,7 @@ dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "httpx==0.28.1",
-    "pyinstaller==6.22.2",
+    "pyinstaller==6.22.3",
     "open-autonomy>=0.21.28",
     "open-aea-cli-ipfs>=2.2.9",
 ]
