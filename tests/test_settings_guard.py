@@ -58,6 +58,7 @@ from connect.mech import (
     MechError,
     MechService,
     MechSigner,
+    MechUnknownRequest,
     PendingDelivery,
     PricedMech,
 )
@@ -1575,7 +1576,7 @@ NATIVE_PAYMENT_TYPE = "ba699a34be8fe0e7725e93dcbce1701b0211a8ca61330aaeb8a05bf2e
 
 def native_mech_info(rate: int) -> tuple:
     """Canned _fetch_mech_info answer for a native-payment mech."""
-    return (SimpleNamespace(name="NATIVE", value=NATIVE_PAYMENT_TYPE), 42, rate)
+    return (PaymentType(NATIVE_PAYMENT_TYPE), 42, rate)
 
 
 class FakeMarketplaceService:
@@ -3458,11 +3459,81 @@ class TestMech:
         )
         assert len(patched_mech.calls) == 1
 
+    @pytest.mark.parametrize(
+        ("kind", "budget"),
+        [
+            (PaymentType.NATIVE, 10**17),
+            (PaymentType.NATIVE_NVM, 10**17),
+            (PaymentType.OLAS_TOKEN, 10**17),
+            (PaymentType.USDC_TOKEN, 10**5),
+            (PaymentType.TOKEN_NVM_USDC, 10**5),
+        ],
+    )
+    def test_every_payment_type_has_its_budget(
+        self,
+        kind: PaymentType,
+        budget: int,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """0.1 of the asset, pinned per type: a dropped key must fail here."""
+        assert set(mech_budget.DEFAULT_MAX_PAYMENT) == set(PaymentType)
+        patched_mech.mech_info = (kind, 42, budget + 1)
+        with pytest.raises(MechError, match=f"above max_payment={budget}"):
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            )
+        patched_mech.mech_info = (kind, 42, budget)
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
+        assert len(patched_mech.calls) == 1
+
+    @pytest.mark.parametrize(
+        ("kind", "chain", "token"),
+        [
+            (PaymentType.NATIVE, "gnosis", "native"),
+            (PaymentType.NATIVE_NVM, "atlantis", "native"),
+            (
+                PaymentType.USDC_TOKEN,
+                "robinhood",
+                "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+            ),
+            (
+                PaymentType.TOKEN_NVM_USDC,
+                "base",
+                "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            ),
+            (
+                PaymentType.OLAS_TOKEN,
+                "gnosis",
+                "0xcE11e14225575945b8E6Dc0D4F2dD4C570f79d9f",
+            ),
+            (PaymentType.USDC_TOKEN, "gnosis", None),
+            (PaymentType.OLAS_TOKEN, "robinhood", None),
+            (PaymentType.USDC_TOKEN, "atlantis", None),
+        ],
+    )
+    def test_payment_token_never_answers_an_unknown_with_an_empty_string(
+        self, kind: PaymentType, chain: str, token: t.Optional[str]
+    ) -> None:
+        """A known chain without the token and an unknown chain both say None."""
+        assert mech_budget.payment_token(kind, chain) == token
+
+    def test_the_report_keeps_its_keys_when_there_is_no_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing default is reported as None, never as a missing key."""
+        monkeypatch.delitem(mech_budget.DEFAULT_MAX_PAYMENT, PaymentType.OLAS_TOKEN)
+        gnosis_olas = "0xcE11e14225575945b8E6Dc0D4F2dD4C570f79d9f"
+        report = mech_budget.payment_report(PaymentType.OLAS_TOKEN, "gnosis")
+        assert report == dict(payment_token=gnosis_olas, default_max_payment=None)
+
     def test_the_default_budget_follows_the_payment_asset(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """0.1 of a 6-decimal token is 10**5, not the native 10**17."""
-        usdc = SimpleNamespace(name="USDC_TOKEN", value=PaymentType.USDC_TOKEN.value)
+        usdc = PaymentType.USDC_TOKEN
         patched_mech.mech_info = (usdc, 42, 10**5 + 1)
         with pytest.raises(MechError, match="above max_payment=100000"):
             mech_service.request(
@@ -3506,7 +3577,7 @@ class TestMech:
             rpc_url="http://127.0.0.1:9", safe_address=SAFE
         )
         patched_mech.mech_info = (
-            SimpleNamespace(name="USDC_TOKEN", value=PaymentType.USDC_TOKEN.value),
+            PaymentType.USDC_TOKEN,
             1,
             10000,
         )
@@ -3515,7 +3586,7 @@ class TestMech:
         assert info["payment_token"] == "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
         assert info["default_max_payment"] == "100000"
         unknown_chain = mech_service.tools(chain="testchain", priority_mech=OTHER)
-        assert unknown_chain["payment_token"] == ""
+        assert unknown_chain["payment_token"] is None
 
     def test_listing_points_mech_client_at_this_chains_rpc(
         self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
@@ -3531,6 +3602,108 @@ class TestMech:
         monkeypatch.setenv("MECHX_CHAIN_RPC", "http://another-chain")
         monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
         mech_service.tools(chain="testchain")
+        # pylint: disable=protected-access
+        assert seen == [mech_service._config.chain("testchain").rpc_url]
+        # and the variable is handed back as it was, set or not
+        assert mech_module.os.environ["MECHX_CHAIN_RPC"] == "http://another-chain"
+        monkeypatch.delenv("MECHX_CHAIN_RPC")
+        mech_service.tools(chain="testchain")
+        assert "MECHX_CHAIN_RPC" not in mech_module.os.environ
+
+    def test_concurrent_listings_each_see_their_own_rpc(
+        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lock, not the timing, keeps two chains' listings apart."""
+        # pylint: disable=protected-access
+        chains = mech_service._config.chains
+        chains["otherchain"] = ChainConfig(rpc_url="http://other-chain")
+        first_inside = threading.Event()
+        second_inside = threading.Event()
+        first_done = threading.Event()
+        seen: dict[str, list[str]] = {"testchain": [], "otherchain": []}
+
+        def _query(chain: str) -> list:
+            """Read the variable again only once the other listing had its chance."""
+            seen[chain].append(mech_module.os.environ["MECHX_CHAIN_RPC"])
+            if chain == "testchain":
+                first_inside.set()
+                second_inside.wait(0.3)
+                seen[chain].append(mech_module.os.environ["MECHX_CHAIN_RPC"])
+                first_done.set()
+            else:
+                second_inside.set()
+                first_done.wait(1)
+                seen[chain].append(mech_module.os.environ["MECHX_CHAIN_RPC"])
+            return []
+
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
+        first = threading.Thread(
+            target=mech_service.tools, kwargs={"chain": "testchain"}
+        )
+        first.start()
+        assert first_inside.wait(5)
+        mech_service.tools(chain="otherchain")
+        first.join(5)
+        assert seen["testchain"] == [chains["testchain"].rpc_url] * 2
+        assert seen["otherchain"] == ["http://other-chain"] * 2
+
+    def test_a_slow_listing_does_not_hold_up_pending_deliveries(
+        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A subgraph query can run for minutes; paid requests must not wait on it."""
+        inside = threading.Event()
+        release = threading.Event()
+
+        def _stalled(chain: str) -> list:
+            """Hang like a slow subgraph until the test lets go."""
+            inside.set()
+            release.wait(10)
+            return []
+
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _stalled)
+        listing = threading.Thread(
+            target=mech_service.tools, kwargs={"chain": "testchain"}
+        )
+        listing.start()
+        try:
+            assert inside.wait(5)
+            answered = threading.Event()
+
+            def _poll() -> None:
+                """Ask for a delivery nobody is waiting on."""
+                with pytest.raises(MechUnknownRequest):
+                    mech_service.result("ab")
+                answered.set()
+
+            poller = threading.Thread(target=_poll)
+            poller.start()
+            assert answered.wait(2), "mech_result waited on the listing"
+            poller.join(5)
+        finally:
+            release.set()
+            listing.join(10)
+
+    def test_a_request_points_mech_client_at_its_own_chain(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An auto-deposit rebuilds a mech-client service mid-send and rereads it."""
+        seen: list[str] = []
+        original = patched_mech.send_request
+
+        async def _send(**kwargs: object) -> dict:
+            """Record the RPC visible while the request is in flight."""
+            seen.append(mech_module.os.environ["MECHX_CHAIN_RPC"])
+            return await original(**kwargs)
+
+        monkeypatch.setattr(patched_mech, "send_request", _send)
+        mech_service._service("testchain")  # pylint: disable=protected-access
+        monkeypatch.setenv("MECHX_CHAIN_RPC", "http://a-chain-listed-since")
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+        )
         # pylint: disable=protected-access
         assert seen == [mech_service._config.chain("testchain").rpc_url]
 

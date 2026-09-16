@@ -75,9 +75,10 @@ composing a prompt:
 
 - **Payment asset.** `mech_tools(priority_mech=...)` reports it as
   `payment_token`: `native`, or the token's address on that chain. Go by the
-  address, not the name — a `USDC_TOKEN` mech on Robinhood is paid in USDG. A
-  mech pricing in an asset the safe does not hold cannot be paid, and
-  `auto_deposit` will fail rather than convert anything.
+  address, not the name — a `USDC_TOKEN` mech on Robinhood is paid in USDG.
+  `null` means this server does not know the token on that chain: do not pay
+  that mech. A mech pricing in an asset the safe does not hold cannot be paid,
+  and `auto_deposit` will fail rather than convert anything.
 - **`offchain_capable`.** The off-chain flow needs an endpoint published in
   the mech's service metadata, and few mechs publish one; the rest serve
   on-chain requests only. When it is `false`, `offchain_note` says why — a
@@ -103,7 +104,8 @@ composing a prompt:
   the tool sees the resolution rules while its estimate stays free of the
   market's own price, which is what you want when you mean to compare the two.
 - `max_payment` (base units of the mech's payment asset; defaults to 0.1 of
-  that asset, reported as `default_max_payment`) caps what one
+  that asset, reported as `default_max_payment` — `null` when there is no
+  default, and the request then needs an explicit one) caps what one
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with
   `mech_tools(priority_mech=...)` (`max_delivery_rate`).

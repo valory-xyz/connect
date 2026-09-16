@@ -19,6 +19,8 @@
 
 """What a mech request may pay by default, and in which token it pays."""
 
+import typing as t
+
 from mech_client.infrastructure.config.contract_addresses import (
     CHAIN_TO_PRICE_TOKEN_OLAS,
     CHAIN_TO_PRICE_TOKEN_USDC,
@@ -47,18 +49,20 @@ PAYMENT_TOKENS = {
 }
 
 
-def payment_token(payment_type: PaymentType, chain: str) -> str:
-    """Name the token a mech is paid in on a chain: "native", an address, or ""."""
+def payment_token(payment_type: PaymentType, chain: str) -> t.Optional[str]:
+    """Name the token a mech is paid in on a chain: "native", an address, or None."""
     if payment_type not in PAYMENT_TOKENS:
         return "native"
     chain_id = CHAIN_NAME_TO_ID.get(chain)
-    return PAYMENT_TOKENS[payment_type].get(chain_id, "") if chain_id else ""
+    if chain_id is None:
+        return None
+    return PAYMENT_TOKENS[payment_type].get(chain_id) or None
 
 
-def payment_report(payment_type_value: str, chain: str) -> dict[str, str]:
+def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
     """Report the token a mech is paid in and the budget a request defaults to."""
-    kind = PaymentType(payment_type_value)
-    report = {"payment_token": payment_token(kind, chain)}
-    if kind in DEFAULT_MAX_PAYMENT:
-        report["default_max_payment"] = str(DEFAULT_MAX_PAYMENT[kind])
-    return report
+    default = DEFAULT_MAX_PAYMENT.get(payment_type)
+    return {
+        "payment_token": payment_token(payment_type, chain),
+        "default_max_payment": None if default is None else str(default),
+    }
