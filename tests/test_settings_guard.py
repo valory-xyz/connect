@@ -58,7 +58,6 @@ from connect.mech import (
     MechError,
     MechService,
     MechSigner,
-    MechUnknownRequest,
     PendingDelivery,
     PricedMech,
 )
@@ -3588,69 +3587,80 @@ class TestMech:
         unknown_chain = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert unknown_chain["payment_token"] is None
 
-    def test_listing_points_mech_client_at_this_chains_rpc(
-        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("before", [None, "http://another-chain"])
+    def test_listing_never_touches_the_rpc_variable(
+        self,
+        before: t.Optional[str],
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """mech-client reads a process-global RPC; another chain's must not linger."""
-        seen: list[str] = []
+        """Only a request's own flow may move it; a listing merely reads it."""
+        if before is None:
+            monkeypatch.delenv("MECHX_CHAIN_RPC", raising=False)
+        else:
+            monkeypatch.setenv("MECHX_CHAIN_RPC", before)
+        seen: list[t.Optional[str]] = []
 
         def _query(chain: str) -> list:
-            """Record the RPC mech-client would read."""
-            seen.append(mech_module.os.environ["MECHX_CHAIN_RPC"])
-            return []
-
-        monkeypatch.setenv("MECHX_CHAIN_RPC", "http://another-chain")
-        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
-        mech_service.tools(chain="testchain")
-        # pylint: disable=protected-access
-        assert seen == [mech_service._config.chain("testchain").rpc_url]
-        # and the variable is handed back as it was, set or not
-        assert mech_module.os.environ["MECHX_CHAIN_RPC"] == "http://another-chain"
-        monkeypatch.delenv("MECHX_CHAIN_RPC")
-        mech_service.tools(chain="testchain")
-        assert "MECHX_CHAIN_RPC" not in mech_module.os.environ
-
-    def test_concurrent_listings_each_see_their_own_rpc(
-        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The lock, not the timing, keeps two chains' listings apart."""
-        # pylint: disable=protected-access
-        chains = mech_service._config.chains
-        chains["otherchain"] = ChainConfig(rpc_url="http://other-chain")
-        first_inside = threading.Event()
-        second_inside = threading.Event()
-        first_done = threading.Event()
-        seen: dict[str, list[str]] = {"testchain": [], "otherchain": []}
-
-        def _query(chain: str) -> list:
-            """Read the variable again only once the other listing had its chance."""
-            seen[chain].append(mech_module.os.environ["MECHX_CHAIN_RPC"])
-            if chain == "testchain":
-                first_inside.set()
-                second_inside.wait(0.3)
-                seen[chain].append(mech_module.os.environ["MECHX_CHAIN_RPC"])
-                first_done.set()
-            else:
-                second_inside.set()
-                first_done.wait(1)
-                seen[chain].append(mech_module.os.environ["MECHX_CHAIN_RPC"])
+            """Record what mech-client would read."""
+            seen.append(mech_module.os.environ.get("MECHX_CHAIN_RPC"))
             return []
 
         monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
-        first = threading.Thread(
-            target=mech_service.tools, kwargs={"chain": "testchain"}
+        mech_service.tools(chain="testchain")
+        assert seen == [before]
+        assert mech_module.os.environ.get("MECHX_CHAIN_RPC") == before
+
+    def test_the_mismatch_warning_is_dropped_only_while_listing(
+        self,
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A stale RPC during a listing is noise; during construction it is a fault."""
+        warner = logging.getLogger(
+            "mech_client.mech_client.infrastructure.config.chain_config"
         )
-        first.start()
-        assert first_inside.wait(5)
-        mech_service.tools(chain="otherchain")
-        first.join(5)
-        assert seen["testchain"] == [chains["testchain"].rpc_url] * 2
-        assert seen["otherchain"] == ["http://other-chain"] * 2
 
-    def test_a_slow_listing_does_not_hold_up_pending_deliveries(
-        self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+        def _query(chain: str) -> list:
+            """Warn the way mech-client does when the variable names another chain."""
+            warner.warning("MECHX_CHAIN_RPC mismatch detected!\n  during listing")
+            warner.warning("an unrelated warning during listing")
+            return []
+
+        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
+        with caplog.at_level(logging.WARNING, logger=warner.name):
+            mech_service.tools(chain="testchain")
+            warner.warning("MECHX_CHAIN_RPC mismatch detected!\n  outside listing")
+        messages = [r.getMessage() for r in caplog.records if r.name == warner.name]
+        assert messages == [
+            "an unrelated warning during listing",
+            "MECHX_CHAIN_RPC mismatch detected!\n  outside listing",
+        ]
+
+    def test_a_slow_listing_holds_up_no_other_mech_work(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A subgraph query can run for minutes; paid requests must not wait on it."""
+        """A subgraph query can run for minutes; requests and polls must not wait.
+
+        Both paths below go through _service and the pre-send pin, where the
+        RPC lock is taken, so a listing that held it would stall them.
+        """
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["0xAB"],
+            "deliveries": {},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+
+        async def _watch(*_a: object) -> dict:
+            """Nothing delivered yet."""
+            return {}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         inside = threading.Event()
         release = threading.Event()
 
@@ -3667,18 +3677,27 @@ class TestMech:
         listing.start()
         try:
             assert inside.wait(5)
-            answered = threading.Event()
+            finished = threading.Event()
+            outcome: dict[str, t.Any] = {}
 
-            def _poll() -> None:
-                """Ask for a delivery nobody is waiting on."""
-                with pytest.raises(MechUnknownRequest):
-                    mech_service.result("ab")
-                answered.set()
+            def _work() -> None:
+                """Pay for a request, then poll it, while the listing hangs."""
+                outcome["sent"] = mech_service.request(
+                    "q",
+                    "t",
+                    chain="testchain",
+                    legacy_on_chain=True,
+                    priority_mech=OTHER,
+                )
+                outcome["polled"] = mech_service.result("ab")
+                finished.set()
 
-            poller = threading.Thread(target=_poll)
-            poller.start()
-            assert answered.wait(2), "mech_result waited on the listing"
-            poller.join(5)
+            worker = threading.Thread(target=_work)
+            worker.start()
+            assert finished.wait(3), "mech work waited on the listing"
+            worker.join(5)
+            assert outcome["sent"]["pending_request_ids"] == ["ab"]
+            assert outcome["polled"]["delivered"] is False
         finally:
             release.set()
             listing.join(10)

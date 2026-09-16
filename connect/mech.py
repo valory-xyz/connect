@@ -58,6 +58,7 @@ from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
+from connect.mech_rpc import RPC_LOCK, listing_mechs
 from connect.mech_types import (
     MechError,
     MechUnknownRequest,
@@ -100,17 +101,6 @@ class _RequestPlan(t.NamedTuple):
     legacy_on_chain: bool
     tool: str
     max_payment: int
-
-
-_RPC_LOCK = threading.Lock()
-
-
-def _restore_rpc(previous: str | None) -> None:
-    """Put MECHX_CHAIN_RPC back as it was before a call borrowed it."""
-    if previous is None:
-        os.environ.pop("MECHX_CHAIN_RPC", None)
-    else:
-        os.environ["MECHX_CHAIN_RPC"] = previous
 
 
 class PendingDelivery(t.NamedTuple):
@@ -372,7 +362,7 @@ class MechService:
                 f"no service safe is configured for chain '{chain}'; mech "
                 "requests are paid by the safe"
             )
-        with _RPC_LOCK:
+        with RPC_LOCK:
             service = self._services.get(chain)
             if service is None:
                 # mech-client reads the RPC from this process-global env var at
@@ -464,15 +454,9 @@ class MechService:
         """
         limit = max(1, min(limit, MAX_MECH_PAGE_SIZE))
         offset = max(0, offset)
-        rpc_url = self._config.chain(chain).rpc_url
         try:
-            with _RPC_LOCK:
-                previous = os.environ.get("MECHX_CHAIN_RPC")
-                os.environ["MECHX_CHAIN_RPC"] = rpc_url
-                try:
-                    mechs = query_mm_mechs_info(chain) or []
-                finally:
-                    _restore_rpc(previous)
+            with listing_mechs():
+                mechs = query_mm_mechs_info(chain) or []
             # inside the try: a malformed subgraph entry must surface as the
             # structured MechError this method promises, not a raw KeyError
             page = [
@@ -775,7 +759,7 @@ class MechService:
         Everything here is past the point of no return: mech-client pays
         before it watches, so a failure below may still have spent funds.
         """
-        with _RPC_LOCK:
+        with RPC_LOCK:
             # an auto-deposit builds a fresh mech-client service mid-send, and
             # it reads this variable again; see _service
             os.environ["MECHX_CHAIN_RPC"] = self._config.chain(plan.chain).rpc_url
