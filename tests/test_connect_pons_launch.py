@@ -50,6 +50,7 @@ THRESHOLD = 42 * 10**17
 ECONOMICS = b"\xee" * 32
 LOGO = "ipfs://bafkreiar3qgowwjij2a2cccofut7lxba6r55tzrz7oaawcizngeuct55je"
 TX_HASH = "0x" + "12" * 32
+BOUGHT = 5 * 10**18
 DOCS_LAUNCH_AND_BUY_ABI = [
     {
         "type": "function",
@@ -142,8 +143,22 @@ class FakeW3:
     """Just enough of Web3 for the script."""
 
     def __init__(self, answers: dict[tuple[str, bytes], t.Any]) -> None:
-        """Wrap a FakeEth."""
+        """Wrap a FakeEth, which also answers each simulated call."""
         self.eth = FakeEth(answers)
+        self.manager = self
+
+    def request_blocking(self, method: str, params: list) -> list[dict]:
+        """Simulate the calls one by one against the table."""
+        assert method == "eth_simulateV1"
+        calls = params[0]["blockStateCalls"][0]["calls"]
+        return [
+            {
+                "calls": [
+                    {"status": "0x1", "returnData": "0x" + self.eth.call(c).hex()}
+                    for c in calls
+                ]
+            }
+        ]
 
 
 class FakeSigner:
@@ -170,8 +185,9 @@ def factory_answers(**over: t.Any) -> dict[tuple[str, bytes], t.Any]:
         (factory, launch.SEL_PAIR_ECONOMICS): word(3236 * 10**6, 8090 * 10**6, 6),
         (factory, launch.SEL_PREVIEW_ECONOMICS): ECONOMICS,
         (factory, launch.SEL_LAUNCH): word(TOKEN, CURVE),
-        (pons.LAUNCH_ROUTER, launch.SEL_LAUNCH_AND_BUY): word(TOKEN, CURVE),
+        (pons.LAUNCH_ROUTER, launch.SEL_LAUNCH_AND_BUY): word(TOKEN, CURVE, BOUGHT),
         (pons.USDG, evm.SEL_DECIMALS): word(6),
+        (pons.USDG, evm.SEL_ERC20_APPROVE): word(True),
         (pons.USDG, evm.SEL_BALANCE_OF): word(over.get("usdg", 10**9)),
     }
     return answers
@@ -343,6 +359,7 @@ def test_errors_name_the_factory_reverts() -> None:
     assert evm.describe_revert("0x" + slip.hex(), launch.ERRORS) == (
         "SlippageExceeded(5, 6)"
     )
+    assert evm.describe_revert("0x13be252b", launch.ERRORS) == "InsufficientAllowance()"
 
 
 def test_launch_config_and_pair_economics() -> None:
@@ -579,7 +596,13 @@ def test_launch_command_sends_and_reports(
     assert run("launch", args) == 0
     assert [c["what"] for c in sent[0]] == ["approve launch router", "launch and buy"]
     out = capsys.readouterr().out
-    assert '"predicted"' not in out
+    assert json.loads(out[: out.index("\n}\n") + 2])["predicted"] == {
+        "token": TOKEN,
+        "curve": CURVE,
+        "tokens_out": 5.0,
+    }
+    simulated = [r for r in w3.eth.requests if "from" in r]
+    assert [r["to"] for r in simulated] == [pons.USDG, pons.LAUNCH_ROUTER]
     assert json.loads(out[out.rindex("{") :]) == {"token": TOKEN, "curve": CURVE}
 
 
@@ -595,10 +618,10 @@ def test_eth_launch_and_buy_command_dry_run(
     assert run("launch", launch_args(buy=0.01, dry_run=True)) == 0
     out = capsys.readouterr().out
     plan = json.loads(out[: out.index("dry-run")])
-    assert plan["predicted"] == {"token": TOKEN, "curve": CURVE}
+    assert plan["predicted"] == {"token": TOKEN, "curve": CURVE, "tokens_out": 5.0}
     (simulated,) = [r for r in w3.eth.requests if "from" in r]
     assert simulated["to"] == pons.LAUNCH_ROUTER
-    assert simulated["value"] == FEE + 10**16
+    assert simulated["value"] == hex(FEE + 10**16)
     assert (
         f"dry-run launch and buy: to={pons.LAUNCH_ROUTER} value={FEE + 10**16}" in out
     )
@@ -622,6 +645,37 @@ def test_eth_launch_and_buy_command_sends_and_reports(
     assert call["value"] == FEE + 10**16
     out = capsys.readouterr().out
     assert json.loads(out[out.rindex("{") :]) == {"token": TOKEN, "curve": CURVE}
+
+
+@pytest.mark.parametrize(
+    ("pair", "buy", "answer"),
+    [
+        ("ETH", 0.0, (pons.V2_FACTORY, launch.SEL_LAUNCH)),
+        ("ETH", 0.01, (pons.LAUNCH_ROUTER, launch.SEL_LAUNCH_AND_BUY)),
+    ],
+)
+def test_launch_command_refuses_a_short_return(
+    monkeypatch: pytest.MonkeyPatch,
+    logo_ok: None,
+    pair: str,
+    buy: float,
+    answer: tuple[str, bytes],
+) -> None:
+    """A launch that returns less than its own shape is a refusal, before sending."""
+    del logo_ok
+    monkeypatch.setattr(pons, "require_v2_ack", lambda: {"status": "unaudited"})
+    sent: list[list[evm.Call]] = []
+    connected(monkeypatch, FakeW3({**factory_answers(), answer: word(TOKEN)}), sent)
+    with pytest.raises(evm.SwapError, match="returned 32 bytes, not"):
+        run("launch", launch_args(pair=pair, buy=buy))
+    assert not sent
+
+
+def test_predicted_refuses_a_call_that_is_not_a_launch() -> None:
+    """Only a launch's return is read as addresses."""
+    call: evm.Call = {"to": pons.USDG, "data": "0x095ea7b3", "what": "approve"}
+    with pytest.raises(evm.SwapError, match="approve is not a launch"):
+        launch.predicted(call, word(TOKEN, CURVE))
 
 
 def test_launch_command_needs_acknowledgement(monkeypatch: pytest.MonkeyPatch) -> None:

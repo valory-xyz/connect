@@ -35,6 +35,7 @@ GATEWAYS = (
     "https://dweb.link/ipfs/",
 )
 IPFS_URI = re.compile(r"^ipfs://([A-Za-z0-9]{46,100})(/[A-Za-z0-9._~-]+)*$")
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp")
 JPEG_SOF = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
 
 
@@ -127,19 +128,20 @@ def check_image(uri: str, user_agent: str) -> dict[str, t.Any]:
         except (OSError, ValueError, http.client.HTTPException) as exc:
             failures.append(f"{gateway}: {type(exc).__name__}: {exc}")
             continue
-        break
+        kind = image_type(body)
+        size = declared if not body and declared else len(body)
+        if size >= IMAGE_MAX_BYTES and (kind or header_type in IMAGE_TYPES):
+            raise evm.SwapError(f"the image is {size} bytes; it must be under 5 MB")
+        if kind is not None and header_type == kind:
+            break
+        failures.append(
+            f"{gateway}: served {header_type} that looks like "
+            f"{kind or 'something else'}"
+        )
     else:
         raise evm.SwapError(
-            f"no gateway served {uri}; is it pinned? ({'; '.join(failures)})"
-        )
-    size = declared if not body and declared else len(body)
-    if size >= IMAGE_MAX_BYTES:
-        raise evm.SwapError(f"the image is {size} bytes; it must be under 5 MB")
-    kind = image_type(body)
-    if kind is None or header_type != kind:
-        raise evm.SwapError(
-            f"the image must be a PNG, JPEG or WebP; the gateway says "
-            f"{header_type} and the file looks like {kind or 'something else'}"
+            f"no gateway served {uri} as a PNG, JPEG or WebP; is it pinned, and "
+            f"is it one? ({'; '.join(failures)})"
         )
     dimensions = image_size(kind, body)
     return {

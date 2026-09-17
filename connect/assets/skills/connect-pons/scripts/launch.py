@@ -77,6 +77,10 @@ SEL_POOL_FEES = evm.selector("pendingFees(bytes32,address)")
 SEL_POOL_TAX = evm.selector("pendingCreatorTax(bytes32,address)")
 SEL_POOL_BUYBACK = evm.selector("pendingBuyback(bytes32,address)")
 SEL_SWEEP_POOL = evm.selector("sweepPoolFees(bytes32,uint256,uint256)")
+LAUNCH_RETURNS = {
+    SEL_LAUNCH: ["address", "address"],
+    SEL_LAUNCH_AND_BUY: ["address", "address", "uint256"],
+}
 
 ERRORS = {
     evm.selector(signature): signature
@@ -115,6 +119,7 @@ ERRORS = {
         "InternalSwapRequiresOperator()",
         "MinimumOutputRequired()",
         "UnknownPool()",
+        "InsufficientAllowance()",
         "ERC20InsufficientAllowance(address,uint256,uint256)",
         "ERC20InsufficientBalance(address,uint256,uint256)",
     )
@@ -408,6 +413,30 @@ def verify_launch_call(  # pylint: disable=too-many-arguments,too-many-positiona
         raise evm.SwapError("the creator fee recipient must be set")
 
 
+def predicted(call: evm.Call, raw: bytes) -> dict[str, t.Any]:
+    """Read the token, curve and any opening-buy output a simulated launch returned.
+
+    Raises:
+        SwapError: when the call is not a launch or its return does not decode.
+    """
+    types = LAUNCH_RETURNS.get(bytes.fromhex(call["data"][2:10]))
+    if types is None:
+        raise evm.SwapError(f"{call['what']} is not a launch; nothing to predict")
+    try:
+        token, curve_address, *bought = abi_decode(types, raw)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise evm.SwapError(
+            f"{call['what']} returned {len(raw)} bytes, not {types}: {exc}"
+        ) from exc
+    result: dict[str, t.Any] = {
+        "token": to_checksum_address(token),
+        "curve": to_checksum_address(curve_address),
+    }
+    if bought:
+        result["tokens_out"] = bought[0] / 10**18
+    return result
+
+
 def launched(receipt: t.Any, deployer: str) -> dict[str, str]:
     """Read the token and curve a confirmed launch emitted.
 
@@ -581,14 +610,8 @@ def _cmd_launch(args: argparse.Namespace) -> int:
     safe = signer.chain_info(pons.CHAIN)["safe"]
     plan = plan_launch(w3, safe, args)
     calls = plan.pop("calls")
-    final = calls[-1]
-    if len(calls) == 1:
-        raw = evm.simulate_call(w3, final, safe, ERRORS)
-        token, curve_address = abi_decode(["address", "address"], raw[:64])
-        plan["predicted"] = {
-            "token": to_checksum_address(token),
-            "curve": to_checksum_address(curve_address),
-        }
+    returns = evm.simulate_calls(w3, calls, safe, ERRORS)
+    plan["predicted"] = predicted(calls[-1], returns[-1])
     print(json.dumps({"audit": audit, **plan}, indent=2))
     if args.dry_run:
         evm.print_dry_run(calls)

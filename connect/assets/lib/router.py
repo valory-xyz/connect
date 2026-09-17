@@ -72,9 +72,15 @@ def router_swap(  # pylint: disable=too-many-arguments,too-many-positional-argum
     """Build, decode and check the approvals and swap that trade ``amount``.
 
     Raises:
-        SwapError: for a refused signature or calldata that does not say what
-            was planned.
+        SwapError: for an RPC on another chain, a refused signature, or
+            calldata that does not say what was planned.
     """
+    node_chain_id = w3.eth.chain_id
+    if node_chain_id != chain_id:
+        raise evm.SwapError(
+            f"the RPC serves chain {node_chain_id}, not chain {chain_id}; "
+            "refusing to build or sign a swap for the wrong chain"
+        )
     where = uniswap.deployment(chain_id)
     spender = where["universal_router"]
     native = evm.is_native(token_in)
@@ -88,6 +94,7 @@ def router_swap(  # pylint: disable=too-many-arguments,too-many-positional-argum
     action = (
         permit.signed_action(
             w3,
+            chain_id,
             signer,
             account,
             token_in,

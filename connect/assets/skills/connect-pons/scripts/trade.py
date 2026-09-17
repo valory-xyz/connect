@@ -71,6 +71,7 @@ class Plan(t.TypedDict):
     fee_bps: int
     creator_tax_bps: int
     snipe_tax_bps: int
+    snipe_tax_payer: str
     pool: t.Optional[uniswap.Pool]
     permit: str
     audit: t.Optional[dict[str, str]]
@@ -209,6 +210,7 @@ def plan_trade(  # pylint: disable=too-many-arguments,too-many-positional-argume
         "fee_bps": launch["fee_bps"],
         "creator_tax_bps": launch["creator_tax_bps"],
         "snipe_tax_bps": quote.snipe_tax_bps,
+        "snipe_tax_payer": pons.snipe_tax_payer(recipient),
         "pool": launch["pool"],
         "permit": "",
         "audit": None,
@@ -251,12 +253,43 @@ def plan_trade(  # pylint: disable=too-many-arguments,too-many-positional-argume
     return plan
 
 
+def _send_wrapped_buy(w3: Web3, signer: t.Any, calls: list[evm.Call]) -> list[evm.Sent]:
+    """Send a v3 buy, unwrapping exactly its wrap if a later call surely did nothing.
+
+    Raises:
+        SwapError: when a call fails, naming any WETH the wrap left in the safe.
+    """
+    try:
+        return evm.send_calls(w3, signer, calls)
+    except evm.SendError as exc:
+        if not exc.landed:
+            raise
+        failed = str(exc).rstrip(".")
+        wrapped = calls[0]["value"]
+        weth = f"{wrapped / 10**18} WETH it wrapped"
+        if not exc.inert:
+            raise evm.SwapError(
+                f"{failed}. If the buy did not land, the {weth} is still in the "
+                f"safe and still needs unwrapping"
+            ) from exc
+        try:
+            evm.send_calls(w3, signer, [evm.weth_withdraw_call(pons.WETH, wrapped)])
+        except evm.SwapError as unwrap_exc:
+            raise evm.SwapError(
+                f"{failed}. Unwrapping the {weth} failed too ({unwrap_exc}); that "
+                f"WETH is in the safe and still needs unwrapping"
+            ) from exc
+        raise evm.SwapError(f"{failed}. The {weth} was unwrapped") from exc
+
+
 def execute(w3: Web3, signer: t.Any, safe: str, plan: Plan) -> list[evm.Sent]:
     """Send a plan's calls; a v3 sell then unwraps exactly the WETH it received.
 
     Raises:
         SwapError: when a call fails, or a v3 sell returns no WETH to unwrap.
     """
+    if plan["venue"] == "v3" and plan["side"] == "buy":
+        return _send_wrapped_buy(w3, signer, plan["calls"])
     unwrap = plan["venue"] == "v3" and plan["side"] == "sell"
     before = evm.raw_balance_of(w3, pons.WETH, safe) if unwrap else 0
     landed = evm.send_calls(w3, signer, plan["calls"])
@@ -300,7 +333,7 @@ def _amount(w3: Web3, launch: pons.Launch, args: argparse.Namespace) -> int:
 
 def _cmd_quote(args: argparse.Namespace) -> int:
     """Price a trade without building or sending anything."""
-    w3 = evm.read_web3(pons.CHAIN, pons.PUBLIC_RPC)
+    w3, safe = evm.read_web3(pons.CHAIN, pons.PUBLIC_RPC)
     launch = pons.launch_record(w3, args.token)
     plan = plan_trade(
         w3,
@@ -309,7 +342,7 @@ def _cmd_quote(args: argparse.Namespace) -> int:
         _amount(w3, launch, args),
         args.slippage,
         args.max_impact_bps,
-        evm.NATIVE,
+        safe or evm.NATIVE,
     )
     plan["permit"] = "not built for a quote"
     cli.print_plan(plan)

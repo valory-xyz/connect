@@ -156,7 +156,7 @@ def test_onchain_search_fills_names_in_bounded_batches(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """Names are read a batch at a time; undecodable ones are retried, not blanked."""
+    """Names are read a batch at a time; an undecodable one is recorded blank, once."""
     api["error"] = OSError("down")
     _feeds(chain)
     chain.names = {TOKEN: ("bad", "bad")}
@@ -167,13 +167,23 @@ def test_onchain_search_fills_names_in_bounded_batches(
     assert "still being built" in err
     assert f"NOTE: {TOKEN}'s name did not decode" in err
     index = json.loads(discovery.INDEX_FILE.read_text())
-    assert index["tokens"][TOKEN]["name"] is None
-    assert index["tokens"][TOKEN]["symbol"] is None
-    chain.names = {TOKEN: ("Pons", "PONS")}
-    assert [f["token"] for f in discovery.search(chain, "pons")[0]] == [TOKEN]
+    assert index["tokens"][TOKEN]["name"] == ""
+    assert index["tokens"][TOKEN]["symbol"] == ""
+    asked = len(chain.multicall_targets)
     assert len(discovery.search(chain, "")[0]) == 2
+    assert chain.multicall_targets[asked:] == [OTHER, OTHER]
     stored = json.loads(discovery.INDEX_FILE.read_text())["tokens"][OTHER]
     assert (stored["name"], stored["symbol"]) == ("", "")
+
+
+def test_onchain_search_reads_a_bytes32_name(chain: Chain, api: dict) -> None:
+    """A legacy bytes32 name and symbol are found by search."""
+    api["error"] = OSError("down")
+    _feeds(chain)
+    chain.names = {TOKEN: (b"Pons".ljust(32, b"\0"), b"PONS".ljust(32, b"\0"))}
+    assert [f["token"] for f in discovery.search(chain, "pons")[0]] == [TOKEN]
+    stored = json.loads(discovery.INDEX_FILE.read_text())["tokens"][TOKEN]
+    assert (stored["name"], stored["symbol"]) == ("Pons", "PONS")
 
 
 def test_onchain_search_skips_tokens_that_fail_verification(

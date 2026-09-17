@@ -49,7 +49,7 @@ QUOTES = ("ETH", "USDG")
 
 def _cmd_search(args: argparse.Namespace) -> int:
     """Search launches and print the on-chain-verified results."""
-    w3 = evm.read_web3(pons.CHAIN, pons.PUBLIC_RPC)
+    w3, _ = evm.read_web3(pons.CHAIN, pons.PUBLIC_RPC)
     results, source = discovery.search(
         w3, args.query, args.sort, args.page, args.quote, args.limit
     )
@@ -64,10 +64,10 @@ def _cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
-def _curve_state(w3: Web3, launch: pons.Launch) -> dict[str, t.Any]:
-    """Live curve reserves and graduation progress for a V2 launch on its curve."""
+def _curve_state(w3: Web3, launch: pons.Launch, buyer: str) -> dict[str, t.Any]:
+    """Live curve reserves, graduation progress and the buyer's snipe tax."""
     address = pons.curve_of(launch)
-    state = curve.CurveState.read(w3, address, evm.NATIVE)
+    state = curve.CurveState.read(w3, address, buyer)
     threshold = evm.call_int(w3, address, SEL_THRESHOLD)
     raised = evm.call_int(w3, address, SEL_REAL_QUOTE)
     scale = 10 ** launch["pair_decimals"]
@@ -83,19 +83,20 @@ def _curve_state(w3: Web3, launch: pons.Launch) -> dict[str, t.Any]:
         "fee_bps": state.fee_bps,
         "creator_tax_bps": state.creator_tax_bps,
         "snipe_tax_bps_now": state.snipe_tax_bps,
+        "snipe_tax_payer": pons.snipe_tax_payer(buyer),
         "ready_to_graduate": state.ready_to_graduate,
     }
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
     """Print one launch as the chain reports it, plus the API's market readout."""
-    w3 = evm.read_web3(pons.CHAIN, pons.PUBLIC_RPC)
+    w3, safe = evm.read_web3(pons.CHAIN, pons.PUBLIC_RPC)
     launch = pons.launch_record(w3, args.token)
     doc: dict[str, t.Any] = dict(launch)
     if launch["venue"] == "none":
         doc["not_tradable"] = pons.PHASE_REASONS[launch["phase"]]
     if launch["venue"] == "curve":
-        doc["curve_state"] = _curve_state(w3, launch)
+        doc["curve_state"] = _curve_state(w3, launch, safe or evm.NATIVE)
     if launch["generation"] == "v2":
         doc["audit"] = pons.audit_status()
         doc["v2_acknowledged"] = pons.v2_acknowledged()

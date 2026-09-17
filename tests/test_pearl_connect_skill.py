@@ -30,18 +30,27 @@ answered from a table, and the signer's own HTTP surface is stubbed.
 # as bundled assets, not an installed package), which mypy cannot follow.
 # mypy: ignore-errors
 
+import io
 import json
 import sys
+import urllib.error
+from email.message import Message
 from pathlib import Path
 
 import pytest
 from eth_utils import to_checksum_address
+from fastapi.testclient import TestClient
 from web3 import Web3
-from web3.exceptions import ExtraDataLengthError
+from web3.exceptions import ContractLogicError, ExtraDataLengthError
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 
+from connect import guard as guard_module
 from connect import workspace
-from connect.config import AGENT_HTTP_PORT, BIND_HOST
+from connect.config import AGENT_HTTP_PORT, BIND_HOST, ChainConfig
+from connect.server.auth import MAX_AUTH_FAILURES
+from connect.settings import MODE_RESTRICTED, Protected, Settings
+
+from tests.conftest import evm
 
 # The skill ships as bundled assets, not an installed package; put its scripts
 # dir on the path so we can import the client under test.
@@ -246,3 +255,89 @@ def test_base_url_handles_the_url_the_server_actually_writes(tmp_path) -> None:
     base_url, _, _ = signer_client.load_mcp_config_dir(tmp_path)
     assert base_url == f"http://{BIND_HOST}:{AGENT_HTTP_PORT}"
     assert not base_url.rstrip("/").endswith("/mcp")
+
+
+def _as_client_error(response) -> Exception:
+    """Return the error signer_client raises for this HTTP answer."""
+    error = urllib.error.HTTPError(
+        "http://signer",
+        response.status_code,
+        "",
+        Message(),
+        io.BytesIO(response.content),
+    )
+    try:
+        signer_client._raise_with_detail(error)  # pylint: disable=protected-access
+    except signer_client.SignerRequestError as exc:
+        return exc
+    raise AssertionError("no error raised")  # pragma: no cover
+
+
+def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
+    make_app, test_signer, app_config, activity, fake_w3, settings_store, monkeypatch
+) -> None:
+    """A reworded pre-signing refusal must fail here, not read as possibly sent."""
+    safe = "0x" + "22" * 20
+    token, tracker = "0x" + "bb" * 20, "0x" + "cc" * 20
+    app_config.chains["nosafe"] = ChainConfig(rpc_url="http://127.0.0.1:9")
+    monkeypatch.setattr(
+        guard_module, "token_approve_targets", lambda chain: {token: tracker}
+    )
+    app = make_app(test_signer, app_config, activity, token="tok")  # nosec B106
+    good = {"Authorization": "Bearer tok"}
+    bad = {"Authorization": "Bearer nope"}
+    outcomes: list[tuple[str, str]] = []
+
+    def send(chain="testchain", to="0x" + "aa" * 20, headers=None) -> None:
+        response = client.post(
+            "/safe-transaction",
+            json={"chain": chain, "to": to},
+            headers=good if headers is None else headers,
+        )
+        error = _as_client_error(response)
+        outcomes.append((str(error), evm.send_outcome(error)))
+
+    def reverting(_tx):
+        raise ContractLogicError("execution reverted: GS013", data="0x")
+
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        send(chain="mystery")
+        send(chain="nosafe")
+        send(to="0x1234")
+        send(to=safe)
+        with monkeypatch.context() as patched:
+            patched.setattr(fake_w3.eth, "estimate_gas", reverting)
+            send()
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
+        send()
+        send(to=token)
+        send(headers={**good, "Origin": "http://evil.example"})
+        for _ in range(MAX_AUTH_FAILURES):
+            send(headers=bad)
+        send()
+    messages = [message for message, _ in outcomes]
+    for status, prefixes in evm.SIGNER_REFUSALS.items():
+        for prefix in prefixes:
+            head = f"signer returned HTTP {status}: {prefix}"
+            assert any(m.startswith(head) for m in messages), head
+    assert [o for _, o in outcomes if o != evm.REFUSED_BEFORE_SIGNING] == [
+        evm.REVERTED_BEFORE_SIGNING
+    ]
+    assert not fake_w3.eth.sent
+
+
+def test_send_outcome_treats_a_failed_broadcast_as_possibly_sent(
+    make_app, test_signer, app_config, activity, fake_w3
+) -> None:
+    """A signer error after signing is not a known refusal."""
+    fake_w3.eth.fail_broadcast = True
+    app = make_app(test_signer, app_config, activity, token="tok")  # nosec B106
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        response = client.post(
+            "/safe-transaction",
+            json={"chain": "testchain", "to": "0x" + "aa" * 20},
+            headers={"Authorization": "Bearer tok"},
+        )
+    assert evm.send_outcome(_as_client_error(response)) == evm.MAY_HAVE_BROADCAST

@@ -33,7 +33,7 @@ import pytest
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from eth_utils import to_checksum_address
-from web3.exceptions import ContractCustomError, Web3RPCError
+from web3.exceptions import Web3RPCError
 
 LIB = Path(__file__).resolve().parent.parent / "connect" / "assets" / "lib"
 sys.path.insert(0, str(LIB))
@@ -135,6 +135,11 @@ class _Signer:
             raise self._error
         self.sent.append(tx)
         return f"0x{len(self.sent):064x}"
+
+    def chain_info(self, chain: str) -> dict:
+        """Name the safe on any chain."""
+        del chain
+        return {"safe": SAFE}
 
 
 def test_native_is_the_zero_address() -> None:
@@ -247,46 +252,75 @@ def test_send_calls_passes_value_and_confirms_each(
 def test_send_calls_names_a_send_that_failed() -> None:
     """A failed send stops the sequence and says whether it may have broadcast."""
     signer = _Signer(error=RuntimeError("boom"))
-    with pytest.raises(evm.SwapError, match="could not be sent.*may still"):
+    with pytest.raises(evm.SendError, match="could not be sent.*may still") as caught:
         evm.send_calls(_ReceiptW3(), signer, [evm.weth_deposit_call(WETH, 1)])
+    assert (caught.value.landed, caught.value.inert) == ([], False)
+
+
+def test_send_calls_marks_a_refused_send_inert() -> None:
+    """A send the signer refused before signing moved nothing."""
+    signer = _Signer(
+        error=RuntimeError("signer returned HTTP 401: invalid or missing bearer token")
+    )
+    with pytest.raises(evm.SendError, match="nothing was broadcast") as caught:
+        evm.send_calls(_ReceiptW3(), signer, [evm.weth_deposit_call(WETH, 1)])
+    assert caught.value.inert
+
+
+REFUSED = "refused it before"
+REVERTED = "reverted in simulation"
+MAY = "may still"
 
 
 @pytest.mark.parametrize(
     ("error", "outcome"),
     [
-        ("signer returned HTTP 400: safe may not call itself", "refused it before"),
-        ("signer returned HTTP 401: invalid token", "refused it before"),
+        *(
+            (f"signer returned HTTP {status}: {prefix}...", REFUSED)
+            for status, prefixes in evm.SIGNER_REFUSALS.items()
+            for prefix in prefixes
+        ),
         (
             "signer returned HTTP 400: send failed: ('execution reverted: GS013', '0x')",
-            "reverted in simulation",
+            REVERTED,
         ),
-        ("signer returned HTTP 400: send failed: read timed out", "may still"),
-        ("signer returned HTTP 400: request 'x' is already in flight", "may still"),
-        ("signer returned HTTP 500: Internal Server Error", "may still"),
-        ("send not confirmed after 3 attempts (timed out)", "may still"),
+        ("signer returned HTTP 400: send failed: read timed out", MAY),
+        ("signer returned HTTP 400: send failed: nonce too low", MAY),
+        ("signer returned HTTP 400: request 'x' is already in flight; retry", MAY),
+        ("signer returned HTTP 400: nope", MAY),
+        ("signer returned HTTP 400: safe may not call itself", MAY),
+        ("signer returned HTTP 401: cross-origin requests are not allowed", MAY),
+        ("signer returned HTTP 409: invalid or missing bearer token", MAY),
+        ("signer returned HTTP 500: execution reverted", MAY),
+        ("signer returned HTTP 500: Internal Server Error", MAY),
+        ("send not confirmed after 3 attempts (timed out)", MAY),
     ],
 )
-def test_send_outcome_says_nothing_broadcast_only_when_that_is_certain(
+def test_send_outcome_says_nothing_broadcast_only_for_known_refusals(
     error: str, outcome: str
 ) -> None:
-    """Refusals and simulation reverts are final; anything else may have landed."""
+    """Only known refusals and simulation reverts are final."""
     assert outcome in evm.send_outcome(RuntimeError(error))
 
 
 def test_send_calls_names_a_call_that_never_confirmed() -> None:
     """A receipt timeout is an unknown fate, not a failure."""
     w3 = _ReceiptW3(error=TimeoutError("slow"))
-    with pytest.raises(evm.SwapError, match="has not confirmed"):
+    with pytest.raises(evm.SendError, match="has not confirmed") as caught:
         evm.send_calls(w3, _Signer(), [evm.weth_deposit_call(WETH, 1)])
+    assert not caught.value.inert
 
 
 def test_send_calls_stops_at_a_revert() -> None:
     """A reverted call must not read as success, and nothing follows it."""
     signer = _Signer()
     calls = [evm.weth_deposit_call(WETH, 1), evm.weth_withdraw_call(WETH, 1)]
-    with pytest.raises(evm.SwapError, match=r"reverted; confirmed so far: \[\]"):
+    with pytest.raises(
+        evm.SendError, match=r"reverted; confirmed so far: \[\]"
+    ) as caught:
         evm.send_calls(_ReceiptW3(status=0), signer, calls)
     assert len(signer.sent) == 1
+    assert caught.value.inert
 
 
 @pytest.mark.parametrize("pool", [V3_POOL, V2_POOL])
@@ -440,13 +474,22 @@ def _fake_permit(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
     def _signed(*args: t.Any, **kwargs: t.Any) -> bytes:
         """Build a well-formed permit for exactly what was asked."""
         asked.append((*args, kwargs))
-        token, amount, spender, expiry = args[3], args[4], args[6], args[7]
+        token, amount, spender, expiry = args[4], args[5], args[7], args[8]
         return permit.permit_input(
             permit.PermitDetails(token, amount, expiry, 0), spender, expiry, b"s"
         )
 
     monkeypatch.setattr(permit, "signed_action", _signed)
     return asked
+
+
+class _ChainW3:
+    """A web3 that only reports which chain it serves."""
+
+    def __init__(self, chain_id: int = CHAIN_ID) -> None:
+        """Serve this chain."""
+        self.eth = self
+        self.chain_id = chain_id
 
 
 def test_router_swap_with_the_native_coin_needs_no_approval(
@@ -456,7 +499,7 @@ def test_router_swap_with_the_native_coin_needs_no_approval(
     asked = _fake_permit(monkeypatch)
     monkeypatch.setattr(router.time, "time", lambda: 1_000)
     routed = router.router_swap(
-        None, object(), SAFE, CHAIN_ID, V4_POOL, NATIVE, TOKEN, 10, 9, False
+        _ChainW3(), object(), SAFE, CHAIN_ID, V4_POOL, NATIVE, TOKEN, 10, 9, False
     )
     assert not asked
     assert routed.permit == router.PERMIT_NONE
@@ -474,13 +517,14 @@ def test_router_swap_folds_the_permit_for_a_token(
     asked = _fake_permit(monkeypatch)
     monkeypatch.setattr(router.time, "time", lambda: 1_000)
     routed = router.router_swap(
-        None, object(), SAFE, CHAIN_ID, V4_POOL, TOKEN, NATIVE, 10, 9, False, 1
+        _ChainW3(), object(), SAFE, CHAIN_ID, V4_POOL, TOKEN, NATIVE, 10, 9, False, 1
     )
     assert routed.permit == router.PERMIT_SIGNED
     assert routed.deadline == 1_000 + router.DEADLINE_S + 2 * evm.RECEIPT_TIMEOUT_S
     assert [c["what"] for c in routed.calls] == ["approve Permit2", "swap"]
     assert all("value" not in c for c in routed.calls)
-    assert asked[0][2:] == (
+    assert asked[0][1] == CHAIN_ID
+    assert asked[0][3:] == (
         SAFE,
         TOKEN,
         10,
@@ -497,7 +541,7 @@ def test_router_swap_dry_run_asks_for_a_placeholder_permit(
     """A dry run builds the same two calls, labelled as signed at send time."""
     asked = _fake_permit(monkeypatch)
     routed = router.router_swap(
-        None,
+        _ChainW3(),
         object(),
         SAFE,
         CHAIN_ID,
@@ -515,9 +559,7 @@ def test_router_swap_dry_run_asks_for_a_placeholder_permit(
 
 
 class _PermitW3:
-    """A web3 on a renumbered fork, answering the reads signed_action makes."""
-
-    chain_id = 9_994_663
+    """A web3 answering the reads signed_action makes."""
 
     def __init__(self) -> None:
         """Answer as a safe with no Permit2 allowance yet."""
@@ -545,6 +587,7 @@ def _permit_for(signer: _DigestSigner, placeholder: bool) -> bytes:
     """Run the real signed_action against the fork stub."""
     return permit.signed_action(
         _PermitW3(),
+        CHAIN_ID,
         signer,
         SAFE,
         TOKEN,
@@ -556,12 +599,12 @@ def _permit_for(signer: _DigestSigner, placeholder: bool) -> bytes:
     )
 
 
-def test_signed_action_signs_for_the_chain_the_node_reports() -> None:
-    """Permit2 checks the digest against the chain it runs on, not the skill's."""
+def test_signed_action_signs_for_the_chain_it_is_given() -> None:
+    """The digest names the caller's chain, the one the addresses belong to."""
     signer = _DigestSigner()
     details, spender, deadline = permit.decode_action(_permit_for(signer, False))
     digest = permit.permit_single_digest(
-        _PermitW3.chain_id, WHERE["permit2"], details, spender, deadline
+        CHAIN_ID, WHERE["permit2"], details, spender, deadline
     )
     assert signer.digests == [permit.safe_message_digest(b"\x11" * 32, digest)]
 
@@ -575,6 +618,29 @@ def test_signed_action_placeholder_never_asks_the_signer() -> None:
     assert signer.digests == []
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_router_swap_refuses_an_rpc_on_another_chain(
+    monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    """A misconfigured RPC gets nothing built or signed, not even in a dry run."""
+    asked = _fake_permit(monkeypatch)
+    with pytest.raises(evm.SwapError, match="serves chain 9994663, not chain 4663"):
+        router.router_swap(
+            _ChainW3(9_994_663),
+            object(),
+            SAFE,
+            CHAIN_ID,
+            V4_POOL,
+            TOKEN,
+            NATIVE,
+            10,
+            9,
+            False,
+            dry_run=dry_run,
+        )
+    assert not asked
+
+
 @pytest.mark.parametrize("signer", [None, object()])
 def test_router_swap_approves_on_chain_when_not_folding(
     monkeypatch: pytest.MonkeyPatch, signer: t.Any
@@ -583,7 +649,16 @@ def test_router_swap_approves_on_chain_when_not_folding(
     asked = _fake_permit(monkeypatch)
     monkeypatch.setattr(router.time, "time", lambda: 1_000)
     routed = router.router_swap(
-        None, signer, SAFE, CHAIN_ID, V3_POOL, WETH, TOKEN, 10, 9, signer is not None
+        _ChainW3(),
+        signer,
+        SAFE,
+        CHAIN_ID,
+        V3_POOL,
+        WETH,
+        TOKEN,
+        10,
+        9,
+        signer is not None,
     )
     assert not asked
     assert routed.permit == router.PERMIT_SEPARATE
@@ -604,7 +679,7 @@ def test_router_swap_refuses_a_permit_missing_from_the_calldata(
     monkeypatch.setattr(uniswap, "permit_action_in", lambda _calldata: None)
     with pytest.raises(evm.SwapError, match="not in the calldata"):
         router.router_swap(
-            None, object(), SAFE, CHAIN_ID, V4_POOL, TOKEN, NATIVE, 10, 9, False
+            _ChainW3(), object(), SAFE, CHAIN_ID, V4_POOL, TOKEN, NATIVE, 10, 9, False
         )
 
 
@@ -615,7 +690,7 @@ def test_router_swap_refuses_a_permit_nobody_asked_for(
     monkeypatch.setattr(uniswap, "permit_action_in", lambda _calldata: b"p")
     with pytest.raises(evm.SwapError, match="nobody asked for"):
         router.router_swap(
-            None, None, SAFE, CHAIN_ID, V4_POOL, NATIVE, TOKEN, 10, 9, False
+            _ChainW3(), None, SAFE, CHAIN_ID, V4_POOL, NATIVE, TOKEN, 10, 9, False
         )
 
 
@@ -682,12 +757,14 @@ def test_call_string_refuses_a_non_string() -> None:
 def test_decode_string_result_tells_revert_from_garbage(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A reverted read is empty; an undecodable one is None and noted."""
+    """A reverted read is empty, and so is an undecodable one, which is noted."""
     assert evm.decode_string_result(True, abi_encode(["string"], ["x"]), "a") == "x"
     assert evm.decode_string_result(False, b"", "a") == ""
+    assert evm.decode_string_result(True, b"MKR".ljust(32, b"\0"), "a") == "MKR"
     assert not capsys.readouterr().err
-    assert evm.decode_string_result(True, b"\x01", "USDG's name") is None
-    assert "NOTE: USDG's name did not decode" in capsys.readouterr().err
+    assert evm.decode_string_result(True, b"\x01", "USDG's name") == ""
+    assert evm.decode_string_result(True, b"\xff" * 32, "USDG's name") == ""
+    assert capsys.readouterr().err.count("NOTE: USDG's name did not decode") == 2
 
 
 def test_multicall3_is_the_canonical_deployment() -> None:
@@ -924,23 +1001,62 @@ def test_check_image_without_dimensions(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.parametrize(
+    "answer",
+    [
+        (b"", "image/png", str(ipfs.IMAGE_MAX_BYTES)),
+        (b"\0" * ipfs.IMAGE_MAX_BYTES, "image/png", None),
+        (PNG.ljust(ipfs.IMAGE_MAX_BYTES, b"\0"), "application/octet-stream", None),
+    ],
+)
+def test_check_image_refuses_an_oversized_image_outright(
+    monkeypatch: pytest.MonkeyPatch, answer: t.Any
+) -> None:
+    """An image over the limit is a verdict on the file, not on the gateway."""
+    asked = serve(monkeypatch, {ipfs.GATEWAYS[0]: answer})
+    with pytest.raises(evm.SwapError, match="under 5 MB"):
+        ipfs.check_image(IMAGE, AGENT)
+    assert len(asked) == 1
+
+
+@pytest.mark.parametrize(
     ("answer", "match"),
     [
-        ((b"", "image/png", str(ipfs.IMAGE_MAX_BYTES)), "under 5 MB"),
-        ((b"\0" * ipfs.IMAGE_MAX_BYTES, "image/png", None), "under 5 MB"),
-        ((PNG, "text/html", None), "gateway says text/html"),
+        (
+            (b"", "text/html", str(ipfs.IMAGE_MAX_BYTES)),
+            "text/html that looks like something",
+        ),
+        ((PNG, "text/html", None), "served text/html that looks like image/png"),
         ((b"GIF89a", "image/gif", None), "looks like something else"),
         ((PNG, "image/jpeg", None), "looks like image/png"),
     ],
 )
-def test_check_image_refuses_bad_files(
+def test_check_image_treats_a_non_image_as_a_gateway_failure(
     monkeypatch: pytest.MonkeyPatch, answer: t.Any, match: str
 ) -> None:
-    """Oversized or wrongly typed files are refused outright."""
-    asked = serve(monkeypatch, {ipfs.GATEWAYS[0]: answer})
-    with pytest.raises(evm.SwapError, match=match):
+    """A wrongly typed answer moves on, and is listed once every gateway fails."""
+    asked = serve(monkeypatch, dict.fromkeys(ipfs.GATEWAYS, answer))
+    with pytest.raises(evm.SwapError, match="no gateway served") as caught:
         ipfs.check_image(IMAGE, AGENT)
-    assert len(asked) == 1
+    assert len(asked) == len(ipfs.GATEWAYS)
+    assert str(caught.value).count(match.split(" ")[-1]) == len(ipfs.GATEWAYS)
+    assert match in str(caught.value)
+
+
+def test_check_image_skips_a_gateway_answering_with_a_web_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limit page served as 200 is not a verdict on the file."""
+    first, second = ipfs.GATEWAYS[:2]
+    serve(
+        monkeypatch,
+        {
+            first: (b"<html>slow down</html>", "text/html", None),
+            second: (PNG, "image/png", str(len(PNG))),
+        },
+    )
+    report = ipfs.check_image(IMAGE, AGENT)
+    assert report["url"].startswith(second)
+    assert report["width"] == 512
 
 
 def test_check_image_refuses_unresolvable_and_malformed(
@@ -957,10 +1073,10 @@ def test_check_image_refuses_unresolvable_and_malformed(
 
 
 def test_read_web3_prefers_the_signer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With a signer, reads use its RPC."""
+    """With a signer, reads use its RPC and name its safe."""
     marker = object()
-    monkeypatch.setattr(evm, "connect", lambda chain: (marker, None))
-    assert evm.read_web3("robinhood", "https://rpc.example") is marker
+    monkeypatch.setattr(evm, "connect", lambda chain: (marker, _Signer()))
+    assert evm.read_web3("robinhood", "https://rpc.example") == (marker, SAFE)
 
 
 def test_read_web3_falls_back_to_the_public_rpc(
@@ -973,7 +1089,8 @@ def test_read_web3_falls_back_to_the_public_rpc(
         raise FileNotFoundError(".mcp.json not found")
 
     monkeypatch.setattr(evm, "connect", _missing)
-    w3 = evm.read_web3("robinhood", "https://rpc.example")
+    w3, safe = evm.read_web3("robinhood", "https://rpc.example")
+    assert safe is None
     assert w3.provider.endpoint_uri == "https://rpc.example"
     assert "reading from https://rpc.example" in capsys.readouterr().err
 
@@ -1026,43 +1143,93 @@ def test_describe_revert_names_known_errors() -> None:
     assert evm.describe_revert(None, ERRORS) == "None"
 
 
-SIMULATED: evm.Call = {"to": USDG, "data": "0x01", "what": "launch", "value": 5}
+@pytest.mark.parametrize(
+    "data",
+    [
+        "0x0",
+        "0xzz",
+        "0x" + evm.selector("Error(string)").hex(),
+        "0x" + evm.selector("Slippage(uint256,uint256)").hex() + "00" * 31,
+    ],
+)
+def test_describe_revert_returns_undecodable_data_verbatim(data: str) -> None:
+    """Data a node supplies never makes naming a revert raise."""
+    assert evm.describe_revert(data, ERRORS) == data
 
 
-def test_simulate_call_returns_the_raw_answer() -> None:
-    """A dry run is made as the sender, with the call's value."""
-    w3 = _CallW3(answer=b"\x07" * 64)
-    assert evm.simulate_call(w3, SIMULATED, SAFE, ERRORS) == b"\x07" * 64  # type: ignore[arg-type]
-    assert w3.calls == [{"from": SAFE, "to": USDG, "data": "0x01", "value": 5}]
-
-
-class _FailingW3:
-    """A web3 whose eth_call raises."""
-
-    def __init__(self, error: Exception) -> None:
-        """Raise this on every call."""
-        self.eth = self
-        self._error = error
-
-    def call(self, tx: dict) -> bytes:
-        """Raise."""
-        raise self._error
-
-
+SIMULATED: evm.Call = {"to": USDG, "data": "0x01", "what": "approve", "value": 5}
+LAUNCHED: evm.Call = {"to": WETH, "data": "0x02", "what": "launch"}
 PAUSED = "0x" + evm.selector("Paused()").hex()
 
 
+class _SimulateW3:
+    """A web3 whose eth_simulateV1 answers fixed results, or raises."""
+
+    def __init__(self, answer: t.Any) -> None:
+        """Answer every simulation with this, or raise it."""
+        self.manager = self
+        self.requests: list[tuple[str, list]] = []
+        self._answer = answer
+
+    def request_blocking(self, method: str, params: list) -> t.Any:
+        """Record the request and answer."""
+        self.requests.append((method, params))
+        if isinstance(self._answer, Exception):
+            raise self._answer
+        return self._answer
+
+
+def _result(status: str, data: str = "0x", error: t.Any = None) -> dict:
+    """One simulated call's result as the node shapes it."""
+    return {"status": status, "returnData": data, "error": error}
+
+
+def test_simulate_calls_runs_them_in_order_as_the_sender() -> None:
+    """Both calls go into one block, as the sender, each with its value."""
+    w3 = _SimulateW3([{"calls": [_result("0x1", "0x01"), _result("0x1", "0x0707")]}])
+    assert evm.simulate_calls(w3, [SIMULATED, LAUNCHED], SAFE, ERRORS) == [  # type: ignore[arg-type]
+        b"\x01",
+        b"\x07\x07",
+    ]
+    ((method, params),) = w3.requests
+    assert method == "eth_simulateV1"
+    assert params == [
+        {
+            "blockStateCalls": [
+                {
+                    "calls": [
+                        {"from": SAFE, "to": USDG, "data": "0x01", "value": "0x5"},
+                        {"from": SAFE, "to": WETH, "data": "0x02", "value": "0x0"},
+                    ]
+                }
+            ]
+        },
+        "latest",
+    ]
+
+
 @pytest.mark.parametrize(
-    ("error", "match"),
+    ("answer", "match"),
     [
-        (ContractCustomError(PAUSED, data=PAUSED), r"launch would revert: Paused\(\)"),
-        (Web3RPCError("down"), "launch could not be simulated: down"),
+        (
+            [{"calls": [_result("0x1"), _result("0x0", error={"data": PAUSED})]}],
+            r"^launch would revert: Paused\(\)$",
+        ),
+        (
+            [{"calls": [_result("0x0", error={"message": "gas"}), _result("0x1")]}],
+            "^approve would revert: gas$",
+        ),
+        ([{"calls": [_result("0x0"), _result("0x0")]}], "^approve would revert: None$"),
+        ([{"calls": [_result("0x1")]}], "answered 1 results for 2 calls"),
+        ([{"calls": [_result("0x1", "0x0"), _result("0x1")]}], "simulation of"),
+        ([], "simulation of approve, launch answered IndexError"),
+        (Web3RPCError("down"), "approve, launch could not be simulated: down"),
     ],
 )
-def test_simulate_call_names_why_it_failed(error: Exception, match: str) -> None:
+def test_simulate_calls_names_why_it_failed(answer: t.Any, match: str) -> None:
     """A revert is named from the error table; other failures are refusals too."""
     with pytest.raises(evm.SwapError, match=match):
-        evm.simulate_call(_FailingW3(error), SIMULATED, SAFE, ERRORS)  # type: ignore[arg-type]
+        evm.simulate_calls(_SimulateW3(answer), [SIMULATED, LAUNCHED], SAFE, ERRORS)  # type: ignore[arg-type]
 
 
 class _HTTPError(OSError):
@@ -1092,13 +1259,13 @@ class _LogsW3:
 
 
 def test_get_logs_backs_off_while_throttled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 429 is retried after a growing pause."""
+    """A 429 is retried after a pause that doubles until it reaches the cap."""
     pauses: list[float] = []
     monkeypatch.setattr(evm.time, "sleep", pauses.append)
-    w3 = _LogsW3([_HTTPError(429), _HTTPError(429)])
+    w3 = _LogsW3([_HTTPError(429)] * 4)
     query = {"fromBlock": 1, "toBlock": 2}
-    assert evm.get_logs(w3, query, "hint", 2, 0.5) == [(1, 2)]  # type: ignore[arg-type]
-    assert pauses == [0.5, 5.0, 50.0]
+    assert evm.get_logs(w3, query, "hint", 4, 2.0) == [(1, 2)]  # type: ignore[arg-type]
+    assert pauses == [2.0, 4.0, 5.0, 5.0, 5.0]
 
 
 @pytest.mark.parametrize(

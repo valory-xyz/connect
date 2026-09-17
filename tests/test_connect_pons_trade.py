@@ -602,6 +602,108 @@ def test_a_v1_sell_unwraps_exactly_what_the_swap_returned(
     assert len(sent) == 1
 
 
+V1_BUY = t.cast(
+    trade.Plan,
+    {
+        "venue": "v3",
+        "side": "buy",
+        "calls": [
+            evm.weth_deposit_call(pons.WETH, 10**16),
+            {"to": TOKEN, "data": "0x", "what": "swap"},
+        ],
+    },
+)
+
+
+def _failing_send(
+    monkeypatch: pytest.MonkeyPatch, failures: list[t.Optional[evm.SendError]]
+) -> list[list[evm.Call]]:
+    """Fail each send_calls with the next scripted error, or let it land."""
+    sent: list[list[evm.Call]] = []
+
+    def _send(_w3: t.Any, _signer: t.Any, calls: list) -> list[evm.Sent]:
+        sent.append(calls)
+        error = failures.pop(0)
+        if error is not None:
+            raise error
+        return [evm.Sent(c["what"], "0x1", {}) for c in calls]
+
+    monkeypatch.setattr(evm, "send_calls", _send)
+    return sent
+
+
+WRAPPED = [evm.Sent("wrap ETH", "0x1", {})]
+
+
+def test_a_v1_buy_that_lands_is_not_unwrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A buy that lands sends its calls once and nothing more."""
+    sent = _failing_send(monkeypatch, [None])
+    landed = trade.execute(t.cast(t.Any, None), object(), SAFE, V1_BUY)
+    assert [s.what for s in landed] == ["wrap ETH", "swap"]
+    assert sent == [V1_BUY["calls"]]
+
+
+def test_a_v1_buy_whose_wrap_fails_has_nothing_to_unwrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no wrap landed, the send's own error stands."""
+    error = evm.SendError("wrap ETH reverted", [], inert=True)
+    sent = _failing_send(monkeypatch, [error])
+    with pytest.raises(evm.SendError) as caught:
+        trade.execute(t.cast(t.Any, None), object(), SAFE, V1_BUY)
+    assert caught.value is error
+    assert len(sent) == 1
+
+
+def test_a_v1_buy_that_surely_failed_unwraps_the_wrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A swap that moved nothing gives back exactly the WETH the wrap made."""
+    sent = _failing_send(
+        monkeypatch, [evm.SendError("swap reverted.", WRAPPED, inert=True), None]
+    )
+    with pytest.raises(
+        evm.SwapError, match="swap reverted. The 0.01 WETH it wrapped was unwrapped"
+    ):
+        trade.execute(t.cast(t.Any, None), object(), SAFE, V1_BUY)
+    assert sent[1] == [evm.weth_withdraw_call(pons.WETH, 10**16)]
+
+
+def test_a_v1_buy_whose_unwrap_fails_says_the_weth_is_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed unwrap names the WETH still in the safe."""
+    _failing_send(
+        monkeypatch,
+        [
+            evm.SendError("swap reverted.", WRAPPED, inert=True),
+            evm.SendError("unwrap down", [], inert=True),
+        ],
+    )
+    with pytest.raises(
+        evm.SwapError,
+        match=r"Unwrapping the 0.01 WETH it wrapped failed too \(unwrap down\); "
+        r"that WETH is in the safe and still needs unwrapping",
+    ):
+        trade.execute(t.cast(t.Any, None), object(), SAFE, V1_BUY)
+
+
+def test_a_v1_buy_of_unknown_fate_is_not_unwrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A swap that may still land leaves the WETH alone, and says so."""
+    sent = _failing_send(
+        monkeypatch, [evm.SendError("swap has not confirmed.", WRAPPED, inert=False)]
+    )
+    with pytest.raises(
+        evm.SwapError,
+        match="If the buy did not land, the 0.01 WETH it wrapped is still in the "
+        "safe and still needs unwrapping",
+    ):
+        trade.execute(t.cast(t.Any, None), object(), SAFE, V1_BUY)
+    assert len(sent) == 1
+
+
 def test_execute_sends_a_curve_plan_as_is(
     monkeypatch: pytest.MonkeyPatch, on_curve: curve.CurveState
 ) -> None:
@@ -634,7 +736,7 @@ def cli_fixture(
     """Run trade.main against a stubbed chain and signer."""
     w3 = _ChainW3({k: list(v) for k, v in RICH.items()})
     monkeypatch.setattr(pons, "launch_record", lambda _w3, _token: _launch())
-    monkeypatch.setattr(evm, "read_web3", lambda chain, rpc: w3)
+    monkeypatch.setattr(evm, "read_web3", lambda chain, rpc: (w3, None))
     monkeypatch.setattr(evm, "connect", lambda _chain: (w3, _Signer()))
     monkeypatch.setattr(
         evm, "to_base_units", lambda _w3, _t, whole: int(Decimal(str(whole)) * 10**18)
@@ -655,6 +757,27 @@ def test_cli_quote_prints_the_plan(
     printed = json.loads(capsys.readouterr().out)
     assert printed["side"] == "sell"
     assert printed["permit"] == "not built for a quote"
+    assert "estimate" in printed["snipe_tax_payer"]
+
+
+def test_cli_quote_prices_the_snipe_tax_for_the_safe(
+    cli: t.Callable[..., int],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With a signer, the curve is read for the safe, which the output names."""
+    readers: list[str] = []
+
+    def _read(cls: t.Any, _w3: t.Any, _curve: str, recipient: str) -> t.Any:
+        readers.append(recipient)
+        return OPEN_STATE
+
+    monkeypatch.setattr(curve.CurveState, "read", classmethod(_read))
+    w3 = _ChainW3({})
+    monkeypatch.setattr(evm, "read_web3", lambda chain, rpc: (w3, SAFE))
+    assert cli("quote", "--token", TOKEN, "--spend", "0.01") == 0
+    assert readers == [SAFE]
+    assert json.loads(capsys.readouterr().out)["snipe_tax_payer"] == SAFE
 
 
 def test_cli_dry_run_prints_the_calls(

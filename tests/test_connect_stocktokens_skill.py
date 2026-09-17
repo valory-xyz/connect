@@ -526,6 +526,8 @@ class _StubW3:
     class eth:  # pylint: disable=invalid-name
         """Eth namespace."""
 
+        chain_id = CHAIN_ID
+
         @staticmethod
         def call(_tx: dict) -> bytes:
             """Fail loudly if a test forgot to stub a read."""
@@ -642,6 +644,7 @@ def test_plan_swap_folds_the_permit_when_a_signer_is_present(
 
     def _capture(
         w3: object,
+        chain_id: int,
         signer: object,
         owner: str,
         token: str,
@@ -654,6 +657,7 @@ def test_plan_swap_folds_the_permit_when_a_signer_is_present(
         """Record what the fold path asks to be signed."""
         del w3, signer, placeholder
         seen.update(
+            chain_id=chain_id,
             owner=owner,
             token=token,
             amount=amount,
@@ -681,6 +685,7 @@ def test_plan_swap_folds_the_permit_when_a_signer_is_present(
     assert plan["permit"] == "signed into the swap"
     assert uniswap.permit_action_in(plan["calls"][-1]["data"]) == seen["action"]
     assert seen["expiry"] == plan["deadline"]
+    assert seen["chain_id"] == CHAIN_ID
     assert seen["amount"] == 1_000 * 10**6
     assert seen["token"] == USDG
     assert seen["owner"] == SAFE
@@ -720,8 +725,6 @@ def test_plan_swap_rejects_a_permit_for_the_wrong_amount(
 class _SigningW3:
     """A web3 that answers the reads signed_action makes."""
 
-    chain_id = CHAIN_ID
-
     def __init__(self, domain: bytes = b"\x11" * 32, allowance: int = 3) -> None:
         """Answer with this domain separator and this current nonce."""
         self.eth = self
@@ -743,6 +746,7 @@ def _signed(w3: object, signer: object) -> bytes:
     """Run signed_action against the stubs with this chain's addresses."""
     return permit.signed_action(
         w3,
+        CHAIN_ID,
         signer,
         SAFE,
         USDG,

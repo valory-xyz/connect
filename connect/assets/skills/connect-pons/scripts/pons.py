@@ -192,6 +192,13 @@ def pool_of(launch: Launch) -> uniswap.Pool:
     return pool
 
 
+def snipe_tax_payer(buyer: str) -> str:
+    """Name whose snipe tax a reading is; a read for address(0) is an estimate."""
+    if evm.is_native(buyer):
+        return "an estimate for a buyer the launch does not exempt"
+    return buyer
+
+
 def _record(w3: Web3, factory: str, token: str, shape: type[RecordT]) -> RecordT:
     """Read a factory's getLaunchedToken record for this token.
 
@@ -515,6 +522,7 @@ __all__ = [
     "pool_of",
     "record_v2_ack",
     "require_v2_ack",
+    "snipe_tax_payer",
     "v2_acknowledged",
     "v2_record",
 ]

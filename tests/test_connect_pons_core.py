@@ -25,6 +25,7 @@ import sys
 import typing as t
 
 import pytest
+from eth_abi import encode as abi_encode
 
 from tests.conftest import (
     CURVE,
@@ -332,9 +333,14 @@ def test_a_missing_acknowledgement_is_silent(
     assert capsys.readouterr().err == ""
 
 
-def _run(monkeypatch: pytest.MonkeyPatch, chain: Chain, *argv: str) -> int:
-    """Run tokens.py against the scripted chain."""
-    monkeypatch.setattr(evm, "read_web3", lambda chain_, rpc: chain)
+def _run(
+    monkeypatch: pytest.MonkeyPatch,
+    chain: Chain,
+    *argv: str,
+    safe: t.Optional[str] = None,
+) -> int:
+    """Run tokens.py against the scripted chain, with a signer's safe when given."""
+    monkeypatch.setattr(evm, "read_web3", lambda chain_, rpc: (chain, safe))
     monkeypatch.setattr(sys, "argv", ["tokens.py", *argv])
     return tokens.main()
 
@@ -379,9 +385,30 @@ def test_cli_show_reports_curve_progress_audit_and_market(
     doc = json.loads(capsys.readouterr().out)
     assert doc["curve_state"]["graduation_progress_pct"] == pytest.approx(10.0)
     assert doc["curve_state"]["raised"] == 809
+    assert doc["curve_state"]["snipe_tax_payer"] == pons.snipe_tax_payer(evm.NATIVE)
+    assert "estimate" in doc["curve_state"]["snipe_tax_payer"]
     assert doc["audit"]["status"] == "unaudited"
     assert doc["v2_acknowledged"] is False
     assert doc["market"]["price_usd"] == 1e-6
+
+
+def test_cli_show_reads_the_snipe_tax_the_safe_pays(
+    chain: Chain,
+    api: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """With a signer, the snipe tax is read for the safe, not for address(0)."""
+    del api
+    _v2(chain)
+    _curve_reads(chain)
+    anyone = evm.selector("currentSnipeTaxBps(address)")
+    del chain.calls[(CURVE, anyone)]
+    chain.on(CURVE, anyone + abi_encode(["address"], [OTHER]), _word(0))
+    chain.on(CURVE, anyone, _word(9000))
+    assert _run(monkeypatch, chain, "show", "--token", TOKEN, safe=OTHER) == 0
+    state = json.loads(capsys.readouterr().out)["curve_state"]
+    assert (state["snipe_tax_bps_now"], state["snipe_tax_payer"]) == (0, OTHER)
 
 
 def test_cli_show_without_a_venue_or_api(

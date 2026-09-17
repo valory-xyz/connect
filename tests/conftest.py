@@ -166,7 +166,8 @@ class Chain:
         """Start empty: every unknown call is a test bug."""
         self.head = 30_000_000
         self.calls: dict[tuple[str, bytes], bytes] = {}
-        self.names: dict[str, tuple[str, str]] = {}
+        self.names: dict[str, tuple[t.Union[str, bytes], t.Union[str, bytes]]] = {}
+        self.multicall_targets: list[str] = []
         self.feed_logs: dict[bytes, list[tuple[int, str]]] = {}
         self.log_queries: list[dict] = []
         self.log_errors: list[Exception] = []
@@ -193,6 +194,7 @@ class Chain:
         (calls,) = abi_decode(["(address,bool,bytes)[]"], data[4:])
         results = []
         for target, _, calldata in calls:
+            self.multicall_targets.append(to_checksum_address(target))
             known = self.names.get(to_checksum_address(target))
             if known is None:
                 results.append((False, b""))
@@ -200,7 +202,7 @@ class Chain:
                 results.append((True, b"\x01"))
             else:
                 text = known[0] if calldata == evm.SEL_NAME else known[1]
-                results.append((True, _text(text)))
+                results.append((True, text if isinstance(text, bytes) else _text(text)))
         if self.multicall_short:
             results = results[:-1]
         return abi_encode(["(bool,bytes)[]"], [results])

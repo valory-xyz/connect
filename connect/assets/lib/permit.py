@@ -191,6 +191,7 @@ def approval_call(
 
 def signed_action(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     w3: Web3,
+    chain_id: int,
     signer: t.Any,
     owner: str,
     token: str,
@@ -216,9 +217,7 @@ def signed_action(  # pylint: disable=too-many-arguments,too-many-positional-arg
     _, _, nonce = decode_allowance(raw)
     details = PermitDetails(token=token, amount=amount, expiration=expiry, nonce=nonce)
     sig_deadline = expiry
-    digest = permit_single_digest(
-        w3.eth.chain_id, permit2, details, spender, sig_deadline
-    )
+    digest = permit_single_digest(chain_id, permit2, details, spender, sig_deadline)
     domain_separator = bytes(w3.eth.call({"to": owner, "data": SEL_DOMAIN_SEPARATOR}))
     if len(domain_separator) != 32:
         raise SwapError(
