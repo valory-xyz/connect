@@ -14,7 +14,8 @@ other non-aea agent. It:
    `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
    the agent session, the bundled skills (`pearl-connect` for signing,
    `connect-polymarket` for prediction markets, `connect-stocktokens` for
-   Robinhood Chain Stock Tokens) and the shared modules they import, installed
+   Robinhood Chain Stock Tokens, `connect-pons` for the Pons memecoin
+   launchpad on Robinhood Chain) and the shared modules they import, installed
    to `.claude/lib/`;
 3. serves on `127.0.0.1:8716`:
    - Pearl SDK contracts: `GET /healthcheck` and `GET /funds-status`.

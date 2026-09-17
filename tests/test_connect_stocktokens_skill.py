@@ -58,6 +58,7 @@ sys.path.insert(0, str(SKILL))
 import evm  # noqa: E402  pylint: disable=wrong-import-position
 import permit  # noqa: E402  pylint: disable=wrong-import-position
 import pools  # noqa: E402  pylint: disable=wrong-import-position
+import router  # noqa: E402  pylint: disable=wrong-import-position
 import stocktokens  # noqa: E402  pylint: disable=wrong-import-position
 import swap  # noqa: E402  pylint: disable=wrong-import-position
 import uniswap  # noqa: E402  pylint: disable=wrong-import-position
@@ -149,7 +150,7 @@ def test_router_inputs_carry_the_per_hop_price_array() -> None:
 def test_approvals_are_for_the_exact_amount() -> None:
     """Never an unlimited Permit2 allowance, whatever the API's own permit does."""
     amount = 1_234_567
-    erc20, permit2 = swap.approval_calls(USDG, amount, 1789473030)
+    erc20, permit2 = router.approval_calls(CHAIN_ID, USDG, amount, 1789473030)
     spender, approved = abi_decode(
         ["address", "uint256"], bytes.fromhex(erc20["data"][10:])
     )
@@ -645,13 +646,13 @@ def test_plan_swap_folds_the_permit_when_a_signer_is_present(
         owner: str,
         token: str,
         amount: int,
-        chain_id: int,
         permit2: str,
         spender: str,
         expiry: int,
+        placeholder: bool,
     ) -> bytes:
         """Record what the fold path asks to be signed."""
-        del w3, signer, chain_id
+        del w3, signer, placeholder
         seen.update(
             owner=owner,
             token=token,
@@ -665,7 +666,7 @@ def test_plan_swap_folds_the_permit_when_a_signer_is_present(
         )
         return bytes(seen["action"])
 
-    monkeypatch.setattr(swap.permit, "signed_action", _capture)
+    monkeypatch.setattr(permit, "signed_action", _capture)
     plan = swap.plan_swap(
         _StubW3(),
         "NVDA",
@@ -702,7 +703,7 @@ def test_plan_swap_rejects_a_permit_for_the_wrong_amount(
         1789473930,
         b"sig",
     )
-    monkeypatch.setattr(swap.permit, "signed_action", lambda *a, **k: wrong)
+    monkeypatch.setattr(permit, "signed_action", lambda *a, **k: wrong)
     with pytest.raises(evm.SwapError, match="permit amount"):
         swap.plan_swap(
             _StubW3(),
@@ -717,7 +718,9 @@ def test_plan_swap_rejects_a_permit_for_the_wrong_amount(
 
 
 class _SigningW3:
-    """A web3 that answers the two reads signed_action makes."""
+    """A web3 that answers the reads signed_action makes."""
+
+    chain_id = CHAIN_ID
 
     def __init__(self, domain: bytes = b"\x11" * 32, allowance: int = 3) -> None:
         """Answer with this domain separator and this current nonce."""
@@ -744,7 +747,6 @@ def _signed(w3: object, signer: object) -> bytes:
         SAFE,
         USDG,
         1_000 * 10**6,
-        CHAIN_ID,
         uniswap.DEPLOYMENTS[CHAIN_ID]["permit2"],
         uniswap.DEPLOYMENTS[CHAIN_ID]["universal_router"],
         1789473930,
@@ -1235,11 +1237,12 @@ class _FakeSigner:
     def __init__(self, safe: str = SAFE) -> None:
         """Answer chain_info with this safe."""
         self.sent: list[dict] = []
+        self.signed: list[bytes] = []
         self._safe = safe
 
     def sign_digest(self, digest: bytes) -> str:
         """Sign the way the connect signer does: raw digest, 65-byte answer."""
-        del digest
+        self.signed.append(digest)
         return "0x" + "cd" * 65
 
     def chain_info(self, _chain: str) -> dict:
@@ -1254,6 +1257,8 @@ class _FakeSigner:
 
 class _ReceiptW3:
     """A web3 whose receipts carry a configurable status."""
+
+    chain_id = CHAIN_ID
 
     def __init__(self, status: int = 1) -> None:
         """Answer every receipt with this status."""
@@ -1307,7 +1312,7 @@ def test_dry_run_sends_nothing(traded: dict, monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_a_real_run_confirms_every_call_and_pays_the_safe(
-    traded: dict, monkeypatch: pytest.MonkeyPatch
+    traded: dict, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
     """The default path: two calls, the permit folded into the swap itself."""
     del traded
@@ -1319,7 +1324,11 @@ def test_a_real_run_confirms_every_call_and_pays_the_safe(
     )
     assert swap._cmd_buy(_plan_args()) == 0  # pylint: disable=protected-access
     assert len(signer.sent) == 2
+    assert len(signer.signed) == 1
     assert len(w3.waited) == 2
+    printed = capsys.readouterr().out.splitlines()
+    for index, tx in enumerate(signer.sent, start=1):
+        assert printed.count(f"{tx['what']}: 0x{index:064x}") == 1
     swap_data = signer.sent[-1]["data"]
     assert uniswap.permit_action_in(swap_data) is not None
     recipient = uniswap._decode_execute(  # pylint: disable=protected-access
@@ -1364,7 +1373,8 @@ def test_a_dry_run_previews_the_calls_a_real_run_would_send(
     )  # pylint: disable=protected-access
     printed = capsys.readouterr().out
     assert signer.sent == []
-    assert '"permit": "signed into the swap"' in printed
+    assert signer.signed == []
+    assert f'"permit": "{router.PERMIT_AT_SEND}"' in printed
     previewed = [line for line in printed.splitlines() if line.startswith("dry-run ")]
     assert [line.split(":")[0] for line in previewed] == [
         "dry-run approve Permit2",
@@ -1711,14 +1721,12 @@ def test_plan_swap_refuses_slippage_that_is_not_protection(traded: dict) -> None
         swap.plan_swap(_StubW3(), "NVDA", USDG, NVDA, 1_000 * 10**6, 100.0, SAFE)
 
 
-def test_amount_in_units_is_exact_at_eighteen_decimals(
+def test_to_base_units_is_exact_at_eighteen_decimals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Float conversion lands over a million wei above what was typed."""
     monkeypatch.setattr(swap.evm, "token_decimals", lambda _w3, _t: 18)
-    got = swap._amount_in_units(
-        _StubW3(), NVDA, 12345.6789
-    )  # pylint: disable=protected-access
+    got = evm.to_base_units(_StubW3(), NVDA, 12345.6789)
     assert got == 12345678900000000000000
     assert got != int(12345.6789 * 10**18)
 
@@ -1872,7 +1880,7 @@ def test_verify_action_checks_the_token() -> None:
 def test_approvals_carry_the_expiry_they_were_given() -> None:
     """The allowance window is a safety property, so pin it."""
     expiry = 1789473930
-    _erc20, permit2 = swap.approval_calls(USDG, 1_000, expiry)
+    _erc20, permit2 = router.approval_calls(CHAIN_ID, USDG, 1_000, expiry)
     decoded = abi_decode(
         ["address", "address", "uint160", "uint48"], bytes.fromhex(permit2["data"][10:])
     )

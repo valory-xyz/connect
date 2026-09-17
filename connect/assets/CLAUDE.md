@@ -117,6 +117,19 @@ paid in USDG too:
 - **See where the liquidity is** — list the pools behind a ticker, or take a
   census across the listed tokens.
 
+Robinhood Chain also hosts **Pons**, a memecoin launchpad, via the
+**connect-pons** skill:
+
+- **Find and size up a memecoin** — search launches, then check where each
+  one trades and how close it is to graduating.
+- **Check the hype before buying** — ask an AI service from the marketplace
+  how a token is being talked about on X and in the news, then weigh that
+  against its curve progress and liquidity.
+- **Trade one** — buy or sell on its bonding curve or, after graduation, on
+  its Uniswap pool, paying in ETH or USDG.
+- **Launch a token** — name, symbol, logo and an optional first buy, then
+  claim the creator fees it earns.
+
 Keep it short: a line of intro, two or three examples drawn from the chain
 they actually have, an invitation. The skills carry the details once they
 choose.
