@@ -630,6 +630,7 @@ def test_macos_and_windows_terminals(
     store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Terminal.app opens a self-deleting script; Windows tries wt, then cmd."""
+    posix = sys.platform != "win32"  # read it before the patch below rewrites it
     monkeypatch.setattr(workspace.sys, "platform", "darwin")
     spaced = store_path / "work dir"
     [launch] = workspace.terminal_launches(spaced, "codex")
@@ -639,7 +640,7 @@ def test_macos_and_windows_terminals(
     assert script.read_text(encoding="utf-8") == (
         f'#!/bin/sh\nrm -f "$0"\ncd {shlex.quote(str(spaced))} && exec codex\n'
     )
-    if sys.platform != "win32":
+    if posix:
         assert stat.S_IMODE(script.stat().st_mode) == 0o700
     script.unlink()
 

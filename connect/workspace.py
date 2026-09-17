@@ -244,10 +244,14 @@ def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
             ["cmd.exe", "/c", "start", "", "/d", cwd, "cmd.exe", "/k", command],
         ]
     argv = [_login_shell(), "-lic", command]
-    preferred = [name for name in LINUX_TERMINALS if name == os.environ.get("TERMINAL")]
+    known = tuple(LINUX_TERMINALS)
+    wanted = os.environ.get("TERMINAL")
+    # by index, so $TERMINAL picks a name out of our table but is never itself spawned
+    chosen = known.index(wanted) if wanted in known else None
+    first = () if chosen is None else (known[chosen],)
     launches: list[list[str]] = []
     seen: set[str] = set()
-    for name in (*preferred, "x-terminal-emulator", *LINUX_TERMINALS):
+    for name in (*first, "x-terminal-emulator", *known):
         found = shutil.which(name)
         if found is None or os.path.realpath(found) in seen:
             continue
