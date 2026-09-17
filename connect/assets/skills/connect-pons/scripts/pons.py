@@ -25,15 +25,12 @@ import typing as t
 import urllib.parse
 from pathlib import Path
 
+import evm
+import state
+import uniswap
+import web
 from eth_utils import is_address, keccak, to_checksum_address
 from web3 import Web3
-
-import _pons_bootstrap  # noqa: F401  pylint: disable=unused-import  # isort: split
-
-import evm  # noqa: E402  pylint: disable=wrong-import-position
-import state  # noqa: E402  pylint: disable=wrong-import-position
-import uniswap  # noqa: E402  pylint: disable=wrong-import-position
-import web  # noqa: E402  pylint: disable=wrong-import-position
 
 CHAIN = "robinhood"
 CHAIN_ID = 4663

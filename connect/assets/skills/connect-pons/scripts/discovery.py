@@ -24,15 +24,12 @@ import time
 import typing as t
 from pathlib import Path
 
+import evm
+import pons
+import state
+import web
 from eth_utils import is_address, keccak, to_checksum_address
 from web3 import Web3
-
-import _pons_bootstrap  # noqa: F401  pylint: disable=unused-import  # isort: split
-
-import evm  # noqa: E402  pylint: disable=wrong-import-position
-import pons  # noqa: E402  pylint: disable=wrong-import-position
-import state  # noqa: E402  pylint: disable=wrong-import-position
-import web  # noqa: E402  pylint: disable=wrong-import-position
 
 TOPIC_V2_GRADUATED = keccak(text="PoolGraduated(address,uint256,uint256,uint256)")
 TOPIC_V1_LAUNCHED = keccak(

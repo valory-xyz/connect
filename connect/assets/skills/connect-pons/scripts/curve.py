@@ -21,15 +21,12 @@
 
 import typing as t
 
+import evm
+import pons
+import uniswap
 from eth_abi import decode as abi_decode
 from eth_utils import to_checksum_address
 from web3 import Web3
-
-import _pons_bootstrap  # noqa: F401  pylint: disable=unused-import  # isort: split
-
-import evm  # noqa: E402  pylint: disable=wrong-import-position
-import pons  # noqa: E402  pylint: disable=wrong-import-position
-import uniswap  # noqa: E402  pylint: disable=wrong-import-position
 
 BPS = 10_000
 MIN_NET_BPS = 100
