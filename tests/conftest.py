@@ -60,17 +60,17 @@ PONS_SCRIPTS = ASSETS / "skills" / "connect-pons" / "scripts"
 sys.path.insert(0, str(ASSETS / "lib"))
 sys.path.insert(0, str(PONS_SCRIPTS))
 
-import curve  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
+import curve  # noqa: E402  pylint: disable=wrong-import-position
 import discovery  # noqa: E402  pylint: disable=wrong-import-position
 import evm  # noqa: E402  pylint: disable=wrong-import-position
-import ipfs  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
-import launch  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
+import ipfs  # noqa: E402  pylint: disable=wrong-import-position
+import launch  # noqa: E402  pylint: disable=wrong-import-position
 import pons  # noqa: E402  pylint: disable=wrong-import-position
-import router  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
-import tokens  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
-import trade  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
+import router  # noqa: E402  pylint: disable=wrong-import-position
+import tokens  # noqa: E402  pylint: disable=wrong-import-position
+import trade  # noqa: E402  pylint: disable=wrong-import-position
 import uniswap  # noqa: E402  pylint: disable=wrong-import-position
-import web  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
+import web  # noqa: E402  pylint: disable=wrong-import-position
 
 TOKEN = to_checksum_address("0x19D861Fc391E70a7FA49f4FBf56588dFC5572BB0")
 OTHER = to_checksum_address("0x51250B135174Ca09450EC01c4afF73CF69DBb590")
@@ -571,3 +571,34 @@ def api_fixture(monkeypatch: pytest.MonkeyPatch) -> dict:
 
     monkeypatch.setattr(urllib.request, "urlopen", _open)
     return state
+
+
+__all__ = [
+    "CURVE",
+    "Chain",
+    "DEPLOYER",
+    "FakeW3",
+    "OTHER",
+    "STATE_VIEW",
+    "TEST_PASSWORD",
+    "TOKEN",
+    "V3_FACTORY",
+    "_item",
+    "_v1",
+    "_v2",
+    "_v2_record",
+    "_word",
+    "audit_entries",
+    "audit_kinds",
+    "curve",
+    "discovery",
+    "evm",
+    "ipfs",
+    "launch",
+    "pons",
+    "router",
+    "tokens",
+    "trade",
+    "uniswap",
+    "web",
+]
