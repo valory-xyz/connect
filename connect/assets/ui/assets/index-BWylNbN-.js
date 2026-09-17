@@ -400,7 +400,7 @@ Error generating stack: `+s.message+`
   &:not(:last-child) {
     margin-bottom: 16px;
   }
-`,V2=({title:e,description:n,children:r})=>Xt.jsxs(e8,{children:[Xt.jsx(t8,{children:e}),Xt.jsx(n8,{children:n}),r]}),r8=[{value:"claude_code_desktop",label:"Claude Desktop"},{value:"claude_code_cli",label:"Claude Code CLI"}],a8=io(gs)`
+`,V2=({title:e,description:n,children:r})=>Xt.jsxs(e8,{children:[Xt.jsx(t8,{children:e}),Xt.jsx(n8,{children:n}),r]}),r8=[{value:"claude_code_desktop",label:"Claude Desktop"},{value:"claude_code_cli",label:"Claude Code CLI"},{value:"codex_desktop",label:"Codex Desktop"},{value:"codex_cli",label:"Codex CLI"}],a8=io(gs)`
   width: max-content;
 
   .ant-select-selector {
