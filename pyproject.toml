@@ -110,6 +110,7 @@ addopts = "-p no:anchorpy"
 markers = [
     "unit: marks tests as unit tests (fast, no network calls)",
     "integration: marks tests as integration tests (slow, requires network/RPC)",
+    "launch: opens a real terminal window (tox -e launch-tests)",
 ]
 
 [tool.uv]

@@ -144,6 +144,43 @@ jobs:
           uv pip install --system tomte[tox,cli]==0.7.0 tox-uv
           tox -e integration-tests
 
+  launch-tests:
+    continue-on-error: False
+    needs:
+      - linter_checks
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04-arm, macos-15, macos-15-large, windows-2025]
+
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.15"
+      - name: Install tox
+        run: uv pip install --system tomte[tox,cli]==0.7.0 tox-uv
+
+      - name: Run launch tests (Linux, xterm on a virtual display)
+        if: runner.os == 'Linux'
+        env:
+          TERMINAL: xterm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xterm xvfb
+          xvfb-run -a tox -e launch-tests
+
+      - name: Run launch tests
+        if: runner.os != 'Linux'
+        run: tox -e launch-tests
+
   all-checks-passed:
     # Single aggregate gate referenced by branch protection on `main`.
     # When adding/removing mandatory jobs, update `needs` here instead of editing branch protection.
@@ -154,6 +191,7 @@ jobs:
       - unit-tests
       - coverage
       - integration-tests
+      - launch-tests
     if: always()
     runs-on: ubuntu-latest
     steps:

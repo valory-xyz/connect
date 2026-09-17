@@ -20,6 +20,7 @@ uv run pytest -m "not integration"          # unit tests
 uv run pytest tests/test_endpoints.py -k <name>   # single test
 tox -e unit-tests-coverage                  # unit tests, enforces 100% coverage
 GNOSIS_TESTNET_RPC=<tenderly-fork-url> tox -e integration-tests
+tox -e launch-tests                         # opens a real terminal: codex_cli launch, stand-in codex
 ```
 
 Lint suite (tomte toolchain, mirrors olas-operate-middleware; install once with `uv pip install "tomte[tox,cli]==0.7.0" tox-uv`):
