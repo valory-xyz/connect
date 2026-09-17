@@ -28,7 +28,7 @@ import typing as t
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from eth_utils import keccak, to_checksum_address
-from evm import SwapError, call_address, call_int, check_fields, selector
+from evm import SwapError, call_address, call_int, check_fields, is_native, selector
 from web3 import Web3
 from web3.exceptions import BadFunctionCallOutput, ContractLogicError
 
@@ -356,6 +356,35 @@ def _quote_v4(  # pylint: disable=too-many-positional-arguments
     return call_int(w3, quoter, data)
 
 
+def constant_product_out(amount_in: int, reserve_in: int, reserve_out: int) -> int:
+    """Fee-less constant-product output, rounded down.
+
+    Raises:
+        SwapError: for a non-positive input, an empty reserve or a zero output.
+    """
+    if amount_in <= 0:
+        raise SwapError("nothing is left to swap once fees are taken")
+    if reserve_in == 0 or reserve_out == 0:
+        raise SwapError("cannot swap against an empty reserve")
+    out = amount_in * reserve_out // (reserve_in + amount_in)
+    if out == 0:
+        raise SwapError(f"{amount_in} is too small to buy anything")
+    return out
+
+
+def constant_product_in(amount_out: int, reserve_in: int, reserve_out: int) -> int:
+    """Fee-less constant-product input for an exact output, rounded up.
+
+    Raises:
+        SwapError: when the output would exhaust the reserve.
+    """
+    if reserve_out <= amount_out:
+        raise SwapError(
+            f"a {reserve_out}-unit reserve cannot cover a {amount_out}-unit output"
+        )
+    return amount_out * reserve_in // (reserve_out - amount_out) + 1
+
+
 def _quote_v2(
     w3: Web3, pool: PoolV2, token_in: str, token_out: str, amount: int
 ) -> int:
@@ -387,6 +416,18 @@ def _quote_v2(
     )
 
 
+def _refuse_native(pool: Pool, *tokens: str) -> None:
+    """Only v4 pools hold the native coin; v2 and v3 trade its wrapped form.
+
+    Raises:
+        SwapError: when a v2 or v3 pool is asked to move the native coin.
+    """
+    if pool["version"] != "v4" and any(is_native(token) for token in tokens):
+        raise SwapError(
+            f"{pool['version']} pools cannot trade the native coin; wrap it first"
+        )
+
+
 def quote_pool(  # pylint: disable=too-many-positional-arguments
     w3: Web3, chain_id: int, pool: Pool, token_in: str, token_out: str, amount: int
 ) -> int:
@@ -394,8 +435,10 @@ def quote_pool(  # pylint: disable=too-many-positional-arguments
 
     Raises:
         Exception: anything that is not a revert, so a degraded RPC cannot
-            masquerade as an empty market.
+            masquerade as an empty market; SwapError for the native coin on
+            a v2 or v3 pool.
     """
+    _refuse_native(pool, token_in, token_out)
     try:
         if pool["version"] == "v3":
             return _quote_v3(w3, chain_id, pool, token_in, token_out, amount)
@@ -448,6 +491,34 @@ def best_route(  # pylint: disable=too-many-positional-arguments
     fillable.sort(key=lambda pair: pair[0], reverse=True)
     best_out, best_pool = fillable[0]
     return best_pool, best_out
+
+
+def price_impact_bps(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    w3: Web3,
+    chain_id: int,
+    pool: Pool,
+    token_in: str,
+    token_out: str,
+    amount: int,
+    quoted_out: int,
+) -> float:
+    """Bps by which this fill's average rate trails a tiny probe on the same pool.
+
+    Raises:
+        SwapError: for a non-positive amount, or when the probe quotes zero,
+            so there is no rate to compare.
+    """
+    if amount <= 0:
+        raise SwapError(f"cannot measure price impact of a {amount}-unit fill")
+    probe = max(amount // 1000, 1)
+    probe_out = quote_pool(w3, chain_id, pool, token_in, token_out, probe)
+    if not probe_out:
+        raise SwapError(
+            f"a {probe}-unit probe of the {pool['version']} pool quoted zero; "
+            f"cannot measure price impact"
+        )
+    probe_rate = probe_out * amount
+    return max(0.0, (probe_rate - quoted_out * probe) * 10_000 / probe_rate)
 
 
 def _v4_swap_input(  # pylint: disable=too-many-positional-arguments
@@ -514,8 +585,10 @@ def build_execute(  # pylint: disable=too-many-arguments,too-many-positional-arg
     Permit2 allowance by signature instead of by transaction.
 
     Raises:
-        SwapError: when the pool carries a version this cannot encode.
+        SwapError: when the pool carries a version this cannot encode, or a
+            v2 or v3 pool is asked to move the native coin.
     """
+    _refuse_native(pool, token_in, token_out)
     if pool["version"] == "v4":
         payload = _v4_swap_input(pool, token_in, token_out, amount, minimum, to)
     elif pool["version"] == "v3":
@@ -651,6 +724,7 @@ def verify_execute(  # pylint: disable=too-many-arguments,too-many-positional-ar
     Raises:
         SwapError: when any field disagrees with what was planned.
     """
+    _refuse_native(pool, token_in, token_out)
     seen = _decode_execute(calldata, pool)
     planned_venue = (
         int(pool["fee"]),

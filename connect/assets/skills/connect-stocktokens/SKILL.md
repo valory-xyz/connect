@@ -64,11 +64,12 @@ USDG in safe --approve--> Permit2 --approve--> UniversalRouter --execute--> Stoc
 ranks them by pool depth — the way to answer "where is the liquidity?". Both
 `pools.py` commands take `--quote USDG|WETH` (default USDG).
 
-Add `--dry-run` to `buy` or `sell` to print the calls without sending them —
-it builds exactly what a real run would send, permit included, so what it
-prints is what would broadcast. `quote` never sends anything and does not
-take the flag. Every command takes `--refresh` to bypass the hour-long pool
-cache.
+Add `--dry-run` to `buy` or `sell` to print the calls without sending them.
+It never asks the signer for anything: the permit carries a placeholder
+signature, and the real signature is made only when the trade is sent, so
+the printed calls match a real run except for those bytes. `quote` never
+sends anything and does not take the flag. Every command takes `--refresh`
+to bypass the hour-long pool cache.
 
 **If the signer refuses to sign the permit**, rerun with
 `--separate-approvals`: the allowance then goes on-chain as its own
@@ -140,7 +141,9 @@ is Robinhood.
 
 The rest is in `.claude/lib/`: `uniswap.py` (discovery, quoting, router calldata),
 `permit.py` (Permit2 and the safe's ERC-1271 wrapper),
-and `evm.py` (the signer's web3, calls, decimals, ERC-20).
+`router.py` (the approvals, permit and checked swap call),
+`evm.py` (the signer's web3, calls, decimals, ERC-20),
+`state.py` (the atomic pool cache write) and `cli.py` (the printed plan).
 
 ## Money safety
 

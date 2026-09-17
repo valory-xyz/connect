@@ -236,5 +236,7 @@ data/
 # Local-testing keystore (the runtime reads it from cwd; never commit key material)
 ethereum_private_key.txt
 stocktokens.pools.json
+pons.index.json
+pons.audit.json
 
 !connect/assets/lib/

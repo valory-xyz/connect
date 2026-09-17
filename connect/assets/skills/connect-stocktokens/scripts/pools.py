@@ -29,7 +29,6 @@ pool, v4 reports in-range liquidity because its funds sit in the singleton.
 
 import argparse
 import json
-import os
 import sys
 import time
 import typing as t
@@ -40,6 +39,7 @@ from web3 import Web3
 import _bootstrap  # noqa: F401  pylint: disable=unused-import  # isort: split
 
 import evm  # noqa: E402  pylint: disable=wrong-import-position
+import state  # noqa: E402  pylint: disable=wrong-import-position
 import stocktokens  # noqa: E402  pylint: disable=wrong-import-position
 import uniswap  # noqa: E402  pylint: disable=wrong-import-position
 
@@ -162,13 +162,6 @@ def _load_cache() -> dict[str, t.Any]:
     return cached if isinstance(cached, dict) else {}
 
 
-def _store_cache(cache: dict[str, t.Any]) -> None:
-    """Persist discovery atomically; a half-written file is the corrupt one."""
-    scratch = CACHE_FILE.with_suffix(".tmp")
-    scratch.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-    os.replace(scratch, CACHE_FILE)
-
-
 def cached_discover(
     w3: Web3, token: str, quote_name: str = "USDG", refresh: bool = False
 ) -> list[uniswap.Pool]:
@@ -186,7 +179,7 @@ def cached_discover(
         "block": w3.eth.block_number,
         "pools": pools,
     }
-    _store_cache(cache)
+    state.write_json_atomic(CACHE_FILE, cache)
     return pools
 
 

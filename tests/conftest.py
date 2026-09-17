@@ -19,14 +19,20 @@
 
 """Shared pytest fixtures."""
 
+import io
 import json
+import sys
 import threading
 import typing as t
+import urllib.request
 from pathlib import Path
 
 import pytest
+from eth_abi import decode as abi_decode
+from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
+from eth_utils import to_checksum_address
 from hexbytes import HexBytes
 from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound
@@ -48,6 +54,229 @@ from connect.signer import Signer, _ChainState
 from connect.workspace import Workspace
 
 TEST_PASSWORD = "test-password"  # nosec B105
+
+ASSETS = Path(__file__).resolve().parent.parent / "connect" / "assets"
+PONS_SCRIPTS = ASSETS / "skills" / "connect-pons" / "scripts"
+sys.path.insert(0, str(ASSETS / "lib"))
+sys.path.insert(0, str(PONS_SCRIPTS))
+
+import curve  # noqa: E402  pylint: disable=wrong-import-position
+import discovery  # noqa: E402  pylint: disable=wrong-import-position
+import evm  # noqa: E402  pylint: disable=wrong-import-position
+import ipfs  # noqa: E402  pylint: disable=wrong-import-position
+import launch  # noqa: E402  pylint: disable=wrong-import-position
+import pons  # noqa: E402  pylint: disable=wrong-import-position
+import router  # noqa: E402  pylint: disable=wrong-import-position
+import tokens  # noqa: E402  pylint: disable=wrong-import-position
+import trade  # noqa: E402  pylint: disable=wrong-import-position
+import uniswap  # noqa: E402  pylint: disable=wrong-import-position
+import web  # noqa: E402  pylint: disable=wrong-import-position
+
+TOKEN = to_checksum_address("0x19D861Fc391E70a7FA49f4FBf56588dFC5572BB0")
+OTHER = to_checksum_address("0x51250B135174Ca09450EC01c4afF73CF69DBb590")
+CURVE = to_checksum_address("0x470701688607CC0583417b07a2C8E5c675c31305")
+DEPLOYER = to_checksum_address("0x490c9a6E2784243C435d21F79448283085C26fc1")
+V3_FACTORY = uniswap.DEPLOYMENTS[4663]["v3_factory"]
+STATE_VIEW = uniswap.DEPLOYMENTS[4663]["v4_state_view"]
+
+
+def _word(value: int) -> bytes:
+    """One ABI word."""
+    return value.to_bytes(32, "big")
+
+
+def _text(value: str) -> bytes:
+    """Encode a string return."""
+    return abi_encode(["string"], [value])
+
+
+def _v2_record(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    token: str = TOKEN,
+    pair: str = pons.USDG,
+    phase: int = 0,
+    exists: bool = True,
+    fee: int = 0,
+    spacing: int = 200,
+    creator: str = DEPLOYER,
+) -> bytes:
+    """Encode a V2 factory LaunchedToken return."""
+    record = pons.V2Record(
+        token=token,
+        curve=CURVE,
+        deployer=DEPLOYER,
+        creatorFeeRecipient=creator,
+        pairToken=pair,
+        graduationThreshold=8090,
+        poolFee=fee,
+        tickSpacing=spacing,
+        creatorTaxBps=100,
+        buybackEnabled=True,
+        phase=phase,
+        sweptQuote=0,
+        sweptTokens=0,
+        sweptAt=0,
+        exists=exists,
+    )
+    return abi_encode([pons.V2_RECORD], [record])
+
+
+def _v1_record(
+    token: str = TOKEN, paired: str = pons.WETH, exists: bool = True
+) -> bytes:
+    """Encode a V1 factory LaunchedToken return."""
+    record = pons.V1Record(
+        token=token,
+        deployer=DEPLOYER,
+        pairedToken=paired,
+        positionManager=DEPLOYER,
+        positionId=1,
+        dexId=0,
+        launchConfigId=0,
+        restrictionsEndBlock=0,
+        supply=10**27,
+        isToken0=False,
+        poolFee=10000,
+        exists=exists,
+        initialBuyAmount=0,
+    )
+    return abi_encode([pons.V1_RECORD], [record])
+
+
+class _Eth:
+    """A scripted eth namespace: calls answered by (to, calldata prefix)."""
+
+    def __init__(self, chain: "Chain") -> None:
+        """Bind to the chain script."""
+        self._chain = chain
+        self.block_number = chain.head
+
+    def call(self, tx: dict) -> bytes:
+        """Answer an eth_call from the script."""
+        return self._chain.answer(tx["to"], bytes(tx["data"]))
+
+    def get_logs(self, query: dict) -> list:
+        """Answer a log query from the script."""
+        return self._chain.logs(query)
+
+
+class Chain:
+    """Scripted chain state for one test."""
+
+    def __init__(self) -> None:
+        """Start empty: every unknown call is a test bug."""
+        self.head = 30_000_000
+        self.calls: dict[tuple[str, bytes], bytes] = {}
+        self.names: dict[str, tuple[t.Union[str, bytes], t.Union[str, bytes]]] = {}
+        self.multicall_targets: list[str] = []
+        self.feed_logs: dict[bytes, list[tuple[int, str]]] = {}
+        self.log_queries: list[dict] = []
+        self.log_errors: list[Exception] = []
+        self.multicall_short = False
+        self.eth = _Eth(self)
+
+    def on(self, to: str, data: bytes, result: bytes) -> None:
+        """Script one call; data is matched as a prefix."""
+        self.calls[(to_checksum_address(to), data)] = result
+
+    def answer(self, to: str, data: bytes) -> bytes:
+        """Find the scripted answer for a call."""
+        to = to_checksum_address(to)
+        if to == evm.MULTICALL3:
+            return self._multicall(data)
+        for (where, prefix), result in self.calls.items():
+            if where == to and data.startswith(prefix):
+                return result
+        raise AssertionError(f"unscripted eth_call to {to}: {data.hex()}")
+
+    def _multicall(self, data: bytes) -> bytes:
+        """Answer an aggregate3 of name()/symbol() reads."""
+        assert data.startswith(evm.SEL_AGGREGATE3)
+        (calls,) = abi_decode(["(address,bool,bytes)[]"], data[4:])
+        results = []
+        for target, _, calldata in calls:
+            self.multicall_targets.append(to_checksum_address(target))
+            known = self.names.get(to_checksum_address(target))
+            if known is None:
+                results.append((False, b""))
+            elif known == ("bad", "bad"):
+                results.append((True, b"\x01"))
+            else:
+                text = known[0] if calldata == evm.SEL_NAME else known[1]
+                results.append((True, text if isinstance(text, bytes) else _text(text)))
+        if self.multicall_short:
+            results = results[:-1]
+        return abi_encode(["(bool,bytes)[]"], [results])
+
+    def logs(self, query: dict) -> list:
+        """Answer a log query, or raise a scripted error first."""
+        self.log_queries.append(query)
+        if self.log_errors:
+            raise self.log_errors.pop(0)
+        topic = bytes.fromhex(query["topics"][0][2:])
+        return [
+            {
+                "blockNumber": block,
+                "topics": [topic, bytes(12) + bytes.fromhex(tok[2:])],
+            }
+            for block, tok in self.feed_logs.get(topic, [])
+            if query["fromBlock"] <= block <= query["toBlock"]
+        ]
+
+
+def _identity(chain: Chain, token: str) -> None:
+    """Script a token's name, symbol and decimals."""
+    chain.on(token, evm.SEL_NAME, _text("Pons"))
+    chain.on(token, evm.SEL_SYMBOL, _text("PONS"))
+    chain.on(token, evm.SEL_DECIMALS, _word(18))
+
+
+def _not_v2(chain: Chain, token: str) -> None:
+    """Script the V2 factory to know nothing of a token."""
+    chain.on(
+        pons.V2_FACTORY,
+        pons.SEL_GET_LAUNCHED + abi_encode(["address"], [token]),
+        _v2_record(exists=False),
+    )
+
+
+def _v2(chain: Chain, token: str = TOKEN, **record: t.Any) -> None:
+    """Script a V2 launch on a USDG curve (unless overridden)."""
+    chain.on(
+        pons.V2_FACTORY,
+        pons.SEL_GET_LAUNCHED + abi_encode(["address"], [token]),
+        _v2_record(token=token, **record),
+    )
+    _identity(chain, token)
+    chain.on(pons.USDG, evm.SEL_SYMBOL, _text("USDG"))
+    chain.on(pons.USDG, evm.SEL_DECIMALS, _word(6))
+    chain.on(CURVE, pons.SEL_FEE_BPS, _word(100))
+    chain.on(
+        pons.V2_FACTORY,
+        pons.SEL_FEE_POLICY + abi_encode(["address"], [token]),
+        abi_encode([pons.FEE_POLICY], [(DEPLOYER, 3000, 5000, 250, 300)]),
+    )
+
+
+def _v1(chain: Chain, token: str = TOKEN, factory: int = 0, **record: t.Any) -> None:
+    """Script a V1 launch whose v3 pool the Uniswap factory agrees with."""
+    _not_v2(chain, token)
+    lookup = pons.SEL_GET_LAUNCHED + abi_encode(["address"], [token])
+    for position, where in enumerate(pons.V1_FACTORIES):
+        found = position == factory
+        chain.on(where, lookup, _v1_record(token=token, exists=found, **record))
+    _identity(chain, token)
+    chain.on(pons.WETH, evm.SEL_DECIMALS, _word(18))
+    pool = uniswap.pool_address(4663, token, pons.WETH, 10000)
+    chain.on(V3_FACTORY, uniswap.SEL_GET_POOL, _word(int(pool, 16)))
+
+
+@pytest.fixture(name="chain")
+def chain_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Chain:
+    """Provide a scripted chain, a clean cwd and no pauses between requests."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(discovery, "REQUEST_PAUSE_S", 0)
+    monkeypatch.setattr(discovery.time, "sleep", lambda _s: None)
+    return Chain()
 
 
 @pytest.fixture
@@ -281,3 +510,97 @@ def make_app(
         )
 
     return _make
+
+
+class _Response(io.BytesIO):
+    """A urlopen response."""
+
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        """Hold a body and status."""
+        super().__init__(body)
+        self.status = status
+
+
+def _item(token: str = TOKEN, **fields: t.Any) -> dict:
+    """One search item as the API returns it."""
+    item = {
+        "factory": pons.V2_FACTORY,
+        "token": token,
+        "deployer": DEPLOYER,
+        "pairToken": pons.USDG,
+        "name": "Pons",
+        "symbol": "PONS",
+        "blockNumber": 1,
+        "graduated": False,
+        "logo": "ipfs://x",
+        "description": None,
+        "launchedAt": "2026-09-12T17:42:50.000Z",
+        "priceUsd": 1e-6,
+        "marketCapUsd": 5000,
+        "liquidityUsd": None,
+        "graduationProgressPct": 0,
+        "version": "v2",
+        "venue": "curve",
+        "quoteAsset": {"address": pons.USDG, "symbol": "USDG"},
+    }
+    item.update(fields)
+    return item
+
+
+@pytest.fixture(name="api")
+def api_fixture(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Serve scripted HTTP answers and record the URLs asked for."""
+    state: dict[str, t.Any] = {
+        "urls": [],
+        "search": {"page": 1, "pageSize": 24, "total": 1, "items": [_item()]},
+        "docs": b"<p>Read this</p><p>No audit has closed. Treat v2 as unaudited</p>",
+        "error": None,
+        "status": 200,
+    }
+
+    def _open(request: urllib.request.Request, timeout: float) -> _Response:
+        """Answer from the script."""
+        assert timeout == pons.HTTP_TIMEOUT_S
+        assert request.get_header("User-agent") == pons.USER_AGENT
+        state["urls"].append(request.full_url)
+        if state["error"] is not None:
+            raise state["error"]
+        if request.full_url == pons.DOCS_V2_URL:
+            return _Response(state["docs"], state["status"])
+        body = state["search"]
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        return _Response(raw, state["status"])
+
+    monkeypatch.setattr(urllib.request, "urlopen", _open)
+    return state
+
+
+__all__ = [
+    "CURVE",
+    "Chain",
+    "DEPLOYER",
+    "FakeW3",
+    "OTHER",
+    "STATE_VIEW",
+    "TEST_PASSWORD",
+    "TOKEN",
+    "V3_FACTORY",
+    "_item",
+    "_v1",
+    "_v2",
+    "_v2_record",
+    "_word",
+    "audit_entries",
+    "audit_kinds",
+    "curve",
+    "discovery",
+    "evm",
+    "ipfs",
+    "launch",
+    "pons",
+    "router",
+    "tokens",
+    "trade",
+    "uniswap",
+    "web",
+]

@@ -48,6 +48,7 @@ PERMIT_SINGLE_TYPEHASH = keccak(
 SAFE_MESSAGE_TYPEHASH = keccak(text="SafeMessage(bytes message)")
 PERMIT2_DOMAIN_NAME = "Permit2"
 PERMIT_SINGLE_ABI = "((address,uint160,uint48,uint48),address,uint256)"
+PLACEHOLDER_SIGNATURE = bytes(65)
 
 SEL_ALLOWANCE = selector("allowance(address,address,address)")
 SEL_DOMAIN_SEPARATOR = selector("domainSeparator()")
@@ -190,14 +191,15 @@ def approval_call(
 
 def signed_action(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     w3: Web3,
+    chain_id: int,
     signer: t.Any,
     owner: str,
     token: str,
     amount: int,
-    chain_id: int,
     permit2: str,
     spender: str,
     expiry: int,
+    placeholder: bool = False,
 ) -> bytes:
     """Build a Permit2 allowance the router carries itself, signed by the owner safe.
 
@@ -222,6 +224,8 @@ def signed_action(  # pylint: disable=too-many-arguments,too-many-positional-arg
             f"{owner} did not answer domainSeparator(); it is not a safe this "
             f"skill can sign a permit for - rerun with --separate-approvals"
         )
+    if placeholder:
+        return permit_input(details, spender, sig_deadline, PLACEHOLDER_SIGNATURE)
     try:
         signature = signer.sign_digest(safe_message_digest(domain_separator, digest))
     except Exception as exc:  # pylint: disable=broad-except
