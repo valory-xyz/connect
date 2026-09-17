@@ -86,11 +86,13 @@ address, its ABI, its signature convention — is the session's problem.
 Two harnesses open Codex. `codex_desktop` uses the desktop app's
 `codex://threads/new` link. The Codex CLI registers no URL handler, so
 `codex_cli` does what Claude Code's `claude-cli://` handler does for itself: it
-opens a terminal running `codex` in STORE_PATH, through the operator's login
-shell on Linux. The terminal is `$TERMINAL`, then `x-terminal-emulator`, then
-the first known emulator installed on Linux; Terminal.app on macOS; Windows
-Terminal, then `cmd.exe`, on Windows. The CLI cannot pre-fill a prompt, so that
-session opens empty.
+opens a terminal running `codex` in STORE_PATH. On Linux that is `$TERMINAL`
+when it names a terminal Connect knows how to drive, then
+`x-terminal-emulator`, then the first known emulator installed, and `codex`
+runs through the operator's `$SHELL` when `/etc/shells` lists it. On macOS,
+Terminal.app opens a self-deleting `.command` file, which needs no Automation
+permission. On Windows, Windows Terminal, then `cmd.exe`. The CLI cannot
+pre-fill a prompt, so that session opens empty.
 
 Codex loads a project's `.codex/config.toml` — our MCP entry with it — only
 once the operator trusts the folder, and asks them to the first time a session

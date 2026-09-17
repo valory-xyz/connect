@@ -20,6 +20,7 @@
 """Test workspace module."""
 
 import json
+import shlex
 import stat
 import sys
 import tomllib
@@ -573,7 +574,7 @@ def test_codex_cli_opens_in_a_terminal(
         return True
 
     monkeypatch.setattr(workspace, "_open_terminal", terminal)
-    monkeypatch.setattr(workspace, "_open_url", lambda url: pytest.fail(url))
+    monkeypatch.setattr(workspace, "_open_url", pytest.fail)
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     assert agent_workspace.open_session("codex_cli") == "codex_cli"
     assert opened == [(store_path, "codex")]
@@ -583,20 +584,23 @@ def test_codex_cli_opens_in_a_terminal(
 def test_linux_terminals_are_tried_in_the_operators_order(
     store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """$TERMINAL, then x-terminal-emulator by what it points at, then the known list."""
+    """A known $TERMINAL, then x-terminal-emulator by its target, then the known list."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for name in ("my-term", "ptyxis", "kitty"):
+    for name in ("my-term", "ptyxis", "kitty", "xterm"):
         (bin_dir / name).touch(mode=0o755)
     (bin_dir / "x-terminal-emulator").symlink_to(bin_dir / "ptyxis")
+    shells = tmp_path / "shells"
+    shells.write_text("# login shells\n/bin/zsh\n", encoding="utf-8")
+    monkeypatch.setattr(workspace, "ETC_SHELLS", shells)
     monkeypatch.setattr(workspace.sys, "platform", "linux")
     monkeypatch.setenv("PATH", str(bin_dir))
-    monkeypatch.setenv("TERMINAL", "my-term")
+    monkeypatch.setenv("TERMINAL", "xterm")
     monkeypatch.setenv("SHELL", "/bin/zsh")
     cwd = str(store_path)
     shell = ["/bin/zsh", "-lic", "codex"]
     assert workspace.terminal_launches(store_path, "codex") == [
-        [str(bin_dir / "my-term"), "-e", *shell],
+        [str(bin_dir / "xterm"), "-e", *shell],
         [
             str(bin_dir / "x-terminal-emulator"),
             "--new-window",
@@ -608,27 +612,36 @@ def test_linux_terminals_are_tried_in_the_operators_order(
         [str(bin_dir / "kitty"), "--directory", cwd, *shell],
     ]
 
-    monkeypatch.delenv("TERMINAL")
-    monkeypatch.delenv("SHELL")
-    first = workspace.terminal_launches(store_path, "codex")[0]
-    assert first[0] == str(bin_dir / "x-terminal-emulator")
-    assert first[-1] == "/bin/sh -lic codex"
+    monkeypatch.setenv("TERMINAL", "my-term")
+    monkeypatch.setenv("SHELL", "/opt/not-a-login-shell")
+    launches = workspace.terminal_launches(store_path, "codex")
+    names = ("x-terminal-emulator", "kitty", "xterm")
+    assert [launch[0] for launch in launches] == [str(bin_dir / n) for n in names]
+    assert launches[0][-1] == "/bin/sh -lic codex"
+
+    shells.unlink()
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    assert (
+        workspace.terminal_launches(store_path, "codex")[0][-1] == "/bin/sh -lic codex"
+    )
 
 
 def test_macos_and_windows_terminals(
     store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Terminal.app runs the command in the workspace; Windows tries wt, then cmd."""
+    """Terminal.app opens a self-deleting script; Windows tries wt, then cmd."""
     monkeypatch.setattr(workspace.sys, "platform", "darwin")
-    assert workspace.terminal_launches(Path('/work/a "b"'), "codex") == [
-        [
-            "osascript",
-            "-e",
-            r'''tell application "Terminal" to do script "cd '/work/a \"b\"' && codex"''',
-            "-e",
-            'tell application "Terminal" to activate',
-        ]
-    ]
+    spaced = store_path / "work dir"
+    [launch] = workspace.terminal_launches(spaced, "codex")
+    assert launch[:-1] == ["open", "-a", "Terminal"]
+    script = Path(launch[-1])
+    assert script.suffix == ".command"
+    assert script.read_text(encoding="utf-8") == (
+        f'#!/bin/sh\nrm -f "$0"\ncd {shlex.quote(str(spaced))} && exec codex\n'
+    )
+    if sys.platform != "win32":
+        assert stat.S_IMODE(script.stat().st_mode) == 0o700
+    script.unlink()
 
     monkeypatch.setattr(workspace.sys, "platform", "win32")
     cwd = str(store_path)

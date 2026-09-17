@@ -70,6 +70,15 @@ def test_codex_cli_launches_in_the_workspace(
     bin_dir.mkdir()
     # an absolute path: client/server terminals and Terminal.app ignore our PATH
     monkeypatch.setitem(workspace.TERMINAL_COMMANDS, "codex_cli", mock_codex(bin_dir))
+    tried: list[list[str]] = []
+    launches = workspace.terminal_launches
+
+    def recorded(path: Path, command: str) -> list[list[str]]:
+        found = launches(path, command)
+        tried.extend(found)
+        return found
+
+    monkeypatch.setattr(workspace, "terminal_launches", recorded)
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     assert agent_workspace.open_session("codex_cli") == "codex_cli"
 
@@ -77,6 +86,6 @@ def test_codex_cli_launches_in_the_workspace(
     deadline = time.monotonic() + LAUNCH_TIMEOUT_SECONDS
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.5)
-    assert marker.exists(), "no terminal ran codex"
+    assert marker.exists(), f"no terminal ran codex; tried {tried}"
     ran_in = Path(marker.read_text(encoding="utf-8").strip())
     assert ran_in.samefile(store_path)

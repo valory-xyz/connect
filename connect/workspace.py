@@ -220,6 +220,7 @@ DEEP_LINKS: dict[str, t.Callable[[Path], str]] = {
 }
 TERMINAL_COMMANDS: dict[str, str] = {HARNESS_CODEX_CLI: "codex"}
 
+ETC_SHELLS = Path("/etc/shells")
 LINUX_TERMINALS: dict[str, t.Callable[[str, list[str]], list[str]]] = {
     "ptyxis": lambda cwd, argv: ["--new-window", "-d", cwd, "-x", shlex.join(argv)],
     "gnome-terminal": lambda cwd, argv: [f"--working-directory={cwd}", "--", *argv],
@@ -236,26 +237,18 @@ def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
     """Command lines that each open a terminal running `command` in store_path."""
     cwd = str(store_path)
     if sys.platform == "darwin":
-        script = _applescript_string(f"cd {shlex.quote(cwd)} && {command}")
-        return [
-            [
-                "osascript",
-                "-e",
-                f'tell application "Terminal" to do script {script}',
-                "-e",
-                'tell application "Terminal" to activate',
-            ]
-        ]
+        return [["open", "-a", "Terminal", _command_file(cwd, command)]]
     if sys.platform == "win32":
         return [
             ["wt.exe", "-d", cwd, "cmd.exe", "/k", command],
             ["cmd.exe", "/c", "start", "", "/d", cwd, "cmd.exe", "/k", command],
         ]
-    argv = [os.environ.get("SHELL") or "/bin/sh", "-lic", command]
+    argv = [_login_shell(), "-lic", command]
+    preferred = [name for name in LINUX_TERMINALS if name == os.environ.get("TERMINAL")]
     launches: list[list[str]] = []
     seen: set[str] = set()
-    for name in (os.environ.get("TERMINAL"), "x-terminal-emulator", *LINUX_TERMINALS):
-        found = shutil.which(name) if name else None
+    for name in (*preferred, "x-terminal-emulator", *LINUX_TERMINALS):
+        found = shutil.which(name)
         if found is None or os.path.realpath(found) in seen:
             continue
         real = os.path.realpath(found)
@@ -570,10 +563,25 @@ def _write_private(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
-def _applescript_string(text: str) -> str:
-    """Quote text as an AppleScript string literal."""
-    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+def _login_shell() -> str:
+    """Return the operator's $SHELL if /etc/shells lists it, else /bin/sh."""
+    wanted = os.environ.get("SHELL")
+    try:
+        listed = ETC_SHELLS.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "/bin/sh"
+    return next((shell for shell in listed if shell == wanted), "/bin/sh")
+
+
+def _command_file(cwd: str, command: str) -> str:
+    """Write a Terminal .command file that runs `command` in cwd, then deletes itself."""
+    fd, path = tempfile.mkstemp(prefix="connect-", suffix=".command")
+    with os.fdopen(fd, "w", encoding="utf-8") as script:
+        script.write(
+            f'#!/bin/sh\nrm -f "$0"\ncd {shlex.quote(cwd)} && exec {command}\n'
+        )
+    os.chmod(path, 0o700)
+    return path
 
 
 def _open_terminal(store_path: Path, command: str) -> bool:
