@@ -104,8 +104,8 @@ def patch_settings(body: SettingsPatch, request: Request) -> dict:
     Omitted fields keep their current value. Changing `protected`
     (mode/whitelist) proves knowledge of the keystore password first; the
     `harness` preference needs no password — it is not integrity-protected
-    and the worst a change can do is open the workspace in the other Claude
-    Code. Origin locality applies to everything via the router dependency.
+    and the worst a change can do is open the workspace in another harness.
+    Origin locality applies to everything via the router dependency.
     """
     state = request.app.state
     if body.protected is None and body.harness is None:

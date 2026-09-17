@@ -13,6 +13,7 @@ dependencies = [
     "mcp==1.28.1",
     "mech-client==0.23.0",
     "open-aea-ledger-ethereum==2.2.9",
+    "tomli-w==1.2.0",
 ]
 
 [project.scripts]

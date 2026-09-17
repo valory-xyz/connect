@@ -19,10 +19,11 @@
 
 """Bearer-token auth, Origin validation and auth-failure braking.
 
-The token is minted per run and reaches Claude Code only via the .mcp.json
-file in STORE_PATH. Origin validation defends the localhost server against
-DNS-rebinding: browsers always attach an Origin to cross-origin requests, so
-anything non-local is rejected before auth. Repeated auth failures across
+The token is minted per run and reaches the agent harness only via the
+.mcp.json and .codex/config.toml files in STORE_PATH. Origin validation
+defends the localhost server against DNS-rebinding: browsers always attach an
+Origin to cross-origin requests, so anything non-local is rejected before
+auth. Repeated auth failures across
 every authenticated surface are audited to the activity log and, past a
 threshold, rate-limited — a stolen token or password being probed should be
 loud and slow, not silent.

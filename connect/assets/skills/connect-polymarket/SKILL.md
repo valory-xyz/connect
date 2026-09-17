@@ -94,9 +94,9 @@ which a pyenv or source-built Python fails every HTTPS call with
 a local gap.
 
 The venv is `.venv` at this workspace's root: persistent, so it survives
-restarts, and outside `.claude/skills/`, which the server overwrites on every
-boot. Override with `CONNECT_POLYMARKET_VENV`; never install into the system
-Python.
+restarts, and outside `.claude/skills/` and `.agents/skills/`, which the
+server overwrites on every boot. Override with `CONNECT_POLYMARKET_VENV`;
+never install into the system Python.
 
 A typical first session, with `$PY` exported as above:
 

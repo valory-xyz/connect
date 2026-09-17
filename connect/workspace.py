@@ -17,42 +17,51 @@
 #
 # ------------------------------------------------------------------------------
 
-"""The agent workspace (STORE_PATH): what the Claude session opens into.
+"""The agent workspace (STORE_PATH): what the agent session opens into.
 
 STORE_PATH is the persistent_data dir Pearl reserves for this service. The
-Workspace owns it: it provisions our MCP entry in .mcp.json (rotating the token
-each run) and overwrites our bundled skill, leaving every other file alone; it
-knows whether it is fit to open a session into, and re-attempts a failed
-provisioning while it is not; and it opens the session itself.
+Workspace owns it: it provisions our MCP entry in .mcp.json and
+.codex/config.toml (rotating the token each run) and overwrites our bundled
+brief and skills, leaving every other file alone; it knows whether it is fit
+to open a session into, and re-attempts a failed provisioning while it is not;
+and it opens the session itself.
 
 What stays outside the class is what is not about *a* workspace: where the
-bundle lives, the MCP URL, the harness-to-deep-link registry, the OS call that
-hands a URL to a URL handler, and the environment scrub that keeps our own
-packaging out of the session it starts.
+bundle lives, the MCP URL, the harness-to-launcher registries, the OS calls
+that hand a URL to a URL handler or a command to a terminal, and the
+environment scrub that keeps our own packaging out of the session it starts.
 """
 
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess  # nosec B404
 import sys
+import tempfile
 import threading
+import tomllib
 import typing as t
 from pathlib import Path
 from urllib.parse import quote
+
+import tomli_w
 
 from connect.config import AGENT_HTTP_PORT, BIND_HOST
 from connect.settings import (
     DEFAULT_HARNESS,
     HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CLAUDE_CODE_DESKTOP,
+    HARNESS_CODEX_CLI,
+    HARNESS_CODEX_DESKTOP,
 )
 
 logger = logging.getLogger("agent")
 
 MCP_SERVER_NAME = "pearl-connect"
 MCP_CONFIG_FILE = ".mcp.json"
+CODEX_CONFIG_FILE = Path(".codex") / "config.toml"
 # Per-server tool budget, in ms. Three separate harness limits would otherwise
 # abort our slowest tool (mech_request) long before it returns: the per-call
 # wall clock, the 60s first-byte timer an HTTP MCP server gets, and its
@@ -68,15 +77,16 @@ MCP_TOOL_TIMEOUT_MS = 2_100_000
 # where a bundled agent-UI build is dropped in (see docs/agent-ui.md)
 UI_SUBDIR = "ui"
 UI_INDEX = "index.html"
-SKILLS_SUBDIR = Path(".claude") / "skills"
-LIB_SUBDIR = Path(".claude") / "lib"
+BRIEF_FILES = ("CLAUDE.md", "AGENTS.md")
+AGENT_DIRS = (Path(".claude"), Path(".agents"))
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harness itself reads .mcp.json; the model never needs to, and reading
 # it would put the bearer token into the session transcript
 TOKEN_DENY_RULES = ("Read(./.mcp.json)",)
 # a `git init` in the workspace must never be able to stage the token, nor
 # the virtualenv the connect-polymarket skill builds at the workspace root
-GITIGNORE_ENTRIES = (".mcp.json", ".venv/")
+GITIGNORE_ENTRIES = (".mcp.json", ".codex/config.toml*", ".venv/")
+LAUNCH_SETTLE_SECONDS = 2.0
 
 # Loader variables our PyInstaller bootloader leaks: its extraction directory
 # leads LD_LIBRARY_PATH and ships an older libcrypto, so a session inheriting
@@ -98,7 +108,7 @@ LOADER_ENV_PREFIXES = ("_PYI_",)
 
 
 class LaunchError(Exception):
-    """A Claude Code session could not be opened in the requested harness."""
+    """An agent session could not be opened in the requested harness."""
 
 
 def assets_dir() -> Path:
@@ -175,7 +185,7 @@ def load_ui_bundle() -> dict[str, bytes] | None:
 
 # Pre-filled into the prompt box of a freshly opened session. A deep link only
 # fills the box — the operator reads it and presses Enter — so this reads as the
-# operator's own opening question, not something we sent. CLAUDE.md tells the
+# operator's own opening question, not something we sent. The brief tells the
 # agent how to answer it: with a short, concrete tour of what it can be asked.
 FIRST_PROMPT = "hi, what can you do?"
 
@@ -190,14 +200,69 @@ def cli_deep_link(store_path: Path) -> str:
     return f"claude-cli://open?cwd={quote(str(store_path))}&q={quote(FIRST_PROMPT)}"
 
 
-# The one place a harness gets a way to be opened. settings.HARNESSES says
-# which harnesses the operator may choose; a test pins these keys against it,
-# because a harness that can be chosen but never opened is a dead end the
+def codex_desktop_deep_link(store_path: Path) -> str:
+    """Codex desktop-app deep link, opening prompt pre-filled."""
+    return (
+        f"codex://threads/new?path={quote(str(store_path))}"
+        f"&prompt={quote(FIRST_PROMPT)}"
+    )
+
+
+# The one place a harness gets a way to be opened: a deep link, or a command
+# for a terminal when the harness registers no URL handler. settings.HARNESSES
+# says which harnesses the operator may choose; a test pins these keys against
+# it, because a harness that can be chosen but never opened is a dead end the
 # operator only discovers when a session refuses to start.
 DEEP_LINKS: dict[str, t.Callable[[Path], str]] = {
     HARNESS_CLAUDE_CODE_DESKTOP: desktop_deep_link,
     HARNESS_CLAUDE_CODE_CLI: cli_deep_link,
+    HARNESS_CODEX_DESKTOP: codex_desktop_deep_link,
 }
+TERMINAL_COMMANDS: dict[str, str] = {HARNESS_CODEX_CLI: "codex"}
+
+LINUX_TERMINALS: dict[str, t.Callable[[str, list[str]], list[str]]] = {
+    "ptyxis": lambda cwd, argv: ["--new-window", "-d", cwd, "-x", shlex.join(argv)],
+    "gnome-terminal": lambda cwd, argv: [f"--working-directory={cwd}", "--", *argv],
+    "konsole": lambda cwd, argv: ["--workdir", cwd, "-e", *argv],
+    "xfce4-terminal": lambda cwd, argv: [f"--working-directory={cwd}", "-x", *argv],
+    "kitty": lambda cwd, argv: ["--directory", cwd, *argv],
+    "alacritty": lambda cwd, argv: ["--working-directory", cwd, "-e", *argv],
+    "wezterm": lambda cwd, argv: ["start", "--cwd", cwd, "--", *argv],
+    "xterm": lambda cwd, argv: ["-e", *argv],
+}
+
+
+def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
+    """Command lines that each open a terminal running `command` in store_path."""
+    cwd = str(store_path)
+    if sys.platform == "darwin":
+        script = _applescript_string(f"cd {shlex.quote(cwd)} && {command}")
+        return [
+            [
+                "osascript",
+                "-e",
+                f'tell application "Terminal" to do script {script}',
+                "-e",
+                'tell application "Terminal" to activate',
+            ]
+        ]
+    if sys.platform == "win32":
+        return [
+            ["wt.exe", "-d", cwd, "cmd.exe", "/k", command],
+            ["cmd.exe", "/c", "start", "", "/d", cwd, "cmd.exe", "/k", command],
+        ]
+    argv = [os.environ.get("SHELL") or "/bin/sh", "-lic", command]
+    launches: list[list[str]] = []
+    seen: set[str] = set()
+    for name in (os.environ.get("TERMINAL"), "x-terminal-emulator", *LINUX_TERMINALS):
+        found = shutil.which(name) if name else None
+        if found is None or os.path.realpath(found) in seen:
+            continue
+        real = os.path.realpath(found)
+        seen.add(real)
+        build = LINUX_TERMINALS.get(Path(real).name, LINUX_TERMINALS["xterm"])
+        launches.append([found, *build(cwd, argv)])
+    return launches
 
 
 class Workspace:
@@ -265,32 +330,41 @@ class Workspace:
     def open_session(
         self, harness: str = DEFAULT_HARNESS, *, fallback: bool = False
     ) -> str:
-        """Open a Claude Code session here; return the harness it opened in.
+        """Open an agent session here; return the harness it opened in.
 
-        Success means the URL handler accepted the deep link, which is as much
-        as the OS tells us: `xdg-open` (and `open`) can exit 0 without any
-        handler having actually opened a window. So a "launched" answer is a
-        best effort, not a proof that the session appeared on screen.
+        Success means the URL handler accepted the deep link, or the terminal
+        started, which is as much as the OS tells us: `xdg-open` (and `open`)
+        can exit 0 without any handler having actually opened a window. So a
+        "launched" answer is a best effort, not a proof that the session
+        appeared on screen.
 
         `fallback` says the harness was ours to pick, not the operator's: try
         it first, then the others. A caller who *names* a harness gets that one
-        or an error, because naming one is a choice and quietly opening the
-        other Claude Code would make the choice a lie. But an unnamed one is
-        only DEFAULT_HARNESS, our guess — and Pearl and the agent UI both
-        launch without naming one, so on a machine with only the CLI installed
-        that guess was the whole reason no session ever opened (OPE-1867).
+        or an error, because naming one is a choice and quietly opening another
+        harness would make the choice a lie. But an unnamed one is only
+        DEFAULT_HARNESS, our guess — and Pearl and the agent UI both launch
+        without naming one, so on a machine with only the CLI installed that
+        guess was the whole reason no session ever opened (OPE-1867).
 
         :raises ValueError: on an unknown harness;
-        :raises LaunchError: when none of the deep links tried would open.
+        :raises LaunchError: when none of the harnesses tried would open.
         """
         order = [harness]
         if fallback:
-            order += [known for known in DEEP_LINKS if known != harness]
+            order += [
+                known for known in (*DEEP_LINKS, *TERMINAL_COMMANDS) if known != harness
+            ]
         for candidate in order:
-            url = self.deep_link(candidate)  # only order[0] can be unknown
-            if not _open_url(url):
+            if candidate in TERMINAL_COMMANDS:
+                via = "a terminal"
+                opened = _open_terminal(self.path, TERMINAL_COMMANDS[candidate])
+            else:
+                url = self.deep_link(candidate)  # only order[0] can be unknown
+                via = url.split("?", maxsplit=1)[0]
+                opened = _open_url(url)
+            if not opened:
                 continue
-            logger.info("launched %s via %s", candidate, url.split("?", maxsplit=1)[0])
+            logger.info("launched %s via %s", candidate, via)
             if candidate != harness:
                 logger.info(
                     "%s would not open, so the session went to %s instead — "
@@ -300,19 +374,17 @@ class Workspace:
                     candidate,
                 )
             return candidate
-        # "change the harness" is no way out on a machine where both have
-        # already been tried, so the exhausted case names what it tried instead
+        # "change the harness" is no way out on a machine where every harness
+        # has already been tried, so the exhausted case names what it tried
         if not fallback:
             reason = (
-                f"Could not open {harness} via its deep link — is it installed? "
-                f"If you use the other Claude Code, change the harness in the "
-                f"agent UI."
+                f"Could not open {harness} — is it installed? "
+                f"If you use another harness, change the harness in the agent UI."
             )
         else:
             reason = (
-                f"Could not open a Claude Code session — none of "
-                f"{', '.join(order)} answered its deep link. Is Claude Code "
-                f"installed?"
+                f"Could not open an agent session — none of {', '.join(order)} "
+                f"would open. Is Claude Code or Codex installed?"
             )
         raise LaunchError(f"{reason} The workspace is at {self.path}")
 
@@ -320,21 +392,23 @@ class Workspace:
         """Write our files into the workspace, leaving every other one alone."""
         self.path.mkdir(parents=True, exist_ok=True)
         self._write_mcp_config()
+        self._write_codex_config()
         self._write_gitignore()
         self._write_claude_settings()
-        self._install_claude_md()
+        self._install_brief()
         self._install_skills()
         self._install_lib()
 
-    def _install_claude_md(self) -> None:
-        """Overwrite CLAUDE.md (the agent's identity/context brief) from assets.
+    def _install_brief(self) -> None:
+        """Overwrite the agent's context brief (CLAUDE.md, AGENTS.md) from assets.
 
         :raises FileNotFoundError: when the bundled CLAUDE.md is absent.
         """
         source = assets_dir() / "CLAUDE.md"
         if not source.exists():
             raise FileNotFoundError(f"bundled CLAUDE.md not found under {source}")
-        shutil.copyfile(source, self.path / "CLAUDE.md")
+        for name in BRIEF_FILES:
+            shutil.copyfile(source, self.path / name)
 
     def _write_mcp_config(self) -> None:
         """Merge our server entry into .mcp.json (0600), preserving other entries."""
@@ -353,12 +427,33 @@ class Workspace:
             "headers": {"Authorization": f"Bearer {self._token}"},
             "timeout": MCP_TOOL_TIMEOUT_MS,
         }
-        tmp = path.with_suffix(".json.tmp")
-        tmp.unlink(missing_ok=True)  # a stale tmp may have looser permissions
-        tmp.touch(mode=0o600)
-        tmp.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        tmp.chmod(0o600)
-        tmp.replace(path)
+        _write_private(path, json.dumps(config, indent=2))
+
+    def _write_codex_config(self) -> None:
+        """Merge our server entry into .codex/config.toml (0600), keeping the rest."""
+        path = self.path / CODEX_CONFIG_FILE
+        config: dict = {}
+        if path.exists():
+            try:
+                config = tomllib.loads(path.read_text(encoding="utf-8"))
+            except tomllib.TOMLDecodeError:
+                backup = path.with_suffix(".toml.bak")
+                path.replace(backup)
+                logger.warning(
+                    "existing %s is invalid TOML; backed up to %s and rewriting",
+                    path,
+                    backup,
+                )
+        config.setdefault("mcp_servers", {})[MCP_SERVER_NAME] = {
+            "url": mcp_url(),
+            "http_headers": {"Authorization": f"Bearer {self._token}"},
+            "tool_timeout_sec": MCP_TOOL_TIMEOUT_MS // 1000,
+        }
+        config.setdefault("sandbox_workspace_write", {}).setdefault(
+            "network_access", True
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private(path, tomli_w.dumps(config))
 
     def _write_gitignore(self) -> None:
         """Keep the token file out of any repo the agent may init here."""
@@ -406,21 +501,25 @@ class Workspace:
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     def _install_lib(self) -> None:
-        """Overwrite the shared modules our skills import from .claude/lib."""
-        _replace_tree(assets_dir() / "lib", self.path / LIB_SUBDIR)
+        """Overwrite the shared modules our skills import, beside each skills dir."""
+        for agent_dir in AGENT_DIRS:
+            _replace_tree(assets_dir() / "lib", self.path / agent_dir / "lib")
 
     def _install_skills(self) -> None:
         """Overwrite our skills from the bundle; user files elsewhere are untouched."""
-        source = assets_dir() / "skills"
-        target_root = self.path / SKILLS_SUBDIR
-        target_root.mkdir(parents=True, exist_ok=True)
-        for skill_dir in source.iterdir():
+        skills = []
+        for skill_dir in (assets_dir() / "skills").iterdir():
             if not skill_dir.is_dir():
                 logger.warning(
                     "skipping non-directory %s under bundled skills", skill_dir
                 )
                 continue
-            _replace_tree(skill_dir, target_root / skill_dir.name)
+            skills.append(skill_dir)
+        for agent_dir in AGENT_DIRS:
+            target_root = self.path / agent_dir / "skills"
+            target_root.mkdir(parents=True, exist_ok=True)
+            for skill_dir in skills:
+                _replace_tree(skill_dir, target_root / skill_dir.name)
 
 
 def _remove(target: Path) -> None:
@@ -454,13 +553,59 @@ def harness_env() -> dict[str, str]:
     if dropped:
         logger.info(
             "not passing %s to the session — our packaging leaks them; "
-            "to set one deliberately, use the workspace's .claude/settings.json",
+            "to set one deliberately, use the workspace's .claude/settings.json "
+            "or .codex/config.toml",
             ", ".join(dropped),
         )
     return scrubbed
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Atomically replace a token-bearing file, readable by its owner alone."""
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.unlink(missing_ok=True)  # a stale tmp may have looser permissions
+    tmp.touch(mode=0o600)
+    tmp.write_text(text, encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
+def _applescript_string(text: str) -> str:
+    """Quote text as an AppleScript string literal."""
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _open_terminal(store_path: Path, command: str) -> bool:
+    """Open the first terminal that starts running `command` in store_path."""
+    for argv in terminal_launches(store_path, command):
+        try:
+            process = (
+                subprocess.Popen(  # pylint: disable=consider-using-with # nosec B603
+                    argv,
+                    cwd=store_path,
+                    env=harness_env(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            )
+        except OSError as e:
+            logger.warning("terminal %s would not start: %s", argv[0], e)
+            continue
+        try:
+            code = process.wait(timeout=LAUNCH_SETTLE_SECONDS)
+        except subprocess.TimeoutExpired:
+            return True
+        if code == 0:
+            return True
+        logger.warning("terminal %s exited with %s", argv[0], code)
+    return False
+
+
 def _open_url(url: str) -> bool:
+    link = url.split("?", maxsplit=1)[0]
     try:
         if sys.platform == "darwin":  # pragma: no cover — macOS only
             args = ["open", url]
@@ -471,24 +616,38 @@ def _open_url(url: str) -> bool:
             return True
         else:  # pragma: no cover — Linux/Unix only
             args = ["xdg-open", url]
-        result = subprocess.run(  # nosec B603, B607
-            args, capture_output=True, timeout=15, check=False, env=harness_env()
-        )
-        if result.returncode == 0:
-            return True
+        # no pipes: the app a handler starts inherits them and outlives any wait
+        with tempfile.TemporaryFile() as stderr:
+            process = (
+                subprocess.Popen(  # pylint: disable=consider-using-with # nosec B603
+                    args,
+                    env=harness_env(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+            )
+            try:
+                code = process.wait(timeout=LAUNCH_SETTLE_SECONDS)
+            except subprocess.TimeoutExpired:
+                return True
+            if code == 0:
+                return True
+            stderr.seek(0)
+            detail = stderr.read().decode(errors="replace").strip()
         # Loudly, and at a level the default config shows. This is the only
         # place the OS says *why* a link did not open, and the caller turns
-        # every failure into the same "is Claude Code installed?" guess — with
-        # a fallback trying two links, a silent first refusal would leave the
+        # every failure into the same "is it installed?" guess — with a
+        # fallback trying several links, a silent first refusal would leave the
         # operator's actual problem nowhere to be read.
-        detail = (result.stderr or b"").decode(errors="replace").strip()
         logger.warning(
             "deep link %s was refused (exit %s)%s",
-            url.split("?", maxsplit=1)[0],
-            result.returncode,
+            link,
+            code,
             f": {detail[:200]}" if detail else "",
         )
         return False
     except Exception as e:  # pylint: disable=broad-exception-caught
-        logger.warning("deep link %s failed: %s", url.split("?", maxsplit=1)[0], e)
+        logger.warning("deep link %s failed: %s", link, e)
         return False

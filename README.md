@@ -10,13 +10,14 @@ other non-aea agent. It:
    preferred: argv is world-readable via `/proc/<pid>/cmdline` on Linux) or
    from the legacy `--password` argument — key material never leaves the
    process;
-2. populates the service's persistent workspace (`STORE_PATH`) with a
-   `.mcp.json` (fresh bearer token every run), a `CLAUDE.md` context brief for
-   the agent session, the bundled skills (`pearl-connect` for signing,
+2. populates the service's persistent workspace (`STORE_PATH`) for either
+   harness: the MCP entry with a fresh bearer token every run (`.mcp.json` for
+   Claude Code, `.codex/config.toml` for Codex), the context brief (`CLAUDE.md`,
+   copied to `AGENTS.md`), the bundled skills (`pearl-connect` for signing,
    `connect-polymarket` for prediction markets, `connect-stocktokens` for
    Robinhood Chain Stock Tokens, `connect-pons` for the Pons memecoin
    launchpad on Robinhood Chain) and the shared modules they import, installed
-   to `.claude/lib/`;
+   as `skills/` and `lib/` under both `.claude/` and `.agents/`;
 3. serves on `127.0.0.1:8716`:
    - Pearl SDK contracts: `GET /healthcheck` and `GET /funds-status`.
      `is_healthy` turns true only once the workspace is populated — Pearl
@@ -30,10 +31,11 @@ other non-aea agent. It:
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its
      editing semantics are specced — while the `harness` preference needs none)
-   - `POST /session` (origin-gated, no token): opens a Claude Code session in
-     the configured harness (`claude_code_desktop` →
+   - `POST /session` (origin-gated, no token): opens an agent session in the
+     configured harness (`claude_code_desktop` →
      `claude://code/new?folder=…`, `claude_code_cli` →
-     `claude-cli://open?cwd=…`) and answers
+     `claude-cli://open?cwd=…`, `codex_desktop` →
+     `codex://threads/new?path=…`, see [Codex](#codex)) and answers
      `{launched, harness, requested, error?}` — `harness` is the one that
      opened, `requested` the one it aimed for. An optional `{"harness": …}`
      body overrides the saved preference for that launch alone, without
@@ -51,7 +53,7 @@ The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 then reaches the operator's UI as a dismissable error instead of dying in this
 process's log. Neither Pearl nor the UI names a harness, so those launches
 start at the saved preference — until an operator changes it, only our default
-guess — and fall back to the other Claude Code rather than leave them with no
+guess — and fall back to the other harnesses rather than leave them with no
 session at all. A launch that *does* name one opens there or not at all:
 naming a harness is a choice.
 
@@ -67,8 +69,8 @@ variables stripped. Restoring `LD_LIBRARY_PATH_ORIG`, PyInstaller's usual
 advice, is wrong here: under Pearl that variable names the middleware's private
 lib dir, carrying the same old libcrypto — the child needs these gone, not
 restored. An operator who genuinely needs one of them can set it back for the
-session in the workspace's `.claude/settings.json`, which we merge into rather
-than own.
+session in the workspace's `.claude/settings.json` or `.codex/config.toml`,
+which we merge into rather than own.
 
 The agent-harness session names the actions; the server signs and broadcasts
 them — a single audited choke point, no plaintext secrets on disk. The agent
@@ -78,6 +80,31 @@ one, though — it names the inner call (`safe_transaction`, `POST
 /safe-transaction`) and the server wraps it in the safe's `execTransaction`,
 threshold-1 pre-validated signature and all. Nothing about the safe — its
 address, its ABI, its signature convention — is the session's problem.
+
+## Codex
+
+Two harnesses open Codex. `codex_desktop` uses the desktop app's
+`codex://threads/new` link. The Codex CLI registers no URL handler, so
+`codex_cli` does what Claude Code's `claude-cli://` handler does for itself: it
+opens a terminal running `codex` in STORE_PATH, through the operator's login
+shell on Linux. The terminal is `$TERMINAL`, then `x-terminal-emulator`, then
+the first known emulator installed on Linux; Terminal.app on macOS; Windows
+Terminal, then `cmd.exe`, on Windows. The CLI cannot pre-fill a prompt, so that
+session opens empty.
+
+Codex loads a project's `.codex/config.toml` — our MCP entry with it — only
+once the operator trusts the folder, and asks them to the first time a session
+opens there. Connect never answers for them and never touches the user's own
+Codex config; a session in an untrusted folder has no signer tools, and the
+brief tells the agent to say so.
+
+The workspace config turns on `sandbox_workspace_write.network_access`, unless
+the file already sets it: Codex's `workspace-write` sandbox otherwise blocks
+every socket, the signer on localhost included, and the skills' scripts need
+the network. Two differences from Claude Code remain. Every MCP tool call asks
+for approval, as Claude Code's do without an allow rule. And there is no
+equivalent of the `Read` deny rule: the token in `.codex/config.toml` is
+gitignored, not kept out of transcripts.
 
 ## Guardrail
 
@@ -150,7 +177,7 @@ and audited; the reasoning lives in `connect/settings.py`'s module
 docstring. The
 `harness` preference is stored alongside without integrity checks and survives
 a guardrail reset. It is outside the MAC because it cannot move funds or widen
-the guardrail — both harnesses are only ways to open Claude Code on the
+the guardrail — every harness is only a way to open a coding agent on the
 operator's own machine, and editing the field just reorders which one is tried
 first. What a tamper can still do is mislead: leave the UI showing a preference
 the operator's sessions are not opening in.
@@ -174,15 +201,15 @@ funds or changes the guardrail requires the bearer token (or the keystore
 password for the `protected` settings), Origin headers are validated, only
 loopback Host headers are accepted, and no CORS is enabled. Two state-changing
 routes are gated on **origin locality alone**, because the FE that calls them
-holds no token: `POST /session` (spawns a Claude Code session on the operator's
+holds no token: `POST /session` (spawns an agent session on the operator's
 machine) and the harness half of `PATCH /settings`. Neither can move funds or
 widen the guardrail; the deliberate trade is that any local process — including
-the agent's own session — can open a session window or change which Claude Code
+the agent's own session — can open a session window or change which harness
 it opens in. Repeated auth failures are audited to the activity log and
-rate-limited (429) so a probed token is loud, not silent. The token itself is
-header-only, rotated per run, dies with the process, and the provisioned
-workspace ships a `.gitignore` and a Claude Code `Read` deny rule so it is
-neither committed nor read into session transcripts.
+rate-limited (429) so a probed token is loud, not silent. The
+token itself is header-only, rotated per run, dies with the process, and the
+provisioned workspace ships a `.gitignore` so it is never committed and, for
+Claude Code, a `Read` deny rule so it is not read into session transcripts.
 
 Out of scope for v1: SSH port forwarding or running on a shared/remote
 machine voids the loopback assumption entirely, and same-user local malware

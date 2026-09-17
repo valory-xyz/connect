@@ -42,8 +42,9 @@ from web3.exceptions import ContractLogicError, TimeExhausted
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 
 # The connect signer HTTP client lives in the sibling pearl-connect skill;
-# both skills install side by side under .claude/skills and are refreshed
-# every boot, so reuse it rather than re-implement auth, retries and signing.
+# both skills install side by side under .claude/skills and .agents/skills
+# and are refreshed every boot, so reuse it rather than re-implement auth,
+# retries and signing.
 _PEARL_SCRIPTS = (
     Path(__file__).resolve().parent.parent.parent / "pearl-connect" / "scripts"
 )

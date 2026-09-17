@@ -1448,29 +1448,38 @@ class TestWorkspaceExtras:
     def test_open_url_linux(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """xdg-open success, failure and exception paths.
+        """xdg-open success, still-launching, failure and exception paths.
 
         A refusal is the only place the OS says why a link did not open, and
-        the caller answers every one of them with the same "is Claude Code
-        installed?" guess — so both failing paths are pinned to a level the
-        default config shows, carrying what the handler said.
+        the caller answers every one of them with the same "is it installed?"
+        guess — so both failing paths are pinned to a level the default config
+        shows, carrying what the handler said. An opener still running when the
+        wait ends is a handler still starting its app, which is a launch.
         """
 
-        class Result:
-            """subprocess result stub."""
+        class Process:
+            """Popen stub: an opener that exits, refuses, or outlasts the wait."""
 
-            def __init__(self, code: int, stderr: bytes = b"") -> None:
-                """Initialize."""
-                self.returncode = code
-                self.stderr = stderr
+            outcome: tuple[int | None, bytes] = (0, b"")
+
+            def __init__(self, args: list[str], **kwargs: t.Any) -> None:
+                """Write what the opener would say to the stderr it was handed."""
+                kwargs["stderr"].write(self.outcome[1])
+
+            def wait(self, timeout: float) -> int:
+                """Exit with the outcome's code, or run past the timeout."""
+                if self.outcome[0] is None:
+                    raise workspace.subprocess.TimeoutExpired("xdg-open", timeout)
+                return self.outcome[0]
 
         monkeypatch.setattr(workspace.sys, "platform", "linux")
-        monkeypatch.setattr(workspace.subprocess, "run", lambda *a, **k: Result(0))
+        monkeypatch.setattr(workspace.subprocess, "Popen", Process)
         assert workspace._open_url("claude://x")  # pylint: disable=protected-access
 
-        monkeypatch.setattr(
-            workspace.subprocess, "run", lambda *a, **k: Result(4, b"no handler for x")
-        )
+        Process.outcome = (None, b"")
+        assert workspace._open_url("claude://x")  # pylint: disable=protected-access
+
+        Process.outcome = (4, b"no handler for x")
         with caplog.at_level("WARNING"):
             assert not workspace._open_url(  # pylint: disable=protected-access
                 "claude://x?folder=/tmp"  # nosec B108
@@ -1483,7 +1492,7 @@ class TestWorkspaceExtras:
 
         # a refusal with nothing to say still names the link and the exit code
         caplog.clear()
-        monkeypatch.setattr(workspace.subprocess, "run", lambda *a, **k: Result(1))
+        Process.outcome = (1, b"")
         with caplog.at_level("WARNING"):
             assert not workspace._open_url(  # pylint: disable=protected-access
                 "claude://x"
@@ -1493,7 +1502,7 @@ class TestWorkspaceExtras:
         caplog.clear()
         monkeypatch.setattr(
             workspace.subprocess,
-            "run",
+            "Popen",
             lambda *a, **k: (_ for _ in ()).throw(OSError("no handler")),
         )
         with caplog.at_level("WARNING"):

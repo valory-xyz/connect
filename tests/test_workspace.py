@@ -22,6 +22,8 @@
 import json
 import stat
 import sys
+import tomllib
+import typing as t
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -254,30 +256,36 @@ def test_harness_env_drops_what_our_packaging_leaks(
 def test_launch_hands_the_url_handler_a_scrubbed_environment(
     platform: str, opener: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No platform that spawns an opener spawns it with our extraction dir.
+    """No opener is spawned with our extraction dir, or with a pipe to hold.
 
     Both branches, because a fix applied to one of them is the regression this
-    guards: the mac binaries are as much a release asset as the Linux ones.
+    guards: the mac binaries are as much a release asset as the Linux ones. And
+    no pipe, because the app a handler starts inherits it: waiting for it to
+    close waited out the app, so a Codex Desktop that opened read as a failure
+    and the launch fell back to a second harness.
     """
     monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIabc123")  # nosec B108
     monkeypatch.setattr(workspace.sys, "platform", platform)
     seen: dict = {}
 
-    class Result:
-        """subprocess result stub."""
+    class Process:
+        """Popen stub that records how the opener was spawned."""
 
-        returncode = 0
+        def __init__(self, args: list[str], **kwargs: t.Any) -> None:
+            """Capture the child's argv, environment and standard streams."""
+            seen["args"] = args
+            seen.update(kwargs)
 
-    def record(*args: object, **kwargs: object) -> Result:
-        """Capture the child's argv and environment."""
-        seen["args"] = args
-        seen.update(kwargs)
-        return Result()
+        def wait(self, timeout: float) -> int:
+            """Report the opener as done."""
+            return 0
 
-    monkeypatch.setattr(workspace.subprocess, "run", record)
+    monkeypatch.setattr(workspace.subprocess, "Popen", Process)
     assert workspace._open_url("claude://x")  # pylint: disable=protected-access
-    assert seen["args"][0] == [opener, "claude://x"]
+    assert seen["args"] == [opener, "claude://x"]
     assert "LD_LIBRARY_PATH" not in seen["env"]
+    streams = (seen["stdin"], seen["stdout"], seen["stderr"])
+    assert workspace.subprocess.PIPE not in streams
 
 
 def test_provisioning_ships_token_hygiene(store_path: Path) -> None:
@@ -394,7 +402,10 @@ def test_every_choosable_harness_can_be_opened() -> None:
     second is a dead end the operator only meets when a session refuses to
     start — so the two are pinned to each other here rather than left to drift.
     """
-    assert set(workspace.DEEP_LINKS) == set(HARNESSES)
+    assert set(workspace.DEEP_LINKS) | set(workspace.TERMINAL_COMMANDS) == set(
+        HARNESSES
+    )
+    assert not set(workspace.DEEP_LINKS) & set(workspace.TERMINAL_COMMANDS)
 
 
 def test_a_named_harness_never_falls_back(
@@ -464,9 +475,206 @@ def test_an_unnamed_harness_falls_back_to_the_other_claude_code(
         tried.append(url)
         return False
 
+    def no_terminal(path: Path, command: str) -> bool:
+        tried.append(command)
+        return False
+
     monkeypatch.setattr(workspace, "_open_url", refuse)
+    monkeypatch.setattr(workspace, "_open_terminal", no_terminal)
     with pytest.raises(workspace.LaunchError, match="none of claude_code_desktop") as e:
         agent_workspace.open_session(fallback=True)
-    assert "claude_code_cli" in str(e.value)
+    assert "codex_cli" in str(e.value)
     assert str(store_path) in str(e.value)
-    assert len(tried) == len(workspace.DEEP_LINKS)
+    assert len(tried) == len(workspace.DEEP_LINKS) + len(workspace.TERMINAL_COMMANDS)
+
+
+def codex_config(store_path: Path) -> dict:
+    """Return the workspace's parsed Codex config."""
+    return tomllib.loads((store_path / ".codex" / "config.toml").read_text())
+
+
+def test_codex_config_carries_the_mcp_json_entry(store_path: Path) -> None:
+    """Codex gets what .mcp.json carries: the URL, this run's token, the budget."""
+    provisioned(store_path, "tok-1")
+    path = store_path / ".codex" / "config.toml"
+    if sys.platform != "win32":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert codex_config(store_path)["mcp_servers"]["pearl-connect"] == {
+        "url": mcp_entry(store_path)["url"],
+        "http_headers": {"Authorization": "Bearer tok-1"},
+        "tool_timeout_sec": workspace.MCP_TOOL_TIMEOUT_MS // 1000,
+    }
+    provisioned(store_path, "tok-2")
+    entry = codex_config(store_path)["mcp_servers"]["pearl-connect"]
+    assert entry["http_headers"]["Authorization"] == "Bearer tok-2"
+
+
+def test_codex_sandbox_reaches_the_network_unless_the_file_says_otherwise(
+    store_path: Path,
+) -> None:
+    """Network access defaults on; a value already in the file is kept."""
+    provisioned(store_path)
+    sandbox = codex_config(store_path)["sandbox_workspace_write"]
+    assert sandbox == {"network_access": True}
+    path = store_path / ".codex" / "config.toml"
+    path.write_text("[sandbox_workspace_write]\nnetwork_access = false\n")
+    provisioned(store_path)
+    sandbox = codex_config(store_path)["sandbox_workspace_write"]
+    assert sandbox == {"network_access": False}
+
+
+def test_codex_config_keeps_what_else_is_in_it(store_path: Path) -> None:
+    """Other settings survive the merge; a broken file is backed up, not lost."""
+    path = store_path / ".codex" / "config.toml"
+    path.parent.mkdir()
+    path.write_text('model = "o3"\n\n[mcp_servers.other]\ncommand = "x"\n')
+    provisioned(store_path)
+    config = tomllib.loads(path.read_text())
+    assert config["model"] == "o3"
+    assert set(config["mcp_servers"]) == {"other", "pearl-connect"}
+
+    path.write_text("[nope")
+    provisioned(store_path)
+    assert set(tomllib.loads(path.read_text())["mcp_servers"]) == {"pearl-connect"}
+    assert path.with_suffix(".toml.bak").read_text() == "[nope"
+
+
+def test_codex_gets_the_brief_skills_and_ignore_rule(store_path: Path) -> None:
+    """AGENTS.md, .agents/skills and the gitignore entry mirror the Claude side."""
+    provisioned(store_path)
+    assert (store_path / "AGENTS.md").read_text() == (
+        store_path / "CLAUDE.md"
+    ).read_text()
+    for root in (".claude", ".agents"):
+        assert (store_path / root / "skills" / "pearl-connect" / "SKILL.md").exists()
+        assert (store_path / root / "lib" / "uniswap.py").exists()
+    gitignore = (store_path / ".gitignore").read_text().splitlines()
+    assert ".codex/config.toml*" in gitignore
+
+
+def test_codex_deep_link(store_path: Path) -> None:
+    """The Codex link opens a new thread in the workspace, prompt pre-filled."""
+    url = Workspace(store_path, "tok").deep_link("codex_desktop")  # nosec B106
+    assert url.startswith("codex://threads/new?")
+    assert parse_qs(urlparse(url).query) == {
+        "path": [str(store_path)],
+        "prompt": [workspace.FIRST_PROMPT],
+    }
+
+
+def test_codex_cli_opens_in_a_terminal(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI registers no URL handler, so its session is a terminal running codex."""
+    opened: list[tuple[Path, str]] = []
+
+    def terminal(path: Path, command: str) -> bool:
+        opened.append((path, command))
+        return True
+
+    monkeypatch.setattr(workspace, "_open_terminal", terminal)
+    monkeypatch.setattr(workspace, "_open_url", lambda url: pytest.fail(url))
+    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    assert agent_workspace.open_session("codex_cli") == "codex_cli"
+    assert opened == [(store_path, "codex")]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executables and symlinks")
+def test_linux_terminals_are_tried_in_the_operators_order(
+    store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """$TERMINAL, then x-terminal-emulator by what it points at, then the known list."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("my-term", "ptyxis", "kitty"):
+        (bin_dir / name).touch(mode=0o755)
+    (bin_dir / "x-terminal-emulator").symlink_to(bin_dir / "ptyxis")
+    monkeypatch.setattr(workspace.sys, "platform", "linux")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("TERMINAL", "my-term")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    cwd = str(store_path)
+    shell = ["/bin/zsh", "-lic", "codex"]
+    assert workspace.terminal_launches(store_path, "codex") == [
+        [str(bin_dir / "my-term"), "-e", *shell],
+        [
+            str(bin_dir / "x-terminal-emulator"),
+            "--new-window",
+            "-d",
+            cwd,
+            "-x",
+            "/bin/zsh -lic codex",
+        ],
+        [str(bin_dir / "kitty"), "--directory", cwd, *shell],
+    ]
+
+    monkeypatch.delenv("TERMINAL")
+    monkeypatch.delenv("SHELL")
+    first = workspace.terminal_launches(store_path, "codex")[0]
+    assert first[0] == str(bin_dir / "x-terminal-emulator")
+    assert first[-1] == "/bin/sh -lic codex"
+
+
+def test_macos_and_windows_terminals(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Terminal.app runs the command in the workspace; Windows tries wt, then cmd."""
+    monkeypatch.setattr(workspace.sys, "platform", "darwin")
+    assert workspace.terminal_launches(Path('/work/a "b"'), "codex") == [
+        [
+            "osascript",
+            "-e",
+            r'''tell application "Terminal" to do script "cd '/work/a \"b\"' && codex"''',
+            "-e",
+            'tell application "Terminal" to activate',
+        ]
+    ]
+
+    monkeypatch.setattr(workspace.sys, "platform", "win32")
+    cwd = str(store_path)
+    assert workspace.terminal_launches(store_path, "codex") == [
+        ["wt.exe", "-d", cwd, "cmd.exe", "/k", "codex"],
+        ["cmd.exe", "/c", "start", "", "/d", cwd, "cmd.exe", "/k", "codex"],
+    ]
+
+
+def test_open_terminal_moves_past_terminals_that_fail(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A terminal that won't start or exits non-zero at once gives way to the next."""
+    launches = [["missing"], ["bad-flags"], ["client"]]
+    monkeypatch.setattr(workspace, "terminal_launches", lambda path, command: launches)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/_MEIabc123")
+    started: list[list[str]] = []
+
+    class Process:
+        """A Popen stand-in whose wait() is the terminal's fate."""
+
+        def __init__(self, argv: list[str], **kwargs: t.Any) -> None:
+            """Refuse the missing terminal; record the rest and how they ran."""
+            if argv == ["missing"]:
+                raise FileNotFoundError(argv[0])
+            assert kwargs["cwd"] == store_path
+            assert "LD_LIBRARY_PATH" not in kwargs["env"]
+            started.append(argv)
+            self.argv = argv
+
+        def wait(self, timeout: float) -> int:
+            """Exit at once, or keep running past the timeout as a window does."""
+            if self.argv == ["window"]:
+                raise workspace.subprocess.TimeoutExpired(self.argv, timeout)
+            return {"bad-flags": 2, "client": 0}[self.argv[0]]
+
+    monkeypatch.setattr(workspace.subprocess, "Popen", Process)
+    open_terminal = workspace._open_terminal  # pylint: disable=protected-access
+    with caplog.at_level("WARNING"):
+        assert open_terminal(store_path, "codex")
+    assert started == [["bad-flags"], ["client"]]
+    assert "missing would not start" in caplog.text
+    assert "bad-flags exited with 2" in caplog.text
+
+    launches[:] = [["window"]]
+    assert open_terminal(store_path, "codex")
+
+    launches[:] = [["missing"], ["bad-flags"]]
+    assert not open_terminal(store_path, "codex")
