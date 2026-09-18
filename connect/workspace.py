@@ -80,13 +80,15 @@ UI_INDEX = "index.html"
 BRIEF_FILES = ("CLAUDE.md", "AGENTS.md")
 AGENT_DIRS = (Path(".claude"), Path(".agents"))
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
-# the harness itself reads .mcp.json; the model never needs to, and reading
-# it would put the bearer token into the session transcript
-TOKEN_DENY_RULES = ("Read(./.mcp.json)",)
+# the harnesses read these themselves; the model never needs to, and reading
+# one would put the bearer token into the session transcript
+TOKEN_DENY_RULES = ("Read(./.mcp.json)", "Read(./.codex/config.toml)")
 # a `git init` in the workspace must never be able to stage the token, nor
 # the virtualenv the connect-polymarket skill builds at the workspace root
-GITIGNORE_ENTRIES = (".mcp.json", ".codex/config.toml*", ".venv/")
+GITIGNORE_ENTRIES = (".mcp.json*", ".codex/config.toml*", ".venv/")
+# picked, not tuned: refusals seen exit in ms; still running by then means launching
 LAUNCH_SETTLE_SECONDS = 2.0
+LAUNCH_PROBE_SECONDS = 10.0
 
 # Loader variables our PyInstaller bootloader leaks: its extraction directory
 # leads LD_LIBRARY_PATH and ships an older libcrypto, so a session inheriting
@@ -248,6 +250,8 @@ def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
     wanted = os.environ.get("TERMINAL")
     # by index, so $TERMINAL picks a name out of our table but is never itself spawned
     chosen = known.index(wanted) if wanted in known else None
+    if wanted and chosen is None:
+        logger.warning("ignoring $TERMINAL: Connect drives only %s", ", ".join(known))
     first = () if chosen is None else (known[chosen],)
     launches: list[list[str]] = []
     seen: set[str] = set()
@@ -354,7 +358,8 @@ class Workspace:
         for candidate in order:
             if candidate in TERMINAL_COMMANDS:
                 via = "a terminal"
-                opened = _open_terminal(self.path, TERMINAL_COMMANDS[candidate])
+                command = TERMINAL_COMMANDS[candidate]
+                opened = _resolves(command) and _open_terminal(self.path, command)
             else:
                 url = self.deep_link(candidate)  # only order[0] can be unknown
                 via = url.split("?", maxsplit=1)[0]
@@ -433,12 +438,17 @@ class Workspace:
         if path.exists():
             try:
                 config = tomllib.loads(path.read_text(encoding="utf-8"))
-            except tomllib.TOMLDecodeError:
+                for table in ("mcp_servers", "sandbox_workspace_write"):
+                    if not isinstance(config.get(table, {}), dict):
+                        raise ValueError(f"{table} is not a table")
+            except ValueError as e:
+                config = {}
                 backup = path.with_suffix(".toml.bak")
                 path.replace(backup)
                 logger.warning(
-                    "existing %s is invalid TOML; backed up to %s and rewriting",
+                    "existing %s is unusable (%s); backed up to %s and rewriting",
                     path,
+                    e,
                     backup,
                 )
         config.setdefault("mcp_servers", {})[MCP_SERVER_NAME] = {
@@ -586,6 +596,32 @@ def _command_file(cwd: str, command: str) -> str:
         )
     os.chmod(path, 0o700)
     return path
+
+
+def _resolves(command: str) -> bool:
+    """Whether `command` resolves where a terminal session would run it."""
+    if sys.platform == "win32":
+        return shutil.which(command) is not None
+    try:
+        code = subprocess.run(  # nosec B603
+            [_login_shell(), "-lic", f"command -v {command}"],
+            env=harness_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=LAUNCH_PROBE_SECONDS,
+            check=False,
+        ).returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.warning(
+            "could not check that %s resolves (%s); trying anyway", command, e
+        )
+        return True
+    if code:
+        logger.warning(
+            "%s is not on the login shell's PATH; not opening a terminal", command
+        )
+    return code == 0
 
 
 def _open_terminal(store_path: Path, command: str) -> bool:

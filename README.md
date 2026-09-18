@@ -92,7 +92,10 @@ when it names a terminal Connect knows how to drive, then
 runs through the operator's `$SHELL` when `/etc/shells` lists it. On macOS,
 Terminal.app opens a self-deleting `.command` file, which needs no Automation
 permission. On Windows, Windows Terminal, then `cmd.exe`. The CLI cannot
-pre-fill a prompt, so that session opens empty.
+pre-fill a prompt, so that session opens empty. A terminal only opens once
+`codex` resolves in that shell (`shutil.which` on Windows); otherwise the
+launch fails as not installed, and a fallback moves on, instead of flashing
+a window that cannot find it.
 
 Codex loads a project's `.codex/config.toml` — our MCP entry with it — only
 once the operator trusts the folder, and asks them to the first time a session
@@ -103,7 +106,11 @@ brief tells the agent to say so.
 The workspace config turns on `sandbox_workspace_write.network_access`, unless
 the file already sets it: Codex's `workspace-write` sandbox otherwise blocks
 every socket, the signer on localhost included, and the skills' scripts need
-the network. Two differences from Claude Code remain. Every MCP tool call asks
+the network. It is all or nothing on purpose: Codex's permission profiles can
+narrow network access to a domain allowlist, but its private-network guard
+blocks loopback, where the signer is, unless `allow_local_binding` is also set,
+and the skills reach operator-configured RPCs and several venue APIs, so the
+list would differ per operator. Two differences from Claude Code remain. Every MCP tool call asks
 for approval, as Claude Code's do without an allow rule. And there is no
 equivalent of the `Read` deny rule: the token in `.codex/config.toml` is
 gitignored, not kept out of transcripts.
@@ -211,7 +218,8 @@ it opens in. Repeated auth failures are audited to the activity log and
 rate-limited (429) so a probed token is loud, not silent. The
 token itself is header-only, rotated per run, dies with the process, and the
 provisioned workspace ships a `.gitignore` so it is never committed and, for
-Claude Code, a `Read` deny rule so it is not read into session transcripts.
+Claude Code, `Read` deny rules on `.mcp.json` and `.codex/config.toml` so it is
+not read into session transcripts.
 
 Out of scope for v1: SSH port forwarding or running on a shared/remote
 machine voids the loopback assumption entirely, and same-user local malware

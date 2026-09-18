@@ -209,7 +209,7 @@ def test_claude_settings_deny_rule_merged(store_path: Path) -> None:
     settings_path.write_text("{nope")
     provisioned(store_path)
     config = json.loads(settings_path.read_text())
-    assert config["permissions"]["deny"] == ["Read(./.mcp.json)"]
+    assert config["permissions"]["deny"] == list(workspace.TOKEN_DENY_RULES)
     # the user's broken content stays recoverable next to the rewrite
     assert settings_path.with_suffix(".json.bak").read_text() == "{nope"
 
@@ -295,6 +295,7 @@ def test_provisioning_ships_token_hygiene(store_path: Path) -> None:
     assert ".mcp.json" in (store_path / ".gitignore").read_text()
     config = json.loads((store_path / ".claude" / "settings.json").read_text())
     assert "Read(./.mcp.json)" in config["permissions"]["deny"]
+    assert "Read(./.codex/config.toml)" in config["permissions"]["deny"]
 
 
 def test_deep_links(store_path: Path) -> None:
@@ -481,6 +482,7 @@ def test_an_unnamed_harness_falls_back_to_the_other_claude_code(
         return False
 
     monkeypatch.setattr(workspace, "_open_url", refuse)
+    monkeypatch.setattr(workspace, "_resolves", lambda command: True)
     monkeypatch.setattr(workspace, "_open_terminal", no_terminal)
     with pytest.raises(workspace.LaunchError, match="none of claude_code_desktop") as e:
         agent_workspace.open_session(fallback=True)
@@ -539,6 +541,11 @@ def test_codex_config_keeps_what_else_is_in_it(store_path: Path) -> None:
     assert set(tomllib.loads(path.read_text())["mcp_servers"]) == {"pearl-connect"}
     assert path.with_suffix(".toml.bak").read_text() == "[nope"
 
+    path.write_text('mcp_servers = "not a table"\n')
+    provisioned(store_path)
+    assert set(tomllib.loads(path.read_text())["mcp_servers"]) == {"pearl-connect"}
+    assert "not a table" in path.with_suffix(".toml.bak").read_text()
+
 
 def test_codex_gets_the_brief_skills_and_ignore_rule(store_path: Path) -> None:
     """AGENTS.md, .agents/skills and the gitignore entry mirror the Claude side."""
@@ -573,6 +580,7 @@ def test_codex_cli_opens_in_a_terminal(
         opened.append((path, command))
         return True
 
+    monkeypatch.setattr(workspace, "_resolves", lambda command: True)
     monkeypatch.setattr(workspace, "_open_terminal", terminal)
     monkeypatch.setattr(workspace, "_open_url", pytest.fail)
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
@@ -582,7 +590,10 @@ def test_codex_cli_opens_in_a_terminal(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executables and symlinks")
 def test_linux_terminals_are_tried_in_the_operators_order(
-    store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A known $TERMINAL, then x-terminal-emulator by its target, then the known list."""
     bin_dir = tmp_path / "bin"
@@ -614,7 +625,9 @@ def test_linux_terminals_are_tried_in_the_operators_order(
 
     monkeypatch.setenv("TERMINAL", "my-term")
     monkeypatch.setenv("SHELL", "/opt/not-a-login-shell")
-    launches = workspace.terminal_launches(store_path, "codex")
+    with caplog.at_level("WARNING"):
+        launches = workspace.terminal_launches(store_path, "codex")
+    assert "ignoring $TERMINAL" in caplog.text
     names = ("x-terminal-emulator", "kitty", "xterm")
     assert [launch[0] for launch in launches] == [str(bin_dir / n) for n in names]
     assert launches[0][-1] == "/bin/sh -lic codex"
@@ -692,3 +705,64 @@ def test_open_terminal_moves_past_terminals_that_fail(
 
     launches[:] = [["missing"], ["bad-flags"]]
     assert not open_terminal(store_path, "codex")
+
+
+def test_a_missing_codex_never_opens_a_terminal(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without codex, codex_cli fails as not installed and a fallback moves past it."""
+    monkeypatch.setattr(workspace, "_resolves", lambda command: False)
+    monkeypatch.setattr(workspace, "_open_terminal", pytest.fail)
+    monkeypatch.setattr(workspace, "_open_url", lambda url: False)
+    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    with pytest.raises(workspace.LaunchError, match="is it installed"):
+        agent_workspace.open_session("codex_cli")
+    with pytest.raises(workspace.LaunchError, match="none of"):
+        agent_workspace.open_session(fallback=True)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (0, True),
+        (1, False),
+        (workspace.subprocess.TimeoutExpired("sh", 10), True),
+        (OSError("no shell"), True),
+    ],
+)
+def test_resolves_asks_the_login_shell(
+    outcome: t.Any, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex counts as installed if the login shell finds it, or cannot say."""
+    monkeypatch.setattr(workspace.sys, "platform", "linux")
+    monkeypatch.setattr(workspace, "_login_shell", lambda: "/bin/zsh")
+    seen: dict = {}
+
+    class Result:
+        """subprocess result stub."""
+
+        returncode = outcome
+
+    def run(args: list[str], **kwargs: t.Any) -> Result:
+        """Record the probe and answer with the outcome."""
+        seen.update(kwargs, args=args)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return Result()
+
+    monkeypatch.setattr(workspace.subprocess, "run", run)
+    assert workspace._resolves("codex") is expected  # pylint: disable=protected-access
+    assert seen["args"] == ["/bin/zsh", "-lic", "command -v codex"]
+    streams = (seen["stdin"], seen["stdout"], seen["stderr"])
+    assert workspace.subprocess.PIPE not in streams
+
+
+def test_resolves_on_windows_looks_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows runs codex from our own PATH, so that is where to look."""
+    monkeypatch.setattr(workspace.sys, "platform", "win32")
+    monkeypatch.setattr(
+        workspace.shutil, "which", lambda name: None if name == "codex" else "C:/x"
+    )
+    resolves = workspace._resolves  # pylint: disable=protected-access
+    assert not resolves("codex")
+    assert resolves("other")
