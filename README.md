@@ -249,6 +249,17 @@ asset, so its default is 0.1 of that asset — 10^17 base units for native and
 OLAS mechs, 10^5 for USDC ones, including Robinhood Chain, where that payment
 type is USDG. `mech_tools` reports the asset as `payment_token`.
 
+Each Mech is run by its own operator, and submitting a request means agreeing
+to that operator's terms. `mech_tools` reports `valory_operated` per mech: it
+resolves the mech's own name under `mech.valory.xyz`, built from the mech
+address without `0x`, a hyphen, then the chain id. Valory creates one DNS record per
+mech it operates, so a name that resolves means Valory operates that mech
+and Valory AG's Mech Terms apply, which the report states in `terms`. The
+answer does not depend on the mech being up. The check fails closed: a name
+that does not resolve, a timed-out lookup, or a zone that answers every
+name all read as not identified. Whatever terms link an operator published in its metadata is
+passed through as `terms_url`, reported as found rather than endorsed.
+
 An optional `request_context` dict is passed through unmodified as a
 top-level key of the request metadata, for the tool to read; the bundled skill
 documents the keys the predict tools look for. Off-chain it is part of the

@@ -59,6 +59,7 @@ from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
 from connect.mech_rpc import RPC_LOCK, listing_mechs
+from connect.mech_terms import terms_report
 from connect.mech_types import (
     MechError,
     MechUnknownRequest,
@@ -443,6 +444,10 @@ class MechService:
         info["offchain_capable"] = blocker is None
         if blocker is not None:
             info["offchain_note"] = blocker
+        # Who the session contracts with, and whose terms that request falls
+        # under. Only the Valory claim is ours to make; a published terms link
+        # is reported as found.
+        info.update(terms_report(priority_mech, chain, read.document))
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:
