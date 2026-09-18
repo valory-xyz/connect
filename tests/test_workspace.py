@@ -214,6 +214,12 @@ def test_claude_settings_deny_rule_merged(store_path: Path) -> None:
     # the user's broken content stays recoverable next to the rewrite
     assert settings_path.with_suffix(".json.bak").read_text() == "{nope"
 
+    # a deny that is not a list cannot take our rules, so it is replaced
+    settings_path.write_text('{"permissions": {"deny": "Read(./secret)"}}')
+    provisioned(store_path)
+    config = json.loads(settings_path.read_text())
+    assert config["permissions"]["deny"] == list(workspace.TOKEN_DENY_RULES)
+
 
 def test_harness_env_drops_what_our_packaging_leaks(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -694,13 +700,15 @@ def test_macos_and_windows_terminals(
     """Terminal.app opens a self-deleting script; Windows tries wt, then cmd."""
     posix = sys.platform != "win32"  # read it before the patch below rewrites it
     monkeypatch.setattr(workspace.sys, "platform", "darwin")
+    monkeypatch.setattr(workspace, "_login_shell", lambda: "/bin/zsh")
     spaced = store_path / "work dir"
     [launch] = workspace.terminal_launches(spaced, "codex")
     assert launch[:-1] == ["open", "-a", "Terminal"]
     script = Path(launch[-1])
     assert script.suffix == ".command"
     assert script.read_text(encoding="utf-8") == (
-        f'#!/bin/sh\nrm -f "$0"\ncd {shlex.quote(str(spaced))} && exec codex\n'
+        '#!/bin/sh\nrm -f "$0"\nexec /bin/zsh -lic '
+        f"'cd -- \"$1\" && exec codex' codex {shlex.quote(str(spaced))}\n"
     )
     if posix:
         assert stat.S_IMODE(script.stat().st_mode) == 0o700

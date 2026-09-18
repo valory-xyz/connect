@@ -242,14 +242,13 @@ def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
     """Command lines that each open a terminal running `command` in store_path."""
     cwd = str(store_path)
     if sys.platform == "darwin":
-        return [["open", "-a", "Terminal", _command_file(cwd, command)]]
+        return [["open", "-a", "Terminal", _command_file(_shell_argv(cwd, command))]]
     if sys.platform == "win32":
         return [
             ["wt.exe", "-d", cwd, "cmd.exe", "/k", command],
             ["cmd.exe", "/c", "start", "", "/d", cwd, "cmd.exe", "/k", command],
         ]
-    # the cd is for client/server terminals, whose window ignores our cwd
-    argv = [_login_shell(), "-lic", f'cd -- "$1" && exec {command}', command, cwd]
+    argv = _shell_argv(cwd, command)
     wanted = os.environ.get("TERMINAL")
     # only a name from our table, so $TERMINAL can pick a terminal but never a program
     first = (wanted,) if wanted in LINUX_TERMINALS else ()
@@ -472,6 +471,8 @@ class Workspace:
         path = self.path / CLAUDE_SETTINGS_FILE
         config = _load_config(path, json.loads, "permissions")
         deny = config.setdefault("permissions", {}).setdefault("deny", [])
+        if not isinstance(deny, list):
+            deny = config["permissions"]["deny"] = []
         for rule in TOKEN_DENY_RULES:
             if rule not in deny:
                 deny.append(rule)
@@ -591,13 +592,17 @@ def _login_shell() -> str:
     return shutil.which("bash") or "/bin/sh"
 
 
-def _command_file(cwd: str, command: str) -> str:
-    """Write a Terminal .command file that runs `command` in cwd, then deletes itself."""
+def _shell_argv(cwd: str, command: str) -> list[str]:
+    """Run `command` in cwd through the login shell _resolves() probed."""
+    # the cd is for client/server terminals, whose window ignores our cwd
+    return [_login_shell(), "-lic", f'cd -- "$1" && exec {command}', command, cwd]
+
+
+def _command_file(argv: list[str]) -> str:
+    """Write a Terminal .command file that execs argv, then deletes itself."""
     fd, path = tempfile.mkstemp(prefix="connect-", suffix=".command")
     with os.fdopen(fd, "w", encoding="utf-8") as script:
-        script.write(
-            f'#!/bin/sh\nrm -f "$0"\ncd {shlex.quote(cwd)} && exec {command}\n'
-        )
+        script.write(f'#!/bin/sh\nrm -f "$0"\nexec {shlex.join(argv)}\n')
     os.chmod(path, 0o700)
     return path
 
