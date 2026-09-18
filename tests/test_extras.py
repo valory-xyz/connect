@@ -1474,15 +1474,19 @@ class TestWorkspaceExtras:
 
         monkeypatch.setattr(workspace.sys, "platform", "linux")
         monkeypatch.setattr(workspace.subprocess, "Popen", Process)
-        assert workspace._open_url("claude://x")  # pylint: disable=protected-access
+        assert workspace._open_url(
+            "claude://x", Path("/ws")
+        )  # pylint: disable=protected-access
 
         Process.outcome = (None, b"")
-        assert workspace._open_url("claude://x")  # pylint: disable=protected-access
+        assert workspace._open_url(
+            "claude://x", Path("/ws")
+        )  # pylint: disable=protected-access
 
         Process.outcome = (4, b"no handler for x")
         with caplog.at_level("WARNING"):
             assert not workspace._open_url(  # pylint: disable=protected-access
-                "claude://x?folder=/tmp"  # nosec B108
+                "claude://x?folder=/tmp", Path("/ws")  # nosec B108
             )
         assert "exit 4" in caplog.text
         assert "no handler for x" in caplog.text
@@ -1495,7 +1499,7 @@ class TestWorkspaceExtras:
         Process.outcome = (1, b"")
         with caplog.at_level("WARNING"):
             assert not workspace._open_url(  # pylint: disable=protected-access
-                "claude://x"
+                "claude://x", Path("/ws")
             )
         assert "exit 1" in caplog.text
 
@@ -1507,6 +1511,6 @@ class TestWorkspaceExtras:
         )
         with caplog.at_level("WARNING"):
             assert not workspace._open_url(  # pylint: disable=protected-access
-                "claude://x"
+                "claude://x", Path("/ws")
             )
         assert "no handler" in caplog.text

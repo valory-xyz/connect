@@ -89,7 +89,7 @@ Two harnesses open Codex. `codex_desktop` uses the desktop app's
 opens a terminal running `codex` in STORE_PATH. On Linux that is `$TERMINAL`
 when it names a terminal Connect knows how to drive, then
 `x-terminal-emulator`, then the first known emulator installed, and `codex`
-runs through the operator's `$SHELL` when `/etc/shells` lists it. On macOS,
+runs through the operator's login shell when it is a POSIX one, else bash. On macOS,
 Terminal.app opens a self-deleting `.command` file, which needs no Automation
 permission. On Windows, Windows Terminal, then `cmd.exe`. The CLI cannot
 pre-fill a prompt, so that session opens empty. A terminal only opens once
@@ -218,7 +218,7 @@ it opens in. Repeated auth failures are audited to the activity log and
 rate-limited (429) so a probed token is loud, not silent. The
 token itself is header-only, rotated per run, dies with the process, and the
 provisioned workspace ships a `.gitignore` so it is never committed and, for
-Claude Code, `Read` deny rules on `.mcp.json` and `.codex/config.toml` so it is
+Claude Code, `Read` deny rules on `.mcp.json*` and `.codex/config.toml*` so it is
 not read into session transcripts.
 
 Out of scope for v1: SSH port forwarding or running on a shared/remote

@@ -24,6 +24,7 @@ import shlex
 import stat
 import sys
 import tomllib
+import types
 import typing as t
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -103,7 +104,7 @@ def test_a_second_run_rotates_the_token(store_path: Path) -> None:
 
 
 def test_lib_installed_and_overwritten(store_path: Path) -> None:
-    """The shared modules land in .claude/lib and are refreshed every boot."""
+    """The shared modules land in .claude/lib and .agents/lib and are refreshed every boot."""
     provisioned(store_path)
     module = store_path / ".claude" / "lib" / "uniswap.py"
     assert module.exists()
@@ -203,7 +204,7 @@ def test_claude_settings_deny_rule_merged(store_path: Path) -> None:
     config = json.loads(settings_path.read_text())
     assert config["model"] == "opus"
     assert "WebFetch" in config["permissions"]["deny"]
-    assert "Read(./.mcp.json)" in config["permissions"]["deny"]
+    assert "Read(./.mcp.json*)" in config["permissions"]["deny"]
 
     # invalid JSON is backed up, then rewritten rather than crashing the boot
     settings_path.write_text("{nope")
@@ -282,8 +283,11 @@ def test_launch_hands_the_url_handler_a_scrubbed_environment(
             return 0
 
     monkeypatch.setattr(workspace.subprocess, "Popen", Process)
-    assert workspace._open_url("claude://x")  # pylint: disable=protected-access
+    assert workspace._open_url(
+        "claude://x", Path("/ws")
+    )  # pylint: disable=protected-access
     assert seen["args"] == [opener, "claude://x"]
+    assert seen["cwd"] == Path("/ws")
     assert "LD_LIBRARY_PATH" not in seen["env"]
     streams = (seen["stdin"], seen["stdout"], seen["stderr"])
     assert workspace.subprocess.PIPE not in streams
@@ -294,8 +298,8 @@ def test_provisioning_ships_token_hygiene(store_path: Path) -> None:
     provisioned(store_path)
     assert ".mcp.json" in (store_path / ".gitignore").read_text()
     config = json.loads((store_path / ".claude" / "settings.json").read_text())
-    assert "Read(./.mcp.json)" in config["permissions"]["deny"]
-    assert "Read(./.codex/config.toml)" in config["permissions"]["deny"]
+    assert "Read(./.mcp.json*)" in config["permissions"]["deny"]
+    assert "Read(./.codex/config.toml*)" in config["permissions"]["deny"]
 
 
 def test_deep_links(store_path: Path) -> None:
@@ -386,7 +390,7 @@ def test_an_unknown_harness_raises_even_with_a_fallback_offered(
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     tried: list[str] = []
 
-    def accept(url: str) -> bool:
+    def accept(url: str, _cwd: Path) -> bool:
         tried.append(url)
         return True
 
@@ -421,7 +425,7 @@ def test_a_named_harness_never_falls_back(
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     tried: list[str] = []
 
-    def refuse(url: str) -> bool:
+    def refuse(url: str, _cwd: Path) -> bool:
         tried.append(url)
         return False
 
@@ -433,7 +437,7 @@ def test_a_named_harness_never_falls_back(
 
     tried.clear()
 
-    def accept(url: str) -> bool:
+    def accept(url: str, _cwd: Path) -> bool:
         tried.append(url)
         return True
 
@@ -454,7 +458,7 @@ def test_an_unnamed_harness_falls_back_to_the_other_claude_code(
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     tried: list[str] = []
 
-    def only_the_cli(url: str) -> bool:
+    def only_the_cli(url: str, _cwd: Path) -> bool:
         tried.append(url)
         return url.startswith("claude-cli://")
 
@@ -473,7 +477,7 @@ def test_an_unnamed_harness_falls_back_to_the_other_claude_code(
     # harness" is no answer once both harnesses have already been tried
     tried.clear()
 
-    def refuse(url: str) -> bool:
+    def refuse(url: str, _cwd: Path) -> bool:
         tried.append(url)
         return False
 
@@ -547,6 +551,28 @@ def test_codex_config_keeps_what_else_is_in_it(store_path: Path) -> None:
     assert "not a table" in path.with_suffix(".toml.bak").read_text()
 
 
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        (".mcp.json", b"{nope"),
+        (".mcp.json", b'{"mcpServers": []}'),
+        (".codex/config.toml", b"model = '\xe9'\n"),
+        (".codex/config.toml", b"[[mcp_servers]]\n"),
+        (".claude/settings.json", b'"just a string"'),
+    ],
+)
+def test_an_unusable_config_is_set_aside_not_fatal(
+    store_path: Path, name: str, content: bytes
+) -> None:
+    """Undecodable or wrong-shaped, the file is kept as .bak and provisioning goes on."""
+    path = store_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    provisioned(store_path)
+    assert path.with_name(f"{path.name}.bak").read_bytes() == content
+    assert "Bearer" in (store_path / ".mcp.json").read_text()
+
+
 def test_codex_gets_the_brief_skills_and_ignore_rule(store_path: Path) -> None:
     """AGENTS.md, .agents/skills and the gitignore entry mirror the Claude side."""
     provisioned(store_path)
@@ -598,18 +624,16 @@ def test_linux_terminals_are_tried_in_the_operators_order(
     """A known $TERMINAL, then x-terminal-emulator by its target, then the known list."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for name in ("my-term", "ptyxis", "kitty", "xterm"):
+    for name in ("my-term", "ptyxis", "kitty", "xterm", "gnome-terminal.wrapper"):
         (bin_dir / name).touch(mode=0o755)
     (bin_dir / "x-terminal-emulator").symlink_to(bin_dir / "ptyxis")
-    shells = tmp_path / "shells"
-    shells.write_text("# login shells\n/bin/zsh\n", encoding="utf-8")
-    monkeypatch.setattr(workspace, "ETC_SHELLS", shells)
+    monkeypatch.setattr(workspace, "_login_shell", lambda: "/bin/zsh")
     monkeypatch.setattr(workspace.sys, "platform", "linux")
     monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setenv("TERMINAL", "xterm")
-    monkeypatch.setenv("SHELL", "/bin/zsh")
     cwd = str(store_path)
-    shell = ["/bin/zsh", "-lic", "codex"]
+    script = f"cd {shlex.quote(cwd)} && exec codex"
+    shell = ["/bin/zsh", "-lic", script]
     assert workspace.terminal_launches(store_path, "codex") == [
         [str(bin_dir / "xterm"), "-e", *shell],
         [
@@ -618,25 +642,51 @@ def test_linux_terminals_are_tried_in_the_operators_order(
             "-d",
             cwd,
             "-x",
-            "/bin/zsh -lic codex",
+            shlex.join(shell),
         ],
         [str(bin_dir / "kitty"), "--directory", cwd, *shell],
     ]
 
     monkeypatch.setenv("TERMINAL", "my-term")
-    monkeypatch.setenv("SHELL", "/opt/not-a-login-shell")
     with caplog.at_level("WARNING"):
         launches = workspace.terminal_launches(store_path, "codex")
     assert "ignoring $TERMINAL" in caplog.text
     names = ("x-terminal-emulator", "kitty", "xterm")
     assert [launch[0] for launch in launches] == [str(bin_dir / n) for n in names]
-    assert launches[0][-1] == "/bin/sh -lic codex"
 
-    shells.unlink()
-    monkeypatch.setenv("SHELL", "/bin/zsh")
-    assert (
-        workspace.terminal_launches(store_path, "codex")[0][-1] == "/bin/sh -lic codex"
-    )
+    # a Debian alternative resolves to a name we do not drive: policy's -e form
+    (bin_dir / "x-terminal-emulator").unlink()
+    (bin_dir / "x-terminal-emulator").symlink_to(bin_dir / "gnome-terminal.wrapper")
+    launches = workspace.terminal_launches(store_path, "codex")
+    assert launches[0] == [str(bin_dir / "x-terminal-emulator"), "-e", *shell]
+
+
+@pytest.mark.parametrize(
+    ("login", "bash", "expected"),
+    [
+        ("/usr/bin/zsh", "/usr/bin/bash", "/usr/bin/zsh"),
+        ("/usr/bin/fish", "/usr/bin/bash", "/usr/bin/bash"),
+        ("/bin/tcsh", None, "/bin/sh"),
+        (None, "/usr/bin/bash", "/usr/bin/bash"),
+    ],
+)
+def test_login_shell_takes_lic(
+    monkeypatch: pytest.MonkeyPatch,
+    login: str | None,
+    bash: str | None,
+    expected: str,
+) -> None:
+    """The login shell when it takes -lic; else bash, which reads ~/.bashrc; else sh."""
+
+    def getpwuid(_uid: int) -> t.Any:
+        if login is None:
+            raise KeyError(_uid)
+        return types.SimpleNamespace(pw_shell=login)
+
+    monkeypatch.setitem(sys.modules, "pwd", types.SimpleNamespace(getpwuid=getpwuid))
+    monkeypatch.setattr(workspace.os, "getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(workspace.shutil, "which", lambda _name: bash)
+    assert workspace._login_shell() == expected  # pylint: disable=protected-access
 
 
 def test_macos_and_windows_terminals(
@@ -685,6 +735,8 @@ def test_open_terminal_moves_past_terminals_that_fail(
             assert "LD_LIBRARY_PATH" not in kwargs["env"]
             started.append(argv)
             self.argv = argv
+            if argv == ["bad-flags"]:
+                kwargs["stderr"].write(b"unknown option -lic")
 
         def wait(self, timeout: float) -> int:
             """Exit at once, or keep running past the timeout as a window does."""
@@ -698,7 +750,7 @@ def test_open_terminal_moves_past_terminals_that_fail(
         assert open_terminal(store_path, "codex")
     assert started == [["bad-flags"], ["client"]]
     assert "missing would not start" in caplog.text
-    assert "bad-flags exited with 2" in caplog.text
+    assert "bad-flags exited with 2: unknown option -lic" in caplog.text
 
     launches[:] = [["window"]]
     assert open_terminal(store_path, "codex")
@@ -713,7 +765,7 @@ def test_a_missing_codex_never_opens_a_terminal(
     """Without codex, codex_cli fails as not installed and a fallback moves past it."""
     monkeypatch.setattr(workspace, "_resolves", lambda command: False)
     monkeypatch.setattr(workspace, "_open_terminal", pytest.fail)
-    monkeypatch.setattr(workspace, "_open_url", lambda url: False)
+    monkeypatch.setattr(workspace, "_open_url", lambda url, cwd: False)
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     with pytest.raises(workspace.LaunchError, match="is it installed"):
         agent_workspace.open_session("codex_cli")

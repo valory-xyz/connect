@@ -82,13 +82,15 @@ AGENT_DIRS = (Path(".claude"), Path(".agents"))
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harnesses read these themselves; the model never needs to, and reading
 # one would put the bearer token into the session transcript
-TOKEN_DENY_RULES = ("Read(./.mcp.json)", "Read(./.codex/config.toml)")
+TOKEN_DENY_RULES = ("Read(./.mcp.json*)", "Read(./.codex/config.toml*)")
 # a `git init` in the workspace must never be able to stage the token, nor
 # the virtualenv the connect-polymarket skill builds at the workspace root
 GITIGNORE_ENTRIES = (".mcp.json*", ".codex/config.toml*", ".venv/")
 # picked, not tuned: refusals seen exit in ms; still running by then means launching
 LAUNCH_SETTLE_SECONDS = 2.0
 LAUNCH_PROBE_SECONDS = 10.0
+# xdg-open's generic fallback runs the handler in the foreground until it exits
+URL_OPENER_SECONDS = 15.0
 
 # Loader variables our PyInstaller bootloader leaks: its extraction directory
 # leads LD_LIBRARY_PATH and ships an older libcrypto, so a session inheriting
@@ -222,7 +224,8 @@ DEEP_LINKS: dict[str, t.Callable[[Path], str]] = {
 }
 TERMINAL_COMMANDS: dict[str, str] = {HARNESS_CODEX_CLI: "codex"}
 
-ETC_SHELLS = Path("/etc/shells")
+# shells that take `-lic`; tcsh, fish and friends do not
+POSIX_SHELLS = ("bash", "zsh", "ksh", "mksh", "dash", "sh")
 LINUX_TERMINALS: dict[str, t.Callable[[str, list[str]], list[str]]] = {
     "ptyxis": lambda cwd, argv: ["--new-window", "-d", cwd, "-x", shlex.join(argv)],
     "gnome-terminal": lambda cwd, argv: [f"--working-directory={cwd}", "--", *argv],
@@ -245,10 +248,12 @@ def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
             ["wt.exe", "-d", cwd, "cmd.exe", "/k", command],
             ["cmd.exe", "/c", "start", "", "/d", cwd, "cmd.exe", "/k", command],
         ]
-    argv = [_login_shell(), "-lic", command]
+    # the cd is for client/server terminals, whose window ignores our cwd
+    argv = [_login_shell(), "-lic", f"cd {shlex.quote(cwd)} && exec {command}"]
     known = tuple(LINUX_TERMINALS)
     wanted = os.environ.get("TERMINAL")
-    # by index, so $TERMINAL picks a name out of our table but is never itself spawned
+    # the membership test is the check; spawning our table's copy keeps taint
+    # scanners from following $TERMINAL into argv
     chosen = known.index(wanted) if wanted in known else None
     if wanted and chosen is None:
         logger.warning("ignoring $TERMINAL: Connect drives only %s", ", ".join(known))
@@ -257,10 +262,13 @@ def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
     seen: set[str] = set()
     for name in (*first, "x-terminal-emulator", *known):
         found = shutil.which(name)
-        if found is None or os.path.realpath(found) in seen:
+        if found is None:
             continue
         real = os.path.realpath(found)
+        if real in seen:
+            continue
         seen.add(real)
+        # x-terminal-emulator wrappers take xterm's `-e program args...` (Debian policy)
         build = LINUX_TERMINALS.get(Path(real).name, LINUX_TERMINALS["xterm"])
         launches.append([found, *build(cwd, argv)])
     return launches
@@ -363,7 +371,7 @@ class Workspace:
             else:
                 url = self.deep_link(candidate)  # only order[0] can be unknown
                 via = url.split("?", maxsplit=1)[0]
-                opened = _open_url(url)
+                opened = _open_url(url, self.path)
             if not opened:
                 continue
             logger.info("launched %s via %s", candidate, via)
@@ -415,14 +423,7 @@ class Workspace:
     def _write_mcp_config(self) -> None:
         """Merge our server entry into .mcp.json (0600), preserving other entries."""
         path = self.path / MCP_CONFIG_FILE
-        config: dict = {}
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(existing, dict):
-                    config = existing
-            except json.JSONDecodeError:
-                logger.warning("existing %s is invalid JSON; rewriting it", path)
+        config = _load_config(path, json.loads, "mcpServers")
         config.setdefault("mcpServers", {})[MCP_SERVER_NAME] = {
             "type": "http",
             "url": mcp_url(),
@@ -434,23 +435,9 @@ class Workspace:
     def _write_codex_config(self) -> None:
         """Merge our server entry into .codex/config.toml (0600), keeping the rest."""
         path = self.path / CODEX_CONFIG_FILE
-        config: dict = {}
-        if path.exists():
-            try:
-                config = tomllib.loads(path.read_text(encoding="utf-8"))
-                for table in ("mcp_servers", "sandbox_workspace_write"):
-                    if not isinstance(config.get(table, {}), dict):
-                        raise ValueError(f"{table} is not a table")
-            except ValueError as e:
-                config = {}
-                backup = path.with_suffix(".toml.bak")
-                path.replace(backup)
-                logger.warning(
-                    "existing %s is unusable (%s); backed up to %s and rewriting",
-                    path,
-                    e,
-                    backup,
-                )
+        config = _load_config(
+            path, tomllib.loads, "mcp_servers", "sandbox_workspace_write"
+        )
         config.setdefault("mcp_servers", {})[MCP_SERVER_NAME] = {
             "url": mcp_url(),
             "http_headers": {"Authorization": f"Bearer {self._token}"},
@@ -484,28 +471,13 @@ class Workspace:
         User-added settings in the file are preserved.
         """
         path = self.path / CLAUDE_SETTINGS_FILE
-        config: dict = {}
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(existing, dict):
-                    config = existing
-            except json.JSONDecodeError:
-                # the file is user-owned config: one typo must not wipe it —
-                # keep the broken content recoverable next to the rewrite
-                backup = path.with_suffix(".json.bak")
-                path.replace(backup)
-                logger.warning(
-                    "existing %s is invalid JSON; backed up to %s and rewriting",
-                    path,
-                    backup,
-                )
+        config = _load_config(path, json.loads, "permissions")
         deny = config.setdefault("permissions", {}).setdefault("deny", [])
         for rule in TOKEN_DENY_RULES:
             if rule not in deny:
                 deny.append(rule)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        _write_private(path, json.dumps(config, indent=2))
 
     def _install_lib(self) -> None:
         """Overwrite the shared modules our skills import, beside each skills dir."""
@@ -567,8 +539,37 @@ def harness_env() -> dict[str, str]:
     return scrubbed
 
 
+def _load_config(path: Path, loads: t.Callable[[str], t.Any], *tables: str) -> dict:
+    """Read a config we merge into; set aside one we cannot, rather than fail.
+
+    It is the operator's file too, so a broken one is kept as `.bak`, not
+    wiped; failing instead would leave the server unhealthy on every retry.
+    """
+    try:
+        config = loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except ValueError as e:  # parse and decode errors alike
+        problem = str(e)
+    else:
+        if isinstance(config, dict) and all(
+            isinstance(config.get(table, {}), dict) for table in tables
+        ):
+            return config
+        problem = "not the expected tables"
+    backup = path.with_name(f"{path.name}.bak")
+    path.replace(backup)
+    logger.warning(
+        "existing %s is unusable (%s); backed up to %s and rewriting",
+        path,
+        problem,
+        backup,
+    )
+    return {}
+
+
 def _write_private(path: Path, text: str) -> None:
-    """Atomically replace a token-bearing file, readable by its owner alone."""
+    """Atomically replace a file, readable by its owner alone."""
     tmp = path.with_name(f"{path.name}.tmp")
     tmp.unlink(missing_ok=True)  # a stale tmp may have looser permissions
     tmp.touch(mode=0o600)
@@ -578,13 +579,17 @@ def _write_private(path: Path, text: str) -> None:
 
 
 def _login_shell() -> str:
-    """Return the operator's $SHELL if /etc/shells lists it, else /bin/sh."""
-    wanted = os.environ.get("SHELL")
+    """Return the operator's login shell if it takes `-lic`, else bash, else sh."""
+    import pwd  # pylint: disable=import-outside-toplevel # POSIX only
+
     try:
-        listed = ETC_SHELLS.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return "/bin/sh"
-    return next((shell for shell in listed if shell == wanted), "/bin/sh")
+        shell = pwd.getpwuid(os.getuid()).pw_shell
+    except KeyError:
+        shell = ""
+    if Path(shell).name in POSIX_SHELLS:
+        return shell
+    # bash, not sh: dash never reads the ~/.bashrc that puts codex on PATH
+    return shutil.which("bash") or "/bin/sh"
 
 
 def _command_file(cwd: str, command: str) -> str:
@@ -624,35 +629,49 @@ def _resolves(command: str) -> bool:
     return code == 0
 
 
+def _launch(
+    argv: list[str], env: dict[str, str], wait: float, cwd: Path
+) -> tuple[int | None, str]:
+    """Start argv detached; return its exit code (None if still running) and stderr."""
+    # no pipes: the app a launcher starts inherits them and outlives any wait
+    with tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(  # pylint: disable=consider-using-with # nosec B603
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        try:
+            code: int | None = process.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            code = None
+        stderr.seek(0)
+        return code, stderr.read(4096).decode(errors="replace").strip()
+
+
+def _detail(text: str) -> str:
+    return f": {text[:200]}" if text else ""
+
+
 def _open_terminal(store_path: Path, command: str) -> bool:
     """Open the first terminal that starts running `command` in store_path."""
+    env = harness_env()
     for argv in terminal_launches(store_path, command):
         try:
-            process = (
-                subprocess.Popen(  # pylint: disable=consider-using-with # nosec B603
-                    argv,
-                    cwd=store_path,
-                    env=harness_env(),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            )
+            code, stderr = _launch(argv, env, LAUNCH_SETTLE_SECONDS, store_path)
         except OSError as e:
             logger.warning("terminal %s would not start: %s", argv[0], e)
             continue
-        try:
-            code = process.wait(timeout=LAUNCH_SETTLE_SECONDS)
-        except subprocess.TimeoutExpired:
+        if code in (None, 0):
             return True
-        if code == 0:
-            return True
-        logger.warning("terminal %s exited with %s", argv[0], code)
+        logger.warning("terminal %s exited with %s%s", argv[0], code, _detail(stderr))
     return False
 
 
-def _open_url(url: str) -> bool:
+def _open_url(url: str, cwd: Path) -> bool:
     link = url.split("?", maxsplit=1)[0]
     try:
         if sys.platform == "darwin":  # pragma: no cover — macOS only
@@ -664,36 +683,24 @@ def _open_url(url: str) -> bool:
             return True
         else:  # pragma: no cover — Linux/Unix only
             args = ["xdg-open", url]
-        # no pipes: the app a handler starts inherits them and outlives any wait
-        with tempfile.TemporaryFile() as stderr:
-            process = (
-                subprocess.Popen(  # pylint: disable=consider-using-with # nosec B603
-                    args,
-                    env=harness_env(),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=stderr,
-                    start_new_session=True,
-                )
+        code, detail = _launch(args, harness_env(), URL_OPENER_SECONDS, cwd)
+        if code is None:
+            logger.info(
+                "opener for %s still running after %ss; assuming it launched%s",
+                link,
+                URL_OPENER_SECONDS,
+                _detail(detail),
             )
-            try:
-                code = process.wait(timeout=LAUNCH_SETTLE_SECONDS)
-            except subprocess.TimeoutExpired:
-                return True
-            if code == 0:
-                return True
-            stderr.seek(0)
-            detail = stderr.read().decode(errors="replace").strip()
+            return True
+        if code == 0:
+            return True
         # Loudly, and at a level the default config shows. This is the only
         # place the OS says *why* a link did not open, and the caller turns
         # every failure into the same "is it installed?" guess — with a
         # fallback trying several links, a silent first refusal would leave the
         # operator's actual problem nowhere to be read.
         logger.warning(
-            "deep link %s was refused (exit %s)%s",
-            link,
-            code,
-            f": {detail[:200]}" if detail else "",
+            "deep link %s was refused (exit %s)%s", link, code, _detail(detail)
         )
         return False
     except Exception as e:  # pylint: disable=broad-exception-caught
