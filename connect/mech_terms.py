@@ -20,19 +20,20 @@
 """Whose terms a mech request falls under, and who operates the mech."""
 
 import logging
+import secrets
+import socket
 import typing as t
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 
-import requests
 from mech_client.utils.constants import CHAIN_NAME_TO_ID
 
 logger = logging.getLogger(__name__)
 
-# A Valory operated mech answers on a name under this zone. The zone is a
-# wildcard record, so a name resolving proves nothing: only a route existing,
-# and therefore a successful response, does.
+# Valory creates one DNS record per mech it operates under this zone, and only
+# Valory can, so a mech's name resolving is what identifies it. The answer does
+# not depend on the mech being up.
 IDENTIFICATION_ZONE = "mech.valory.xyz"
-# The mech root answers 400, so ask for the endpoint that answers 200.
-IDENTIFICATION_PATH = "/healthcheck"
 # Short: this runs inside a discovery call the session is waiting on.
 IDENTIFICATION_TIMEOUT = 3
 
@@ -40,39 +41,63 @@ MECH_TERMS_VERSION = "v1.0"
 MECH_TERMS_URL = "https://www.valory.xyz/terms/mechs"
 
 
-def identification_url(mech_address: str, chain_id: int) -> str:
-    """Build the name that identifies a mech as Valory operated.
+def identification_name(mech_address: str, chain_id: int) -> str:
+    """Build the DNS name that identifies a mech as Valory operated.
 
     :param mech_address: the mech contract address, with or without `0x`.
     :param chain_id: the chain the mech is deployed on.
-    :return: the URL the identification check requests.
+    :return: the name the identification check resolves.
     """
-    address = mech_address.lower().removeprefix("0x")
-    return f"https://{address}.{chain_id}.{IDENTIFICATION_ZONE}{IDENTIFICATION_PATH}"
+    return f"{mech_address.lower().removeprefix('0x')}.{chain_id}.{IDENTIFICATION_ZONE}"
+
+
+def _resolves(name: str) -> bool:
+    """Report whether a DNS name resolves, giving up after the timeout.
+
+    The lookup has no timeout of its own, so it runs in a thread the caller
+    stops waiting on. The pool is not used as a context manager, which would
+    wait for a hung lookup and defeat the timeout.
+
+    :param name: the DNS name to look up.
+    :return: True if the name resolved within the timeout.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        executor.submit(socket.getaddrinfo, name, None).result(
+            timeout=IDENTIFICATION_TIMEOUT
+        )
+    except (OSError, UnicodeError, FuturesTimeoutError) as exc:
+        logger.debug("%s did not resolve: %s", name, exc)
+        return False
+    finally:
+        executor.shutdown(wait=False)
+    return True
 
 
 def is_valory_operated(mech_address: str, chain: str) -> bool:
     """Report whether Valory operates a mech.
 
-    Fails closed. A timeout, a connection error, a 404, an unknown chain: all
-    mean "not identified as Valory operated". Telling a session a mech is
-    Valory's when it is not would be the harmful direction, so anything short
-    of a clear success is a no.
+    Fails closed. A name that does not resolve, a timed-out lookup, no network,
+    or an unknown chain all mean "not identified as Valory operated". Telling a
+    session a mech is Valory's when it is not would be the harmful direction.
+
+    A positive answer is also checked against a name that cannot belong to any
+    mech. If that resolves too, the zone answers every name, as a wildcard
+    record or a resolver that answers made-up names would, and the positive
+    answer proves nothing, so the check says no.
 
     :param mech_address: the mech contract address.
     :param chain: the chain name the mech is deployed on.
-    :return: True only on a successful response from the identification URL.
+    :return: True only if the mech's own name resolves and an arbitrary one does not.
     """
     chain_id = CHAIN_NAME_TO_ID.get(chain)
     if chain_id is None:
         return False
-    url = identification_url(mech_address, chain_id)
-    try:
-        response = requests.get(url, timeout=IDENTIFICATION_TIMEOUT)
-    except requests.RequestException as exc:
-        logger.debug("identification check failed for %s: %s", url, exc)
+    if not _resolves(identification_name(mech_address, chain_id)):
         return False
-    return bool(response.ok)
+    # 32 hex characters, so it can never be a 40-character mech address.
+    probe = f"{secrets.token_hex(16)}.{chain_id}.{IDENTIFICATION_ZONE}"
+    return not _resolves(probe)
 
 
 def terms_report(mech_address: str, chain: str, metadata: t.Any) -> dict:
