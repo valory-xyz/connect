@@ -213,7 +213,7 @@ type is USDG. `mech_tools` reports the asset as `payment_token`.
 Each Mech is run by its own operator, and submitting a request means agreeing
 to that operator's terms. `mech_tools` reports `valory_operated` per mech: it
 resolves the mech's own name under `mech.valory.xyz`, built from the mech
-address without `0x` and the chain id. Valory creates one DNS record per
+address without `0x`, a hyphen, then the chain id. Valory creates one DNS record per
 mech it operates, so a name that resolves means Valory operates that mech
 and Valory AG's Mech Terms apply, which the report states in `terms`. The
 answer does not depend on the mech being up. The check fails closed: a name
