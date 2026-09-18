@@ -208,7 +208,7 @@ def codex_desktop_deep_link(store_path: Path) -> str:
     """Codex desktop-app deep link, opening prompt pre-filled."""
     return (
         f"codex://threads/new?path={quote(str(store_path))}"
-        f"&prompt={quote(FIRST_PROMPT)}"
+        f"&prompt={quote(FIRST_PROMPT)}&mode=codex"
     )
 
 

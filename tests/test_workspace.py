@@ -599,6 +599,7 @@ def test_codex_deep_link(store_path: Path) -> None:
     assert parse_qs(urlparse(url).query) == {
         "path": [str(store_path)],
         "prompt": [workspace.FIRST_PROMPT],
+        "mode": ["codex"],
     }
 
 

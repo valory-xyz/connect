@@ -84,18 +84,20 @@ address, its ABI, its signature convention — is the session's problem.
 ## Codex
 
 Two harnesses open Codex. `codex_desktop` uses the desktop app's
-`codex://threads/new` link. The Codex CLI registers no URL handler, so
-`codex_cli` does what Claude Code's `claude-cli://` handler does for itself: it
-opens a terminal running `codex` in STORE_PATH. On Linux that is `$TERMINAL`
-when it names a terminal Connect knows how to drive, then
-`x-terminal-emulator`, then the first known emulator installed, and `codex`
-runs through the operator's login shell when it is a POSIX one, else bash. On macOS,
-Terminal.app opens a self-deleting `.command` file, which needs no Automation
-permission. On Windows, Windows Terminal, then `cmd.exe`. The CLI cannot
-pre-fill a prompt, so that session opens empty. A terminal only opens once
-`codex` resolves in that shell (`shutil.which` on Windows); otherwise the
-launch fails as not installed, and a fallback moves on, instead of flashing
-a window that cannot find it.
+`codex://threads/new` link, with `mode=codex` so an app sitting on its chat
+tab switches to Codex rather than opening the thread there; the parameter is
+read from the app's code, not documented, so it may change under us. The Codex
+CLI registers no URL handler, so `codex_cli` does what Claude Code's
+`claude-cli://` handler does for itself: it opens a terminal running `codex`
+in STORE_PATH. On Linux that is `$TERMINAL` when it names a terminal Connect
+knows how to drive, then `x-terminal-emulator`, then the first known emulator
+installed, and `codex` runs through the operator's login shell when it is a
+POSIX one, else bash. On macOS, Terminal.app opens a self-deleting `.command`
+file, which needs no Automation permission. On Windows, Windows Terminal, then
+`cmd.exe`. The CLI cannot pre-fill a prompt, so that session opens empty. A
+terminal only opens once `codex` resolves in that shell (`shutil.which` on
+Windows); otherwise the launch fails as not installed, and a fallback moves
+on, instead of flashing a window that cannot find it.
 
 Codex loads a project's `.codex/config.toml` — our MCP entry with it — only
 once the operator trusts the folder, and asks them to the first time a session
