@@ -250,17 +250,16 @@ def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
         ]
     # the cd is for client/server terminals, whose window ignores our cwd
     argv = [_login_shell(), "-lic", f'cd -- "$1" && exec {command}', command, cwd]
-    known = tuple(LINUX_TERMINALS)
     wanted = os.environ.get("TERMINAL")
-    # the membership test is the check; spawning our table's copy keeps taint
-    # scanners from following $TERMINAL into argv
-    chosen = known.index(wanted) if wanted in known else None
-    if wanted and chosen is None:
-        logger.warning("ignoring $TERMINAL: Connect drives only %s", ", ".join(known))
-    first = () if chosen is None else (known[chosen],)
+    # only a name from our table, so $TERMINAL can pick a terminal but never a program
+    first = (wanted,) if wanted in LINUX_TERMINALS else ()
+    if wanted and not first:
+        logger.warning(
+            "ignoring $TERMINAL: Connect drives only %s", ", ".join(LINUX_TERMINALS)
+        )
     launches: list[list[str]] = []
     seen: set[str] = set()
-    for name in (*first, "x-terminal-emulator", *known):
+    for name in (*first, "x-terminal-emulator", *LINUX_TERMINALS):
         found = shutil.which(name)
         if found is None:
             continue
