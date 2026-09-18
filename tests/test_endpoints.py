@@ -241,7 +241,10 @@ class TestOpenEndpoints:
         # the harness values it submits must be values the API accepts — a
         # typo here is invisible to every other test in the suite
         for harness in HARNESSES:
-            assert f'"{harness}"' in bundle
+            assert f'"{harness}"' in bundle, (
+                f"the bundled UI offers no {harness!r}: bundle a connect-ui "
+                "release that does (docs/agent-ui.md)"
+            )
         # the canonical shape it renders, exactly as GET /settings returns it
         served = client.get("/settings").json()
         assert set(served) == {"protected", "harness"}

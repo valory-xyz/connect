@@ -46,14 +46,14 @@ configuration.
 ## What the UI can call
 
 Same-origin `fetch` from this page, no token needed — the endpoints below are
-open or origin-gated. The bearer token belongs to the Claude session and must
+open or origin-gated. The bearer token belongs to the agent session and must
 never be embedded in the UI.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /settings` | current settings: `{"protected": {"mode", "whitelist"}, "harness"}` |
+| `GET /settings` | current settings: `{"protected": {"mode", "whitelist"}, "harness"}`. `harness` is one of `claude_code_desktop`, `claude_code_cli`, `codex_desktop`, `codex_cli`, and the harness select must offer each — a test pins every value against the bundle |
 | `PATCH /settings` | merge-patch. The keystore password is required **only** when the body touches `protected`; a `harness`-only change needs none. **The whitelist is frozen:** a `whitelist` key in the patch is refused with a 422, password or not — send `protected: {mode}` alone |
-| `POST /session` | open a Claude Code session → `{launched, harness, requested, error?}`: `requested` is the harness asked for, `harness` the one that opened — they differ when a launch falls back to the other Claude Code, and are equal when nothing opened. An optional `{"harness": …}` overrides the preference for that launch alone, and opens there or not at all |
+| `POST /session` | open an agent session → `{launched, harness, requested, error?}`: `requested` is the harness asked for, `harness` the one that opened — they differ when a launch falls back to another harness, and are equal when nothing opened. An optional `{"harness": …}` overrides the preference for that launch alone, and opens there or not at all |
 | `GET /healthcheck` | `{"is_healthy": bool}` — false until the workspace is provisioned |
 | `GET /funds-status` | balances against the funding requirements |
 

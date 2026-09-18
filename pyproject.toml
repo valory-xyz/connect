@@ -13,6 +13,7 @@ dependencies = [
     "mcp==1.28.1",
     "mech-client==0.23.0",
     "open-aea-ledger-ethereum==2.2.9",
+    "tomli-w==1.2.0",
 ]
 
 [project.scripts]
@@ -109,6 +110,7 @@ addopts = "-p no:anchorpy"
 markers = [
     "unit: marks tests as unit tests (fast, no network calls)",
     "integration: marks tests as integration tests (slow, requires network/RPC)",
+    "launch: opens a real terminal window (tox -e launch-tests)",
 ]
 
 [tool.uv]

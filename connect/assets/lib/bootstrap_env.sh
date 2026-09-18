@@ -26,8 +26,8 @@
 # assignments, so the eval above is safe and the script can still be run on
 # its own to see what it would do.
 #
-# The venv is `.venv` at the workspace ROOT — not `.claude/skills/`, which the
-# server overwrites on every boot. See SKILL.md for the rest; the one thing
+# The venv is `.venv` at the workspace ROOT — not the skills directories, which
+# the server overwrites on every boot. See SKILL.md for the rest; the one thing
 # not written there is why certifi is exported on every run and not only at
 # creation: a reused venv needs it just as much.
 

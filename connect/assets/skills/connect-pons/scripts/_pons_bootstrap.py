@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Put .claude/lib on the path; import this before any shared module."""
+"""Put the lib/ beside skills/ on the path; import this before any shared module."""
 
 import importlib.util
 import sys
@@ -27,7 +27,7 @@ LIB = Path(__file__).resolve().parents[3] / "lib"
 if not (LIB / "evm.py").is_file():
     raise ImportError(
         f"connect-pons needs the shared modules the connect server installs "
-        f"into .claude/lib; expected evm.py under {LIB}"
+        f"beside skills/; expected evm.py under {LIB}"
     )
 if importlib.util.find_spec("web3") is None:
     raise ImportError(
