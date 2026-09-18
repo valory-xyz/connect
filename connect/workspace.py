@@ -249,7 +249,7 @@ def terminal_launches(store_path: Path, command: str) -> list[list[str]]:
             ["cmd.exe", "/c", "start", "", "/d", cwd, "cmd.exe", "/k", command],
         ]
     # the cd is for client/server terminals, whose window ignores our cwd
-    argv = [_login_shell(), "-lic", f"cd {shlex.quote(cwd)} && exec {command}"]
+    argv = [_login_shell(), "-lic", f'cd -- "$1" && exec {command}', command, cwd]
     known = tuple(LINUX_TERMINALS)
     wanted = os.environ.get("TERMINAL")
     # the membership test is the check; spawning our table's copy keeps taint

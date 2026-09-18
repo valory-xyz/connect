@@ -632,8 +632,7 @@ def test_linux_terminals_are_tried_in_the_operators_order(
     monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setenv("TERMINAL", "xterm")
     cwd = str(store_path)
-    script = f"cd {shlex.quote(cwd)} && exec codex"
-    shell = ["/bin/zsh", "-lic", script]
+    shell = ["/bin/zsh", "-lic", 'cd -- "$1" && exec codex', "codex", cwd]
     assert workspace.terminal_launches(store_path, "codex") == [
         [str(bin_dir / "xterm"), "-e", *shell],
         [
