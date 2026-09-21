@@ -32,10 +32,10 @@ other non-aea agent. It:
      object — currently the mode; the whitelist is read-only until its
      editing semantics are specced — while the `harness` preference needs none)
    - `POST /session` (origin-gated, no token): opens an agent session in the
-     configured harness (`claude_code_desktop` →
-     `claude://code/new?folder=…`, `claude_code_cli` →
+     configured harness (`claude_code_cli` →
      `claude-cli://open?cwd=…`, `codex_desktop` →
-     `codex://threads/new?path=…`, see [Codex](#codex)) and answers
+     `codex://threads/new?path=…`, `claude_code_desktop` →
+     `claude://code/new?folder=…`, see [Codex](#codex)) and answers
      `{launched, harness, requested, error?}` — `harness` is the one that
      opened, `requested` the one it aimed for. An optional `{"harness": …}`
      body overrides the saved preference for that launch alone, without
@@ -53,8 +53,10 @@ The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 then reaches the operator's UI as a dismissable error instead of dying in this
 process's log. Neither Pearl nor the UI names a harness, so those launches
 start at the saved preference — until an operator changes it, only our default
-guess — and fall back to the other harnesses rather than leave them with no
-session at all. A launch that *does* name one opens there or not at all:
+guess, the Claude Code CLI — and fall back to the other harnesses, in the
+order `DEEP_LINKS` then `TERMINAL_COMMANDS` declare them
+(`claude_code_cli`, `codex_desktop`, `claude_code_desktop`, `codex_cli`),
+rather than leave them with no session at all. A launch that *does* name one opens there or not at all:
 naming a harness is a choice.
 
 What the session must *not* inherit is our own packaging. We ship as a

@@ -217,10 +217,15 @@ def codex_desktop_deep_link(store_path: Path) -> str:
 # says which harnesses the operator may choose; a test pins these keys against
 # it, because a harness that can be chosen but never opened is a dead end the
 # operator only discovers when a session refuses to start.
+# The insertion order below *is* the fallback order an unnamed launch walks
+# (open_session builds it from these keys, then TERMINAL_COMMANDS), so it is
+# product behaviour rather than a listing: the CLI first because it is
+# DEFAULT_HARNESS, and Claude Code desktop deliberately last of the three.
+# Do not re-sort this dict — a test pins the order for that reason.
 DEEP_LINKS: dict[str, t.Callable[[Path], str]] = {
-    HARNESS_CLAUDE_CODE_DESKTOP: desktop_deep_link,
     HARNESS_CLAUDE_CODE_CLI: cli_deep_link,
     HARNESS_CODEX_DESKTOP: codex_desktop_deep_link,
+    HARNESS_CLAUDE_CODE_DESKTOP: desktop_deep_link,
 }
 TERMINAL_COMMANDS: dict[str, str] = {HARNESS_CODEX_CLI: "codex"}
 
