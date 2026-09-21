@@ -59,7 +59,6 @@ from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
 from connect.mech_rpc import RPC_LOCK, listing_mechs
-from connect.mech_terms import terms_report
 from connect.mech_types import (
     MechError,
     MechUnknownRequest,
@@ -102,6 +101,7 @@ class _RequestPlan(t.NamedTuple):
     legacy_on_chain: bool
     tool: str
     max_payment: int
+    terms: dict  # mech-client's terms_report, merged into the request's report
 
 
 class PendingDelivery(t.NamedTuple):
@@ -447,7 +447,8 @@ class MechService:
         # Who the session contracts with, and whose terms that request falls
         # under. Only the Valory claim is ours to make; a published terms link
         # is reported as found.
-        info.update(terms_report(priority_mech, chain, read.document))
+        # mech-client owns the rule that only a Valory mech gets the statement.
+        info.update(service.tool_manager.terms_report(priority_mech, read.document))
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:
@@ -740,6 +741,8 @@ class MechService:
                 if request_context is None
                 else {"request_context": request_context}
             )
+        # A session can skip mech_tools, so the report says whose terms apply
+        # too. No document: the Valory statement does not depend on one.
         return _RequestPlan(
             chain=chain,
             service=service,
@@ -749,6 +752,7 @@ class MechService:
             legacy_on_chain=legacy_on_chain,
             tool=tool,
             max_payment=max_payment,
+            terms=service.tool_manager.terms_report(priority_mech, None),
         )
 
     def _dispatch(
@@ -804,13 +808,15 @@ class MechService:
             ),
             request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
-        return self._with_pending(
+        payload = self._with_pending(
             dict(result),
             chain=plan.chain,
             mech=plan.priced.mech,
             service_id=plan.priced.service_id,
             offchain=not plan.legacy_on_chain,
         )
+        payload.update(plan.terms)
+        return payload
 
     def _with_pending(  # pylint: disable=too-many-locals
         self,
