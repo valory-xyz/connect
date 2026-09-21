@@ -449,6 +449,8 @@ class MechService:
         # is reported as found.
         # mech-client owns the rule that only a Valory mech gets the statement.
         info.update(service.tool_manager.terms_report(priority_mech, read.document))
+        if read.document is None:  # like tools_note: unread is not unpublished
+            info["terms_note"] = "metadata unreadable, so any terms link is unknown"
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:
@@ -663,7 +665,7 @@ class MechService:
             merged["replay_errors"] = errors
         return merged
 
-    def _prepare(  # pylint: disable=too-many-arguments
+    def _prepare(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         prompt: str,
         tool: str,
@@ -713,13 +715,16 @@ class MechService:
             # a message about metadata, which reads as a transient gateway
             # problem. Most listed mechs publish no endpoint at all, so decide
             # it here, before any payment, and name the flow that does work.
-            blocker = _offchain_blocker(self._service_metadata(service, service_id))
+            read = self._service_metadata(service, service_id)
+            blocker = _offchain_blocker(read)
             if blocker is not None:
                 self._blocked(chain, tool, "offchain-unreachable", blocker)
                 raise MechError(
                     f"mech {priority_mech} (service {service_id}) cannot serve "
                     f"off-chain requests: {blocker}"
                 )
+            # before any allowance is armed, so a failure here spends nothing
+            terms = service.tool_manager.terms_report(priority_mech, read.document)
             # Pin the metadata salt so the CID — and with it the request id
             # mech-client will derive and sign — is known here first; the
             # matching allowance is registered before the send. Armed in
@@ -736,13 +741,13 @@ class MechService:
             if auto_deposit:
                 auto_deposit = self._allowances.arm_auto_deposit(chain, priced)
         else:
+            # nothing reads the document on-chain, so no operator link here
+            terms = service.tool_manager.terms_report(priority_mech, None)
             extra_attributes = (
                 None
                 if request_context is None
                 else {"request_context": request_context}
             )
-        # A session can skip mech_tools, so the report says whose terms apply
-        # too. No document: the Valory statement does not depend on one.
         return _RequestPlan(
             chain=chain,
             service=service,
@@ -752,7 +757,7 @@ class MechService:
             legacy_on_chain=legacy_on_chain,
             tool=tool,
             max_payment=max_payment,
-            terms=service.tool_manager.terms_report(priority_mech, None),
+            terms=terms,
         )
 
     def _dispatch(

@@ -261,9 +261,14 @@ does not resolve, a failed or timed-out lookup, or a zone that answers every
 name all read as not identified, and a check that could not complete says so
 in `identification_note`. Whatever terms link an operator published in its
 metadata is passed through as `terms_url`, reported as found rather than
-endorsed. `mech_request` reports `valory_operated` and `terms` too, decided
-before anything is paid, so a session that skips `mech_tools` still learns
-whose terms apply. The check and the terms statement come from mech-client
+endorsed; `terms_note` says when the metadata could not be read, so an
+absent link is unknown rather than unpublished. `mech_request` reports
+`valory_operated` and `terms` or `identification_note` too, plus `terms_url`
+on the off-chain flow, decided before anything is paid or any allowance is
+armed, so a session that skips `mech_tools` still learns whose terms apply.
+Each report runs its own check, and `mech_request`'s is the one that governs
+the request it sent. mech-client's warnings, including a check that could not
+complete, are routed into `log.txt`. The check and the terms statement come from mech-client
 (`ToolManager.terms_report`), so the rule lives in one place.
 
 An optional `request_context` dict is passed through unmodified as a

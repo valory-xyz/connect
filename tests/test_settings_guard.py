@@ -1777,10 +1777,57 @@ class TestMech:
             "q", "prediction-online", chain="testchain", priority_mech=OTHER
         )
         assert order == ["terms", "send"]
-        # no document: the Valory statement does not depend on one
-        assert patched_mech.terms_calls == [(OTHER, None)]
+        # the default off-chain flow reuses the document its pre-flight read
+        assert patched_mech.terms_calls == [(OTHER, patched_mech.metadata)]
         assert out["valory_operated"] is True
         assert out["terms"] == VALORY_TERMS_NOTICE
+
+    def test_on_chain_request_checks_the_terms_without_a_document(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """On-chain nothing reads the document, so the check gets none."""
+        patched_mech.terms = {"valory_operated": True, "terms": VALORY_TERMS_NOTICE}
+        out = mech_service.request(
+            "q",
+            "prediction-online",
+            chain="testchain",
+            priority_mech=OTHER,
+            legacy_on_chain=True,
+        )
+        assert patched_mech.terms_calls == [(OTHER, None)]
+        assert out["terms"] == VALORY_TERMS_NOTICE
+
+    def test_a_failing_terms_check_arms_no_allowance(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The check runs before any allowance is armed, so its failure spends nothing."""
+        armed: list[str] = []
+        allowances = mech_service._allowances  # pylint: disable=protected-access
+        monkeypatch.setattr(
+            allowances,
+            "register_offchain_digest",
+            lambda *a, **k: armed.append("digest"),
+        )
+
+        def arm_deposit(*_args: t.Any, **_kwargs: t.Any) -> bool:
+            armed.append("deposit")
+            return True
+
+        monkeypatch.setattr(allowances, "arm_auto_deposit", arm_deposit)
+
+        def broken(mech: str, doc: t.Any) -> dict:
+            raise RuntimeError("executor shut down")
+
+        patched_mech.tool_manager.terms_report = broken
+        with pytest.raises(RuntimeError, match="executor shut down"):
+            mech_service.request(
+                "q", "prediction-online", chain="testchain", priority_mech=OTHER
+            )
+        assert not armed
+        assert not patched_mech.calls
 
     def test_request_reports_a_check_that_could_not_complete(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3346,6 +3393,7 @@ class TestMech:
         assert info["terms_url"] == "https://www.valory.xyz/terms/mechs"
         # the report's other keys survive the merge
         assert info["tools"] == ["prediction-online"]
+        assert "terms_note" not in info
 
     def test_tools_pass_no_document_when_metadata_is_unreadable(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3361,17 +3409,56 @@ class TestMech:
         assert info["valory_operated"] is False
         assert "terms" not in info
         assert info["identification_note"].startswith("Could not check")
+        # an unread document is not a mech that published no link
+        assert info["terms_note"].startswith("metadata unreadable")
 
+    @pytest.mark.parametrize(
+        ("outcome", "expected"),
+        [
+            (
+                "valory",
+                {
+                    "valory_operated": True,
+                    "terms": (
+                        "By submitting a request to this Mech, you agree to be "
+                        "bound by Valory AG's Mech Terms (v1.0), available at "
+                        "https://www.valory.xyz/terms/mechs."
+                    ),
+                    "terms_url": "https://www.valory.xyz/terms/mechs",
+                },
+            ),
+            (
+                "not_valory",
+                {
+                    "valory_operated": False,
+                    "terms_url": "https://www.valory.xyz/terms/mechs",
+                },
+            ),
+            (
+                "unknown",
+                {
+                    "valory_operated": False,
+                    "identification_note": (
+                        "Could not check whether Valory operates this mech."
+                    ),
+                    "terms_url": "https://www.valory.xyz/terms/mechs",
+                },
+            ),
+        ],
+        ids=["valory", "not_valory", "unknown"],
+    )
     def test_tools_use_mech_client_s_real_terms_report(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
+        outcome: str,
+        expected: dict,
     ) -> None:
-        """The pinned mech-client's terms_report fits this call, end to end past DNS.
+        """The pinned mech-client's terms_report fits this call, for every outcome.
 
-        Guards the pin: a mech-client whose terms_report changes shape or
-        meaning fails here rather than in a session.
+        Guards the pin: a mech-client whose terms_report changes shape, keys or
+        wording in any of its three outcomes fails here rather than in a session.
         """
         manager = ToolManager.__new__(ToolManager)
         manager.mech_config = SimpleNamespace(
@@ -3385,8 +3472,6 @@ class TestMech:
             terms_report=manager.terms_report,
         )
         own_name = f"{OTHER.lower().removeprefix('0x')}-100.mech.valory.xyz"
-
-        looked_up: list[str] = []
         real_getaddrinfo = socket.getaddrinfo
 
         def getaddrinfo(name: str, *args: t.Any) -> list:
@@ -3394,24 +3479,20 @@ class TestMech:
             # chain's local RPC) resolves as it normally would.
             if not name.endswith(".mech.valory.xyz"):
                 return real_getaddrinfo(name, *args)
-            looked_up.append(name)
-            if name == own_name:
+            if outcome == "unknown":
+                raise socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+            if outcome == "valory" and name == own_name:
                 return [("ok",)]
             raise socket.gaierror(socket.EAI_NONAME, "not known")
 
         monkeypatch.setattr(identification.socket, "getaddrinfo", getaddrinfo)
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
-        assert info["valory_operated"] is True
-        assert info["terms"] == (
-            "By submitting a request to this Mech, you agree to be bound by "
-            "Valory AG's Mech Terms (v1.0), available at "
-            "https://www.valory.xyz/terms/mechs."
-        )
-        assert info["terms_url"] == "https://www.valory.xyz/terms/mechs"
-        # the mech's own name, then one random probe beside it
-        assert looked_up[0] == own_name
-        assert len(looked_up) == 2
-        assert looked_up[1].endswith("-100.mech.valory.xyz")
+        reported = {
+            key: info[key]
+            for key in ("valory_operated", "terms", "identification_note", "terms_url")
+            if key in info
+        }
+        assert reported == expected
 
     def test_tools_degrade_without_metadata(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
