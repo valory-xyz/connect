@@ -78,7 +78,22 @@ def setup_logging(level: str = "info") -> logging.Logger:
     ]
     logging.basicConfig(format=LOG_FORMAT, handlers=handlers)
     logging.getLogger().setLevel(getattr(logging, level.upper()))
+    route_mech_client_logs()
     return logging.getLogger("agent")
+
+
+def route_mech_client_logs() -> None:
+    """Send mech-client's log records through the root handlers into log.txt.
+
+    mech-client gives its ``mech_client`` logger its own stdout handler and
+    turns propagation off, so its warnings (a failed Valory Mech Check among
+    them) would never reach log.txt. Its handler is swapped for a
+    NullHandler rather than removed: mech-client's own setup skips a logger
+    that already has handlers, so a later call cannot undo this.
+    """
+    mech_logger = logging.getLogger("mech_client")
+    mech_logger.handlers = [logging.NullHandler()]
+    mech_logger.propagate = True
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

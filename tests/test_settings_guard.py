@@ -22,6 +22,7 @@
 import asyncio
 import json
 import logging
+import socket
 import threading
 import time
 import typing as t
@@ -36,7 +37,10 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client.domain import identification
 from mech_client.domain.delivery.models import DeliveryResult
+from mech_client.domain.identification import VALORY_TERMS_NOTICE
+from mech_client.domain.tools.manager import ToolManager
 from mech_client.infrastructure.config import PaymentType
 from mech_client.infrastructure.ipfs import metadata as ipfs_metadata
 from web3 import Web3
@@ -1602,8 +1606,13 @@ class FakeMarketplaceService:
             "tools": ["prediction-online"],
             "url": "https://mech.example/offchain",
         }
+        # What mech-client's ToolManager.terms_report answers, and every call
+        # it gets, so tests can tell which mech and document were passed.
+        self.terms: dict = {"valory_operated": False}
+        self.terms_calls: list[tuple] = []
         self.tool_manager = SimpleNamespace(
-            fetch_tools_metadata=lambda service_id: self.metadata
+            fetch_tools_metadata=lambda service_id: self.metadata,
+            terms_report=self._terms_report,
         )
         self.contract = FakeMarketplaceContract()
         self.signer: t.Any = None  # the MechSigner mech-client would sign with
@@ -1613,6 +1622,11 @@ class FakeMarketplaceService:
         self.mech_config = SimpleNamespace(
             ledger_config=SimpleNamespace(chain_id=31337)
         )
+
+    def _terms_report(self, mech_address: str, metadata: t.Any) -> dict:
+        """Record the call and return the canned terms report."""
+        self.terms_calls.append((mech_address, metadata))
+        return dict(self.terms)
 
     def _fetch_mech_info(self, mech: str) -> tuple:
         """Return the canned (payment_type, service_id, max_delivery_rate)."""
@@ -1738,6 +1752,106 @@ class TestMech:
         monkeypatch.setattr(mech_module, "MarketplaceService", _construct)
         monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
         return fake
+
+    def test_request_reports_whose_terms_apply(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """mech_request carries the terms, decided before anything is sent."""
+        patched_mech.terms = {"valory_operated": True, "terms": VALORY_TERMS_NOTICE}
+        order: list[str] = []
+        report = patched_mech.tool_manager.terms_report
+
+        def recording_report(mech: str, doc: t.Any) -> dict:
+            order.append("terms")
+            return report(mech, doc)
+
+        patched_mech.tool_manager.terms_report = recording_report
+        send = patched_mech.send_request
+
+        async def sending(**kwargs: object) -> dict:
+            order.append("send")
+            return await send(**kwargs)
+
+        patched_mech.send_request = sending  # type: ignore[method-assign]
+        out = mech_service.request(
+            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+        )
+        assert order == ["terms", "send"]
+        # the default off-chain flow reuses the document its pre-flight read
+        assert patched_mech.terms_calls == [(OTHER, patched_mech.metadata)]
+        assert out["valory_operated"] is True
+        assert out["terms"] == VALORY_TERMS_NOTICE
+
+    def test_on_chain_request_checks_the_terms_without_a_document(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """On-chain nothing reads the document, so the check gets none."""
+        patched_mech.terms = {"valory_operated": True, "terms": VALORY_TERMS_NOTICE}
+        out = mech_service.request(
+            "q",
+            "prediction-online",
+            chain="testchain",
+            priority_mech=OTHER,
+            legacy_on_chain=True,
+        )
+        assert patched_mech.terms_calls == [(OTHER, None)]
+        assert out["terms"] == VALORY_TERMS_NOTICE
+
+    def test_a_failing_terms_check_arms_no_allowance(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The check runs before any allowance is armed, so its failure spends nothing."""
+        armed: list[str] = []
+        allowances = mech_service._allowances  # pylint: disable=protected-access
+        monkeypatch.setattr(
+            allowances,
+            "register_offchain_digest",
+            lambda *a, **k: armed.append("digest"),
+        )
+
+        def arm_deposit(*_args: t.Any, **_kwargs: t.Any) -> bool:
+            armed.append("deposit")
+            return True
+
+        monkeypatch.setattr(allowances, "arm_auto_deposit", arm_deposit)
+
+        def broken(mech: str, doc: t.Any) -> dict:
+            raise RuntimeError("executor shut down")
+
+        patched_mech.tool_manager.terms_report = broken
+        with pytest.raises(RuntimeError, match="executor shut down"):
+            mech_service.request(
+                "q", "prediction-online", chain="testchain", priority_mech=OTHER
+            )
+        assert not armed
+        assert not patched_mech.calls
+
+    def test_request_reports_a_check_that_could_not_complete(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A failed check is reported as such, with no terms statement."""
+        patched_mech.terms = {
+            "valory_operated": False,
+            "identification_note": "Could not check whether Valory operates this mech.",
+        }
+        out = mech_service.request(
+            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+        )
+        assert out["valory_operated"] is False
+        assert "terms" not in out
+        assert out["identification_note"].startswith("Could not check")
+
+    def test_a_refused_request_never_checks_the_terms(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """A request refused on price spends no DNS lookups either."""
+        patched_mech.mech_info = native_mech_info(10**18)
+        with pytest.raises(MechError, match="max_payment"):
+            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        assert not patched_mech.terms_calls
 
     def test_request_maps_arguments(
         self,
@@ -3263,6 +3377,123 @@ class TestMech:
         assert info["offchain_capable"] is True
         assert "offchain_note" not in info
 
+    def test_tools_report_whose_terms_apply(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """mech-client's terms report is asked about this mech and document, and merged."""
+        patched_mech.terms = {
+            "valory_operated": True,
+            "terms": VALORY_TERMS_NOTICE,
+            "terms_url": "https://www.valory.xyz/terms/mechs",
+        }
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert patched_mech.terms_calls == [(OTHER, patched_mech.metadata)]
+        assert info["valory_operated"] is True
+        assert info["terms"] == VALORY_TERMS_NOTICE
+        assert info["terms_url"] == "https://www.valory.xyz/terms/mechs"
+        # the report's other keys survive the merge
+        assert info["tools"] == ["prediction-online"]
+        assert "terms_note" not in info
+
+    def test_tools_pass_no_document_when_metadata_is_unreadable(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """An unreadable document reaches the terms report as None, not a guess."""
+        patched_mech.metadata = None
+        patched_mech.terms = {
+            "valory_operated": False,
+            "identification_note": "Could not check whether Valory operates this mech.",
+        }
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert patched_mech.terms_calls == [(OTHER, None)]
+        assert info["valory_operated"] is False
+        assert "terms" not in info
+        assert info["identification_note"].startswith("Could not check")
+        # an unread document is not a mech that published no link
+        assert info["terms_note"].startswith("metadata unreadable")
+
+    @pytest.mark.parametrize(
+        ("outcome", "expected"),
+        [
+            (
+                "valory",
+                {
+                    "valory_operated": True,
+                    "terms": (
+                        "By submitting a request to this Mech, you agree to be "
+                        "bound by Valory AG's Mech Terms (v1.0), available at "
+                        "https://www.valory.xyz/terms/mechs."
+                    ),
+                    "terms_url": "https://www.valory.xyz/terms/mechs",
+                },
+            ),
+            (
+                "not_valory",
+                {
+                    "valory_operated": False,
+                    "terms_url": "https://www.valory.xyz/terms/mechs",
+                },
+            ),
+            (
+                "unknown",
+                {
+                    "valory_operated": False,
+                    "identification_note": (
+                        "Could not check whether Valory operates this mech."
+                    ),
+                    "terms_url": "https://www.valory.xyz/terms/mechs",
+                },
+            ),
+        ],
+        ids=["valory", "not_valory", "unknown"],
+    )
+    def test_tools_use_mech_client_s_real_terms_report(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: str,
+        expected: dict,
+    ) -> None:
+        """The pinned mech-client's terms_report fits this call, for every outcome.
+
+        Guards the pin: a mech-client whose terms_report changes shape, keys or
+        wording in any of its three outcomes fails here rather than in a session.
+        """
+        manager = ToolManager.__new__(ToolManager)
+        manager.mech_config = SimpleNamespace(
+            ledger_config=SimpleNamespace(chain_id=100)
+        )
+        patched_mech.tool_manager = SimpleNamespace(
+            fetch_tools_metadata=lambda service_id: {
+                "tools": ["prediction-online"],
+                "termsUrl": "https://www.valory.xyz/terms/mechs",
+            },
+            terms_report=manager.terms_report,
+        )
+        own_name = f"{OTHER.lower().removeprefix('0x')}-100.mech.valory.xyz"
+        real_getaddrinfo = socket.getaddrinfo
+
+        def getaddrinfo(name: str, *args: t.Any) -> list:
+            # Only the identification zone is faked; anything else (the test
+            # chain's local RPC) resolves as it normally would.
+            if not name.endswith(".mech.valory.xyz"):
+                return real_getaddrinfo(name, *args)
+            if outcome == "unknown":
+                raise socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+            if outcome == "valory" and name == own_name:
+                return [("ok",)]
+            raise socket.gaierror(socket.EAI_NONAME, "not known")
+
+        monkeypatch.setattr(identification.socket, "getaddrinfo", getaddrinfo)
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        reported = {
+            key: info[key]
+            for key in ("valory_operated", "terms", "identification_note", "terms_url")
+            if key in info
+        }
+        assert reported == expected
+
     def test_tools_degrade_without_metadata(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
@@ -3275,7 +3506,8 @@ class TestMech:
         patched_mech.tool_manager = SimpleNamespace(
             fetch_tools_metadata=lambda service_id: (_ for _ in ()).throw(
                 TimeoutError("slow")
-            )
+            ),
+            terms_report=patched_mech.tool_manager.terms_report,
         )
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert "tools" not in info

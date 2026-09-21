@@ -249,6 +249,28 @@ asset, so its default is 0.1 of that asset — 10^17 base units for native and
 OLAS mechs, 10^5 for USDC ones, including Robinhood Chain, where that payment
 type is USDG. `mech_tools` reports the asset as `payment_token`.
 
+Each Mech is run by its own operator. `mech_tools` reports `valory_operated`
+per mech: it resolves the mech's own name under `mech.valory.xyz`, built from
+the mech address without `0x`, a hyphen, then the chain id. Valory creates
+one DNS record for each mech it operates and for no other, so a name that
+resolves in the public DNS means Valory operates that mech and Valory AG's
+Mech Terms apply, which the report states in `terms`. The answer does not
+depend on the mech being up. The lookup is not DNSSEC-validated, so it trusts
+the resolver to return the public answer. The check fails closed: a name that
+does not resolve, a failed or timed-out lookup, or a zone that answers every
+name all read as not identified, and a check that could not complete says so
+in `identification_note`. Whatever terms link an operator published in its
+metadata is passed through as `terms_url`, reported as found rather than
+endorsed; `terms_note` says when the metadata could not be read, so an
+absent link is unknown rather than unpublished. `mech_request` reports
+`valory_operated` and `terms` or `identification_note` too, plus `terms_url`
+on the off-chain flow, decided before anything is paid or any allowance is
+armed, so a session that skips `mech_tools` still learns whose terms apply.
+Each report runs its own check, and `mech_request`'s is the one that governs
+the request it sent. mech-client's warnings, including a check that could not
+complete, are routed into `log.txt`. The check and the terms statement come from mech-client
+(`ToolManager.terms_report`), so the rule lives in one place.
+
 An optional `request_context` dict is passed through unmodified as a
 top-level key of the request metadata, for the tool to read; the bundled skill
 documents the keys the predict tools look for. Off-chain it is part of the

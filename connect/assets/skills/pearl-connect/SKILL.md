@@ -79,6 +79,19 @@ composing a prompt:
   `null` means this server does not know the token on that chain: do not pay
   that mech. A mech pricing in an asset the safe does not hold cannot be paid,
   and `auto_deposit` will fail rather than convert anything.
+- **Whose terms apply.** `mech_tools(priority_mech=...)` reports
+  `valory_operated`. When it is true the mech is operated by Valory and
+  submitting a request means agreeing to Valory AG's Mech Terms, which the
+  report states in `terms`. When it is false the mech is run by someone else,
+  or the check could not complete, in which case `identification_note` says
+  so; its operator's own terms apply. The report passes through whatever link
+  that operator published as `terms_url`, which is reported as found, not
+  endorsed; `terms_note` means the metadata could not be read, so any link
+  is unknown. `mech_request` reports the same fields (`terms_url` only on
+  the off-chain flow). Each report is its own check, so the two can differ
+  after a DNS hiccup: state whose terms apply from `mech_request`'s report,
+  which governs the request it sent. Tell the user whose terms a request
+  falls under before spending their funds on an unfamiliar mech.
 - **`offchain_capable`.** The off-chain flow needs an endpoint published in
   the mech's service metadata, and few mechs publish one; the rest serve
   on-chain requests only. When it is `false`, `offchain_note` says why — a

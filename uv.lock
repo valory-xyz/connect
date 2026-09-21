@@ -653,7 +653,7 @@ requires-dist = [
     { name = "eth-account", specifier = "==0.13.7" },
     { name = "fastapi", specifier = "==0.139.2" },
     { name = "mcp", specifier = "==1.28.1" },
-    { name = "mech-client", specifier = "==0.23.0" },
+    { name = "mech-client", specifier = "==0.23.3" },
     { name = "open-aea-ledger-ethereum", specifier = "==2.2.9" },
     { name = "tomli-w", specifier = "==1.2.0" },
     { name = "uvicorn", specifier = "==0.52.4" },
@@ -1724,7 +1724,7 @@ wheels = [
 
 [[package]]
 name = "mech-client"
-version = "0.23.0"
+version = "0.23.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -1739,9 +1739,9 @@ dependencies = [
     { name = "setuptools" },
     { name = "tabulate" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/af/64/d26d016932fc3c337342f688da68d63cd5ee37fbcc22e9b4a048f999dc0f/mech_client-0.23.0.tar.gz", hash = "sha256:c8884063fa4b04db5ed6c905c12e257701bb21f809cf12d9362c41937957547c", size = 225718, upload-time = "2026-09-16T09:26:31.218Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/90/14/2c4580c9cccd5a713da49ca63d12340a05d9e6a0d903747dec24966a11a3/mech_client-0.23.3.tar.gz", hash = "sha256:2e21b7f5381ba4beaf4e018801d42e019a588f47fef7eb55e883ce08ebf9c11d", size = 232117, upload-time = "2026-09-21T14:24:00.034Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c4/28/729ba3b4e30c3f03a5263702e07a6df51a73c6534c7a02a5b4613428c5cb/mech_client-0.23.0-py3-none-any.whl", hash = "sha256:bfae7b3d30e80ebec7e5c9099662832f3b4c86e871e5bbfd6d1b1cfff01686bd", size = 314178, upload-time = "2026-09-16T09:26:29.931Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/d8/2ab4273e37525dd14d92aac02a6a343d8913aac240a9de93f343a962e4be/mech_client-0.23.3-py3-none-any.whl", hash = "sha256:a2b22d2253b1021e13eea37dbbb5f5d38d97b211e4e233719d91b7ca934bd560", size = 321026, upload-time = "2026-09-21T14:23:57.693Z" },
 ]
 
 [[package]]
@@ -1871,7 +1871,7 @@ wheels = [
 
 [[package]]
 name = "olas-operate-middleware"
-version = "0.15.38"
+version = "0.15.39"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1891,9 +1891,9 @@ dependencies = [
     { name = "uvicorn" },
     { name = "werkzeug" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/74/8d/69ca70306c86f8b698ad12916d8a0753db1484855b6436919462b90cf136/olas_operate_middleware-0.15.38.tar.gz", hash = "sha256:6346ffa30dd5cbf972b1793011a26d3ca68e04faa061a12047ecb23a10640b52", size = 299370, upload-time = "2026-09-14T18:09:31.986Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/39/d6/8591a981769735b4e3bc04968e9e9ca94741b393336786e2a2a2ac43b7e8/olas_operate_middleware-0.15.39.tar.gz", hash = "sha256:7bd5c08df0a165f893dbe3ecee1505911cdd7bbbeae710c58120551a25548775", size = 299796, upload-time = "2026-09-16T12:16:31.92Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e4/44/e5404bbb84503be0609cc848a6bf5f5f4485f9c4aabfa25e2888b25f5063/olas_operate_middleware-0.15.38-py3-none-any.whl", hash = "sha256:0d0d118cd8cd3fde6f5928891df60eee915a13600753dc9aeab5f49d4887dc61", size = 358401, upload-time = "2026-09-14T18:09:30.398Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/cf/fbe91cb0d4f6d3518ff4fa8bebc9f788ee23cdff96c7bbe8c703d244262b/olas_operate_middleware-0.15.39-py3-none-any.whl", hash = "sha256:6e81d94c7289803e91eac727572649ff31d80253e06980d3f049dd3903c730e5", size = 358752, upload-time = "2026-09-16T12:16:30.125Z" },
 ]
 
 [[package]]

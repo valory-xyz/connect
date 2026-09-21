@@ -33,6 +33,7 @@ from aea_ledger_ethereum import rpc_rotation
 from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
 
 from connect import __main__ as main_module
@@ -129,6 +130,39 @@ class TestMain:
             main_module.setup_logging("debug")
             assert root.level == logging.DEBUG
         finally:
+            root.setLevel(old_level)
+
+    def test_mech_client_warnings_reach_connect_s_log(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """mech-client's own stdout-only logger is routed through the root handlers.
+
+        A failed Valory Mech Check is logged by mech-client as a warning; with
+        propagation off it would never reach log.txt. Re-running mech-client's
+        setup afterwards must not undo the routing.
+        """
+        monkeypatch.chdir(tmp_path)
+        mech_logger = logging.getLogger("mech_client")
+        saved = (list(mech_logger.handlers), mech_logger.propagate)
+        root = logging.getLogger()
+        old_level = root.level
+        try:
+            main_module.setup_logging()
+            mech_client_logger.setup_logger()  # mech-client's own setup, again
+            with caplog.at_level(logging.WARNING):
+                logging.getLogger(
+                    "mech_client.mech_client.domain.identification"
+                ).warning("Could not look up x.mech.valory.xyz")
+            assert "Could not look up x.mech.valory.xyz" in caplog.text
+            assert mech_logger.propagate is True
+            assert not any(
+                isinstance(h, logging.StreamHandler) for h in mech_logger.handlers
+            )
+        finally:
+            mech_logger.handlers, mech_logger.propagate = saved
             root.setLevel(old_level)
 
     def test_parse_args_both_forms(self) -> None:

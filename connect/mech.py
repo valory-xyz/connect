@@ -101,6 +101,7 @@ class _RequestPlan(t.NamedTuple):
     legacy_on_chain: bool
     tool: str
     max_payment: int
+    terms: dict  # mech-client's terms_report, merged into the request's report
 
 
 class PendingDelivery(t.NamedTuple):
@@ -443,6 +444,13 @@ class MechService:
         info["offchain_capable"] = blocker is None
         if blocker is not None:
             info["offchain_note"] = blocker
+        # Who the session contracts with, and whose terms that request falls
+        # under. Only the Valory claim is ours to make; a published terms link
+        # is reported as found.
+        # mech-client owns the rule that only a Valory mech gets the statement.
+        info.update(service.tool_manager.terms_report(priority_mech, read.document))
+        if read.document is None:  # like tools_note: unread is not unpublished
+            info["terms_note"] = "metadata unreadable, so any terms link is unknown"
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:
@@ -657,7 +665,7 @@ class MechService:
             merged["replay_errors"] = errors
         return merged
 
-    def _prepare(  # pylint: disable=too-many-arguments
+    def _prepare(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         prompt: str,
         tool: str,
@@ -707,13 +715,16 @@ class MechService:
             # a message about metadata, which reads as a transient gateway
             # problem. Most listed mechs publish no endpoint at all, so decide
             # it here, before any payment, and name the flow that does work.
-            blocker = _offchain_blocker(self._service_metadata(service, service_id))
+            read = self._service_metadata(service, service_id)
+            blocker = _offchain_blocker(read)
             if blocker is not None:
                 self._blocked(chain, tool, "offchain-unreachable", blocker)
                 raise MechError(
                     f"mech {priority_mech} (service {service_id}) cannot serve "
                     f"off-chain requests: {blocker}"
                 )
+            # before any allowance is armed, so a failure here spends nothing
+            terms = service.tool_manager.terms_report(priority_mech, read.document)
             # Pin the metadata salt so the CID — and with it the request id
             # mech-client will derive and sign — is known here first; the
             # matching allowance is registered before the send. Armed in
@@ -730,6 +741,8 @@ class MechService:
             if auto_deposit:
                 auto_deposit = self._allowances.arm_auto_deposit(chain, priced)
         else:
+            # nothing reads the document on-chain, so no operator link here
+            terms = service.tool_manager.terms_report(priority_mech, None)
             extra_attributes = (
                 None
                 if request_context is None
@@ -744,6 +757,7 @@ class MechService:
             legacy_on_chain=legacy_on_chain,
             tool=tool,
             max_payment=max_payment,
+            terms=terms,
         )
 
     def _dispatch(
@@ -799,13 +813,15 @@ class MechService:
             ),
             request_ids=[_request_key(r) for r in result.get("request_ids") or []],
         )
-        return self._with_pending(
+        payload = self._with_pending(
             dict(result),
             chain=plan.chain,
             mech=plan.priced.mech,
             service_id=plan.priced.service_id,
             offchain=not plan.legacy_on_chain,
         )
+        payload.update(plan.terms)
+        return payload
 
     def _with_pending(  # pylint: disable=too-many-locals
         self,
