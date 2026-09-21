@@ -82,7 +82,7 @@ class SessionRequest(BaseModel):
 
 @router.post("/session", dependencies=[Depends(require_local_origin)])
 def start_session(request: Request, body: SessionRequest | None = None) -> dict:
-    """Open a Claude Code session in the configured harness, on demand.
+    """Open an agent session in the configured harness, on demand.
 
     Pearl calls this once /healthcheck reports healthy; nothing is launched at
     boot, so a launch failure reaches the operator's UI instead of dying in

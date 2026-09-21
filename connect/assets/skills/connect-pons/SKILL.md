@@ -191,7 +191,7 @@ caller and receives the tokens.
 addresses, the on-chain launch record, the API client and the audit check;
 `discovery.py` the search, with its on-chain fallback index; `curve.py` the bonding-curve maths and calls.
 Uniswap routing and constant-product maths, Permit2, chain access, log scans,
-the IPFS image check, HTTP and the JSON state files come from `.claude/lib/`
+the IPFS image check, HTTP and the JSON state files come from `lib/` beside the skills directory
 (`uniswap.py`, `router.py`, `permit.py`, `evm.py`, `ipfs.py`, `web.py`,
 `state.py`, `cli.py`).
 

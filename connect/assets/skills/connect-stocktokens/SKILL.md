@@ -139,7 +139,7 @@ The price-gap refusal above is what stops bad priced trades from filling silentl
 holds the registry, the reference price and the multiplier — everything that
 is Robinhood.
 
-The rest is in `.claude/lib/`: `uniswap.py` (discovery, quoting, router calldata),
+The rest is in `lib/` beside the skills directory: `uniswap.py` (discovery, quoting, router calldata),
 `permit.py` (Permit2 and the safe's ERC-1271 wrapper),
 `router.py` (the approvals, permit and checked swap call),
 `evm.py` (the signer's web3, calls, decimals, ERC-20),

@@ -2343,7 +2343,7 @@ def _stage_bootstrap(root: Path, with_lib: bool) -> Path:
 def test_the_path_shim_names_a_missing_lib_tree(tmp_path: Path) -> None:
     """A bare "No module named evm" hides that the server installs this tree."""
     shim = _stage_bootstrap(tmp_path, with_lib=False)
-    with pytest.raises(ImportError, match="installs into .claude/lib"):
+    with pytest.raises(ImportError, match="installs beside skills/"):
         runpy.run_path(str(shim))
 
 
