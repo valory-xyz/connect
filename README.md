@@ -53,11 +53,11 @@ The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 then reaches the operator's UI as a dismissable error instead of dying in this
 process's log. Neither Pearl nor the UI names a harness, so those launches
 start at the saved preference — until an operator changes it, only our default
-guess, the Claude Code CLI — and fall back to the other harnesses, in the
-order `DEEP_LINKS` then `TERMINAL_COMMANDS` declare them
+guess, the Claude Code CLI — and fall back through the other harnesses in
+the order `DEEP_LINKS` then `TERMINAL_COMMANDS` declare them
 (`claude_code_cli`, `codex_desktop`, `claude_code_desktop`, `codex_cli`),
-rather than leave them with no session at all. A launch that *does* name one opens there or not at all:
-naming a harness is a choice.
+rather than leave them with no session at all. A launch that *does* name one
+opens there or not at all: naming a harness is a choice.
 
 What the session must *not* inherit is our own packaging. We ship as a
 PyInstaller one-file binary, whose bootloader puts its extraction directory at

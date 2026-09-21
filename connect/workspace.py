@@ -355,8 +355,9 @@ class Workspace:
         or an error, because naming one is a choice and quietly opening another
         harness would make the choice a lie. But an unnamed one is only
         DEFAULT_HARNESS, our guess — and Pearl and the agent UI both launch
-        without naming one, so on a machine with only the CLI installed that
-        guess was the whole reason no session ever opened (OPE-1867).
+        without naming one, so on a machine that does not have that harness
+        installed the guess was the whole reason no session ever opened
+        (OPE-1867).
 
         :raises ValueError: on an unknown harness;
         :raises LaunchError: when none of the harnesses tried would open.
