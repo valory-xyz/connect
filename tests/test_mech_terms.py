@@ -31,7 +31,6 @@ import pytest
 from connect import mech_terms
 from connect.mech_terms import (
     IDENTIFICATION_TIMEOUT,
-    MECH_TERMS_URL,
     identification_name,
     is_valory_operated,
     terms_report,
@@ -175,8 +174,11 @@ class TestTermsReport:
         with patch(f"{MODULE}.is_valory_operated", return_value=True):
             report = terms_report(MECH, "gnosis", {})
         assert report["valory_operated"] is True
-        assert MECH_TERMS_URL in report["terms"]
-        assert "Valory AG's Mech Terms (v1.0)" in report["terms"]
+        assert report["terms"] == (
+            "By submitting a request to this Mech, you agree to be bound by "
+            "Valory AG's Mech Terms (v1.0), available at "
+            "https://www.valory.xyz/terms/mechs."
+        )
 
     def test_another_operator_s_mech_gets_no_terms_statement(self) -> None:
         """Another operator's terms are theirs to state, not ours."""

@@ -39,6 +39,11 @@ IDENTIFICATION_TIMEOUT = 3
 
 MECH_TERMS_VERSION = "v1.0"
 MECH_TERMS_URL = "https://www.valory.xyz/terms/mechs"
+# Legal-approved wording, used verbatim here and in mech-client.
+VALORY_TERMS_NOTICE = (
+    f"By submitting a request to this Mech, you agree to be bound by "
+    f"Valory AG's Mech Terms ({MECH_TERMS_VERSION}), available at {MECH_TERMS_URL}."
+)
 
 
 def identification_name(mech_address: str, chain_id: int) -> str:
@@ -118,10 +123,7 @@ def terms_report(mech_address: str, chain: str, metadata: t.Any) -> dict:
     """
     report: dict = {"valory_operated": is_valory_operated(mech_address, chain)}
     if report["valory_operated"]:
-        report["terms"] = (
-            f"Submitting a request to this mech means agreeing to Valory AG's "
-            f"Mech Terms ({MECH_TERMS_VERSION}): {MECH_TERMS_URL}"
-        )
+        report["terms"] = VALORY_TERMS_NOTICE
     terms_url = None
     if isinstance(metadata, dict):
         published = metadata.get("termsUrl")
