@@ -180,13 +180,14 @@ class TestSettingsStore:
                 protected=Protected(
                     mode=MODE_UNRESTRICTED, whitelist={"gnosis": (OTHER,)}
                 ),
-                harness="claude_code_cli",
+                # not the default, so a dropped harness cannot pass as kept
+                harness="codex_desktop",
             )
         )
         loaded = store.load()
         assert loaded.protected.mode == MODE_UNRESTRICTED
         assert loaded.protected.whitelist == {"gnosis": (OTHER,)}
-        assert loaded.harness == "claude_code_cli"
+        assert loaded.harness == "codex_desktop"
         # a fresh store defaults to the CLI harness
         assert defaults().harness == "claude_code_cli"
 

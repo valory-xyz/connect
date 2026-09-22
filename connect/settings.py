@@ -168,8 +168,7 @@ class Settings:
     """The persisted state in its canonical shape: protected + preferences."""
 
     protected: Protected
-    # which harness the server opens the workspace session in (preference);
-    # unset, it is the Claude Code CLI — see DEFAULT_HARNESS
+    # which harness the server opens the workspace session in (preference)
     harness: str = DEFAULT_HARNESS
 
     def to_dict(self) -> dict:
