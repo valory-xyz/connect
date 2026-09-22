@@ -202,11 +202,15 @@ class TestSettingsStore:
         assert defaults().harness == HARNESS_CLAUDE_CODE_CLI
 
     def test_a_stored_harness_is_never_migrated(self, store: SettingsStore) -> None:
-        """Changing the default must not move an operator who already chose.
+        """The default only ever fills in a missing value.
 
-        The default only ever fills in a missing value: a settings file that
-        carries a harness keeps it, including the one that used to be the
-        default. Nothing migrates installs, by decision.
+        A settings file that carries a harness keeps it, including the one
+        that used to be the default. Note that this is not the same as
+        respecting a choice: _load persists defaults() on its first read, so
+        an install that predates this default carries the old one because we
+        wrote it, not because the operator picked it. Migrating anyway would
+        move the operators who did pick it, and the file cannot tell the two
+        apart — so nothing migrates installs, by decision.
         """
         store.save(
             Settings(
@@ -517,8 +521,9 @@ class TestSettingsStore:
         store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
         payload = json.loads(path.read_text())
-        payload["harness"] = "codex_desktop"  # not the default: an ignored
-        path.write_text(json.dumps(payload))  # edit would answer claude_code_cli
+        # not the default: an edit that was ignored would answer claude_code_cli
+        payload["harness"] = "codex_desktop"
+        path.write_text(json.dumps(payload))
         loaded = store.load()
         assert loaded.harness == "codex_desktop"
         assert loaded.protected.mode == MODE_RESTRICTED  # protected fields untouched
