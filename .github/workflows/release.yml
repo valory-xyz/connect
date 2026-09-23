@@ -1,4 +1,4 @@
-name: release
+name: Release Flow
 
 on:
   release:

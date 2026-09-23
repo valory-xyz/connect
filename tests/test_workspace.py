@@ -33,7 +33,13 @@ import pytest
 
 from connect import workspace
 from connect.mech import MAX_DELIVERY_TIMEOUT
-from connect.settings import HARNESSES
+from connect.settings import (
+    HARNESSES,
+    HARNESS_CLAUDE_CODE_CLI,
+    HARNESS_CLAUDE_CODE_DESKTOP,
+    HARNESS_CODEX_CLI,
+    HARNESS_CODEX_DESKTOP,
+)
 from connect.workspace import Workspace
 
 
@@ -320,8 +326,9 @@ def test_deep_links(store_path: Path) -> None:
         assert parse_qs(urlparse(url).query)["q"] == [workspace.FIRST_PROMPT]
     # each harness resolves to exactly one link, and to its own
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
-    assert agent_workspace.deep_link().startswith("claude://")
-    assert agent_workspace.deep_link("claude_code_cli").startswith("claude-cli://")
+    assert agent_workspace.deep_link().startswith("claude-cli://")  # the default
+    # named, and not the default, so the argument is what is under test here
+    assert agent_workspace.deep_link("claude_code_desktop").startswith("claude://")
 
 
 def test_ui_build_dir(
@@ -420,13 +427,32 @@ def test_every_choosable_harness_can_be_opened() -> None:
     assert not set(workspace.DEEP_LINKS) & set(workspace.TERMINAL_COMMANDS)
 
 
+def test_the_fallback_order_is_the_one_that_was_decided() -> None:
+    """The declaration order of DEEP_LINKS is product behaviour, not a listing.
+
+    open_session walks these keys and then TERMINAL_COMMANDS', so the dict's
+    insertion order *is* the order an unnamed launch tries harnesses in. A
+    human chose it — CLI first because it is the default, Claude Code desktop
+    deliberately last of the deep links. Nothing else pins it: the test above
+    compares sets, so an alphabetical re-sort would sail past it.
+    """
+    assert tuple(workspace.DEEP_LINKS) == (
+        HARNESS_CLAUDE_CODE_CLI,
+        HARNESS_CODEX_DESKTOP,
+        HARNESS_CLAUDE_CODE_DESKTOP,
+    )
+    assert tuple(workspace.TERMINAL_COMMANDS) == (HARNESS_CODEX_CLI,)
+
+
 def test_a_named_harness_never_falls_back(
     store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Ask for a harness by name and you get that one: no silent other open.
 
     Naming one is a choice. The caller needs to see *that* one fail, not to be
-    handed the other and told it worked.
+    handed the other and told it worked. The harness named here is
+    deliberately not DEFAULT_HARNESS, so what is under test is that the
+    argument was honoured rather than that the default happened to match.
     """
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     tried: list[str] = []
@@ -437,9 +463,9 @@ def test_a_named_harness_never_falls_back(
 
     monkeypatch.setattr(workspace, "_open_url", refuse)
     with pytest.raises(workspace.LaunchError, match="change the harness"):
-        agent_workspace.open_session("claude_code_cli")
-    assert len(tried) == 1  # the desktop link was never tried as a fallback
-    assert tried[0].startswith("claude-cli://")
+        agent_workspace.open_session("claude_code_desktop")
+    assert len(tried) == 1  # the cli link, the default, was never tried
+    assert tried[0].startswith("claude://code/new")
 
     tried.clear()
 
@@ -448,39 +474,42 @@ def test_a_named_harness_never_falls_back(
         return True
 
     monkeypatch.setattr(workspace, "_open_url", accept)
-    assert agent_workspace.open_session("claude_code_cli") == "claude_code_cli"
-    assert tried == [workspace.cli_deep_link(store_path)]
+    assert agent_workspace.open_session("claude_code_desktop") == "claude_code_desktop"
+    assert tried == [workspace.desktop_deep_link(store_path)]
 
 
-def test_an_unnamed_harness_falls_back_to_the_other_claude_code(
+def test_an_unnamed_harness_falls_back_through_the_others(
     store_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Our own guess is not a choice to hold the operator to (OPE-1867).
 
-    An operator with only the CLI installed met nothing but the default
-    failing — so a launch nobody named tries the other one too, and says which
-    one it ended up in.
+    An operator without the default installed met nothing but that default
+    failing — so a launch nobody named walks the rest of the order too, and
+    says which one it ended up in. The stub here accepts only the harness that
+    is tried *last* of the deep links, so every step of the order is exercised
+    rather than the first one answering and the fallback never running.
     """
     agent_workspace = Workspace(store_path, "tok")  # nosec B106
     tried: list[str] = []
 
-    def only_the_cli(url: str, _cwd: Path) -> bool:
+    def only_the_desktop_app(url: str, _cwd: Path) -> bool:
         tried.append(url)
-        return url.startswith("claude-cli://")
+        return url.startswith("claude://code/new")
 
-    monkeypatch.setattr(workspace, "_open_url", only_the_cli)
+    monkeypatch.setattr(workspace, "_open_url", only_the_desktop_app)
     with caplog.at_level("INFO"):
         launched = agent_workspace.open_session(fallback=True)
-    assert launched == "claude_code_cli"  # the harness that opened, not the ask
+    assert launched == "claude_code_desktop"  # the harness that opened, not the ask
     assert tried == [
-        workspace.desktop_deep_link(store_path),
         workspace.cli_deep_link(store_path),
+        workspace.codex_desktop_deep_link(store_path),
+        workspace.desktop_deep_link(store_path),
     ]
     # never silently: the preference the operator has stopped getting is named
-    assert "went to claude_code_cli instead" in caplog.text
+    assert "went to claude_code_desktop instead" in caplog.text
 
-    # and with neither installed, the error names what was tried — "change the
-    # harness" is no answer once both harnesses have already been tried
+    # and with none installed, the error names what was tried — "change the
+    # harness" is no answer once every harness has already been tried
     tried.clear()
 
     def refuse(url: str, _cwd: Path) -> bool:
@@ -494,7 +523,7 @@ def test_an_unnamed_harness_falls_back_to_the_other_claude_code(
     monkeypatch.setattr(workspace, "_open_url", refuse)
     monkeypatch.setattr(workspace, "_resolves", lambda command: True)
     monkeypatch.setattr(workspace, "_open_terminal", no_terminal)
-    with pytest.raises(workspace.LaunchError, match="none of claude_code_desktop") as e:
+    with pytest.raises(workspace.LaunchError, match="none of claude_code_cli") as e:
         agent_workspace.open_session(fallback=True)
     assert "codex_cli" in str(e.value)
     assert str(store_path) in str(e.value)
