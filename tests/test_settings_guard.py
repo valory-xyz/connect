@@ -87,6 +87,9 @@ from connect.server.settings_routes import (
     WHITELIST_FROZEN,
 )
 from connect.settings import (
+    DEFAULT_HARNESS,
+    HARNESS_CLAUDE_CODE_CLI,
+    HARNESS_CLAUDE_CODE_DESKTOP,
     MAC_FIELDS,
     MODE_RESTRICTED,
     MODE_UNRESTRICTED,
@@ -177,15 +180,52 @@ class TestSettingsStore:
                 protected=Protected(
                     mode=MODE_UNRESTRICTED, whitelist={"gnosis": (OTHER,)}
                 ),
-                harness="claude_code_cli",
+                # not the default, so a dropped harness cannot pass as kept
+                harness="codex_desktop",
             )
         )
         loaded = store.load()
         assert loaded.protected.mode == MODE_UNRESTRICTED
         assert loaded.protected.whitelist == {"gnosis": (OTHER,)}
-        assert loaded.harness == "claude_code_cli"
-        # a fresh store defaults to the desktop harness
-        assert defaults().harness == "claude_code_desktop"
+        assert loaded.harness == "codex_desktop"
+        # a fresh store defaults to the CLI harness
+        assert defaults().harness == "claude_code_cli"
+
+    def test_the_default_harness_is_the_claude_code_cli(self) -> None:
+        """What an operator who has chosen nothing gets (OPE-1939).
+
+        Pinned by name rather than only through the fresh-store assertions
+        elsewhere, so a change of default is a deliberate edit here and not a
+        test-fixture update someone makes to get a suite green.
+        """
+        assert DEFAULT_HARNESS == HARNESS_CLAUDE_CODE_CLI
+        assert defaults().harness == HARNESS_CLAUDE_CODE_CLI
+
+    def test_a_stored_harness_is_never_migrated(self, store: SettingsStore) -> None:
+        """The default only ever fills in a missing value.
+
+        A settings file that carries a harness keeps it, including the one
+        that used to be the default. Note that this is not the same as
+        respecting a choice: _load persists defaults() on its first read, so
+        an install that predates this default carries the old one because we
+        wrote it, not because the operator picked it. Migrating anyway would
+        move the operators who did pick it, and the file cannot tell the two
+        apart — so nothing migrates installs, by decision.
+        """
+        store.save(
+            Settings(
+                protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}),
+                harness=HARNESS_CLAUDE_CODE_DESKTOP,
+            )
+        )
+        assert store.load().harness == HARNESS_CLAUDE_CODE_DESKTOP
+
+        # and a file with no harness key at all is the case the default is for
+        path = store._path  # pylint: disable=protected-access
+        payload = json.loads(path.read_text())
+        del payload["harness"]
+        path.write_text(json.dumps(payload))
+        assert store.load().harness == HARNESS_CLAUDE_CODE_CLI
 
     def test_every_persisted_field_has_decided_its_mac_coverage(
         self, store: SettingsStore
@@ -226,9 +266,7 @@ class TestSettingsStore:
             threading.Thread(
                 target=store.patch, args=({"protected": {"mode": MODE_RESTRICTED}},)
             ),
-            threading.Thread(
-                target=store.patch, args=({"harness": "claude_code_cli"},)
-            ),
+            threading.Thread(target=store.patch, args=({"harness": "codex_desktop"},)),
         ]
         for thread in threads:
             thread.start()
@@ -236,7 +274,8 @@ class TestSettingsStore:
             thread.join()
         final = store.load()
         assert final.protected.mode == MODE_RESTRICTED
-        assert final.harness == "claude_code_cli"
+        # not the default: a lost harness patch must not look like a kept one
+        assert final.harness == "codex_desktop"
 
     def test_unreadable_file_serves_defaults(  # pylint: disable=too-many-arguments
         self,
@@ -303,7 +342,7 @@ class TestSettingsStore:
         store.save(
             Settings(
                 protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}),
-                harness="claude_code_cli",
+                harness="codex_desktop",
             )
         )
         before = store._path.read_bytes()  # pylint: disable=protected-access
@@ -320,7 +359,8 @@ class TestSettingsStore:
         assert store._path.read_bytes() == before  # pylint: disable=protected-access
         restored = store.load()
         assert restored.protected.mode == MODE_UNRESTRICTED
-        assert restored.harness == "claude_code_cli"
+        # not the default, so a reset would not answer this the same way
+        assert restored.harness == "codex_desktop"
 
     def test_invalid_patch_persists_nothing(self, store: SettingsStore) -> None:
         """A patch that fails validation leaves the stored settings untouched."""
@@ -355,7 +395,7 @@ class TestSettingsStore:
                 protected=Protected(
                     mode=MODE_UNRESTRICTED, whitelist={"gnosis": (OTHER,)}
                 ),
-                harness="claude_code_cli",
+                harness="codex_desktop",
             )
         )
         previous, updated = store.patch(
@@ -363,7 +403,8 @@ class TestSettingsStore:
         )
         assert updated.protected.mode == MODE_UNRESTRICTED
         assert updated.protected.whitelist == {"gnosis": (OTHER,)}
-        assert updated.harness == "claude_code_cli"
+        # not the default: a None taken as "reset" would land there instead
+        assert updated.harness == "codex_desktop"
         # nothing moved, and the caller can see that: it is what lets the
         # route audit only real changes
         assert previous == updated
@@ -480,10 +521,11 @@ class TestSettingsStore:
         store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
         payload = json.loads(path.read_text())
-        payload["harness"] = "claude_code_cli"
+        # not the default: an edit that was ignored would answer claude_code_cli
+        payload["harness"] = "codex_desktop"
         path.write_text(json.dumps(payload))
         loaded = store.load()
-        assert loaded.harness == "claude_code_cli"
+        assert loaded.harness == "codex_desktop"
         assert loaded.protected.mode == MODE_RESTRICTED  # protected fields untouched
 
     def test_invalid_harness_falls_back_without_tamper(
@@ -496,7 +538,7 @@ class TestSettingsStore:
         payload["harness"] = "cursor"
         path.write_text(json.dumps(payload))
         loaded = store.load()
-        assert loaded.harness == "claude_code_desktop"
+        assert loaded.harness == "claude_code_cli"
         assert (
             loaded.protected.mode == MODE_UNRESTRICTED
         )  # protected fields still verify
@@ -509,7 +551,7 @@ class TestSettingsStore:
         store.save(
             Settings(
                 protected=Protected(mode=MODE_RESTRICTED, whitelist={}),
-                harness="claude_code_cli",
+                harness="codex_desktop",
             )
         )
         path = store._path  # pylint: disable=protected-access
@@ -518,7 +560,8 @@ class TestSettingsStore:
         path.write_text(json.dumps(payload))
         loaded = store.load()
         assert loaded.protected.mode == MODE_UNRESTRICTED  # reset to defaults
-        assert loaded.harness == "claude_code_cli"  # preference survives
+        # not the default, so this says "preserved" and not merely "reset"
+        assert loaded.harness == "codex_desktop"  # preference survives
 
     def test_valid_mac_but_bad_mode_rejected(self, store: SettingsStore) -> None:
         """A MAC'd payload with an unknown mode still falls back to defaults."""
@@ -4068,7 +4111,7 @@ class TestSettingsEndpoints:
         body = client.get("/settings").json()
         assert body == {
             "protected": {"mode": "unrestricted", "whitelist": {}},
-            "harness": "claude_code_desktop",
+            "harness": "claude_code_cli",
         }
 
     def test_wrong_password_is_throttled_401(
@@ -4137,10 +4180,11 @@ class TestSettingsEndpoints:
 
     def test_harness_updates_and_validates(self, client: TestClient) -> None:
         """The harness is updatable from the UI endpoint and validated."""
-        flipped = client.patch("/settings", json={"harness": "claude_code_cli"})
+        # away from the default, so this shows the endpoint *changed* something
+        flipped = client.patch("/settings", json={"harness": "codex_desktop"})
         assert flipped.status_code == 200
-        assert flipped.json()["harness"] == "claude_code_cli"
-        assert client.get("/settings").json()["harness"] == "claude_code_cli"
+        assert flipped.json()["harness"] == "codex_desktop"
+        assert client.get("/settings").json()["harness"] == "codex_desktop"
 
         bad = client.patch("/settings", json={"harness": "cursor"})
         assert bad.status_code == 400
@@ -4162,17 +4206,18 @@ class TestSettingsEndpoints:
             return harness
 
         monkeypatch.setattr(workspace_module.Workspace, "open_session", record)
-        client.patch("/settings", json={"harness": "claude_code_cli"})
+        # not the default, so the launch follows the *configured* harness
+        client.patch("/settings", json={"harness": "codex_desktop"})
         response = client.post("/session")
         assert response.status_code == 200
         assert response.json() == {
             "launched": True,
-            "harness": "claude_code_cli",
-            "requested": "claude_code_cli",
+            "harness": "codex_desktop",
+            "requested": "codex_desktop",
         }
         # nobody named a harness on the call, so the saved preference is ours
         # to fall back from — see test_session_reports_the_harness_it_opened
-        assert opened == [("claude_code_cli", True)]
+        assert opened == [("codex_desktop", True)]
         assert "session_launched" in audit_kinds(store_path)
 
     def test_session_reports_the_harness_it_opened(
@@ -4183,27 +4228,28 @@ class TestSettingsEndpoints:
     ) -> None:
         """A fallback launch answers with where it went, not where it aimed.
 
-        On a machine with only one Claude Code installed, the preference and
+        On a machine without the default harness installed, the preference and
         the session part ways (OPE-1867). Answering with the preference would
-        have the UI report a desktop session the operator never got.
+        have the UI report a CLI session the operator never got. The stub
+        returns a harness that is *not* the default, so the two stay distinct.
         """
         monkeypatch.setattr(
             workspace_module.Workspace,
             "open_session",
-            lambda self, harness, *, fallback=False: "claude_code_cli",
+            lambda self, harness, *, fallback=False: "claude_code_desktop",
         )
         response = client.post("/session")
         assert response.status_code == 200
         assert response.json() == {
             "launched": True,
-            "harness": "claude_code_cli",
-            "requested": "claude_code_desktop",
+            "harness": "claude_code_desktop",
+            "requested": "claude_code_cli",
         }
         entry = audit_entries(store_path)[-1]
         assert entry["kind"] == "session_launched"
         assert (entry["harness"], entry["requested"]) == (
-            "claude_code_cli",
             "claude_code_desktop",
+            "claude_code_cli",
         )
 
     def test_session_launch_failure_is_reported(
@@ -4230,16 +4276,16 @@ class TestSettingsEndpoints:
         # depend on whether the launch worked
         assert response.json() == {
             "launched": False,
-            "harness": "claude_code_desktop",
-            "requested": "claude_code_desktop",
-            "error": "could not open claude_code_desktop",
+            "harness": "claude_code_cli",
+            "requested": "claude_code_cli",
+            "error": "could not open claude_code_cli",
         }
         # the trail carries both harnesses on this outcome too
         entry = audit_entries(store_path)[-1]
         assert entry["kind"] == "session_launch_failed"
         assert (entry["harness"], entry["requested"]) == (
-            "claude_code_desktop",
-            "claude_code_desktop",
+            "claude_code_cli",
+            "claude_code_cli",
         )
 
     def test_session_rejects_cross_origin(self, client: TestClient) -> None:
@@ -4260,19 +4306,21 @@ class TestSettingsEndpoints:
             return harness
 
         monkeypatch.setattr(workspace_module.Workspace, "open_session", record)
-        response = client.post("/session", json={"harness": "claude_code_cli"})
+        # not the default, so the preference assertion below can tell the two
+        # apart: a persisted override would read back as codex_desktop
+        response = client.post("/session", json={"harness": "codex_desktop"})
         assert response.status_code == 200
         assert response.json() == {
             "launched": True,
-            "harness": "claude_code_cli",
-            "requested": "claude_code_cli",
+            "harness": "codex_desktop",
+            "requested": "codex_desktop",
         }
-        # named, so it opens there or nowhere: no fallback to the other one
-        assert opened == [("claude_code_cli", False)]
+        # named, so it opens there or nowhere: no fallback to the others
+        assert opened == [("codex_desktop", False)]
         # the saved preference is untouched: the next default launch uses it
-        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
+        assert client.get("/settings").json()["harness"] == "claude_code_cli"
         client.post("/session")
-        assert opened[-1] == ("claude_code_desktop", True)
+        assert opened[-1] == ("claude_code_cli", True)
 
     def test_session_survives_an_unwritable_audit_log(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -4299,7 +4347,7 @@ class TestSettingsEndpoints:
         response = client.post("/session")
         assert response.status_code == 200
         assert response.json()["launched"] is True
-        assert opened == ["claude_code_desktop"]
+        assert opened == ["claude_code_cli"]
 
     def test_session_rejects_an_unknown_harness(self, client: TestClient) -> None:
         """An unknown harness is a 400, not a deep link nobody can open."""
@@ -4350,11 +4398,13 @@ class TestSettingsEndpoints:
         self, store_path: Path, client: TestClient, activity: ActivityLog
     ) -> None:
         """The harness is a preference: changing it never asks for the password."""
-        response = client.patch("/settings", json={"harness": "claude_code_cli"})
+        # away from the default: patch_settings audits harness_changed only
+        # when the value actually moved, so a no-op would prove nothing here
+        response = client.patch("/settings", json={"harness": "codex_desktop"})
         assert response.status_code == 200
-        assert response.json()["harness"] == "claude_code_cli"
+        assert response.json()["harness"] == "codex_desktop"
         loaded = client.get("/settings").json()
-        assert loaded["harness"] == "claude_code_cli"
+        assert loaded["harness"] == "codex_desktop"
         # protected fields untouched
         assert loaded["protected"]["mode"] == "unrestricted"
         assert "harness_changed" in audit_kinds(store_path)
@@ -4404,7 +4454,7 @@ class TestSettingsEndpoints:
         """Merge-patch semantics: omitted fields keep their current values."""
         store = client.app.state.settings_store  # type: ignore[attr-defined]
         store.patch({"protected": {"whitelist": {"testchain": [WHITELISTED]}}})
-        client.patch("/settings", json={"harness": "claude_code_cli"})
+        client.patch("/settings", json={"harness": "codex_desktop"})
         # mode-only patch: the whitelist and the harness survive it
         response = client.patch(
             "/settings",
@@ -4414,7 +4464,7 @@ class TestSettingsEndpoints:
         body = response.json()
         assert body["protected"]["mode"] == "restricted"
         assert body["protected"]["whitelist"] == {"testchain": [WHITELISTED.lower()]}
-        assert body["harness"] == "claude_code_cli"  # preference not reset
+        assert body["harness"] == "codex_desktop"  # preference not reset
 
     def test_a_patch_that_changes_nothing_is_audited_as_nothing(
         self, store_path: Path, client: TestClient, activity: ActivityLog
@@ -4425,13 +4475,13 @@ class TestSettingsEndpoints:
         worse than one that stays quiet: it is the record an operator reaches
         for when something has gone wrong.
         """
-        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
+        assert client.get("/settings").json()["harness"] == "claude_code_cli"
         noop = client.patch(
             "/settings",
             json={
                 "password": TEST_PASSWORD,
                 "protected": {},  # every field None: merges nothing
-                "harness": "claude_code_desktop",  # already the stored value
+                "harness": "claude_code_cli",  # already the stored value
             },
         )
         assert noop.status_code == 200
@@ -4439,8 +4489,9 @@ class TestSettingsEndpoints:
         assert "settings_changed" not in kinds
         assert "harness_changed" not in kinds
 
-        # a real change still lands
-        client.patch("/settings", json={"harness": "claude_code_cli"})
+        # a real change still lands — one that moves the value, since that is
+        # the only kind patch_settings audits
+        client.patch("/settings", json={"harness": "codex_desktop"})
         assert "harness_changed" in audit_kinds(store_path)
 
     def test_host_header_is_validated(self, client: TestClient) -> None:
@@ -4617,13 +4668,13 @@ class TestSettingsEndpoints:
     def test_failed_patch_changes_nothing(self, client: TestClient) -> None:
         """A patch is atomic: an invalid protected half also drops the harness half."""
         before = client.get("/settings").json()
-        assert before["harness"] != "claude_code_cli"
+        assert before["harness"] != "codex_desktop"
         response = client.patch(
             "/settings",
             json={
                 "password": TEST_PASSWORD,
                 "protected": {"mode": "yolo"},
-                "harness": "claude_code_cli",
+                "harness": "codex_desktop",
             },
         )
         assert response.status_code == 400
@@ -4659,12 +4710,13 @@ class TestSettingsEndpoints:
         # forged without the key: a whitelist entry the operator never allowed
         payload["protected"]["whitelist"] = {"testchain": [OTHER]}
         path.write_text(json.dumps(payload))
-        response = client.patch("/settings", json={"harness": "claude_code_cli"})
+        # a harness the patch actually moves, so the vehicle is a real change
+        response = client.patch("/settings", json={"harness": "codex_desktop"})
         assert response.status_code == 200
         body = response.json()
         # reset to the defaults, not merged with the forgery
         assert OTHER not in body["protected"]["whitelist"].get("testchain", [])
-        assert body["harness"] == "claude_code_cli"
+        assert body["harness"] == "codex_desktop"
         assert "settings_tampered" in audit_kinds(store_path)
 
     def test_unpersistable_patch_is_a_clear_error(
@@ -4679,12 +4731,13 @@ class TestSettingsEndpoints:
                 "_save",
                 lambda self, settings: (_ for _ in ()).throw(OSError("disk full")),
             )
-            response = client.patch("/settings", json={"harness": "claude_code_cli"})
+            response = client.patch("/settings", json={"harness": "codex_desktop"})
         assert response.status_code == 503
         assert "persisted" in response.json()["detail"]
         assert "settings_persist_failed" in audit_kinds(store_path)
-        # nothing changed on disk
-        assert client.get("/settings").json()["harness"] == "claude_code_desktop"
+        # nothing changed on disk — and the patch above was a real change, so
+        # a write that had landed would show here
+        assert client.get("/settings").json()["harness"] == "claude_code_cli"
 
 
 def _build_tools(  # pylint: disable=too-many-arguments
@@ -4765,7 +4818,7 @@ class TestMcpGuardrailTools:
         assert not writers  # the MCP surface still cannot change the guardrail
         assert await tools["settings"]() == {
             "protected": {"mode": "unrestricted", "whitelist": {}},
-            "harness": "claude_code_desktop",
+            "harness": "claude_code_cli",
         }
         assert (await tools["wallet_info"]())["mode"] == "unrestricted"
         # tampering is not visible through the tool — only the enforced state

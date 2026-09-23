@@ -96,7 +96,7 @@ HARNESSES = (
     HARNESS_CODEX_CLI,
     HARNESS_CODEX_DESKTOP,
 )
-DEFAULT_HARNESS = HARNESS_CLAUDE_CODE_DESKTOP
+DEFAULT_HARNESS = HARNESS_CLAUDE_CODE_CLI
 
 _MAC_KEY_INFO = b"pearl-connect settings hmac v1"
 
@@ -168,7 +168,7 @@ class Settings:
     """The persisted state in its canonical shape: protected + preferences."""
 
     protected: Protected
-    # which Claude Code the server opens the workspace session in (preference)
+    # which harness the server opens the workspace session in (preference)
     harness: str = DEFAULT_HARNESS
 
     def to_dict(self) -> dict:
