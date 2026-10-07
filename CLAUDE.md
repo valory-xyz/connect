@@ -64,6 +64,7 @@ Core modules:
 - `connect/idempotency.py` — at-most-once execution keyed by caller-chosen request ids, for actions paid for before they are answered; `mech.py` is the only user, and `signer.py` keeps its own simpler cache mapping ids to tx hashes. Its entries hold a whole report plus a stamp of what was asked, because a replay has to resume a watch rather than repeat a value, and a reused id must not answer a different question.
 - `connect/config.py` — the only module that reads env vars *as configuration* (`CONNECTION_*`, injected by Pearl from the service template); `workspace.harness_env()` touches the environment only to scrub it on the way out, and `workspace.terminal_launches()` reads `$TERMINAL` only to pick the operator's terminal.
 - `connect/activity.py` — audit trail of every signer action + `agent_performance.json` (Pearl SDK contract file).
+- `connect/run_goal.py` — `RunGoal`, Connect's activity goal: a run window of `target` minutes (default `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN`, 15) opened at process start. Each `snapshot()` rolls the window over first — once its minutes have elapsed it stamps `last_met_at` and reopens at the current time, so a suspend counts as one completed run, not a burst. A target of 0 is always met and never rolls over. Connect never stops itself; Pearl's Auto-run keys its hand-over on `last_met_at`.
 - `connect/wallet.py` — balance queries shared by `/funds-status`, `/wallet`, and the `wallet_info` MCP tool.
 
 Server (`connect/server/`):
