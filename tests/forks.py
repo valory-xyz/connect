@@ -38,6 +38,7 @@ import httpx
 ANVIL_IMAGE = Path(__file__).with_name("ANVIL_IMAGE").read_text("utf-8").strip()
 START_TIMEOUT = 180
 START_ATTEMPTS = 3
+REFORK_ATTEMPTS = 2
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -189,14 +190,20 @@ class AnvilFork:
         """Drop all state and fork again from the latest upstream block."""
         # Re-forking instead of evm_revert: non-archive upstreams prune the state
         # of a fork block within minutes.
-        try:
-            json_rpc(
-                self.url, "anvil_reset", {"forking": {"jsonRpcUrl": self._upstream}}
-            )
-        except (httpx.HTTPError, RuntimeError) as e:
-            raise RuntimeError(
-                f"Re-forking {self.name} failed: {redact(str(e), self._upstream)}"
-            ) from None
+        for attempt in range(REFORK_ATTEMPTS):
+            try:
+                json_rpc(
+                    self.url,
+                    "anvil_reset",
+                    {"forking": {"jsonRpcUrl": self._upstream}},
+                )
+                return
+            except (httpx.HTTPError, RuntimeError) as e:
+                if attempt + 1 == REFORK_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Re-forking {self.name} failed: "
+                        f"{redact(str(e), self._upstream)}"
+                    ) from None
 
     def stop(self) -> None:
         """Remove the container and its volumes."""

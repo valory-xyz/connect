@@ -72,6 +72,7 @@ from tests.forks import AnvilFork, json_rpc
 RPC_ENV = "GNOSIS_RPC"
 POLYGON_RPC_ENV = "POLYGON_RPC"
 GNOSIS_CHAIN_ID = 100
+POLYGON_CHAIN_ID = 137
 MIDDLEWARE_ENV_FILE = (
     Path(__file__).parent.parent.parent / "olas-operate-middleware" / ".env"
 )
@@ -257,10 +258,28 @@ def test_signer_client_reaches_the_server_that_provisioned_it(
         assert "gnosis" in str(excinfo.value)
 
 
+@pytest.fixture(name="polygon_rpc_url")
+def polygon_rpc_url_fixture() -> t.Iterator[str]:
+    """Return the RPC URL of an Anvil fork of Polygon, run for one test."""
+    assert POLYGON_RPC_URL is not None
+    try:
+        fork = AnvilFork("polygon", POLYGON_CHAIN_ID, POLYGON_RPC_URL)
+    except RuntimeError as e:
+        # a configured-but-dead endpoint is a missing tool, not a failing
+        # assertion about the constants
+        pytest.skip(f"{POLYGON_RPC_ENV} is unusable: {e}")
+    try:
+        yield fork.url
+    finally:
+        fork.stop()
+
+
 @pytest.mark.skipif(
     not POLYGON_RPC_URL, reason=f"{POLYGON_RPC_ENV} not set and .env not usable"
 )
-def test_polymarket_token_constants_are_the_tokens_they_claim() -> None:
+def test_polymarket_token_constants_are_the_tokens_they_claim(
+    polygon_rpc_url: str,
+) -> None:
     """Resolve the skill's hardcoded Polygon tokens against the real chain.
 
     These decide which balance the operator is shown; a wrong address reports
@@ -269,16 +288,7 @@ def test_polymarket_token_constants_are_the_tokens_they_claim() -> None:
     "USDC" on-chain, which is exactly how a funded safe gets read as holding
     none — so each is pinned by address here.
     """
-    assert POLYGON_RPC_URL is not None
-    w3 = Web3(Web3.HTTPProvider(POLYGON_RPC_URL, request_kwargs={"timeout": 45}))
-    try:
-        chain_id = w3.eth.chain_id
-    except Exception as e:  # pylint: disable=broad-except
-        # a configured-but-dead endpoint is a missing tool, not a failing
-        # assertion about the constants
-        pytest.skip(f"{POLYGON_RPC_ENV} is unreachable: {e}")
-    if chain_id != 137:  # pragma: no cover - misconfigured endpoint
-        pytest.skip(f"{POLYGON_RPC_ENV} is not Polygon (chain {chain_id})")
+    w3 = Web3(Web3.HTTPProvider(polygon_rpc_url, request_kwargs={"timeout": 45}))
 
     sys.path.insert(0, str(_POLYMARKET_SCRIPTS))
     # tox.ini excludes connect-polymarket from mypy (it needs py_clob_client_v2
@@ -1044,10 +1054,9 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     # the mech-side validation a real mech performs all passed
     assert endpoint.validation_errors == []
     # the 402 fired, and the deposit it demanded landed on the tracker; the
-    # safe paid exactly the shortfall (the fork is shared, so the tracker's
-    # own growth is only bounded from below)
+    # safe paid exactly the shortfall
     assert endpoint.saw_402 is True
-    assert endpoint.paid >= endpoint.required
+    assert endpoint.paid == endpoint.required
     assert (
         int(w3.eth.get_balance(Web3.to_checksum_address(safe_address)))
         == safe_balance_before - endpoint.required
