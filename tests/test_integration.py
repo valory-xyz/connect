@@ -17,10 +17,10 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Integration tests against a Tenderly Gnosis fork.
+"""Integration tests against a local Anvil fork of Gnosis.
 
-The RPC comes from the GNOSIS_TESTNET_RPC env var (CI) or, for local runs,
-from the sibling olas-operate-middleware checkout's .env file.
+The fork's upstream RPC comes from the GNOSIS_RPC env var (CI) or, for local
+runs, from the sibling olas-operate-middleware checkout's .env file.
 """
 
 import contextlib
@@ -35,7 +35,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-import httpx
 import pytest
 import uvicorn
 from eth_account.signers.local import LocalAccount
@@ -68,16 +67,19 @@ from connect.signer import Signer
 from connect.workspace import Workspace
 
 from tests.conftest import TEST_PASSWORD, audit_kinds
+from tests.forks import AnvilFork, json_rpc
 
-RPC_ENV = "GNOSIS_TESTNET_RPC"
-POLYGON_RPC_ENV = "POLYGON_TESTNET_RPC"
+RPC_ENV = "GNOSIS_RPC"
+POLYGON_RPC_ENV = "POLYGON_RPC"
+GNOSIS_CHAIN_ID = 100
+POLYGON_CHAIN_ID = 137
 MIDDLEWARE_ENV_FILE = (
     Path(__file__).parent.parent.parent / "olas-operate-middleware" / ".env"
 )
 
 
 def _resolve_rpc(name: str = RPC_ENV) -> str | None:
-    """Return a testnet RPC from the env, else the middleware repo's .env."""
+    """Return a mainnet RPC from the env, else the middleware repo's .env."""
     if os.environ.get(name):
         return os.environ[name]
     try:
@@ -102,30 +104,30 @@ pytestmark = [
 
 
 def _set_balance(rpc_url: str, address: str, wei: int) -> None:
-    response = httpx.post(
-        rpc_url,
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tenderly_setBalance",
-            "params": [[address], hex(wei)],
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    assert "result" in response.json(), response.text
+    json_rpc(rpc_url, "anvil_setBalance", address, hex(wei))
+
+
+@pytest.fixture(name="gnosis_fork", scope="session")
+def gnosis_fork_fixture() -> t.Iterator[AnvilFork]:
+    """Run one Anvil fork of Gnosis for the session."""
+    assert RPC_URL is not None
+    fork = AnvilFork("gnosis", GNOSIS_CHAIN_ID, RPC_URL)
+    try:
+        yield fork
+    finally:
+        fork.stop()
 
 
 @pytest.fixture(name="rpc_url")
-def rpc_url_fixture() -> str:
-    """Return the Tenderly fork RPC URL."""
-    assert RPC_URL is not None
-    return RPC_URL
+def rpc_url_fixture(gnosis_fork: AnvilFork) -> str:
+    """Return the fork RPC URL, re-forked from the latest block for this test."""
+    gnosis_fork.refork()
+    return gnosis_fork.url
 
 
 @pytest.fixture(name="fork_config")
 def fork_config_fixture(rpc_url: str, store_path: Path) -> AppConfig:
-    """Return an AppConfig pointing at the Tenderly fork."""
+    """Return an AppConfig pointing at the Anvil fork."""
     return AppConfig(
         chains={"gnosis": ChainConfig(rpc_url=rpc_url)},
         store_path=store_path,
@@ -256,10 +258,28 @@ def test_signer_client_reaches_the_server_that_provisioned_it(
         assert "gnosis" in str(excinfo.value)
 
 
+@pytest.fixture(name="polygon_rpc_url")
+def polygon_rpc_url_fixture() -> t.Iterator[str]:
+    """Return the RPC URL of an Anvil fork of Polygon, run for one test."""
+    assert POLYGON_RPC_URL is not None
+    try:
+        fork = AnvilFork("polygon", POLYGON_CHAIN_ID, POLYGON_RPC_URL)
+    except RuntimeError as e:
+        # a configured-but-dead endpoint is a missing tool, not a failing
+        # assertion about the constants
+        pytest.skip(f"{POLYGON_RPC_ENV} is unusable: {e}")
+    try:
+        yield fork.url
+    finally:
+        fork.stop()
+
+
 @pytest.mark.skipif(
     not POLYGON_RPC_URL, reason=f"{POLYGON_RPC_ENV} not set and .env not usable"
 )
-def test_polymarket_token_constants_are_the_tokens_they_claim() -> None:
+def test_polymarket_token_constants_are_the_tokens_they_claim(
+    polygon_rpc_url: str,
+) -> None:
     """Resolve the skill's hardcoded Polygon tokens against the real chain.
 
     These decide which balance the operator is shown; a wrong address reports
@@ -268,16 +288,7 @@ def test_polymarket_token_constants_are_the_tokens_they_claim() -> None:
     "USDC" on-chain, which is exactly how a funded safe gets read as holding
     none — so each is pinned by address here.
     """
-    assert POLYGON_RPC_URL is not None
-    w3 = Web3(Web3.HTTPProvider(POLYGON_RPC_URL, request_kwargs={"timeout": 45}))
-    try:
-        chain_id = w3.eth.chain_id
-    except Exception as e:  # pylint: disable=broad-except
-        # a configured-but-dead endpoint (an expired fork answers 400) is a
-        # missing tool, not a failing assertion about the constants
-        pytest.skip(f"{POLYGON_RPC_ENV} is unreachable: {e}")
-    if chain_id != 137:  # pragma: no cover - misconfigured endpoint
-        pytest.skip(f"{POLYGON_RPC_ENV} is not Polygon (chain {chain_id})")
+    w3 = Web3(Web3.HTTPProvider(polygon_rpc_url, request_kwargs={"timeout": 45}))
 
     sys.path.insert(0, str(_POLYMARKET_SCRIPTS))
     # tox.ini excludes connect-polymarket from mypy (it needs py_clob_client_v2
@@ -379,8 +390,6 @@ def test_safe_transaction_mines_a_server_composed_call_on_fork(
     app = _fork_app(funded_signer, fork_config, fork_store, store_path, token)
 
     w3 = funded_signer.w3("gnosis")
-    # a random recipient, not a fixed one: the fork persists state across runs,
-    # so a reused address would already hold what a prior run sent it
     recipient = Web3.to_checksum_address("0x" + secrets.token_hex(20))
     before = w3.eth.get_balance(recipient)
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
@@ -590,18 +599,14 @@ def test_wallet_reports_only_actionable_chains_on_fork(
         assert drained["actionable_chains"] == []
         assert "no gas" in drained["chains"]["gnosis"]["not_actionable_because"]
 
-    # leave the fork funded: its state persists across runs
-    _set_balance(rpc_url, account.address, 10 * 10**18)
-
 
 def _iter_gnosis_mechs(
     mech_service: MechService, limit: int | None = None
 ) -> t.Iterator[tuple[str, dict]]:
     """Yield (address, mech_tools report) for live gnosis mechs.
 
-    Exercises MechService.tools() against the live subgraph + fork. Mechs that
-    post-date the fork snapshot revert on the info call; that is expected here
-    and skipped rather than failed.
+    Exercises MechService.tools() against the live subgraph + fork. Mechs whose
+    info call fails are skipped rather than failed.
     """
     listing = mech_service.tools(chain="gnosis")
     assert listing["mechs"], "subgraph returned no live mechs"
@@ -1049,10 +1054,9 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     # the mech-side validation a real mech performs all passed
     assert endpoint.validation_errors == []
     # the 402 fired, and the deposit it demanded landed on the tracker; the
-    # safe paid exactly the shortfall (the fork is shared, so the tracker's
-    # own growth is only bounded from below)
+    # safe paid exactly the shortfall
     assert endpoint.saw_402 is True
-    assert endpoint.paid >= endpoint.required
+    assert endpoint.paid == endpoint.required
     assert (
         int(w3.eth.get_balance(Web3.to_checksum_address(safe_address)))
         == safe_balance_before - endpoint.required
