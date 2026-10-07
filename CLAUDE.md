@@ -69,7 +69,7 @@ Core modules:
 
 Server (`connect/server/`):
 
-- `app.py` — FastAPI application factory; also serves the bundled UI from `connect/assets/ui` (read into memory at boot).
+- `app.py` — FastAPI application factory; also serves the bundled UI from `connect/assets/ui` (read into memory at boot). Its lifespan runs `refresh_performance`, which rewrites `agent_performance.json` every `PERFORMANCE_REFRESH_SECONDS` (15) off the event loop, so the run window rolls over and a session's edit of `activity_goal.target` takes effect with nothing else happening; it is cancelled on shutdown.
 - `auth.py` — bearer-token auth, Origin/Host validation, auth-failure rate limiting. The localhost bind is *not* trusted: any browser page can hit localhost, so every fund-moving or guardrail-changing route needs the bearer token (or the keystore password for protected settings). Only `POST /session` and the harness half of `PATCH /settings` are origin-gated without a token — deliberately, because they can't move funds.
 - `pearl_routes.py` — Pearl SDK contracts (`/healthcheck`, `/funds-status`); `is_healthy` flips true only once the workspace is populated.
 - `signer_routes.py` / `settings_routes.py` — HTTP signing surface and settings.

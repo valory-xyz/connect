@@ -19,6 +19,8 @@
 
 """FastAPI application factory."""
 
+import asyncio
+import contextlib
 import logging
 import mimetypes
 import threading
@@ -47,6 +49,22 @@ from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
 
+# how often agent_performance.json is rewritten with nothing else happening:
+# it bounds both how stale the run window Pearl sees can be and how long a
+# session's edit of activity_goal.target waits to take effect
+PERFORMANCE_REFRESH_SECONDS = 15.0
+
+
+async def refresh_performance(activity: ActivityLog) -> None:
+    """Rewrite agent_performance.json periodically, until cancelled.
+
+    The write blocks on disk I/O and the activity lock, so it runs off the
+    event loop. A failing disk is logged by write_performance itself.
+    """
+    while True:
+        await asyncio.sleep(PERFORMANCE_REFRESH_SECONDS)
+        await asyncio.to_thread(activity.write_performance)
+
 
 def create_app(  # pylint: disable=too-many-arguments
     signer: Signer,
@@ -71,8 +89,14 @@ def create_app(  # pylint: disable=too-many-arguments
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> t.AsyncIterator[None]:
-        async with mcp.session_manager.run():
-            yield
+        refresher = asyncio.create_task(refresh_performance(activity))
+        try:
+            async with mcp.session_manager.run():
+                yield
+        finally:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresher
 
     app = FastAPI(title="connect", lifespan=lifespan)
     # DNS-rebinding defense: a rebound hostname reaches the socket with the

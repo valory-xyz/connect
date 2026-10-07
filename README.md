@@ -104,7 +104,8 @@ carries it as the `activity_goal` block Pearl reads through the middleware's
 }
 ```
 
-`progress` is whole minutes since `period_start`. Once `target` minutes have
+The server rewrites the file every 15 seconds as well as after every recorded
+action. `progress` is whole minutes since `period_start`. Once `target` minutes have
 elapsed, the write stamps `last_met_at` and opens the next window at that
 moment: `progress` goes back to 0 and `is_met` stays false, so a completed
 run shows only as a later `last_met_at`, which is what Pearl's Auto-run keys

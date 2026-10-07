@@ -19,7 +19,9 @@
 
 """Test endpoints module."""
 
+import json
 import mimetypes
+import time
 import typing as t
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from connect import wallet as wallet_module
 from connect import workspace
 from connect.activity import ActivityLog
 from connect.config import AppConfig
+from connect.server import app as app_module
 from connect.settings import HARNESSES
 from connect.signer import Signer
 
@@ -341,6 +344,61 @@ class TestOpenEndpoints:
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/html")
         assert TOKEN not in response.text
+
+
+def _wait_for(condition: t.Callable[[], bool], timeout: float = 5.0) -> bool:
+    """Poll until condition() holds or the timeout passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
+
+
+class TestPerformanceRefresh:
+    """The lifespan job that keeps agent_performance.json current."""
+
+    def test_job_writes_the_block_while_serving_and_stops_after(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """While the app runs the file is rewritten; on shutdown the job ends."""
+        monkeypatch.setattr(app_module, "PERFORMANCE_REFRESH_SECONDS", 0.01)
+        performance = app_config.store_path / "agent_performance.json"
+        app = make_app(test_signer, app_config, activity, token=TOKEN)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            assert _wait_for(performance.exists)
+            goal = json.loads(performance.read_text())["activity_goal"]
+            assert (goal["unit"], goal["target"]) == ("minutes", 15)
+        performance.unlink()
+        time.sleep(0.1)
+        assert not performance.exists()
+
+    def test_failing_disk_does_not_end_the_job(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A write that fails is logged and the next tick tries again."""
+        monkeypatch.setattr(app_module, "PERFORMANCE_REFRESH_SECONDS", 0.01)
+        attempts: list[int] = []
+
+        def failing_write() -> None:
+            attempts.append(1)
+            raise OSError("read-only fs")
+
+        monkeypatch.setattr(activity, "_write_performance", failing_write)
+        app = make_app(test_signer, app_config, activity, token=TOKEN)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            assert _wait_for(lambda: len(attempts) >= 2)
 
 
 class TestAuth:
