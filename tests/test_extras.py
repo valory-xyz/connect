@@ -775,6 +775,27 @@ class TestActivityGoal:
         assert "could not read agent_performance.json back" in caplog.text
         assert _performance(store_path)["activity_goal"]["target"] == 15
 
+    def test_failed_audit_still_writes_the_new_target(
+        self,
+        store_path: Path,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An unwritable audit log is reported as such and the change still applies."""
+        activity.write_performance()
+        _session_sets_target(store_path, 30)
+        monkeypatch.setattr(
+            activity,
+            "_append",
+            lambda entry: (_ for _ in ()).throw(OSError("log full")),
+        )
+        with caplog.at_level(logging.ERROR):
+            activity.write_performance()
+        assert "could not audit minutes per run 15 -> 30" in caplog.text
+        assert "could not write agent_performance.json" not in caplog.text
+        assert _performance(store_path)["activity_goal"]["target"] == 30
+
     def test_failing_disk_is_logged_not_raised(
         self,
         activity: ActivityLog,

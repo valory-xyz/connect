@@ -144,14 +144,20 @@ class ActivityLog:
                 "minutes per run restored from %s: %d", PERFORMANCE_FILE, stored
             )
             return
-        self._append(
-            {
-                "timestamp": int(time.time()),
-                "kind": "minutes_per_run_changed",
-                "old": current,
-                "new": stored,
-            }
-        )
+        try:
+            self._append(
+                {
+                    "timestamp": int(time.time()),
+                    "kind": "minutes_per_run_changed",
+                    "old": current,
+                    "new": stored,
+                }
+            )
+        except OSError:
+            # the change stands and the performance write still runs
+            logger.exception(
+                "could not audit minutes per run %d -> %d", current, stored
+            )
 
     def _write_performance(self) -> None:
         self._adopt_stored_target()
