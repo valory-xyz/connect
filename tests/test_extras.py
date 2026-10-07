@@ -44,6 +44,7 @@ from connect.config import (
     AppConfig,
     ChainConfig,
     FUND_REQUIREMENTS_ENV,
+    MINUTES_PER_RUN_ENV,
     SAFES_ENV,
     STORE_PATH_ENV,
     load_config,
@@ -51,12 +52,13 @@ from connect.config import (
 from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
+from connect.run_goal import RunGoal
 from connect.server.auth import AuthFailureLimiter, AuthMiddleware
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError, _IdempotencyCache
 
-from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
 
 
 class StubServer:
@@ -597,6 +599,7 @@ class TestActivityExtras:
             "agent_behavior",
             "last_activity",
             "last_chat_message",
+            "activity_goal",
         }
 
     def test_transactions_metric_counts_only_transactions(
@@ -611,6 +614,182 @@ class TestActivityExtras:
         assert metric["name"] == "transactions"
         assert metric["value"] == 1
         assert activity.count == 3  # the all-actions counter still sees everything
+
+
+def _performance(store_path: Path) -> dict:
+    """Read agent_performance.json as Pearl reads it."""
+    return json.loads((store_path / "agent_performance.json").read_text())
+
+
+def _session_sets_target(store_path: Path, target: t.Any) -> None:
+    """Edit activity_goal.target in place, as the session is told to."""
+    payload = _performance(store_path)
+    payload["activity_goal"]["target"] = target
+    (store_path / "agent_performance.json").write_text(json.dumps(payload))
+
+
+class TestActivityGoal:
+    """The activity_goal block and the session's minutes-per-run write-back."""
+
+    def test_block_is_written_with_the_default_target(
+        self, store_path: Path, activity: ActivityLog
+    ) -> None:
+        """A fresh store gets a not-yet-met 15-minute window."""
+        activity.write_performance()
+        goal = _performance(store_path)["activity_goal"]
+        assert set(goal) == {
+            "unit",
+            "target",
+            "progress",
+            "is_met",
+            "period_start",
+            "last_met_at",
+            "updated_at",
+        }
+        assert (goal["unit"], goal["target"], goal["progress"]) == ("minutes", 15, 0)
+        assert (goal["is_met"], goal["last_met_at"]) == (False, None)
+
+    def test_block_is_written_after_record(
+        self, store_path: Path, activity: ActivityLog
+    ) -> None:
+        """Every recorded action rewrites the block alongside the other keys."""
+        activity.record("transaction", chain="testchain")
+        payload = _performance(store_path)
+        assert payload["activity_goal"]["target"] == 15
+        assert payload["metrics"][0]["value"] == 1
+
+    def test_session_target_is_adopted_and_audited_once(
+        self, store_path: Path, activity: ActivityLog
+    ) -> None:
+        """A valid new target takes effect on the next write; repeating it is silent."""
+        activity.write_performance()
+        _session_sets_target(store_path, 30)
+        activity.write_performance()
+        activity.write_performance()
+        assert _performance(store_path)["activity_goal"]["target"] == 30
+        changes = [
+            entry
+            for entry in audit_entries(store_path)
+            if entry["kind"] == "minutes_per_run_changed"
+        ]
+        assert [(c["old"], c["new"]) for c in changes] == [(15, 30)]
+
+    @pytest.mark.parametrize("bad", [-1, 1.5, True, "30", None])
+    def test_invalid_session_target_is_put_back(
+        self,
+        store_path: Path,
+        activity: ActivityLog,
+        bad: t.Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A value that is not a whole number >= 0 changes nothing and is rewritten."""
+        activity.write_performance()
+        _session_sets_target(store_path, bad)
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            activity.write_performance()
+        assert _performance(store_path)["activity_goal"]["target"] == 15
+        assert "ignoring activity_goal.target" in caplog.text
+        assert "minutes_per_run_changed" not in audit_kinds(store_path)
+
+    @pytest.mark.parametrize(
+        "content",
+        ["{not json", "[]", '{"activity_goal": 5}', "{}"],
+        ids=["corrupt", "not-an-object", "block-not-an-object", "missing-block"],
+    )
+    def test_unusable_file_keeps_the_current_target(
+        self,
+        store_path: Path,
+        activity: ActivityLog,
+        content: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A file the server cannot read a target from is logged and overwritten."""
+        activity.write_performance()
+        (store_path / "agent_performance.json").write_text(content)
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            activity.write_performance()
+        assert _performance(store_path)["activity_goal"]["target"] == 15
+        assert "agent_performance.json" in caplog.text
+
+    def test_target_at_or_below_progress_completes_the_run(
+        self, store_path: Path
+    ) -> None:
+        """Lowering the goal below the minutes already run completes the window."""
+        now = [1_791_331_200.0]
+        activity = ActivityLog(store_path, RunGoal(15, clock=lambda: now[0]))
+        activity.write_performance()
+        now[0] += 5 * 60
+        _session_sets_target(store_path, 5)
+        activity.write_performance()
+        assert _performance(store_path)["activity_goal"]["last_met_at"] == now[0]
+
+    def test_target_in_the_file_survives_a_restart(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+    ) -> None:
+        """Boot adopts the user's value over the template default, without an audit."""
+        monkeypatch.setenv(MINUTES_PER_RUN_ENV, "15")
+        (boot_env / "agent_performance.json").write_text(
+            json.dumps({"activity_goal": {"target": 45}})
+        )
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert served
+        goal = _performance(boot_env)["activity_goal"]
+        assert (goal["target"], goal["progress"], goal["last_met_at"]) == (45, 0, None)
+        assert "minutes_per_run_changed" not in audit_kinds(boot_env)
+
+    def test_boot_uses_the_configured_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+    ) -> None:
+        """With nothing stored, the service template's default is the target."""
+        monkeypatch.setenv(MINUTES_PER_RUN_ENV, "20")
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert served
+        assert _performance(boot_env)["activity_goal"]["target"] == 20
+
+    def test_unreadable_file_never_fails_the_write(
+        self,
+        store_path: Path,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A read-back error is logged, the target kept, and the file still written."""
+        activity.write_performance()
+        real_read_text = Path.read_text
+
+        def read_text(path: Path, *args: t.Any, **kwargs: t.Any) -> str:
+            if path.name == "agent_performance.json":
+                raise PermissionError("locked")
+            return real_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            activity.write_performance()
+        monkeypatch.undo()
+        assert "could not read agent_performance.json back" in caplog.text
+        assert _performance(store_path)["activity_goal"]["target"] == 15
+
+    def test_failing_disk_is_logged_not_raised(
+        self,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An OSError on write stays inside write_performance."""
+        monkeypatch.setattr(
+            Path,
+            "replace",
+            lambda self, target: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        with caplog.at_level(logging.ERROR):
+            activity.write_performance()
+        assert "could not write agent_performance.json" in caplog.text
 
 
 class TestConfigExtras:

@@ -83,6 +83,44 @@ one, though — it names the inner call (`safe_transaction`, `POST
 threshold-1 pre-validated signature and all. Nothing about the safe — its
 address, its ABI, its signature convention — is the session's problem.
 
+## Run window
+
+Connect has no staking epoch, so its activity goal is a **run window** of N
+minutes, opened when the process starts. Every write of `agent_performance.json`
+carries it as the `activity_goal` block Pearl reads through the middleware's
+`agent_performance` endpoint:
+
+```json
+{
+  "activity_goal": {
+    "unit": "minutes",
+    "target": 15,
+    "progress": 4,
+    "is_met": false,
+    "period_start": 1791332100,
+    "last_met_at": 1791332100,
+    "updated_at": 1791332340
+  }
+}
+```
+
+`progress` is whole minutes since `period_start`. Once `target` minutes have
+elapsed, the write stamps `last_met_at` and opens the next window at that
+moment: `progress` goes back to 0 and `is_met` stays false, so a completed
+run shows only as a later `last_met_at`, which is what Pearl's Auto-run keys
+its hand-over on. Connect never stops itself. A suspend that spans several
+windows counts as one completed run. A target of `0` is always met and never
+rolls over. Window state does not survive a restart: a new process opens a
+fresh window with `last_met_at: null`.
+
+`activity_goal.target` is the one field the session may write. Each server
+write reads it back first: a whole number >= 0 becomes the target of the
+current window (raising it extends the window, lowering it to at or below
+`progress` completes it) and is audited as `minutes_per_run_changed`;
+anything else is logged and overwritten with the current target. The file
+sits in `STORE_PATH`, so the user's value survives restarts. Until one is
+set, the target is `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN` (default 15).
+
 ## Codex
 
 Two harnesses open Codex. `codex_desktop` uses the desktop app's
