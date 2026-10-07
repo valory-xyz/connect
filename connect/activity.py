@@ -140,7 +140,9 @@ class ActivityLog:
         self._run_goal.set_target(stored)
         if restoring:
             # the value the user set before a restart, not a change
-            logger.info("minutes per run restored from %s: %d", PERFORMANCE_FILE, stored)
+            logger.info(
+                "minutes per run restored from %s: %d", PERFORMANCE_FILE, stored
+            )
             return
         self._append(
             {

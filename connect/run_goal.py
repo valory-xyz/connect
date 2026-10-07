@@ -36,9 +36,7 @@ UNIT = "minutes"
 class RunGoal:
     """The current run window and its target, safe to share across threads."""
 
-    def __init__(
-        self, target: int, clock: t.Callable[[], float] = time.time
-    ) -> None:
+    def __init__(self, target: int, clock: t.Callable[[], float] = time.time) -> None:
         """Open the first window now."""
         self._lock = threading.Lock()
         self._clock = clock
