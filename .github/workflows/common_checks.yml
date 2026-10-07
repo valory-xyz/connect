@@ -128,7 +128,8 @@ jobs:
     timeout-minutes: 30
 
     env:
-      GNOSIS_TESTNET_RPC: ${{ secrets.GNOSIS_TESTNET_RPC }}
+      GNOSIS_RPC: ${{ secrets.GNOSIS_RPC }}
+      POLYGON_RPC: ${{ secrets.POLYGON_RPC }}
 
     steps:
       - uses: actions/checkout@v7
@@ -138,6 +139,9 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.15"
+
+      - name: Pull the Anvil image for fork tests
+        run: docker pull "$(cat tests/ANVIL_IMAGE)"
 
       - name: Run integration tests
         run: |

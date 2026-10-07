@@ -27,10 +27,10 @@ tox -p -e flake8 -e pylint -e black-check -e isort-check -e bandit -e safety -e 
 autonomy packages lock
 ```
 
-**Integration tests** run against a Tenderly Gnosis fork and are skipped without an RPC:
+**Integration tests** run against a local Anvil fork of Gnosis (Docker required) and are skipped without an RPC:
 
 ```bash
-GNOSIS_TESTNET_RPC=<tenderly-fork-url> tox -e integration-tests
+GNOSIS_RPC=<gnosis-rpc-url> tox -e integration-tests
 ```
 
 ### Documentation (docstrings and inline comments)

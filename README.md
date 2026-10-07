@@ -327,7 +327,7 @@ uv pip install "tomte[tox,cli]==0.7.0" tox-uv
 tox -p -e flake8 -e pylint
 tox -p -e black-check -e isort-check -e bandit -e safety -e mypy
 tox -e unit-tests-coverage        # enforces 100% coverage
-GNOSIS_TESTNET_RPC=<tenderly-fork-url> tox -e integration-tests
+GNOSIS_RPC=<gnosis-rpc-url> tox -e integration-tests
 tox -e launch-tests               # opens a real terminal for codex_cli (stand-in codex)
 ```
 
