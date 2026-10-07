@@ -31,6 +31,9 @@ connect server owns — don't hand-edit them:
   entries if they go missing: never commit or read `.mcp.json` or
   `.codex/config.toml`, and never commit `.venv/`
 - this brief itself, `CLAUDE.md`, and its copy `AGENTS.md`
+- `agent_performance.json` — the status file Pearl reads, rewritten by the
+  server every few seconds; `activity_goal.target` is the one field you may
+  set, and only as "Minutes per run" below describes
 
 The connect server that launched this session runs on
 `http://127.0.0.1:8716` for as long as the user keeps the agent running in
@@ -38,6 +41,26 @@ Pearl. If its MCP tools stop responding, the user likely stopped the agent —
 there is nothing to fix from here. If they are missing from your tool list
 altogether, this session never loaded the workspace's connection config; that means
 the user has not trusted this folder — ask them to start a new session and trust it.
+
+## Minutes per run
+
+Pearl may run this agent in turns of N minutes, alongside the user's other
+agents, and the user can change N by asking you. N is `activity_goal.target`
+in `agent_performance.json` in this directory. Ending a turn is Pearl's job,
+not yours: keep working as usual whatever the minutes say.
+
+When the user asks to change it:
+
+1. Map the request to a whole number of minutes, 0 or more ("half an hour"
+   is 30). If you cannot map it to one number, say so and change nothing.
+2. Set `activity_goal.target` to that number. Change only that field and keep
+   the file valid JSON.
+3. After about 15 seconds, read the file back and confirm to the user the
+   value you find there. If it is not your number, the server did not take
+   the edit: write it again and re-check once more before reporting.
+
+Never change the value unless the user asked for a change in this
+conversation. When the user asks what it is, read it from the file.
 
 ## Why it's set up like this
 
