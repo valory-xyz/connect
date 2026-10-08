@@ -17,13 +17,14 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Connect's activity goal: a run window of N minutes.
+"""Connect's activity goal: N minutes of running per process.
 
-Connect has no staking epoch, so its period is a run window that opens when
-the process starts. When a window's minutes have elapsed, the window is
-stamped as met (`last_met_at`) and the next one opens at once: Connect never
-stops itself, and Pearl's Auto-run keys its hand-over on `last_met_at`.
-A target of 0 is always met and never rolls over.
+Connect has no staking epoch, so its period is one window per process, opened
+when the process starts and never rolled over. The goal is met once `target`
+minutes have elapsed and stays met for the life of the process; a target
+change is measured against the same window. `last_met_at` is stamped on the
+first time the goal is seen met. Connect never stops itself: Pearl's Auto-run
+reads `is_met` and decides when to hand over.
 """
 
 import threading
@@ -34,15 +35,15 @@ UNIT = "minutes"
 
 
 class RunGoal:
-    """The current run window and its target, safe to share across threads."""
+    """The process's run window and its target, safe to share across threads."""
 
     def __init__(self, target: int, clock: t.Callable[[], float] = time.time) -> None:
-        """Open the first window now."""
+        """Open the window now."""
         self._lock = threading.Lock()
         self._clock = clock
         self._target = target
         self._period_start = self._now()
-        self._last_met_at: int | None = self._period_start if target == 0 else None
+        self._last_met_at: int | None = None
 
     def _now(self) -> int:
         return int(self._clock())
@@ -54,36 +55,23 @@ class RunGoal:
             return self._target
 
     def set_target(self, target: int) -> None:
-        """Apply a new target to the current window.
-
-        The window keeps its start, so raising the target extends it and
-        lowering it to at or below the progress made completes it on the
-        next snapshot.
-        """
+        """Apply a new target to the window; the next snapshot re-checks is_met."""
         with self._lock:
-            if target == self._target:
-                return
             self._target = target
-            if target == 0:
-                self._last_met_at = self._now()
 
     def snapshot(self) -> dict[str, t.Any]:
-        """Return the activity_goal block, rolling the window over first.
-
-        A rollover opens the next window at the current time, not at the
-        theoretical boundary: after a suspend, that is one completed run
-        rather than a burst of back-to-back ones.
-        """
+        """Return the activity_goal block."""
         with self._lock:
             now = self._now()
-            if self._target > 0 and now - self._period_start >= self._target * 60:
+            progress = (now - self._period_start) // 60
+            is_met = progress >= self._target
+            if is_met and self._last_met_at is None:
                 self._last_met_at = now
-                self._period_start = now
             return {
                 "unit": UNIT,
                 "target": self._target,
-                "progress": (now - self._period_start) // 60,
-                "is_met": self._target == 0,
+                "progress": progress,
+                "is_met": is_met,
                 "period_start": self._period_start,
                 "last_met_at": self._last_met_at,
                 "updated_at": now,

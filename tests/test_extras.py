@@ -714,14 +714,15 @@ class TestActivityGoal:
     def test_target_at_or_below_progress_completes_the_run(
         self, store_path: Path
     ) -> None:
-        """Lowering the goal below the minutes already run completes the window."""
+        """Lowering the goal to the minutes already run meets it on the next write."""
         now = [1_791_331_200.0]
         activity = ActivityLog(store_path, RunGoal(15, clock=lambda: now[0]))
         activity.write_performance()
         now[0] += 5 * 60
         _session_sets_target(store_path, 5)
         activity.write_performance()
-        assert _performance(store_path)["activity_goal"]["last_met_at"] == now[0]
+        goal = _performance(store_path)["activity_goal"]
+        assert (goal["is_met"], goal["last_met_at"]) == (True, now[0])
 
     def test_target_in_the_file_survives_a_restart(
         self,

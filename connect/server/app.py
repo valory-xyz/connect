@@ -50,7 +50,7 @@ from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 logger = logging.getLogger("agent")
 
 # how often agent_performance.json is rewritten with nothing else happening:
-# it bounds both how stale the run window Pearl sees can be and how long a
+# it bounds both how stale the activity goal Pearl sees can be and how long a
 # session's edit of activity_goal.target waits to take effect
 PERFORMANCE_REFRESH_SECONDS = 15.0
 

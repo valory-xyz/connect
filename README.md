@@ -85,19 +85,19 @@ address, its ABI, its signature convention — is the session's problem.
 
 ## Run window
 
-Connect has no staking epoch, so its activity goal is a **run window** of N
-minutes, opened when the process starts. Every write of `agent_performance.json`
-carries it as the `activity_goal` block Pearl reads through the middleware's
-`agent_performance` endpoint:
+Connect has no staking epoch, so its activity goal is **one run window per
+process** of N minutes, opened when the process starts and never rolled over.
+Every write of `agent_performance.json` carries it as the `activity_goal`
+block Pearl reads through the middleware's `agent_performance` endpoint:
 
 ```json
 {
   "activity_goal": {
     "unit": "minutes",
     "target": 15,
-    "progress": 4,
-    "is_met": false,
-    "period_start": 1791332100,
+    "progress": 19,
+    "is_met": true,
+    "period_start": 1791331200,
     "last_met_at": 1791332100,
     "updated_at": 1791332340
   }
@@ -105,19 +105,20 @@ carries it as the `activity_goal` block Pearl reads through the middleware's
 ```
 
 The server rewrites the file every 15 seconds as well as after every recorded
-action. `progress` is whole minutes since `period_start`. Once `target` minutes have
-elapsed, the write stamps `last_met_at` and opens the next window at that
-moment: `progress` goes back to 0 and `is_met` stays false, so a completed
-run shows only as a later `last_met_at`, which is what Pearl's Auto-run keys
-its hand-over on. Connect never stops itself. A suspend that spans several
-windows counts as one completed run. A target of `0` is always met and never
-rolls over. Window state does not survive a restart: a new process opens a
-fresh window with `last_met_at: null`.
+action. `progress` is whole minutes since `period_start`, and `is_met` is
+`progress >= target`: once met, it stays met for the rest of the process
+unless the target is raised.
+`last_met_at` is stamped once, the first time a write sees the goal met. A
+target of `0` is met at once. Connect never stops itself; Pearl's Auto-run
+reads `is_met` and decides when to hand the turn to another agent. Window
+state does not survive a restart: a new process opens a fresh window with
+`is_met: false` (unless the target is 0) and `last_met_at: null`.
 
 `activity_goal.target` is the one field the session may write. Each server
 write reads it back first: a whole number >= 0 becomes the target of the
-current window (raising it extends the window, lowering it to at or below
-`progress` completes it) and is audited as `minutes_per_run_changed`;
+current window (raising it above `progress` makes the goal unmet again,
+lowering it to or below `progress` meets it) and is audited as
+`minutes_per_run_changed`;
 anything else is logged and overwritten with the current target. The file
 sits in `STORE_PATH`, so the user's value survives restarts. The workspace
 brief (`connect/assets/CLAUDE.md`, "Minutes per run") tells the session to
