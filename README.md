@@ -124,9 +124,10 @@ sits in `STORE_PATH`, so the user's value survives restarts. When the session
 may change it is the brief's to say
 ([`connect/assets/CLAUDE.md`](connect/assets/CLAUDE.md), "Minutes per run");
 that is instruction, not enforcement, which is why every change is audited.
-Until one is set, the target is `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN`
-(default 15); a value that is not a whole number >= 0 is a configuration
-error.
+The target starts as `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN` (default
+15). The first write stores it in the file, and the file's value wins from
+then on, so a later change to the env var doesn't reach an existing install.
+A value that is not a whole number >= 0 is a configuration error.
 
 ## Codex
 

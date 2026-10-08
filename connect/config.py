@@ -72,7 +72,8 @@ class AppConfig:
         default_factory=dict
     )
     log_level: str = DEFAULT_LOG_LEVEL
-    # the default run window; a target the session set in the store wins
+    # the starting run window; the first write stores it, and the stored value
+    # wins from then on, so changing this never reaches an existing install
     minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
 
     def chain(self, name: str) -> ChainConfig:
