@@ -142,14 +142,12 @@ def test_minutes_per_run_default_and_custom(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("raw", ["-1", "1.5", "a while"])
-def test_invalid_minutes_per_run_falls_back_with_a_warning(
-    tmp_path: Path, raw: str, caplog: pytest.LogCaptureFixture
+def test_invalid_minutes_per_run_is_a_configuration_error(
+    tmp_path: Path, raw: str
 ) -> None:
-    """A value that is not a whole number >= 0 is not fatal: it uses the default."""
-    with caplog.at_level(logging.WARNING, logger="agent"):
-        config = load_config(base_env(tmp_path) | {MINUTES_PER_RUN_ENV: raw})
-    assert config.minutes_per_run == 15
-    assert MINUTES_PER_RUN_ENV in caplog.text
+    """A value that is not a whole number >= 0 fails like any other bad config."""
+    with pytest.raises(ValueError, match=MINUTES_PER_RUN_ENV):
+        load_config(base_env(tmp_path) | {MINUTES_PER_RUN_ENV: raw})
 
 
 def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:

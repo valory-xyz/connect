@@ -120,12 +120,13 @@ current window (raising it above `progress` makes the goal unmet again,
 lowering it to or below `progress` meets it) and is audited as
 `minutes_per_run_changed`;
 anything else is logged and overwritten with the current target. The file
-sits in `STORE_PATH`, so the user's value survives restarts. The workspace
-brief (`connect/assets/CLAUDE.md`, "Minutes per run") tells the session to
-change it only when the user asks, to confirm the value it reads back, and to
-decline a request it cannot map to whole minutes; that is instruction, not
-enforcement, which is why every change is audited. Until one is
-set, the target is `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN` (default 15).
+sits in `STORE_PATH`, so the user's value survives restarts. When the session
+may change it is the brief's to say
+([`connect/assets/CLAUDE.md`](connect/assets/CLAUDE.md), "Minutes per run");
+that is instruction, not enforcement, which is why every change is audited.
+Until one is set, the target is `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN`
+(default 15); a value that is not a whole number >= 0 is a configuration
+error.
 
 ## Codex
 

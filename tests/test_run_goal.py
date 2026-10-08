@@ -20,6 +20,8 @@
 
 """Tests for the run window behind Connect's activity goal."""
 
+import pytest
+
 from connect.run_goal import RunGoal
 
 START = 1_791_331_200
@@ -140,3 +142,14 @@ def test_switching_to_zero_meets_the_goal() -> None:
     assert block["is_met"] is True
     assert block["last_met_at"] == START + 120
     assert goal.target == 0
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "30", None])
+def test_target_that_is_not_whole_minutes_is_refused(bad: object) -> None:
+    """Neither the constructor nor set_target accepts a non-target."""
+    with pytest.raises(ValueError, match="not a whole number of minutes >= 0"):
+        RunGoal(bad, clock=FakeClock())  # type: ignore[arg-type]
+    goal = RunGoal(15, clock=FakeClock())
+    with pytest.raises(ValueError, match="not a whole number of minutes >= 0"):
+        goal.set_target(bad)  # type: ignore[arg-type]
+    assert goal.target == 15

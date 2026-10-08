@@ -17,21 +17,20 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Connect's activity goal: N minutes of running per process.
-
-Connect has no staking epoch, so its period is one window per process, opened
-when the process starts and never rolled over. The goal is met once `target`
-minutes have elapsed and stays met for the life of the process; a target
-change is measured against the same window. `last_met_at` is stamped on the
-first time the goal is seen met. Connect never stops itself: Pearl's Auto-run
-reads `is_met` and decides when to hand over.
-"""
+"""Connect's activity goal: one run window per process (README, "Run window")."""
 
 import threading
 import time
 import typing as t
 
 UNIT = "minutes"
+
+
+def check_target(target: object) -> int:
+    """Return target if it is a whole number of minutes >= 0, else raise ValueError."""
+    if isinstance(target, bool) or not isinstance(target, int) or target < 0:
+        raise ValueError(f"{target!r} is not a whole number of minutes >= 0")
+    return target
 
 
 class RunGoal:
@@ -41,7 +40,7 @@ class RunGoal:
         """Open the window now."""
         self._lock = threading.Lock()
         self._clock = clock
-        self._target = target
+        self._target = check_target(target)
         self._period_start = self._now()
         self._last_met_at: int | None = None
 
@@ -56,6 +55,7 @@ class RunGoal:
 
     def set_target(self, target: int) -> None:
         """Apply a new target to the window; the next snapshot re-checks is_met."""
+        check_target(target)
         with self._lock:
             self._target = target
 

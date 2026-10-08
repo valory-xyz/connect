@@ -30,6 +30,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from connect.run_goal import check_target
+
 logger = logging.getLogger("agent")
 
 AGENT_HTTP_PORT = 8716
@@ -136,23 +138,16 @@ def _parse_fund_requirements(raw: str) -> dict[str, dict[str, dict[str, int]]]:
 
 
 def _parse_minutes_per_run(raw: str) -> int:
-    """Parse the default minutes per run; a bad value falls back to the default."""
+    """Parse the default minutes per run; unset means the default."""
     raw = raw.strip()
     if not raw:
         return DEFAULT_MINUTES_PER_RUN
     try:
-        minutes = int(raw)
-    except ValueError:
-        minutes = -1
-    if minutes < 0:
-        logger.warning(
-            "%s=%r is not a whole number of minutes >= 0; using %d",
-            MINUTES_PER_RUN_ENV,
-            raw,
-            DEFAULT_MINUTES_PER_RUN,
-        )
-        return DEFAULT_MINUTES_PER_RUN
-    return minutes
+        return check_target(int(raw))
+    except ValueError as e:
+        raise ValueError(
+            f"{MINUTES_PER_RUN_ENV} is not a whole number of minutes >= 0: {raw!r}"
+        ) from e
 
 
 def load_config(env: dict[str, str] | None = None) -> AppConfig:

@@ -21,9 +21,8 @@
 
 The activity log is the audit trail of every signer action (rotating, bounded
 on disk). agent_performance.json is the Pearl SDK contract file the desktop
-app reads from STORE_PATH. It also carries the activity_goal block, whose
-`target` is the one field the session may write: every write reads it back
-first, so the user's minutes per run live in the file and survive restarts.
+app reads from STORE_PATH, carrying the activity_goal block (README, "Run
+window").
 """
 
 import json
@@ -34,7 +33,7 @@ import typing as t
 from pathlib import Path
 
 from connect.config import DEFAULT_MINUTES_PER_RUN
-from connect.run_goal import RunGoal
+from connect.run_goal import RunGoal, check_target
 
 logger = logging.getLogger("agent")
 
@@ -116,20 +115,20 @@ class ActivityLog:
             )
         except FileNotFoundError:
             return None
-        except (OSError, ValueError) as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # the session writes this file, so any parse failure is possible,
+            # RecursionError on deep nesting included
             logger.warning("could not read %s back: %s", PERFORMANCE_FILE, e)
             return None
         goal = stored.get(ACTIVITY_GOAL_KEY) if isinstance(stored, dict) else None
         target = goal.get("target") if isinstance(goal, dict) else None
-        if isinstance(target, bool) or not isinstance(target, int) or target < 0:
+        try:
+            return check_target(target)
+        except ValueError as e:
             logger.warning(
-                "ignoring %s.target %r in %s: not a whole number of minutes >= 0",
-                ACTIVITY_GOAL_KEY,
-                target,
-                PERFORMANCE_FILE,
+                "ignoring %s.target in %s: %s", ACTIVITY_GOAL_KEY, PERFORMANCE_FILE, e
             )
             return None
-        return target
 
     def _adopt_stored_target(self) -> None:
         stored = self._stored_target()
