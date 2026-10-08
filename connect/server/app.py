@@ -30,7 +30,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from connect.activity import ActivityLog
+from connect.activity import PERFORMANCE_FILE, ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
@@ -59,11 +59,15 @@ async def refresh_performance(activity: ActivityLog) -> None:
     """Rewrite agent_performance.json periodically, until cancelled.
 
     The write blocks on disk I/O and the activity lock, so it runs off the
-    event loop. A failing disk is logged by write_performance itself.
+    event loop. No failed write may end the job: Pearl would go on reading a
+    frozen activity goal.
     """
     while True:
         await asyncio.sleep(PERFORMANCE_REFRESH_SECONDS)
-        await asyncio.to_thread(activity.write_performance)
+        try:
+            await asyncio.to_thread(activity.write_performance)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("could not refresh %s", PERFORMANCE_FILE)
 
 
 def create_app(  # pylint: disable=too-many-arguments

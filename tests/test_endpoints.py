@@ -20,6 +20,7 @@
 """Test endpoints module."""
 
 import json
+import logging
 import mimetypes
 import time
 import typing as t
@@ -37,7 +38,7 @@ from connect.server import app as app_module
 from connect.settings import HARNESSES
 from connect.signer import Signer
 
-from tests.conftest import FakeW3
+from tests.conftest import FakeW3, audit_entries, audit_kinds
 
 TOKEN = "unit-test-token"  # nosec B105
 
@@ -370,16 +371,24 @@ class TestPerformanceRefresh:
         """While the app runs the file is rewritten; on shutdown the job ends."""
         monkeypatch.setattr(app_module, "PERFORMANCE_REFRESH_SECONDS", 0.01)
         performance = app_config.store_path / "agent_performance.json"
+        writes: list[int] = []
+        write_performance = activity.write_performance
+
+        def counted_write() -> None:
+            writes.append(1)
+            write_performance()
+
+        monkeypatch.setattr(activity, "write_performance", counted_write)
         app = make_app(test_signer, app_config, activity, token=TOKEN)
         with TestClient(app, base_url="http://127.0.0.1:8716"):
             assert _wait_for(performance.exists)
             goal = json.loads(performance.read_text())["activity_goal"]
             assert (goal["unit"], goal["target"]) == ("minutes", 15)
-        performance.unlink()
+        writes_at_shutdown = len(writes)
         time.sleep(0.1)
-        assert not performance.exists()
+        assert len(writes) == writes_at_shutdown
 
-    def test_failing_disk_does_not_end_the_job(
+    def test_job_adopts_a_session_edit(
         self,
         test_signer: Signer,
         app_config: AppConfig,
@@ -387,18 +396,54 @@ class TestPerformanceRefresh:
         make_app: t.Callable,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A write that fails is logged and the next tick tries again."""
+        """An edit of activity_goal.target takes effect with nothing else happening."""
+        monkeypatch.setattr(app_module, "PERFORMANCE_REFRESH_SECONDS", 0.01)
+        performance = app_config.store_path / "agent_performance.json"
+        app = make_app(test_signer, app_config, activity, token=TOKEN)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            assert _wait_for(performance.exists)
+            # hold the lock so the edit cannot land between a tick's read and write
+            with activity._lock:  # pylint: disable=protected-access
+                payload = json.loads(performance.read_text())
+                payload["activity_goal"]["target"] = 30
+                performance.write_text(json.dumps(payload))
+            assert _wait_for(
+                lambda: "minutes_per_run_changed"
+                in audit_kinds(app_config.store_path)
+            )
+        changes = [
+            (entry["old"], entry["new"])
+            for entry in audit_entries(app_config.store_path)
+            if entry["kind"] == "minutes_per_run_changed"
+        ]
+        assert changes == [(15, 30)]
+        assert json.loads(performance.read_text())["activity_goal"]["target"] == 30
+
+    @pytest.mark.parametrize("error", [OSError, RecursionError])
+    def test_failing_write_does_not_end_the_job(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        error: type[Exception],
+    ) -> None:
+        """A write that fails, however it fails, is logged and retried next tick."""
         monkeypatch.setattr(app_module, "PERFORMANCE_REFRESH_SECONDS", 0.01)
         attempts: list[int] = []
 
         def failing_write() -> None:
             attempts.append(1)
-            raise OSError("read-only fs")
+            raise error("boom")
 
         monkeypatch.setattr(activity, "_write_performance", failing_write)
         app = make_app(test_signer, app_config, activity, token=TOKEN)
-        with TestClient(app, base_url="http://127.0.0.1:8716"):
-            assert _wait_for(lambda: len(attempts) >= 2)
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            with TestClient(app, base_url="http://127.0.0.1:8716"):
+                assert _wait_for(lambda: len(attempts) >= 2)
+        assert "agent_performance.json" in caplog.text
 
 
 class TestAuth:
