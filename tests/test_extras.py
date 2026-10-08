@@ -754,7 +754,7 @@ class TestActivityGoal:
         boot_env: Path,
         served: list[StubServer],
     ) -> None:
-        """Boot adopts the user's value over the template default, without an audit."""
+        """Boot adopts the user's value over the template default, audited as a restore."""
         monkeypatch.setenv(MINUTES_PER_RUN_ENV, "15")
         (boot_env / "agent_performance.json").write_text(
             json.dumps({"activity_goal": {"target": 45}})
@@ -763,7 +763,28 @@ class TestActivityGoal:
         assert served
         goal = _performance(boot_env)["activity_goal"]
         assert (goal["target"], goal["progress"], goal["last_met_at"]) == (45, 0, None)
+        restores = [
+            entry
+            for entry in audit_entries(boot_env)
+            if entry["kind"] == "minutes_per_run_restored"
+        ]
+        assert [(r["old"], r["new"]) for r in restores] == [(15, 45)]
         assert "minutes_per_run_changed" not in audit_kinds(boot_env)
+
+    def test_stored_default_is_not_audited_as_a_restore(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+    ) -> None:
+        """A boot that finds the template default already stored audits nothing."""
+        monkeypatch.setenv(MINUTES_PER_RUN_ENV, "15")
+        (boot_env / "agent_performance.json").write_text(
+            json.dumps({"activity_goal": {"target": 15}})
+        )
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert served
+        assert "minutes_per_run_restored" not in audit_kinds(boot_env)
 
     def test_boot_uses_the_configured_default(
         self,

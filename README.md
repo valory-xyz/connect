@@ -120,8 +120,11 @@ current window (raising it above `progress` makes the goal unmet again,
 lowering it to or below `progress` meets it) and is audited as
 `minutes_per_run_changed`;
 anything else is logged and overwritten with the current target. The file
-sits in `STORE_PATH`, so the user's value survives restarts. When the session
-may change it is the brief's to say
+sits in `STORE_PATH`, so the user's value survives restarts. The first read of
+a process that finds a value other than the configured one is audited as
+`minutes_per_run_restored`: it may be the value from before the restart, or
+an edit the session made while Connect was stopped. When the session may
+change it is the brief's to say
 ([`connect/assets/CLAUDE.md`](connect/assets/CLAUDE.md), "Minutes per run");
 that is instruction, not enforcement, which is why every change is audited.
 The target starts as `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN` (default

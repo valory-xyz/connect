@@ -136,17 +136,14 @@ class ActivityLog:
         if stored is None or stored == current:
             return
         self._run_goal.set_target(stored)
-        if restoring:
-            # the value the user set before a restart, not a change
-            logger.info(
-                "minutes per run restored from %s: %d", PERFORMANCE_FILE, stored
-            )
-            return
+        # a boot read may hold an edit made while Connect was stopped, so it is
+        # audited too, under its own kind: it may equally be an old value
+        kind = "minutes_per_run_restored" if restoring else "minutes_per_run_changed"
         try:
             self._append(
                 {
                     "timestamp": int(time.time()),
-                    "kind": "minutes_per_run_changed",
+                    "kind": kind,
                     "old": current,
                     "new": stored,
                 }
