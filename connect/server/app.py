@@ -56,12 +56,7 @@ PERFORMANCE_REFRESH_SECONDS = 15.0
 
 
 async def refresh_performance(activity: ActivityLog) -> None:
-    """Rewrite agent_performance.json periodically, until cancelled.
-
-    The write blocks on disk I/O and the activity lock, so it runs off the
-    event loop. No failed write may end the job: Pearl would go on reading a
-    frozen activity goal.
-    """
+    """Rewrite agent_performance.json periodically, until cancelled."""
     while True:
         await asyncio.sleep(PERFORMANCE_REFRESH_SECONDS)
         try:

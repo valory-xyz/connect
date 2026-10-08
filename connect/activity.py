@@ -116,8 +116,7 @@ class ActivityLog:
         except FileNotFoundError:
             return None
         except Exception as e:  # pylint: disable=broad-exception-caught
-            # the session writes this file, so any parse failure is possible,
-            # RecursionError on deep nesting included
+            # the session writes this file; any parse error, RecursionError included
             logger.warning("could not read %s back: %s", PERFORMANCE_FILE, e)
             return None
         goal = stored.get(ACTIVITY_GOAL_KEY) if isinstance(stored, dict) else None
