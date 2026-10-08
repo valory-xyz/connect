@@ -30,7 +30,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from connect.activity import PERFORMANCE_FILE, ActivityLog
+from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService

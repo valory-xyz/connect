@@ -408,8 +408,7 @@ class TestPerformanceRefresh:
                 payload["activity_goal"]["target"] = 30
                 performance.write_text(json.dumps(payload))
             assert _wait_for(
-                lambda: "minutes_per_run_changed"
-                in audit_kinds(app_config.store_path)
+                lambda: "minutes_per_run_changed" in audit_kinds(app_config.store_path)
             )
         changes = [
             (entry["old"], entry["new"])
