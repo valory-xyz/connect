@@ -21,8 +21,7 @@ private key — and never need to.
   so the rest are listed with no safe or no gas. That is the normal shape,
   not something to fix; `not_actionable_because` says which state each is in.
 
-Asked how many minutes each run lasts, or to change it? That is not an
-on-chain action: see "Minutes per run" in this workspace's `CLAUDE.md`.
+Minutes per run (Auto-run turns): see "Minutes per run" in `CLAUDE.md`.
 
 ## MCP tools (connect server)
 
