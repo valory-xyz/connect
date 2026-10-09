@@ -83,6 +83,55 @@ one, though — it names the inner call (`safe_transaction`, `POST
 threshold-1 pre-validated signature and all. Nothing about the safe — its
 address, its ABI, its signature convention — is the session's problem.
 
+## Run window
+
+Connect has no staking epoch, so its activity goal is **one run window per
+process** of N minutes, opened when the process starts and never rolled over.
+Every write of `agent_performance.json` carries it as the `activity_goal`
+block Pearl reads through the middleware's `agent_performance` endpoint:
+
+```json
+{
+  "activity_goal": {
+    "unit": "minutes",
+    "target": 15,
+    "progress": 19,
+    "is_met": true,
+    "period_start": 1791331200,
+    "last_met_at": 1791332100,
+    "updated_at": 1791332340
+  }
+}
+```
+
+The server rewrites the file every 15 seconds as well as after every recorded
+action. `progress` is whole minutes since `period_start`, and `is_met` is
+`progress >= target`: once met, it stays met for the rest of the process
+unless the target is raised.
+`last_met_at` is stamped once, the first time a write sees the goal met. A
+target of `0` is met at once. Connect never stops itself; Pearl's Auto-run
+reads `is_met` and decides when to hand the turn to another agent. Window
+state does not survive a restart: a new process opens a fresh window with
+`is_met: false` (unless the target is 0) and `last_met_at: null`.
+
+`activity_goal.target` is the one field the session may write. Each server
+write reads it back first: a whole number >= 0 becomes the target of the
+current window (raising it above `progress` makes the goal unmet again,
+lowering it to or below `progress` meets it) and is audited as
+`minutes_per_run_changed`;
+anything else is logged and overwritten with the current target. The file
+sits in `STORE_PATH`, so the user's value survives restarts. The first read of
+a process that finds a value other than the configured one is audited as
+`minutes_per_run_restored`: it may be the value from before the restart, or
+an edit the session made while Connect was stopped. When the session may
+change it is the brief's to say
+([`connect/assets/CLAUDE.md`](connect/assets/CLAUDE.md), "Minutes per run");
+that is instruction, not enforcement, which is why every change is audited.
+The target starts as `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN` (default
+15). The first write stores it in the file, and the file's value wins from
+then on, so a later change to the env var doesn't reach an existing install.
+A value that is not a whole number >= 0 is a configuration error.
+
 ## Codex
 
 Two harnesses open Codex. `codex_desktop` uses the desktop app's
@@ -380,7 +429,7 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL}`)
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN}`)
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
   vendorable dependencies, synced on demand)
 

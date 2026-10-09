@@ -19,6 +19,8 @@
 
 """FastAPI application factory."""
 
+import asyncio
+import contextlib
 import logging
 import mimetypes
 import threading
@@ -28,7 +30,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from connect.activity import ActivityLog
+from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
@@ -46,6 +48,21 @@ from connect.signer import Signer
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
+
+# how often agent_performance.json is rewritten with nothing else happening:
+# it bounds both how stale the activity goal Pearl sees can be and how long a
+# session's edit of activity_goal.target waits to take effect
+PERFORMANCE_REFRESH_SECONDS = 15.0
+
+
+async def refresh_performance(activity: ActivityLog) -> None:
+    """Rewrite agent_performance.json periodically, until cancelled."""
+    while True:
+        await asyncio.sleep(PERFORMANCE_REFRESH_SECONDS)
+        try:
+            await asyncio.to_thread(activity.write_performance)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("could not refresh %s", PERFORMANCE_FILE)
 
 
 def create_app(  # pylint: disable=too-many-arguments
@@ -71,8 +88,14 @@ def create_app(  # pylint: disable=too-many-arguments
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> t.AsyncIterator[None]:
-        async with mcp.session_manager.run():
-            yield
+        refresher = asyncio.create_task(refresh_performance(activity))
+        try:
+            async with mcp.session_manager.run():
+                yield
+        finally:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresher
 
     app = FastAPI(title="connect", lifespan=lifespan)
     # DNS-rebinding defense: a rebound hostname reaches the socket with the

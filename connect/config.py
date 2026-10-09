@@ -30,6 +30,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from connect.run_goal import check_target
+
 logger = logging.getLogger("agent")
 
 AGENT_HTTP_PORT = 8716
@@ -44,9 +46,11 @@ STORE_PATH_ENV = CUSTOM_ENV_VARS_PREFIX + "STORE_PATH"
 SAFES_ENV = CUSTOM_ENV_VARS_PREFIX + "SAFE_CONTRACT_ADDRESSES"
 FUND_REQUIREMENTS_ENV = CUSTOM_ENV_VARS_PREFIX + "FUND_REQUIREMENTS"
 LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
+MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 DEFAULT_LOG_LEVEL = "info"
+DEFAULT_MINUTES_PER_RUN = 15
 
 
 @dataclass
@@ -68,6 +72,9 @@ class AppConfig:
         default_factory=dict
     )
     log_level: str = DEFAULT_LOG_LEVEL
+    # the starting run window; the first write stores it, and the stored value
+    # wins from then on, so changing this never reaches an existing install
+    minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
 
     def chain(self, name: str) -> ChainConfig:
         """Chain."""
@@ -131,6 +138,19 @@ def _parse_fund_requirements(raw: str) -> dict[str, dict[str, dict[str, int]]]:
     return result
 
 
+def _parse_minutes_per_run(raw: str) -> int:
+    """Parse the default minutes per run; unset means the default."""
+    raw = raw.strip()
+    if not raw:
+        return DEFAULT_MINUTES_PER_RUN
+    try:
+        return check_target(int(raw))
+    except ValueError as e:
+        raise ValueError(
+            f"{MINUTES_PER_RUN_ENV} is not a whole number of minutes >= 0: {raw!r}"
+        ) from e
+
+
 def load_config(env: dict[str, str] | None = None) -> AppConfig:
     """Load config."""
     env = dict(os.environ) if env is None else env
@@ -171,4 +191,5 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         store_path=store_path,
         fund_requirements=fund_requirements,
         log_level=log_level,
+        minutes_per_run=_parse_minutes_per_run(env.get(MINUTES_PER_RUN_ENV, "")),
     )

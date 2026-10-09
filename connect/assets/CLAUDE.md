@@ -31,6 +31,7 @@ connect server owns — don't hand-edit them:
   entries if they go missing: never commit or read `.mcp.json` or
   `.codex/config.toml`, and never commit `.venv/`
 - this brief itself, `CLAUDE.md`, and its copy `AGENTS.md`
+- `agent_performance.json` — except as "Minutes per run" below describes
 
 The connect server that launched this session runs on
 `http://127.0.0.1:8716` for as long as the user keeps the agent running in
@@ -38,6 +39,19 @@ Pearl. If its MCP tools stop responding, the user likely stopped the agent —
 there is nothing to fix from here. If they are missing from your tool list
 altogether, this session never loaded the workspace's connection config; that means
 the user has not trusted this folder — ask them to start a new session and trust it.
+
+## Minutes per run
+
+With Pearl's Auto-run, the user's agents take turns. This agent's turn lasts
+at least N minutes: after that, Pearl hands over to the next agent that can
+run, or lets this one continue if none can. N is `activity_goal.target` in
+`agent_performance.json`; 0 hands over at Pearl's next check. Never stop
+yourself — Pearl ends the turn.
+
+Change N only when the user asks: set `activity_goal.target` to a whole
+number of minutes, 0 or more (if you can't map the request to one, say so and
+change nothing), leave the rest of the file as is, then read it back after
+about 15 seconds and confirm the value.
 
 ## Why it's set up like this
 
