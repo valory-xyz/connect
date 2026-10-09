@@ -101,7 +101,7 @@ class _RequestPlan(t.NamedTuple):
     legacy_on_chain: bool
     tool: str
     max_payment: int
-    terms: dict  # mech-client's terms_report, merged into the request's report
+    terms: dict  # mech-client's mech report, merged into the request's report
 
 
 class PendingDelivery(t.NamedTuple):
@@ -444,11 +444,8 @@ class MechService:
         info["offchain_capable"] = blocker is None
         if blocker is not None:
             info["offchain_note"] = blocker
-        # Who the session contracts with, and whose terms that request falls
-        # under. Only the Valory claim is ours to make; a published terms link
-        # is reported as found.
-        # mech-client owns the rule that only a Valory mech gets the statement.
-        info.update(service.tool_manager.terms_report(priority_mech, read.document))
+        # Whose mech this is and its record; every check and label is mech-client's.
+        info |= service.tool_manager.mech_report_or_terms(priority_mech, read.document)
         if read.document is None:  # like tools_note: unread is not unpublished
             info["terms_note"] = "metadata unreadable, so any terms link is unknown"
         return info
@@ -724,7 +721,9 @@ class MechService:
                     f"off-chain requests: {blocker}"
                 )
             # before any allowance is armed, so a failure here spends nothing
-            terms = service.tool_manager.terms_report(priority_mech, read.document)
+            terms = service.tool_manager.mech_report_or_terms(
+                priority_mech, read.document
+            )
             # Pin the metadata salt so the CID — and with it the request id
             # mech-client will derive and sign — is known here first; the
             # matching allowance is registered before the send. Armed in

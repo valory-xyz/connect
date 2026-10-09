@@ -235,6 +235,13 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         Off-chain by default: few mechs can serve that, so check
         `offchain_capable` with mech_tools first; legacy_on_chain=true goes
         through the marketplace instead.
+        The report says whose mech was paid, decided before paying:
+        `valory_operated` and `terms` or `identification_note`, and off-chain
+        also the `operator` domain the mech's manifest claims (with
+        `domain_verified`; `claimed_name` is never checked), its `delivery`
+        record and age, its `payment` method, any `benchmarks` link, and
+        `terms_url`. These are the same
+        fields mech_tools reports, checked afresh for this request.
         Refused before paying if the mech's price exceeds max_payment
         (base units of the mech's payment asset, default 0.1 of that asset;
         mech_tools reports the asset as payment_token).
@@ -294,7 +301,15 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         (`total` says how many exist). With it: that mech's payment type,
         service id, tool names for mech_request's `tool`, and
         `offchain_capable` — false means only legacy_on_chain=true reaches it,
-        and `offchain_note` says why.
+        and `offchain_note` says why. Also whose mech it is: `valory_operated`
+        and `terms`, the `operator` domain its manifest claims with
+        `domain_verified` (false means the claim is just the operator's word,
+        and `verification_note` says why); `claimed_name` is the operator's
+        own text and is never checked, so name the domain when saying who
+        runs a mech. Then its on-chain `delivery` record and `age_days`, its
+        `payment` method, and `benchmarks` links as the operator's claim.
+        `report_note` means the manifest or record could not be read and only
+        the terms are reported.
         """
         # same as mech_request: the sync gql subgraph client refuses to run
         # on an already-running loop
