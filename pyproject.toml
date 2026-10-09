@@ -11,7 +11,7 @@ dependencies = [
     "web3==7.16.0",
     "eth-account==0.13.7",
     "mcp==1.28.1",
-    "mech-client==0.23.3",
+    "mech-client==0.24.0",
     "open-aea-ledger-ethereum==2.2.9",
     "tomli-w==1.2.0",
 ]
@@ -119,3 +119,8 @@ markers = [
 # set MECHX_CHAIN_RPC and never call its CLI/setup services). Override keeps
 # our own server on the pinned fastapi.
 override-dependencies = ["fastapi==0.139.2"]
+
+# 0.24.0 is not on PyPI yet: it is valory-xyz/mech-client#263, pinned at its
+# head commit. Drop this source once the release ships.
+[tool.uv.sources]
+mech-client = { git = "https://github.com/valory-xyz/mech-client", rev = "d002711515d67a36a8d3d123a2834d0d44358b6a" }

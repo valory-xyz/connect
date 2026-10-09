@@ -58,6 +58,7 @@ from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
+from connect.mech_report import mech_report
 from connect.mech_rpc import RPC_LOCK, listing_mechs
 from connect.mech_types import (
     MechError,
@@ -101,7 +102,7 @@ class _RequestPlan(t.NamedTuple):
     legacy_on_chain: bool
     tool: str
     max_payment: int
-    terms: dict  # mech-client's terms_report, merged into the request's report
+    terms: dict  # mech-client's mech report, merged into the request's report
 
 
 class PendingDelivery(t.NamedTuple):
@@ -444,11 +445,9 @@ class MechService:
         info["offchain_capable"] = blocker is None
         if blocker is not None:
             info["offchain_note"] = blocker
-        # Who the session contracts with, and whose terms that request falls
-        # under. Only the Valory claim is ours to make; a published terms link
-        # is reported as found.
-        # mech-client owns the rule that only a Valory mech gets the statement.
-        info.update(service.tool_manager.terms_report(priority_mech, read.document))
+        # Whose mech this is and what its record says, so the session can
+        # see who it is about to pay. Every check and label is mech-client's.
+        info.update(mech_report(service, chain, priority_mech, read.document))
         if read.document is None:  # like tools_note: unread is not unpublished
             info["terms_note"] = "metadata unreadable, so any terms link is unknown"
         return info
@@ -724,7 +723,7 @@ class MechService:
                     f"off-chain requests: {blocker}"
                 )
             # before any allowance is armed, so a failure here spends nothing
-            terms = service.tool_manager.terms_report(priority_mech, read.document)
+            terms = mech_report(service, chain, priority_mech, read.document)
             # Pin the metadata salt so the CID — and with it the request id
             # mech-client will derive and sign — is known here first; the
             # matching allowance is registered before the send. Armed in

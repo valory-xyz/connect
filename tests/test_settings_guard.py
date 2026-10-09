@@ -27,6 +27,7 @@ import threading
 import time
 import typing as t
 from dataclasses import fields
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,17 +39,21 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from mech_client.domain import identification
+from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
 from mech_client.domain.identification import VALORY_TERMS_NOTICE
+from mech_client.domain.tools import manager as manager_module
 from mech_client.domain.tools.manager import ToolManager
 from mech_client.infrastructure.config import PaymentType
 from mech_client.infrastructure.ipfs import metadata as ipfs_metadata
+from mech_client.infrastructure.subgraph.queries import MechRecord
 from web3 import Web3
 from web3.datastructures import AttributeDict
 
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
+from connect import mech_report as mech_report_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -108,6 +113,18 @@ from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
 OTHER = "0x" + "bb" * 20
+# A mech's on-chain record as the marketplace indexer counts it. A fixed
+# creation time keeps everything but the age independent of the clock.
+SAMPLE_CREATED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
+SAMPLE_RECORD = MechRecord(
+    service_id=42,
+    received_requests=120,
+    self_delivered=100,
+    delivered_by_others=5,
+    created_at=SAMPLE_CREATED_AT,
+    payment_type=PaymentType.NATIVE.value,
+    metadata_hash=None,
+)
 PAYMENT_TOKEN = "0x" + "cc" * 20
 TRACKER = "0x" + "ee" * 20
 
@@ -1653,9 +1670,21 @@ class FakeMarketplaceService:
         # it gets, so tests can tell which mech and document were passed.
         self.terms: dict = {"valory_operated": False}
         self.terms_calls: list[tuple] = []
+        # What ToolManager.mech_report adds over the terms, and every call it
+        # gets, with the record connect read for it.
+        self.report: dict = {
+            "delivery": {"received_requests": 120},
+            "payment": {"type": "native"},
+        }
+        self.report_calls: list[tuple] = []
+        # What connect's own read of the mech's record returns, or raises.
+        self.record: t.Any = SAMPLE_RECORD
+        self.record_error: Exception | None = None
+        self.record_queries: list[tuple] = []
         self.tool_manager = SimpleNamespace(
             fetch_tools_metadata=lambda service_id: self.metadata,
             terms_report=self._terms_report,
+            mech_report=self._mech_report,
         )
         self.contract = FakeMarketplaceContract()
         self.signer: t.Any = None  # the MechSigner mech-client would sign with
@@ -1670,6 +1699,20 @@ class FakeMarketplaceService:
         """Record the call and return the canned terms report."""
         self.terms_calls.append((mech_address, metadata))
         return dict(self.terms)
+
+    def _mech_report(
+        self, mech_address: str, metadata: t.Any, record: t.Any = None
+    ) -> dict:
+        """Record the call and return the canned terms plus the canned record."""
+        self.report_calls.append((mech_address, metadata, record))
+        return {**self.terms, **self.report}
+
+    def _query_mech_record(self, chain: str, mech_address: str) -> t.Any:
+        """Stand in for mech-client's indexer read of one mech's record."""
+        self.record_queries.append((chain, mech_address))
+        if self.record_error is not None:
+            raise self.record_error
+        return self.record
 
     def _fetch_mech_info(self, mech: str) -> tuple:
         """Return the canned (payment_type, service_id, max_delivery_rate)."""
@@ -1793,22 +1836,25 @@ class TestMech:
             return fake
 
         monkeypatch.setattr(mech_module, "MarketplaceService", _construct)
+        monkeypatch.setattr(
+            mech_report_module, "query_mech_record", fake._query_mech_record
+        )
         monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
         return fake
 
     def test_request_reports_whose_terms_apply(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
-        """mech_request carries the terms, decided before anything is sent."""
+        """mech_request carries the mech report, decided before anything is sent."""
         patched_mech.terms = {"valory_operated": True, "terms": VALORY_TERMS_NOTICE}
         order: list[str] = []
-        report = patched_mech.tool_manager.terms_report
+        report = patched_mech.tool_manager.mech_report
 
-        def recording_report(mech: str, doc: t.Any) -> dict:
-            order.append("terms")
-            return report(mech, doc)
+        def recording_report(mech: str, doc: t.Any, record: t.Any = None) -> dict:
+            order.append("report")
+            return report(mech, doc, record=record)
 
-        patched_mech.tool_manager.terms_report = recording_report
+        patched_mech.tool_manager.mech_report = recording_report
         send = patched_mech.send_request
 
         async def sending(**kwargs: object) -> dict:
@@ -1819,11 +1865,42 @@ class TestMech:
         out = mech_service.request(
             "q", "prediction-online", chain="testchain", priority_mech=OTHER
         )
-        assert order == ["terms", "send"]
-        # the default off-chain flow reuses the document its pre-flight read
-        assert patched_mech.terms_calls == [(OTHER, patched_mech.metadata)]
+        assert order == ["report", "send"]
+        # the default off-chain flow reuses the document its pre-flight read,
+        # and hands over the record it read so the report is one indexer call
+        assert patched_mech.record_queries == [("testchain", OTHER)]
+        assert patched_mech.report_calls == [
+            (OTHER, patched_mech.metadata, SAMPLE_RECORD)
+        ]
+        assert not patched_mech.terms_calls
         assert out["valory_operated"] is True
         assert out["terms"] == VALORY_TERMS_NOTICE
+        assert out["delivery"] == {"received_requests": 120}
+        assert out["payment"] == {"type": "native"}
+
+    def test_request_falls_back_to_the_terms_when_the_record_is_unreadable(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """An indexer outage costs the record, not the terms, and not the request.
+
+        The terms decide what the request agrees to; the record only informs
+        the choice. So the report degrades to the terms and says so, and the
+        request still goes out.
+        """
+        patched_mech.terms = {"valory_operated": True, "terms": VALORY_TERMS_NOTICE}
+        patched_mech.record_error = RuntimeError("subgraph down")
+        out = mech_service.request(
+            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+        )
+        assert patched_mech.terms_calls == [(OTHER, patched_mech.metadata)]
+        assert not patched_mech.report_calls
+        assert out["terms"] == VALORY_TERMS_NOTICE
+        assert "delivery" not in out
+        assert out["report_note"] == (
+            "operator and delivery record unavailable (RuntimeError: subgraph "
+            "down); only the terms are reported"
+        )
+        assert len(patched_mech.calls) == 1
 
     def test_on_chain_request_checks_the_terms_without_a_document(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -1838,7 +1915,10 @@ class TestMech:
             legacy_on_chain=True,
         )
         assert patched_mech.terms_calls == [(OTHER, None)]
+        assert not patched_mech.record_queries
+        assert not patched_mech.report_calls
         assert out["terms"] == VALORY_TERMS_NOTICE
+        assert "delivery" not in out
 
     def test_a_failing_terms_check_arms_no_allowance(
         self,
@@ -1861,10 +1941,10 @@ class TestMech:
 
         monkeypatch.setattr(allowances, "arm_auto_deposit", arm_deposit)
 
-        def broken(mech: str, doc: t.Any) -> dict:
+        def broken(mech: str, doc: t.Any, record: t.Any = None) -> dict:
             raise RuntimeError("executor shut down")
 
-        patched_mech.tool_manager.terms_report = broken
+        patched_mech.tool_manager.mech_report = broken
         with pytest.raises(RuntimeError, match="executor shut down"):
             mech_service.request(
                 "q", "prediction-online", chain="testchain", priority_mech=OTHER
@@ -1895,6 +1975,7 @@ class TestMech:
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
         assert not patched_mech.terms_calls
+        assert not patched_mech.record_queries
 
     def test_request_maps_arguments(
         self,
@@ -3423,20 +3504,45 @@ class TestMech:
     def test_tools_report_whose_terms_apply(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
-        """mech-client's terms report is asked about this mech and document, and merged."""
+        """mech-client's mech report is asked about this mech, document and record, and merged."""
         patched_mech.terms = {
             "valory_operated": True,
             "terms": VALORY_TERMS_NOTICE,
             "terms_url": "https://www.valory.xyz/terms/mechs",
         }
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
-        assert patched_mech.terms_calls == [(OTHER, patched_mech.metadata)]
+        assert patched_mech.record_queries == [("testchain", OTHER)]
+        assert patched_mech.report_calls == [
+            (OTHER, patched_mech.metadata, SAMPLE_RECORD)
+        ]
+        assert not patched_mech.terms_calls
         assert info["valory_operated"] is True
         assert info["terms"] == VALORY_TERMS_NOTICE
         assert info["terms_url"] == "https://www.valory.xyz/terms/mechs"
+        assert info["delivery"] == {"received_requests": 120}
+        assert info["payment"] == {"type": "native"}
         # the report's other keys survive the merge
         assert info["tools"] == ["prediction-online"]
         assert "terms_note" not in info
+        assert "report_note" not in info
+
+    def test_tools_fall_back_to_the_terms_when_the_record_is_unreadable(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """An unreadable record degrades the report to the terms, and says so."""
+        patched_mech.terms = {"valory_operated": True, "terms": VALORY_TERMS_NOTICE}
+        patched_mech.record_error = RuntimeError("subgraph down")
+        info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+        assert patched_mech.terms_calls == [(OTHER, patched_mech.metadata)]
+        assert not patched_mech.report_calls
+        assert info["valory_operated"] is True
+        assert info["terms"] == VALORY_TERMS_NOTICE
+        assert "delivery" not in info
+        assert "payment" not in info
+        assert info["report_note"] == (
+            "operator and delivery record unavailable (RuntimeError: subgraph "
+            "down); only the terms are reported"
+        )
 
     def test_tools_pass_no_document_when_metadata_is_unreadable(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3449,6 +3555,9 @@ class TestMech:
         }
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert patched_mech.terms_calls == [(OTHER, None)]
+        # no document, so there is no manifest to report an operator from
+        assert not patched_mech.record_queries
+        assert not patched_mech.report_calls
         assert info["valory_operated"] is False
         assert "terms" not in info
         assert info["identification_note"].startswith("Could not check")
@@ -3490,7 +3599,7 @@ class TestMech:
         ],
         ids=["valory", "not_valory", "unknown"],
     )
-    def test_tools_use_mech_client_s_real_terms_report(
+    def test_tools_use_mech_client_s_real_mech_report(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
@@ -3498,12 +3607,14 @@ class TestMech:
         outcome: str,
         expected: dict,
     ) -> None:
-        """The pinned mech-client's terms_report fits this call, for every outcome.
+        """The pinned mech-client's mech_report fits this call, for every outcome.
 
-        Guards the pin: a mech-client whose terms_report changes shape, keys or
-        wording in any of its three outcomes fails here rather than in a session.
+        Guards the pin: a mech-client whose report changes shape, keys or
+        wording fails here rather than in a session. Only the network is faked:
+        the resolver, the registry indexer's agent id, and the domain's proof.
         """
         manager = ToolManager.__new__(ToolManager)
+        manager.chain_config = "gnosis"
         manager.mech_config = SimpleNamespace(
             ledger_config=SimpleNamespace(chain_id=100)
         )
@@ -3511,9 +3622,45 @@ class TestMech:
             fetch_tools_metadata=lambda service_id: {
                 "tools": ["prediction-online"],
                 "termsUrl": "https://www.valory.xyz/terms/mechs",
+                "operator": {"name": "Valory AG", "domain": "www.valory.xyz"},
+                "toolMetadata": {
+                    "prediction-online": {
+                        "benchmark": {
+                            "metric": "brier",
+                            "window": "30d",
+                            "url": "https://www.valory.xyz/benchmarks/po",
+                        }
+                    }
+                },
             },
-            terms_report=manager.terms_report,
+            mech_report=manager.mech_report,
         )
+        agent_ids: list[tuple] = []
+
+        def agent_id(chain_config: str, service_id: int) -> int:
+            agent_ids.append((chain_config, service_id))
+            return 516
+
+        monkeypatch.setattr(manager_module, "query_erc8004_agent_id", agent_id)
+        proof_urls: list[str] = []
+
+        def get_proof(url: str, **kwargs: t.Any) -> SimpleNamespace:
+            proof_urls.append(url)
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "registrations": [
+                        {
+                            "agentId": 516,
+                            "agentRegistry": (
+                                f"eip155:100:{operator_module.IDENTITY_REGISTRY}"
+                            ),
+                        }
+                    ]
+                },
+            )
+
+        monkeypatch.setattr(operator_module.requests, "get", get_proof)
         own_name = f"{OTHER.lower().removeprefix('0x')}-100.mech.valory.xyz"
         real_getaddrinfo = socket.getaddrinfo
 
@@ -3530,12 +3677,42 @@ class TestMech:
 
         monkeypatch.setattr(identification.socket, "getaddrinfo", getaddrinfo)
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
-        reported = {
-            key: info[key]
-            for key in ("valory_operated", "terms", "identification_note", "terms_url")
-            if key in info
+        terms_keys = ("valory_operated", "terms", "identification_note", "terms_url")
+        assert {key: info[key] for key in terms_keys if key in info} == expected
+        # the record connect read is the one the report is built from, and
+        # the agent id is looked up for that record's service, not guessed
+        assert patched_mech.record_queries == [("testchain", OTHER)]
+        assert agent_ids == [("gnosis", 42)]
+        assert proof_urls == [
+            "https://www.valory.xyz/.well-known/agent-registration.json"
+        ]
+        assert info["operator"] == {
+            "name": "Valory AG",
+            "domain": "www.valory.xyz",
+            "url": "https://www.valory.xyz",
+            "domain_verified": True,
         }
-        assert reported == expected
+        assert info["benchmarks"] == {
+            "prediction-online": {
+                "metric": "brier",
+                "window": "30d",
+                "url": "https://www.valory.xyz/benchmarks/po",
+            }
+        }
+        assert info["benchmark_note"] == operator_module.BENCHMARK_NOTE
+        assert info["delivery"] == {
+            "received_requests": 120,
+            "self_delivered": 100,
+            "delivered_by_others": 5,
+            "since": "2026-01-01T00:00:00+00:00",
+            "age_days": (datetime.now(timezone.utc) - SAMPLE_CREATED_AT).days,
+            "note": manager_module.DELIVERY_NOTE,
+        }
+        assert info["payment"] == {
+            "type": "native",
+            "note": manager_module.PAYMENT_NOTE,
+        }
+        assert "report_note" not in info
 
     def test_tools_degrade_without_metadata(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService

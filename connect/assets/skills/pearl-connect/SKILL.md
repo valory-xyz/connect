@@ -79,19 +79,33 @@ composing a prompt:
   `null` means this server does not know the token on that chain: do not pay
   that mech. A mech pricing in an asset the safe does not hold cannot be paid,
   and `auto_deposit` will fail rather than convert anything.
-- **Whose terms apply.** `mech_tools(priority_mech=...)` reports
-  `valory_operated`. When it is true the mech is operated by Valory and
-  submitting a request means agreeing to Valory AG's Mech Terms, which the
-  report states in `terms`. When it is false the mech is run by someone else,
-  or the check could not complete, in which case `identification_note` says
-  so; its operator's own terms apply. The report passes through whatever link
-  that operator published as `terms_url`, which is reported as found, not
-  endorsed; `terms_note` means the metadata could not be read, so any link
-  is unknown. `mech_request` reports the same fields (`terms_url` only on
-  the off-chain flow). Each report is its own check, so the two can differ
-  after a DNS hiccup: state whose terms apply from `mech_request`'s report,
-  which governs the request it sent. Tell the user whose terms a request
-  falls under before spending their funds on an unfamiliar mech.
+- **Whose mech it is, and whose terms apply.** `mech_tools(priority_mech=...)`
+  reports `valory_operated`. When it is true the mech is operated by Valory
+  and submitting a request means agreeing to Valory AG's Mech Terms, which
+  the report states in `terms`. When it is false the mech is run by someone
+  else, or the check could not complete, in which case `identification_note`
+  says so; its operator's own terms apply. The report passes through whatever
+  link that operator published as `terms_url`, which is reported as found,
+  not endorsed; `terms_note` means the metadata could not be read, so any
+  link is unknown. The report also says who the operator claims to be and
+  how the mech has behaved: `operator` is the name and domain the mech's own
+  manifest claims, and `domain_verified` is true only when that domain
+  publishes a proof naming this mech; otherwise the claim is just the
+  operator's word and `verification_note` says why. `delivery` is the
+  on-chain record (requests received, self-delivered, delivered by others,
+  the creation time and `age_days`); its `note` says the counters cover
+  on-chain requests and off-chain requests the mech settled on-chain, so an
+  undelivered off-chain request appears nowhere. `payment` is the method,
+  with no price. `benchmarks` are the operator's own links, never a checked
+  figure. `report_note` means the record could not be read and only the
+  terms are reported. `mech_request` reports the same fields (`operator`,
+  `delivery`, `payment`, `benchmarks` and `terms_url` only on the off-chain
+  flow). Each report is its own check, so the two can differ after a DNS or
+  indexer hiccup: state who runs the mech and whose terms apply from
+  `mech_request`'s report, which governs the request it sent. Tell the user
+  whose mech a request goes to and whose terms it falls under before
+  spending their funds on an unfamiliar mech, and say when the operator's
+  claim is unverified.
 - **`offchain_capable`.** The off-chain flow needs an endpoint published in
   the mech's service metadata, and few mechs publish one; the rest serve
   on-chain requests only. When it is `false`, `offchain_note` says why — a
