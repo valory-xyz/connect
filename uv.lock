@@ -653,7 +653,7 @@ requires-dist = [
     { name = "eth-account", specifier = "==0.13.7" },
     { name = "fastapi", specifier = "==0.139.2" },
     { name = "mcp", specifier = "==1.28.1" },
-    { name = "mech-client", git = "https://github.com/valory-xyz/mech-client?rev=d002711515d67a36a8d3d123a2834d0d44358b6a" },
+    { name = "mech-client", git = "https://github.com/valory-xyz/mech-client?rev=da08f076efa722cd72ec73bca4da748d2a6400c6" },
     { name = "open-aea-ledger-ethereum", specifier = "==2.2.9" },
     { name = "tomli-w", specifier = "==1.2.0" },
     { name = "uvicorn", specifier = "==0.54.0" },
@@ -1725,7 +1725,7 @@ wheels = [
 [[package]]
 name = "mech-client"
 version = "0.24.0"
-source = { git = "https://github.com/valory-xyz/mech-client?rev=d002711515d67a36a8d3d123a2834d0d44358b6a#d002711515d67a36a8d3d123a2834d0d44358b6a" }
+source = { git = "https://github.com/valory-xyz/mech-client?rev=da08f076efa722cd72ec73bca4da748d2a6400c6#da08f076efa722cd72ec73bca4da748d2a6400c6" }
 dependencies = [
     { name = "click" },
     { name = "gql" },

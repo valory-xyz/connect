@@ -58,7 +58,6 @@ from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
-from connect.mech_report import mech_report
 from connect.mech_rpc import RPC_LOCK, listing_mechs
 from connect.mech_types import (
     MechError,
@@ -445,9 +444,8 @@ class MechService:
         info["offchain_capable"] = blocker is None
         if blocker is not None:
             info["offchain_note"] = blocker
-        # Whose mech this is and what its record says, so the session can
-        # see who it is about to pay. Every check and label is mech-client's.
-        info.update(mech_report(service, chain, priority_mech, read.document))
+        # Whose mech this is and its record; every check and label is mech-client's.
+        info |= service.tool_manager.mech_report_or_terms(priority_mech, read.document)
         if read.document is None:  # like tools_note: unread is not unpublished
             info["terms_note"] = "metadata unreadable, so any terms link is unknown"
         return info
@@ -723,7 +721,9 @@ class MechService:
                     f"off-chain requests: {blocker}"
                 )
             # before any allowance is armed, so a failure here spends nothing
-            terms = mech_report(service, chain, priority_mech, read.document)
+            terms = service.tool_manager.mech_report_or_terms(
+                priority_mech, read.document
+            )
             # Pin the metadata salt so the CID — and with it the request id
             # mech-client will derive and sign — is known here first; the
             # matching allowance is registered before the send. Armed in

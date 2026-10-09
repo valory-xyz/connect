@@ -123,4 +123,4 @@ override-dependencies = ["fastapi==0.139.2"]
 # 0.24.0 is not on PyPI yet: it is valory-xyz/mech-client#263, pinned at its
 # head commit. Drop this source once the release ships.
 [tool.uv.sources]
-mech-client = { git = "https://github.com/valory-xyz/mech-client", rev = "d002711515d67a36a8d3d123a2834d0d44358b6a" }
+mech-client = { git = "https://github.com/valory-xyz/mech-client", rev = "da08f076efa722cd72ec73bca4da748d2a6400c6" }

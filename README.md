@@ -315,25 +315,27 @@ metadata is passed through as `terms_url`, reported as found rather than
 endorsed; `terms_note` says when the metadata could not be read, so an
 absent link is unknown rather than unpublished.
 
-The same report says who the operator claims to be and how the mech has
-behaved, from mech-client's `ToolManager.mech_report`. `operator` is the name
-and domain the mech's manifest claims, passed on as data, with
-`domain_verified` true only when `https://<domain>/.well-known/agent-registration.json`
-lists the mech's ERC-8004 agent id for the chain's identity registry (the
-agent id is read from the service registry indexer; it is not the Olas service
-id except by coincidence). Otherwise `verification_note` says why, and the
-proof is fetched again next time rather than remembered as a no. `benchmarks`
-carries the metric, window and link the operator publishes per tool, as a
-claim and never as a figure, which `benchmark_note` says. `delivery` is the
+The same report says who runs the mech and how it has behaved, from
+mech-client's `ToolManager.mech_report_or_terms`. In `operator` the domain is
+the identity: `domain_verified` is true only when
+`https://<domain>/.well-known/agent-registration.json` lists the mech's
+ERC-8004 agent id for the chain's identity registry (the agent id is read from
+the service registry indexer; it is not the Olas service id except by
+coincidence). Otherwise `verification_note` says why, including a domain that
+redirects instead of serving the proof itself, and the proof is fetched again
+next time rather than remembered as a no. The name is `claimed_name`, the
+operator's own text, never checked, which `name_note` says: a verified domain
+proves the domain, not the name. `benchmarks` maps each tool to the link the
+operator publishes, as a claim and never as a figure, which `benchmark_note`
+says. `delivery` is the
 on-chain record from the marketplace indexer: requests received,
 self-delivered and delivered by others, the creation time in ISO 8601 UTC and
 `age_days`; its `note` says the counters cover on-chain requests and off-chain
 requests the mech settled on-chain, so an off-chain request that was never
 delivered appears nowhere. `payment` names the method with no price, since the
 contract quotes the charge at request time. The record is only an aid to
-choosing: when the indexer cannot be read the report falls back to the terms
-alone and says so in `report_note`, and an unreadable manifest gives the
-terms alone, as above.
+choosing: when the manifest or the indexer cannot be read, mech-client reports
+the terms alone and says so in `report_note`.
 
 `mech_request` reports the same fields, decided before anything is paid or any
 allowance is armed, so a session that skips `mech_tools` still learns whose
