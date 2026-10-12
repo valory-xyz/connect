@@ -45,7 +45,7 @@ get_logger(chain_config.__name__).addFilter(_ListingMismatchFilter())
 
 @contextlib.contextmanager
 def listing_mechs() -> t.Iterator[None]:
-    """Run a mech listing, which reads MECHX_CHAIN_RPC only to warn about it."""
+    """Run a mech listing or report; both read MECHX_CHAIN_RPC only to warn."""
     _LISTING.active = True
     try:
         yield
