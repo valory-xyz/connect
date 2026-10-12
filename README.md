@@ -334,9 +334,7 @@ requests the mech settled on-chain, so an off-chain request that was never
 delivered appears nowhere. `payment` names the method with no price, since the
 contract quotes the charge at request time. The record is only an aid to
 choosing: when the manifest or the indexer cannot be read, mech-client reports
-the terms alone and says so in `report_note`. Connect gives the whole report
-10 seconds, since it reads a proof from a host the mech's operator controls;
-a report that takes longer falls back to the terms the same way.
+the terms alone and says so in `report_note`.
 
 `mech_request` reports the same fields, decided before anything is paid or any
 allowance is armed, so a session that skips `mech_tools` still learns whose

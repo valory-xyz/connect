@@ -53,8 +53,7 @@ from web3.datastructures import AttributeDict
 
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
-from connect import mech_budget
-from connect import mech_report as mech_report_module
+from connect import mech_budget, mech_rpc
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -1680,6 +1679,8 @@ class FakeMarketplaceService:
         }
         self.report_fallback: str | None = None
         self.report_calls: list[tuple] = []
+        # whether each report ran with mech-client's RPC mismatch warning muted
+        self.report_muted: list[bool] = []
         self.tool_manager = SimpleNamespace(
             fetch_tools_metadata=lambda service_id: self.metadata,
             terms_report=self._terms_report,
@@ -1702,6 +1703,7 @@ class FakeMarketplaceService:
     def _mech_report_or_terms(self, mech_address: str, metadata: t.Any) -> dict:
         """Record the call; return the canned report, or the terms and a note."""
         self.report_calls.append((mech_address, metadata))
+        self.report_muted.append(getattr(mech_rpc._LISTING, "active", False))
         if self.report_fallback is not None:
             return {**self.terms, "report_note": self.report_fallback}
         return {**self.terms, **self.report}
@@ -1941,6 +1943,8 @@ class TestMech:
         assert order == ["report", "send"]
         # the default off-chain flow reuses the document its pre-flight read
         assert patched_mech.report_calls == [(OTHER, patched_mech.metadata)]
+        # its indexer reads must not warn that MECHX_CHAIN_RPC is for another chain
+        assert patched_mech.report_muted == [True]
         assert not patched_mech.terms_calls
         assert out["valory_operated"] is True
         assert out["terms"] == VALORY_TERMS_NOTICE
@@ -3573,6 +3577,7 @@ class TestMech:
         }
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert patched_mech.report_calls == [(OTHER, patched_mech.metadata)]
+        assert patched_mech.report_muted == [True]
         assert not patched_mech.terms_calls
         assert info["valory_operated"] is True
         assert info["terms"] == VALORY_TERMS_NOTICE
@@ -3732,41 +3737,6 @@ class TestMech:
         assert not calls["records"]
         assert info["report_note"] == manager_module.MANIFEST_UNREADABLE_NOTE
         assert "terms_note" not in info
-        assert "operator" not in info
-
-    def test_a_proof_host_that_trickles_cannot_hold_the_report(
-        self,
-        mech_service: MechService,
-        patched_mech: FakeMarketplaceService,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The real report against a proof that never finishes gives way to the terms."""
-        _wire_real_report(patched_mech, monkeypatch)
-        release = threading.Event()
-
-        def stalled_body(_chunk_size: int) -> t.Iterator[bytes]:
-            release.wait(10)
-            yield b"{}"
-
-        def trickling_get(url: str, **kwargs: t.Any) -> MagicMock:
-            response = MagicMock(status_code=200)
-            response.__enter__.return_value = response
-            response.iter_content.side_effect = stalled_body
-            return response
-
-        monkeypatch.setattr(operator_module.requests, "get", trickling_get)
-        monkeypatch.setattr(mech_report_module, "REPORT_DEADLINE", 0.5)
-        try:
-            start = time.monotonic()
-            info = mech_service.tools(chain="testchain", priority_mech=OTHER)
-            elapsed = time.monotonic() - start
-        finally:
-            release.set()
-        assert elapsed < 5
-        assert info["terms_url"] == "https://www.valory.xyz/terms/mechs"
-        assert info["report_note"] == mech_report_module.REPORT_TIMEOUT_NOTE.format(
-            deadline=0.5
-        )
         assert "operator" not in info
 
     def test_tools_degrade_without_metadata(
