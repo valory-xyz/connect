@@ -4099,6 +4099,11 @@ class TestMech:
         warner = logging.getLogger(
             "mech_client.mech_client.infrastructure.config.chain_config"
         )
+        # mech-client turns propagation off on its root logger at import, so
+        # the records reach caplog only if an earlier test ran main(). Hand
+        # them to caplog here, once, whatever ran before.
+        monkeypatch.setattr(warner, "handlers", [caplog.handler])
+        monkeypatch.setattr(warner, "propagate", False)
 
         def _query(chain: str) -> list:
             """Warn the way mech-client does when the variable names another chain."""
