@@ -54,6 +54,7 @@ from web3.datastructures import AttributeDict
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
+from connect import mech_report as mech_report_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -1781,6 +1782,7 @@ def _wire_real_report(
     manager.mech_config = SimpleNamespace(ledger_config=SimpleNamespace(chain_id=100))
     patched_mech.tool_manager = SimpleNamespace(
         fetch_tools_metadata=lambda service_id: metadata,
+        terms_report=manager.terms_report,
         mech_report_or_terms=manager.mech_report_or_terms,
     )
     calls: dict = {"records": [], "agent_ids": [], "proofs": []}
@@ -3579,7 +3581,6 @@ class TestMech:
         assert info["payment"] == {"type": "native"}
         # the report's other keys survive the merge
         assert info["tools"] == ["prediction-online"]
-        assert "terms_note" not in info
         assert "report_note" not in info
 
     def test_tools_pass_on_a_report_that_fell_back_to_the_terms(
@@ -3610,8 +3611,8 @@ class TestMech:
         assert info["valory_operated"] is False
         assert "terms" not in info
         assert info["identification_note"].startswith("Could not check")
-        # an unread document is not a mech that published no link
-        assert info["terms_note"].startswith("metadata unreadable")
+        # one note says why: mech-client's, not a second one from connect
+        assert "terms_note" not in info
 
     @pytest.mark.parametrize(
         ("outcome", "expected"),
@@ -3719,18 +3720,53 @@ class TestMech:
         assert "operator" not in info
         assert "delivery" not in info
 
-    def test_an_unreadable_manifest_reports_the_real_terms_and_both_notes(
+    def test_an_unreadable_manifest_reports_the_real_terms_and_its_note(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """No document: mech-client says only the terms are reported, connect adds why."""
+        """No document: mech-client reports the terms and says why, once."""
         calls = _wire_real_report(patched_mech, monkeypatch, metadata=None)
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert not calls["records"]
         assert info["report_note"] == manager_module.MANIFEST_UNREADABLE_NOTE
-        assert info["terms_note"].startswith("metadata unreadable")
+        assert "terms_note" not in info
+        assert "operator" not in info
+
+    def test_a_proof_host_that_trickles_cannot_hold_the_report(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The real report against a proof that never finishes gives way to the terms."""
+        _wire_real_report(patched_mech, monkeypatch)
+        release = threading.Event()
+
+        def stalled_body(_chunk_size: int) -> t.Iterator[bytes]:
+            release.wait(10)
+            yield b"{}"
+
+        def trickling_get(url: str, **kwargs: t.Any) -> MagicMock:
+            response = MagicMock(status_code=200)
+            response.__enter__.return_value = response
+            response.iter_content.side_effect = stalled_body
+            return response
+
+        monkeypatch.setattr(operator_module.requests, "get", trickling_get)
+        monkeypatch.setattr(mech_report_module, "REPORT_DEADLINE", 0.5)
+        try:
+            start = time.monotonic()
+            info = mech_service.tools(chain="testchain", priority_mech=OTHER)
+            elapsed = time.monotonic() - start
+        finally:
+            release.set()
+        assert elapsed < 5
+        assert info["terms_url"] == "https://www.valory.xyz/terms/mechs"
+        assert info["report_note"] == mech_report_module.REPORT_TIMEOUT_NOTE.format(
+            deadline=0.5
+        )
         assert "operator" not in info
 
     def test_tools_degrade_without_metadata(
