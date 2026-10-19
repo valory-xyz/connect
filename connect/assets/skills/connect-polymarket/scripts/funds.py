@@ -44,7 +44,6 @@ from deposit_wallet import _resolve_dw, dw_or_exit
 from relayer_proxy import RelayerProxyClient
 
 POSITIONS_PAGE_LIMIT = 500
-POSITIONS_MAX_OFFSET = 10_000
 
 
 def cmd_balances(cs: pm.ConnectSigner) -> None:
@@ -142,10 +141,9 @@ def cmd_top_up(cs: pm.ConnectSigner, amount: float) -> None:
 def _dw_position_token_ids(dw: str) -> list:
     """Outcome-token ids the DW currently holds, across all data-API pages."""
     positions = pm.fetch_all_positions(
-        {"user": dw, "sizeThreshold": 0},
+        {"user": dw},
         label="DW-position",
         page_limit=POSITIONS_PAGE_LIMIT,
-        max_offset=POSITIONS_MAX_OFFSET,
     )
     return [int(p["asset"]) for p in positions if p.get("asset")]
 

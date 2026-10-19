@@ -43,16 +43,15 @@ import argparse
 import pm_common as pm
 
 POSITIONS_PAGE_LIMIT = 500
-POSITIONS_MAX_OFFSET = 10_000
 
 
 def _redeemable(cs: pm.ConnectSigner) -> list:
     """Return every redeemable safe position, across all data-API pages."""
     return pm.fetch_all_positions(
-        {"user": cs.safe_address, "redeemable": "true", "sizeThreshold": 0},
+        {"user": cs.safe_address},
         label="redeemable-position",
         page_limit=POSITIONS_PAGE_LIMIT,
-        max_offset=POSITIONS_MAX_OFFSET,
+        redeemable=True,
     )
 
 

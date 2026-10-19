@@ -51,6 +51,15 @@ import remote_signer  # noqa: E402
 import trade  # noqa: E402
 from py_clob_client_v2.exceptions import PolyApiException  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _gamma_lists_tokens_on_v1_markets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer the order commands' market-version lookup without the network."""
+    monkeypatch.setattr(
+        trade.pm, "http_get_json", lambda url, params=None: [{"version": "v1"}]
+    )
+
+
 # --- trade._auth_failed ---------------------------------------------------------
 
 
@@ -640,3 +649,29 @@ def test_cmd_sweep_force_skips_order_check(monkeypatch, capsys) -> None:
     called = _mock_empty_dw(monkeypatch)
     funds.cmd_sweep(_EmptyDwCS(), None, force=True)
     assert called == []
+
+
+# --- trade: orders only on supported-version markets ----------------------------
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda: trade.cmd_quote(object(), "12345", 1.0, "fok"),
+        lambda: trade.cmd_buy(object(), "12345", 1.0, "fok"),
+        lambda: trade.cmd_sell(object(), "12345", 1.0, "fak"),
+        lambda: trade.cmd_limit(object(), "12345", "buy", 0.5, 10.0, "gtc", None),
+        lambda: trade.cmd_limit(object(), "12345", "sell", 0.5, 10.0, "gtc", None),
+    ],
+)
+def test_orders_refuse_a_token_off_a_v1_market(monkeypatch, invoke) -> None:
+    """A token no open v1 market lists is refused before any client exists."""
+    built = []
+    monkeypatch.setattr(
+        trade.pm, "http_get_json", lambda url, params=None: [{"version": "v2"}]
+    )
+    monkeypatch.setattr(trade, "_run_client", lambda *a, **k: built.append(a))
+
+    with pytest.raises(SystemExit, match="no open v1 market lists token 12345"):
+        invoke()
+    assert built == []

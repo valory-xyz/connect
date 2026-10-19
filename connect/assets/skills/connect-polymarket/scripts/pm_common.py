@@ -185,6 +185,46 @@ def labelled(addresses: t.Iterable[str]) -> dict:
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
+# A paginated data-API read needing more pages than this is refused.
+DATA_API_MAX_PAGES = 200
+# Data-API v2 rows are snake_case; the scripts read the v1 camelCase names.
+POSITION_FIELDS_V2_TO_V1 = {
+    "proxy_wallet": "proxyWallet",
+    "token_id": "asset",  # nosec B105
+    "condition_id": "conditionId",
+    "current_size": "size",
+    "avg_price": "avgPrice",
+    "entry_cost_usdc": "initialValue",
+    "current_value": "currentValue",
+    "unrealized_pnl": "cashPnl",
+    "current_price": "curPrice",
+    "redeemable": "redeemable",
+    "mergeable": "mergeable",
+    "title": "title",
+    "slug": "slug",
+    "event_slug": "eventSlug",
+    "outcome": "outcome",
+    "outcome_index": "outcomeIndex",
+    "end_date": "endDate",
+    "negative_risk": "negativeRisk",
+}
+TRADE_FIELDS_V2_TO_V1 = {
+    "proxy_wallet": "proxyWallet",
+    "side": "side",
+    "token_id": "asset",  # nosec B105
+    "condition_id": "conditionId",
+    "size": "size",
+    "price": "price",
+    "timestamp": "timestamp",
+    "title": "title",
+    "slug": "slug",
+    "event_slug": "eventSlug",
+    "outcome": "outcome",
+    "outcome_index": "outcomeIndex",
+    "transaction_hash": "transactionHash",
+}
+# Gamma market `version` this skill can trade; other versions settle elsewhere.
+SUPPORTED_MARKET_VERSION = "v1"
 DEFAULT_RELAYER_PROXY_URL = "https://mpp.valory.xyz"
 
 HTTP_TIMEOUT = 30
@@ -840,40 +880,109 @@ def quote_buy(  # pylint: disable=protected-access
     }
 
 
+def to_v1_fields(row: dict, field_map: dict) -> dict:
+    """Rename a data-API v2 row to the v1 field names the scripts read.
+
+    Fields with no v1 counterpart are dropped.
+    """
+    return {v1: row[v2] for v2, v1 in field_map.items() if v2 in row}
+
+
+def data_api_page(page: t.Any, label: str) -> tuple[list, str | None]:
+    """Split one data-API v2 page into its rows and the next page's cursor.
+
+    A documented miss is ``data: null`` or an empty list, never an error;
+    any other shape is refused rather than read as "no rows".
+    """
+    rows = page.get("data") if isinstance(page, dict) else None
+    pagination = page.get("pagination") if isinstance(page, dict) else None
+    rows = [] if rows is None else rows
+    if (
+        not isinstance(pagination, dict)
+        or not isinstance(rows, list)
+        or not all(isinstance(row, dict) for row in rows)
+    ):
+        raise SystemExit(
+            f"{label} API returned malformed data: expected a v2 page, got "
+            f"{type(page).__name__}; refusing to claim all rows were discovered"
+        )
+    return rows, pagination.get("next_cursor")
+
+
 def fetch_all_positions(
-    params: dict, *, label: str, page_limit: int, max_offset: int
+    params: dict,
+    *,
+    label: str,
+    page_limit: int,
+    redeemable: bool | None = None,
 ) -> list:
-    """Fetch every ``/positions`` page for `params`, or fail loudly.
+    """Fetch every ``/v2/positions`` page for `params`, or fail loudly.
 
     The data API pages, so a single unpaginated read silently drops
-    everything past the first page. Two things are refused rather than
-    mistaken for "that is all there is": a non-list payload, and a full
-    final addressable page (the offset ceiling). `label` names the caller in
-    those errors so the operator knows which discovery was incomplete.
+    everything past the first page. A malformed page, a repeated cursor and
+    more than DATA_API_MAX_PAGES pages are refused rather than mistaken for
+    "that is all there is"; `label` names the caller in those errors so the
+    operator knows which discovery was incomplete.
+
+    Every held position is read, dust and archived markets included. v2 has
+    no ``redeemable`` parameter and its default status returns settled rows
+    too, so `redeemable` (None for all) is also applied on the row flag.
     """
-    results: list = []
-    offset = 0
-    while True:
-        page = http_get_json(
-            f"{DATA_API}/positions",
-            params={**params, "limit": page_limit, "offset": offset},
+    query = {
+        **params,
+        "limit": page_limit,
+        "filter_type": "TOKENS",
+        "filter_amount": 0,
+        "include_archived": "true",
+    }
+    if redeemable:
+        query["status"] = "REDEEMABLE"
+    rows: list = []
+    seen: set = set()
+    cursor = None
+    for _ in range(DATA_API_MAX_PAGES):
+        page_params = {**query, "cursor": cursor} if cursor else query
+        page = http_get_json(f"{DATA_API}/v2/positions", params=page_params)
+        page_rows, cursor = data_api_page(page, label)
+        rows.extend(page_rows)
+        if not cursor:
+            break
+        if cursor in seen:
+            raise SystemExit(
+                f"{label} API repeated a pagination cursor; refusing to claim "
+                "all positions were discovered"
+            )
+        seen.add(cursor)
+    else:
+        raise SystemExit(
+            f"{label} pagination limit reached; refusing to claim all "
+            "positions were discovered"
         )
-        if not isinstance(page, list):
-            raise SystemExit(
-                f"{label} API returned malformed data at offset {offset}: "
-                f"expected a list, got {type(page).__name__}; refusing to "
-                "claim all positions were discovered"
-            )
-        results.extend(page)
-        if len(page) < page_limit:
-            return results
-        next_offset = offset + page_limit
-        if next_offset > max_offset:
-            raise SystemExit(
-                f"{label} pagination limit reached; refusing to claim all "
-                "positions were discovered"
-            )
-        offset = next_offset
+    positions = [to_v1_fields(row, POSITION_FIELDS_V2_TO_V1) for row in rows]
+    if redeemable is None:
+        return positions
+    return [p for p in positions if bool(p.get("redeemable")) is redeemable]
+
+
+def require_supported_market(token_id: str) -> None:
+    """Refuse an outcome token unless an open market of the supported version lists it.
+
+    Only Gamma ``version`` SUPPORTED_MARKET_VERSION markets settle on the
+    contracts this skill signs for. Other versions identify outcomes by a
+    different id, and Gamma omits closed markets by default, so a token no
+    open market lists is refused as well.
+    """
+    markets = http_get_json(
+        f"{GAMMA_API}/markets", params={"clob_token_ids": str(token_id)}
+    )
+    listed = markets if isinstance(markets, list) else []
+    versions = {market.get("version") for market in listed if isinstance(market, dict)}
+    if versions != {SUPPORTED_MARKET_VERSION}:
+        raise SystemExit(
+            f"no open {SUPPORTED_MARKET_VERSION} market lists token {token_id}; "
+            f"this skill trades only {SUPPORTED_MARKET_VERSION} markets (Gamma "
+            "`version`), and a closed market cannot be traded"
+        )
 
 
 def print_json(payload: t.Any) -> None:

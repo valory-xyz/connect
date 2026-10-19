@@ -41,7 +41,6 @@ import pm_common as pm
 from deposit_wallet import _resolve_dw, dw_or_exit
 
 POSITIONS_PAGE_LIMIT = 500
-POSITIONS_MAX_OFFSET = 10_000
 
 # The indexer truncates `size` to 4 decimals while the chain carries 6
 # (411.4355 vs 411.435578, seen live), so an exact comparison called every
@@ -263,14 +262,11 @@ def cmd_positions(  # pylint: disable=too-many-arguments
     unverified one.
     """
     address = _wallet_address(cs, wallet)
-    params: dict = {"user": address, "sizeThreshold": 0}
-    if redeemable:
-        params["redeemable"] = "true"
     positions = pm.fetch_all_positions(
-        params,
+        {"user": address},
         label="position",
         page_limit=POSITIONS_PAGE_LIMIT,
-        max_offset=POSITIONS_MAX_OFFSET,
+        redeemable=True if redeemable else None,
     )
     indexed = [_slim(p) for p in positions]
     result: dict = {
@@ -316,10 +312,12 @@ def cmd_positions(  # pylint: disable=too-many-arguments
 
 def cmd_trades(cs: pm.ConnectSigner, wallet: str, limit: int) -> None:
     """Trade history for a wallet (indexed, so it lags the chain too)."""
-    trades = pm.http_get_json(
-        f"{pm.DATA_API}/trades",
+    page = pm.http_get_json(
+        f"{pm.DATA_API}/v2/trades",
         params={"user": _wallet_address(cs, wallet), "limit": limit},
     )
+    rows, _next_cursor = pm.data_api_page(page, "trade")
+    trades = [pm.to_v1_fields(row, pm.TRADE_FIELDS_V2_TO_V1) for row in rows]
     result: dict = {
         "wallet": wallet,
         "source": "data-api (indexer)",
