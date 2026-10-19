@@ -246,8 +246,9 @@ def cmd_list(  # pylint: disable=too-many-arguments
             "closed": "false",
             "order": "volumeNum",
             "ascending": "false",
-            # over-fetch when filtering client-side so a narrow filter still fills
-            "limit": limit if not bounds else max(limit * 10, 100),
+            # over-fetch: the version and window filters run client-side, so a
+            # page of exactly `limit` could come back short
+            "limit": max(limit * 10, 100),
         }
         if tag:
             params["tag_slug"] = tag

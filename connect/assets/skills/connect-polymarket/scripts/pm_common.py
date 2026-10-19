@@ -187,6 +187,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 # A paginated data-API read needing more pages than this is refused.
 DATA_API_MAX_PAGES = 200
+# Data-API v2 rejects a `limit` (page size) above this.
+DATA_API_PAGE_MAX = 1000
 # Data-API v2 rows are snake_case; the scripts read the v1 camelCase names.
 POSITION_FIELDS_V2_TO_V1 = {
     "proxy_wallet": "proxyWallet",
@@ -894,19 +896,57 @@ def data_api_page(page: t.Any, label: str) -> tuple[list, str | None]:
     A documented miss is ``data: null`` or an empty list, never an error;
     any other shape is refused rather than read as "no rows".
     """
-    rows = page.get("data") if isinstance(page, dict) else None
-    pagination = page.get("pagination") if isinstance(page, dict) else None
+    malformed = SystemExit(
+        f"{label} API returned malformed data: expected a v2 page, got "
+        f"{type(page).__name__}; refusing to claim all rows were discovered"
+    )
+    if not isinstance(page, dict):
+        raise malformed
+    rows = page.get("data")
     rows = [] if rows is None else rows
+    pagination = page.get("pagination")
     if (
         not isinstance(pagination, dict)
         or not isinstance(rows, list)
         or not all(isinstance(row, dict) for row in rows)
     ):
-        raise SystemExit(
-            f"{label} API returned malformed data: expected a v2 page, got "
-            f"{type(page).__name__}; refusing to claim all rows were discovered"
-        )
+        raise malformed
     return rows, pagination.get("next_cursor")
+
+
+def fetch_data_api_rows(
+    path: str, query: dict, *, label: str, max_rows: int | None = None
+) -> list:
+    """Follow a data-API v2 read across its pages, or fail loudly.
+
+    Reads every page, or stops once `max_rows` rows are in hand. A malformed
+    page, a repeated cursor and more than DATA_API_MAX_PAGES pages are
+    refused rather than mistaken for "that is all there is"; `label` names
+    the caller in those errors so the operator knows which read was
+    incomplete.
+    """
+    rows: list = []
+    seen: set = set()
+    cursor = None
+    for _ in range(DATA_API_MAX_PAGES):
+        page_params = {**query, "cursor": cursor} if cursor else query
+        page = http_get_json(f"{DATA_API}{path}", params=page_params)
+        page_rows, cursor = data_api_page(page, label)
+        rows.extend(page_rows)
+        if max_rows is not None and len(rows) >= max_rows:
+            return rows[:max_rows]
+        if not cursor:
+            return rows
+        if cursor in seen:
+            raise SystemExit(
+                f"{label} API repeated a pagination cursor; refusing to claim "
+                "all rows were discovered"
+            )
+        seen.add(cursor)
+    raise SystemExit(
+        f"{label} pagination limit reached; refusing to claim all rows were "
+        "discovered"
+    )
 
 
 def fetch_all_positions(
@@ -914,19 +954,13 @@ def fetch_all_positions(
     *,
     label: str,
     page_limit: int,
-    redeemable: bool | None = None,
+    redeemable: bool = False,
 ) -> list:
-    """Fetch every ``/v2/positions`` page for `params`, or fail loudly.
+    """Fetch every ``/v2/positions`` row for `params`, or fail loudly.
 
-    The data API pages, so a single unpaginated read silently drops
-    everything past the first page. A malformed page, a repeated cursor and
-    more than DATA_API_MAX_PAGES pages are refused rather than mistaken for
-    "that is all there is"; `label` names the caller in those errors so the
-    operator knows which discovery was incomplete.
-
-    Every held position is read, dust and archived markets included. v2 has
-    no ``redeemable`` parameter and its default status returns settled rows
-    too, so `redeemable` (None for all) is also applied on the row flag.
+    Every held position is read, dust and archived markets included.
+    `redeemable` narrows to settled positions; v2 ignores a ``redeemable``
+    parameter, so the row flag is checked too.
     """
     query = {
         **params,
@@ -937,31 +971,11 @@ def fetch_all_positions(
     }
     if redeemable:
         query["status"] = "REDEEMABLE"
-    rows: list = []
-    seen: set = set()
-    cursor = None
-    for _ in range(DATA_API_MAX_PAGES):
-        page_params = {**query, "cursor": cursor} if cursor else query
-        page = http_get_json(f"{DATA_API}/v2/positions", params=page_params)
-        page_rows, cursor = data_api_page(page, label)
-        rows.extend(page_rows)
-        if not cursor:
-            break
-        if cursor in seen:
-            raise SystemExit(
-                f"{label} API repeated a pagination cursor; refusing to claim "
-                "all positions were discovered"
-            )
-        seen.add(cursor)
-    else:
-        raise SystemExit(
-            f"{label} pagination limit reached; refusing to claim all "
-            "positions were discovered"
-        )
+    rows = fetch_data_api_rows("/v2/positions", query, label=label)
     positions = [to_v1_fields(row, POSITION_FIELDS_V2_TO_V1) for row in rows]
-    if redeemable is None:
+    if not redeemable:
         return positions
-    return [p for p in positions if bool(p.get("redeemable")) is redeemable]
+    return [p for p in positions if p.get("redeemable")]
 
 
 def require_supported_market(token_id: str) -> None:

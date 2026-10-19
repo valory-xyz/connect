@@ -96,16 +96,37 @@ DW_ADDR = to_checksum_address("0x" + "d0" * 20)
 SAFE_ADDR = to_checksum_address("0x" + "5a" * 20)
 
 
-def _v2_page(rows, next_cursor=None, fields=None):
-    """Wrap fixture rows as one data-API v2 page.
+# The data API's v2 name for each v1 field the fixtures are written in. Kept
+# literal, not derived from the skill's own map, so a wrong entry there fails
+# these tests instead of cancelling out.
+_POSITION_V1_TO_V2 = {
+    "proxyWallet": "proxy_wallet",
+    "asset": "token_id",
+    "conditionId": "condition_id",
+    "size": "current_size",
+    "avgPrice": "avg_price",
+    "initialValue": "entry_cost_usdc",
+    "currentValue": "current_value",
+    "cashPnl": "unrealized_pnl",
+    "curPrice": "current_price",
+    "redeemable": "redeemable",
+    "mergeable": "mergeable",
+    "title": "title",
+    "slug": "slug",
+    "eventSlug": "event_slug",
+    "outcome": "outcome",
+    "outcomeIndex": "outcome_index",
+    "endDate": "end_date",
+    "negativeRisk": "negative_risk",
+}
 
-    Rows are written with the v1 names the scripts read and renamed to v2 with
-    the skill's own mapping, so a fixture reads like the data it stands for;
-    the mapping itself is pinned against literal v2 rows in its own tests.
-    """
-    v1_to_v2 = {v1: v2 for v2, v1 in (fields or pm.POSITION_FIELDS_V2_TO_V1).items()}
+
+def _v2_page(rows, next_cursor=None):
+    """Wrap fixture rows, written with v1 names, as one data-API v2 page."""
     return {
-        "data": [{v1_to_v2.get(k, k): v for k, v in row.items()} for row in rows],
+        "data": [
+            {_POSITION_V1_TO_V2.get(k, k): v for k, v in row.items()} for row in rows
+        ],
         "pagination": {"next_cursor": next_cursor},
     }
 
@@ -2901,6 +2922,11 @@ V2_POSITION_ROW = {
     "outcome": "No",
     "outcome_index": 1,
     "negative_risk": False,
+    "mergeable": False,
+    "slug": "us-x-iran-ceasefire",
+    "event_slug": "us-x-iran",
+    "end_date": "2026-08-31",
+    "total_pnl": -33.0839,
 }
 
 
@@ -2931,6 +2957,10 @@ def test_positions_map_v2_rows_to_the_names_the_scripts_read(monkeypatch) -> Non
             "outcome": "No",
             "outcomeIndex": 1,
             "negativeRisk": False,
+            "mergeable": False,
+            "slug": "us-x-iran-ceasefire",
+            "eventSlug": "us-x-iran",
+            "endDate": "2026-08-31",
         }
     ]
 
@@ -2961,7 +2991,7 @@ def test_positions_query_reads_every_holding(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     ("redeemable", "status", "kept"),
-    [(True, "REDEEMABLE", [True]), (False, None, [False]), (None, None, [True, False])],
+    [(True, "REDEEMABLE", [True]), (False, None, [True, False])],
 )
 def test_redeemable_selects_rows_whatever_the_server_sends(
     monkeypatch, redeemable, status, kept
@@ -3005,7 +3035,7 @@ def test_trades_read_v2_and_keep_the_v1_names(monkeypatch, capsys, tmp_path) -> 
 
     def fake_get(url, params=None):
         calls.append((url, dict(params)))
-        return _literal_page([row], "more")
+        return _literal_page([row])
 
     monkeypatch.setattr(pm, "http_get_json", fake_get)
     positions.cmd_trades(_ChainCS(tmp_path), "safe", 10)
@@ -3022,6 +3052,52 @@ def test_trades_read_v2_and_keep_the_v1_names(monkeypatch, capsys, tmp_path) -> 
             "transactionHash": "0x85eb",
         }
     ]
+
+
+def _trade_rows(*sizes):
+    """Literal v2 trade rows, one per size."""
+    return [{"side": "BUY", "size": size} for size in sizes]
+
+
+def test_trades_follow_the_cursor_up_to_the_limit(monkeypatch, capsys, tmp_path):
+    """`--limit` is met across pages and the extra row is not reported."""
+    fake_get, seen = _paged(
+        {
+            None: _literal_page(_trade_rows(1.0, 2.0), "c2"),
+            "c2": _literal_page(_trade_rows(3.0, 4.0), "c3"),
+        }
+    )
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    positions.cmd_trades(_ChainCS(tmp_path), "safe", 3)
+
+    trades = json.loads(capsys.readouterr().out)["trades"]
+    assert [t["size"] for t in trades] == [1.0, 2.0, 3.0]
+    assert [params.get("cursor") for params in seen] == [None, "c2"]
+
+
+def test_trades_stop_once_the_limit_is_met(monkeypatch, capsys, tmp_path):
+    """A full first page ends the read even when the API has more."""
+    fake_get, seen = _paged({None: _literal_page(_trade_rows(1.0, 2.0), "c2")})
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    positions.cmd_trades(_ChainCS(tmp_path), "safe", 2)
+
+    assert len(json.loads(capsys.readouterr().out)["trades"]) == 2
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(("limit", "page_size"), [(50, 50), (1000, 1000), (5000, 1000)])
+def test_trades_never_ask_for_a_page_above_the_api_max(
+    monkeypatch, tmp_path, limit, page_size
+):
+    """v2 rejects a `limit` above 1000, so larger asks page instead."""
+    fake_get, seen = _paged({None: _literal_page([])})
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    positions.cmd_trades(_ChainCS(tmp_path), "safe", limit)
+
+    assert seen[0]["limit"] == page_size
 
 
 @pytest.mark.parametrize("payload", [[{"side": "BUY"}], None, {"trades": []}])
@@ -3047,6 +3123,28 @@ def test_only_supported_version_markets_are_tradeable(version, tradeable) -> Non
         market["version"] = version
 
     assert markets._tradeable(market) is tradeable
+
+
+def test_cmd_list_fills_the_limit_past_markets_of_another_version(
+    monkeypatch, capsys
+) -> None:
+    """Gamma is over-asked, so v2 markets ranked first don't shorten the list."""
+    seen = []
+
+    def fake_get(url, params=None):
+        seen.append(dict(params))
+        ranked = [{"question": f"v2 {i}", "version": "v2"} for i in range(3)]
+        return ranked + [{"question": f"v1 {i}", "version": "v1"} for i in range(3)]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    markets.cmd_list(3, None, None, None, False)
+
+    assert [m["question"] for m in json.loads(capsys.readouterr().out)] == [
+        "v1 0",
+        "v1 1",
+        "v1 2",
+    ]
+    assert seen[0]["limit"] == 100
 
 
 def test_cmd_list_drops_markets_of_another_version(monkeypatch, capsys) -> None:

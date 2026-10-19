@@ -266,7 +266,7 @@ def cmd_positions(  # pylint: disable=too-many-arguments
         {"user": address},
         label="position",
         page_limit=POSITIONS_PAGE_LIMIT,
-        redeemable=True if redeemable else None,
+        redeemable=redeemable,
     )
     indexed = [_slim(p) for p in positions]
     result: dict = {
@@ -311,12 +311,16 @@ def cmd_positions(  # pylint: disable=too-many-arguments
 
 
 def cmd_trades(cs: pm.ConnectSigner, wallet: str, limit: int) -> None:
-    """Trade history for a wallet (indexed, so it lags the chain too)."""
-    page = pm.http_get_json(
-        f"{pm.DATA_API}/v2/trades",
-        params={"user": _wallet_address(cs, wallet), "limit": limit},
+    """Show the wallet's latest `limit` trades (indexed, so they lag the chain too)."""
+    rows = pm.fetch_data_api_rows(
+        "/v2/trades",
+        {
+            "user": _wallet_address(cs, wallet),
+            "limit": min(limit, pm.DATA_API_PAGE_MAX),
+        },
+        label="trade",
+        max_rows=limit,
     )
-    rows, _next_cursor = pm.data_api_page(page, "trade")
     trades = [pm.to_v1_fields(row, pm.TRADE_FIELDS_V2_TO_V1) for row in rows]
     result: dict = {
         "wallet": wallet,
