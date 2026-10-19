@@ -2966,7 +2966,7 @@ def test_positions_map_v2_rows_to_the_names_the_scripts_read(monkeypatch) -> Non
 
 
 def test_positions_query_reads_every_holding(monkeypatch) -> None:
-    """v2 is asked for dust and archived markets too, with no v1 parameters."""
+    """v2 is asked for dust too, with no v1 parameters and no archived markets."""
     fake_get, seen = _paged({None: _literal_page([])})
     urls = []
     monkeypatch.setattr(
@@ -2984,19 +2984,22 @@ def test_positions_query_reads_every_holding(monkeypatch) -> None:
             "limit": 7,
             "filter_type": "TOKENS",
             "filter_amount": 0,
-            "include_archived": "true",
         }
     ]
 
 
 @pytest.mark.parametrize(
-    ("redeemable", "status", "kept"),
-    [(True, "REDEEMABLE", [True]), (False, None, [True, False])],
+    ("redeemable", "status", "archived", "kept"),
+    [(True, "REDEEMABLE", "true", [True]), (False, None, None, [True, False])],
 )
 def test_redeemable_selects_rows_whatever_the_server_sends(
-    monkeypatch, redeemable, status, kept
+    monkeypatch, redeemable, status, archived, kept
 ) -> None:
-    """v2 ignores a `redeemable` parameter, so the row flag decides."""
+    """v2 ignores a `redeemable` parameter, so the row flag decides.
+
+    Only the redeemable read reaches into archived markets: a settled position
+    there is still redeemed, while an open one has no order book to sell into.
+    """
     open_row = {**V2_POSITION_ROW, "token_id": "2"}  # nosec B105
     rows = [V2_POSITION_ROW, {**open_row, "redeemable": False}]
     fake_get, seen = _paged({None: _literal_page(rows)})
@@ -3007,6 +3010,7 @@ def test_redeemable_selects_rows_whatever_the_server_sends(
     )
 
     assert seen[0].get("status") == status
+    assert seen[0].get("include_archived") == archived
     assert [p["redeemable"] for p in found] == kept
 
 

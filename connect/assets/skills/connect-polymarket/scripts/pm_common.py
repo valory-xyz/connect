@@ -958,8 +958,10 @@ def fetch_all_positions(
 ) -> list:
     """Fetch every ``/v2/positions`` row for `params`, or fail loudly.
 
-    Every held position is read, dust and archived markets included.
-    `redeemable` narrows to settled positions; v2 ignores a ``redeemable``
+    Every held position is read, dust included. `redeemable` narrows to
+    settled positions and also reaches into archived markets, so those are
+    still redeemed; other reads leave archived markets out, as v1 did, since
+    they have no order book to sell into. v2 ignores a ``redeemable``
     parameter, so the row flag is checked too.
     """
     query = {
@@ -967,10 +969,10 @@ def fetch_all_positions(
         "limit": page_limit,
         "filter_type": "TOKENS",
         "filter_amount": 0,
-        "include_archived": "true",
     }
     if redeemable:
         query["status"] = "REDEEMABLE"
+        query["include_archived"] = "true"
     rows = fetch_data_api_rows("/v2/positions", query, label=label)
     positions = [to_v1_fields(row, POSITION_FIELDS_V2_TO_V1) for row in rows]
     if not redeemable:
