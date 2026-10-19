@@ -19,7 +19,10 @@
 
 """Test endpoints module."""
 
+import json
+import logging
 import mimetypes
+import time
 import typing as t
 from pathlib import Path
 
@@ -31,10 +34,11 @@ from connect import wallet as wallet_module
 from connect import workspace
 from connect.activity import ActivityLog
 from connect.config import AppConfig
+from connect.server import app as app_module
 from connect.settings import HARNESSES
 from connect.signer import Signer
 
-from tests.conftest import FakeW3
+from tests.conftest import FakeW3, audit_entries, audit_kinds
 
 TOKEN = "unit-test-token"  # nosec B105
 
@@ -341,6 +345,104 @@ class TestOpenEndpoints:
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/html")
         assert TOKEN not in response.text
+
+
+def _wait_for(condition: t.Callable[[], bool], timeout: float = 5.0) -> bool:
+    """Poll until condition() holds or the timeout passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
+
+
+class TestPerformanceRefresh:
+    """The lifespan job that keeps agent_performance.json current."""
+
+    def test_job_writes_the_block_while_serving_and_stops_after(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """While the app runs the file is rewritten; on shutdown the job ends."""
+        monkeypatch.setattr(app_module, "PERFORMANCE_REFRESH_SECONDS", 0.01)
+        performance = app_config.store_path / "agent_performance.json"
+        writes: list[int] = []
+        write_performance = activity.write_performance
+
+        def counted_write() -> None:
+            writes.append(1)
+            write_performance()
+
+        monkeypatch.setattr(activity, "write_performance", counted_write)
+        app = make_app(test_signer, app_config, activity, token=TOKEN)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            assert _wait_for(performance.exists)
+            goal = json.loads(performance.read_text())["activity_goal"]
+            assert (goal["unit"], goal["target"]) == ("minutes", 15)
+        writes_at_shutdown = len(writes)
+        time.sleep(0.1)
+        assert len(writes) == writes_at_shutdown
+
+    def test_job_adopts_a_session_edit(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An edit of activity_goal.target takes effect with nothing else happening."""
+        monkeypatch.setattr(app_module, "PERFORMANCE_REFRESH_SECONDS", 0.01)
+        performance = app_config.store_path / "agent_performance.json"
+        app = make_app(test_signer, app_config, activity, token=TOKEN)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            assert _wait_for(performance.exists)
+            # hold the lock so the edit cannot land between a tick's read and write
+            with activity._lock:  # pylint: disable=protected-access
+                payload = json.loads(performance.read_text())
+                payload["activity_goal"]["target"] = 30
+                performance.write_text(json.dumps(payload))
+            assert _wait_for(
+                lambda: "minutes_per_run_changed" in audit_kinds(app_config.store_path)
+            )
+        changes = [
+            (entry["old"], entry["new"])
+            for entry in audit_entries(app_config.store_path)
+            if entry["kind"] == "minutes_per_run_changed"
+        ]
+        assert changes == [(15, 30)]
+        assert json.loads(performance.read_text())["activity_goal"]["target"] == 30
+
+    @pytest.mark.parametrize("error", [OSError, RecursionError])
+    def test_failing_write_does_not_end_the_job(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        error: type[Exception],
+    ) -> None:
+        """A write that fails, however it fails, is logged and retried next tick."""
+        monkeypatch.setattr(app_module, "PERFORMANCE_REFRESH_SECONDS", 0.01)
+        attempts: list[int] = []
+
+        def failing_write() -> None:
+            attempts.append(1)
+            raise error("boom")
+
+        monkeypatch.setattr(activity, "_write_performance", failing_write)
+        app = make_app(test_signer, app_config, activity, token=TOKEN)
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            with TestClient(app, base_url="http://127.0.0.1:8716"):
+                assert _wait_for(lambda: len(attempts) >= 2)
+        assert "agent_performance.json" in caplog.text
 
 
 class TestAuth:

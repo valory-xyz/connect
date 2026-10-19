@@ -45,6 +45,7 @@ from connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
 from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
+from connect.run_goal import RunGoal
 from connect.server.app import create_app
 from connect.settings import SETTINGS_FILE, SettingsStore, derive_mac_key
 from connect.signer import Signer
@@ -189,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("agent EOA: %s", account.address)
     logger.info("configured chains: %s", sorted(config.chains) or "none")
 
-    activity = ActivityLog(config.store_path)
+    activity = ActivityLog(config.store_path, RunGoal(config.minutes_per_run))
     settings_store = SettingsStore(
         config.store_path / SETTINGS_FILE, derive_mac_key(account), activity
     )
@@ -211,7 +212,8 @@ def main(argv: list[str] | None = None) -> int:
     agent_workspace.ensure()
 
     # Pearl reads it whatever our health, so write it even on a degraded boot.
-    # A dead disk must not take the process down with it.
+    # A dead disk must not take the process down with it. This first write
+    # also adopts the minutes per run the user set before a restart.
     activity.write_performance()
 
     app = create_app(

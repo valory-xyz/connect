@@ -83,6 +83,55 @@ one, though — it names the inner call (`safe_transaction`, `POST
 threshold-1 pre-validated signature and all. Nothing about the safe — its
 address, its ABI, its signature convention — is the session's problem.
 
+## Run window
+
+Connect has no staking epoch, so its activity goal is **one run window per
+process** of N minutes, opened when the process starts and never rolled over.
+Every write of `agent_performance.json` carries it as the `activity_goal`
+block Pearl reads through the middleware's `agent_performance` endpoint:
+
+```json
+{
+  "activity_goal": {
+    "unit": "minutes",
+    "target": 15,
+    "progress": 19,
+    "is_met": true,
+    "period_start": 1791331200,
+    "last_met_at": 1791332100,
+    "updated_at": 1791332340
+  }
+}
+```
+
+The server rewrites the file every 15 seconds as well as after every recorded
+action. `progress` is whole minutes since `period_start`, and `is_met` is
+`progress >= target`: once met, it stays met for the rest of the process
+unless the target is raised.
+`last_met_at` is stamped once, the first time a write sees the goal met. A
+target of `0` is met at once. Connect never stops itself; Pearl's Auto-run
+reads `is_met` and decides when to hand the turn to another agent. Window
+state does not survive a restart: a new process opens a fresh window with
+`is_met: false` (unless the target is 0) and `last_met_at: null`.
+
+`activity_goal.target` is the one field the session may write. Each server
+write reads it back first: a whole number >= 0 becomes the target of the
+current window (raising it above `progress` makes the goal unmet again,
+lowering it to or below `progress` meets it) and is audited as
+`minutes_per_run_changed`;
+anything else is logged and overwritten with the current target. The file
+sits in `STORE_PATH`, so the user's value survives restarts. The first read of
+a process that finds a value other than the configured one is audited as
+`minutes_per_run_restored`: it may be the value from before the restart, or
+an edit the session made while Connect was stopped. When the session may
+change it is the brief's to say
+([`connect/assets/CLAUDE.md`](connect/assets/CLAUDE.md), "Minutes per run");
+that is instruction, not enforcement, which is why every change is audited.
+The target starts as `CONNECTION_CONFIGS_CONFIG_MINUTES_PER_RUN` (default
+15). The first write stores it in the file, and the file's value wins from
+then on, so a later change to the env var doesn't reach an existing install.
+A value that is not a whole number >= 0 is a configuration error.
+
 ## Codex
 
 Two harnesses open Codex. `codex_desktop` uses the desktop app's
@@ -263,15 +312,42 @@ does not resolve, a failed or timed-out lookup, or a zone that answers every
 name all read as not identified, and a check that could not complete says so
 in `identification_note`. Whatever terms link an operator published in its
 metadata is passed through as `terms_url`, reported as found rather than
-endorsed; `terms_note` says when the metadata could not be read, so an
-absent link is unknown rather than unpublished. `mech_request` reports
-`valory_operated` and `terms` or `identification_note` too, plus `terms_url`
-on the off-chain flow, decided before anything is paid or any allowance is
-armed, so a session that skips `mech_tools` still learns whose terms apply.
-Each report runs its own check, and `mech_request`'s is the one that governs
-the request it sent. mech-client's warnings, including a check that could not
-complete, are routed into `log.txt`. The check and the terms statement come from mech-client
-(`ToolManager.terms_report`), so the rule lives in one place.
+endorsed.
+
+The same report says who runs the mech and how it has behaved, from
+mech-client's `ToolManager.mech_report_or_terms`. In `operator` the domain is
+the identity: `domain_verified` is true only when
+`https://<domain>/.well-known/agent-registration.json` lists the mech's
+ERC-8004 agent id for the chain's identity registry (the agent id is read from
+the service registry indexer; it is not the Olas service id except by
+coincidence). Otherwise `verification_note` says why, including a domain that
+redirects instead of serving the proof itself, and the proof is fetched again
+next time rather than remembered as a no. The name is `claimed_name`, the
+operator's own text, never checked, which `name_note` says: a verified domain
+proves the domain, not the name. `benchmarks` maps each tool to the link the
+operator publishes, as a claim and never as a figure, which `benchmark_note`
+says. `delivery` is the
+on-chain record from the marketplace indexer: requests received,
+self-delivered and delivered by others, the creation time in ISO 8601 UTC and
+`age_days`; its `note` says the counters cover on-chain requests and off-chain
+requests the mech settled on-chain, so an off-chain request that was never
+delivered appears nowhere. `payment` names the method with no price, since the
+contract quotes the charge at request time. The record is only an aid to
+choosing: when the manifest or the indexer cannot be read, mech-client reports
+the terms alone and says so in `report_note`.
+
+`mech_request` reports the same fields, decided before anything is paid or any
+allowance is armed, so a session that skips `mech_tools` still learns whose
+mech it pays and whose terms apply: `valory_operated` and `terms` or
+`identification_note` on both flows, plus `operator`, `benchmarks`,
+`delivery`, `payment` and `terms_url` on the off-chain flow, which is the one
+that reads the manifest. Each report is its own check, resolver, indexer and
+proof fetch alike, so two reports in one flow can disagree after a DNS blip
+or an indexer hiccup; `mech_request`'s is the one that governs the request it
+sent. mech-client's warnings, including a check that could not complete, are
+routed into `log.txt`. Every check and label comes from mech-client, so the
+rules live in one place; this server recomputes none of the domain check, the
+id resolution or the labels.
 
 An optional `request_context` dict is passed through unmodified as a
 top-level key of the request metadata, for the tool to read; the bundled skill
@@ -354,7 +430,7 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL}`)
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN}`)
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
   vendorable dependencies, synced on demand)
 

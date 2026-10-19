@@ -21,29 +21,37 @@
 
 The activity log is the audit trail of every signer action (rotating, bounded
 on disk). agent_performance.json is the Pearl SDK contract file the desktop
-app reads from STORE_PATH.
+app reads from STORE_PATH, carrying the activity_goal block (README, "Run
+window").
 """
 
 import json
 import logging
 import threading
 import time
+import typing as t
 from pathlib import Path
+
+from connect.config import DEFAULT_MINUTES_PER_RUN
+from connect.run_goal import RunGoal, check_target
 
 logger = logging.getLogger("agent")
 
 ACTIVITY_LOG_FILE = "activity_log.jsonl"
 PERFORMANCE_FILE = "agent_performance.json"
 MAX_LOG_BYTES = 5 * 1024 * 1024  # rotate to .1 beyond this
+ACTIVITY_GOAL_KEY = "activity_goal"
 
 
 class ActivityLog:
     """ActivityLog."""
 
-    def __init__(self, store_path: Path) -> None:
+    def __init__(self, store_path: Path, run_goal: RunGoal | None = None) -> None:
         """Initialize."""
         self._path = store_path / ACTIVITY_LOG_FILE
         self._performance_path = store_path / PERFORMANCE_FILE
+        self._run_goal = run_goal or RunGoal(DEFAULT_MINUTES_PER_RUN)
+        self._first_read_back = True
         self._lock = threading.Lock()
         self._count = 0
         self._tx_count = 0
@@ -94,7 +102,60 @@ class ActivityLog:
             except OSError:
                 logger.exception("could not write %s", PERFORMANCE_FILE)
 
+    def _stored_target(self) -> int | None:
+        """Return the activity_goal.target on disk, or None if it is unusable.
+
+        A missing file is a fresh store, not a fault. Anything else that does
+        not hold a whole number >= 0 is logged and ignored, and the write that
+        follows puts the current target back for the session to read.
+        """
+        try:
+            stored: t.Any = json.loads(
+                self._performance_path.read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            return None
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # the session writes this file; any parse error, RecursionError included
+            logger.warning("could not read %s back: %s", PERFORMANCE_FILE, e)
+            return None
+        goal = stored.get(ACTIVITY_GOAL_KEY) if isinstance(stored, dict) else None
+        target = goal.get("target") if isinstance(goal, dict) else None
+        try:
+            return check_target(target)
+        except ValueError as e:
+            logger.warning(
+                "ignoring %s.target in %s: %s", ACTIVITY_GOAL_KEY, PERFORMANCE_FILE, e
+            )
+            return None
+
+    def _adopt_stored_target(self) -> None:
+        stored = self._stored_target()
+        current = self._run_goal.target
+        restoring, self._first_read_back = self._first_read_back, False
+        if stored is None or stored == current:
+            return
+        self._run_goal.set_target(stored)
+        # a boot read may hold an edit made while Connect was stopped, so it is
+        # audited too, under its own kind: it may equally be an old value
+        kind = "minutes_per_run_restored" if restoring else "minutes_per_run_changed"
+        try:
+            self._append(
+                {
+                    "timestamp": int(time.time()),
+                    "kind": kind,
+                    "old": current,
+                    "new": stored,
+                }
+            )
+        except OSError:
+            # the change stands and the performance write still runs
+            logger.exception(
+                "could not audit minutes per run %d -> %d", current, stored
+            )
+
     def _write_performance(self) -> None:
+        self._adopt_stored_target()
         payload = {
             "timestamp": int(time.time()),
             "metrics": [
@@ -108,6 +169,7 @@ class ActivityLog:
             "agent_behavior": None,
             "last_activity": self._last_activity,
             "last_chat_message": None,
+            ACTIVITY_GOAL_KEY: self._run_goal.snapshot(),
         }
         tmp = self._performance_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")

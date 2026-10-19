@@ -28,6 +28,7 @@ import pytest
 from connect.config import (
     FUND_REQUIREMENTS_ENV,
     LOG_LEVEL_ENV,
+    MINUTES_PER_RUN_ENV,
     SAFES_ENV,
     STORE_PATH_ENV,
     load_config,
@@ -129,6 +130,24 @@ def test_log_level_default_custom_and_invalid(tmp_path: Path) -> None:
     assert load_config(env | {LOG_LEVEL_ENV: "DEBUG"}).log_level == "debug"
     assert load_config(env | {LOG_LEVEL_ENV: " Warning "}).log_level == "warning"
     assert load_config(env | {LOG_LEVEL_ENV: "verbose"}).log_level == "info"
+
+
+def test_minutes_per_run_default_and_custom(tmp_path: Path) -> None:
+    """MINUTES_PER_RUN defaults to 15 and accepts any whole number >= 0."""
+    env = base_env(tmp_path)
+    assert load_config(env).minutes_per_run == 15
+    assert load_config(env | {MINUTES_PER_RUN_ENV: ""}).minutes_per_run == 15
+    assert load_config(env | {MINUTES_PER_RUN_ENV: " 30 "}).minutes_per_run == 30
+    assert load_config(env | {MINUTES_PER_RUN_ENV: "0"}).minutes_per_run == 0
+
+
+@pytest.mark.parametrize("raw", ["-1", "1.5", "a while"])
+def test_invalid_minutes_per_run_is_a_configuration_error(
+    tmp_path: Path, raw: str
+) -> None:
+    """A value that is not a whole number >= 0 fails like any other bad config."""
+    with pytest.raises(ValueError, match=MINUTES_PER_RUN_ENV):
+        load_config(base_env(tmp_path) | {MINUTES_PER_RUN_ENV: raw})
 
 
 def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:

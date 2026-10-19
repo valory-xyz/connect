@@ -21,6 +21,8 @@ private key — and never need to.
   so the rest are listed with no safe or no gas. That is the normal shape,
   not something to fix; `not_actionable_because` says which state each is in.
 
+Minutes per run (Auto-run turns): see "Minutes per run" in `CLAUDE.md`.
+
 ## MCP tools (connect server)
 
 Each tool's own description carries its parameters and returns. What those
@@ -86,12 +88,15 @@ composing a prompt:
   or the check could not complete, in which case `identification_note` says
   so; its operator's own terms apply. The report passes through whatever link
   that operator published as `terms_url`, which is reported as found, not
-  endorsed; `terms_note` means the metadata could not be read, so any link
-  is unknown. `mech_request` reports the same fields (`terms_url` only on
+  endorsed. `mech_request` reports the same fields (`terms_url` only on
   the off-chain flow). Each report is its own check, so the two can differ
   after a DNS hiccup: state whose terms apply from `mech_request`'s report,
   which governs the request it sent. Tell the user whose terms a request
   falls under before spending their funds on an unfamiliar mech.
+  When saying who runs a mech, name `operator.domain` and whether it is
+  verified; `claimed_name` is only the operator's claim. With no `operator`,
+  who runs the mech is unknown unless `valory_operated` is true, so do not
+  guess. Tell the user if the domain is unverified before paying.
 - **`offchain_capable`.** The off-chain flow needs an endpoint published in
   the mech's service metadata, and few mechs publish one; the rest serve
   on-chain requests only. When it is `false`, `offchain_note` says why — a

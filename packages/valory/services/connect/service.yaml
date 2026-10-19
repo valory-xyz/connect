@@ -58,3 +58,4 @@ config:
   store_path: ${STORE_PATH:str:./data}
   fund_requirements: ${FUND_REQUIREMENTS:str:{}}
   log_level: ${LOG_LEVEL:str:info}
+  minutes_per_run: ${MINUTES_PER_RUN:int:15}
