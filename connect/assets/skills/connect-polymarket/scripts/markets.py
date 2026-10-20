@@ -121,8 +121,12 @@ def _attach_live_prices(slims: list, live: bool = True) -> list:
 
 
 def _tradeable(market: dict) -> bool:
-    """Whether a market can still be traded."""
-    return not market.get("closed") and market.get("active") is not False
+    """Whether this skill can still trade a market."""
+    return (
+        not market.get("closed")
+        and market.get("active") is not False
+        and market.get("version") == pm.SUPPORTED_MARKET_VERSION
+    )
 
 
 def _volume(market: dict) -> float:
@@ -242,14 +246,16 @@ def cmd_list(  # pylint: disable=too-many-arguments
             "closed": "false",
             "order": "volumeNum",
             "ascending": "false",
-            # over-fetch when filtering client-side so a narrow filter still fills
-            "limit": limit if not bounds else max(limit * 10, 100),
+            # over-fetch: the version and window filters run client-side, so a
+            # page of exactly `limit` could come back short
+            "limit": max(limit * 10, 100),
         }
         if tag:
             params["tag_slug"] = tag
         if bounds:
             params.update(_ends_within_params(*bounds))
         markets = pm.http_get_json(f"{pm.GAMMA_API}/markets", params=params) or []
+        markets = [m for m in markets if _tradeable(m)]
     if bounds:
         markets = [m for m in markets if _ends_in_window(m, *bounds)]
     pm.print_json(_attach_live_prices([_slim(m) for m in markets[:limit]], live))

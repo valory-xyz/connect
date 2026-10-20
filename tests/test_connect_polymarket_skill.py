@@ -96,6 +96,52 @@ DW_ADDR = to_checksum_address("0x" + "d0" * 20)
 SAFE_ADDR = to_checksum_address("0x" + "5a" * 20)
 
 
+# The data API's v2 name for each v1 field the fixtures are written in. Kept
+# literal, not derived from the skill's own map, so a wrong entry there fails
+# these tests instead of cancelling out.
+_POSITION_V1_TO_V2 = {
+    "proxyWallet": "proxy_wallet",
+    "asset": "token_id",
+    "conditionId": "condition_id",
+    "size": "current_size",
+    "avgPrice": "avg_price",
+    "initialValue": "entry_cost_usdc",
+    "currentValue": "current_value",
+    "cashPnl": "unrealized_pnl",
+    "curPrice": "current_price",
+    "redeemable": "redeemable",
+    "mergeable": "mergeable",
+    "title": "title",
+    "slug": "slug",
+    "eventSlug": "event_slug",
+    "outcome": "outcome",
+    "outcomeIndex": "outcome_index",
+    "endDate": "end_date",
+    "negativeRisk": "negative_risk",
+}
+
+
+def _v2_page(rows, next_cursor=None):
+    """Wrap fixture rows, written with v1 names, as one data-API v2 page."""
+    return {
+        "data": [
+            {_POSITION_V1_TO_V2.get(k, k): v for k, v in row.items()} for row in rows
+        ],
+        "pagination": {"next_cursor": next_cursor},
+    }
+
+
+def _paged(pages):
+    """Serve `pages` (cursor -> page) and record each request's params."""
+    seen = []
+
+    def fake_get(url, params=None):
+        seen.append(dict(params))
+        return pages[params.get("cursor")]
+
+    return fake_get, seen
+
+
 # --- calldata encoders ----------------------------------------------------------
 
 
@@ -596,41 +642,39 @@ class _FakeRelayer:
 def test_dw_position_token_ids_fetches_every_page(monkeypatch) -> None:
     """Every indexed DW-position page contributes sweep candidates."""
     monkeypatch.setattr(funds, "POSITIONS_PAGE_LIMIT", 2, raising=False)
-    seen = []
-
-    def fake_get(url, params=None):
-        seen.append(dict(params))
-        return {
-            0: [{"asset": "11"}, {"asset": "12"}],
-            2: [{"asset": "13"}],
-        }[params.get("offset", 0)]
-
+    fake_get, seen = _paged(
+        {
+            None: _v2_page([{"asset": "11"}, {"asset": "12"}], "c2"),
+            "c2": _v2_page([{"asset": "13"}]),
+        }
+    )
     monkeypatch.setattr(pm, "http_get_json", fake_get)
 
     assert funds._dw_position_token_ids(DW_ADDR) == [11, 12, 13]
-    assert [params["offset"] for params in seen] == [0, 2]
+    assert [params.get("cursor") for params in seen] == [None, "c2"]
     assert all(params["limit"] == 2 for params in seen)
 
 
-@pytest.mark.parametrize("payload", [None, {"positions": []}])
-def test_dw_position_token_ids_rejects_non_list_page(monkeypatch, payload) -> None:
-    """Malformed indexed-position pages cannot masquerade as completion."""
-    monkeypatch.setattr(funds, "POSITIONS_PAGE_LIMIT", 1, raising=False)
-    pages = iter(([{"asset": "11"}], payload))
+@pytest.mark.parametrize(
+    "payload", [None, {"positions": []}, [{"asset": "12"}], {"data": []}]
+)
+def test_dw_position_token_ids_rejects_malformed_page(monkeypatch, payload) -> None:
+    """Malformed or v1-shaped pages cannot masquerade as completion."""
+    pages = iter((_v2_page([{"asset": "11"}], "c2"), payload))
     monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: next(pages))
 
-    with pytest.raises(SystemExit, match="expected a list"):
+    with pytest.raises(SystemExit, match="malformed data"):
         funds._dw_position_token_ids(DW_ADDR)
 
 
-def test_dw_position_token_ids_fails_at_api_offset_ceiling(monkeypatch) -> None:
-    """A full final addressable page cannot be mistaken for completion."""
-    monkeypatch.setattr(funds, "POSITIONS_PAGE_LIMIT", 2, raising=False)
-    monkeypatch.setattr(funds, "POSITIONS_MAX_OFFSET", 2, raising=False)
+def test_dw_position_token_ids_fails_at_the_page_cap(monkeypatch) -> None:
+    """A read still paging at the cap cannot be mistaken for completion."""
+    monkeypatch.setattr(pm, "DATA_API_MAX_PAGES", 2)
+    cursors = iter(("c1", "c2", "c3"))
     monkeypatch.setattr(
         pm,
         "http_get_json",
-        lambda url, params=None: [{"asset": "11"}, {"asset": "12"}],
+        lambda url, params=None: _v2_page([{"asset": "11"}], next(cursors)),
     )
 
     with pytest.raises(SystemExit, match="pagination limit"):
@@ -844,17 +888,18 @@ def test_redeem_all_success(monkeypatch, capsys) -> None:
 
 
 def test_redeemable_fetches_every_page(monkeypatch) -> None:
-    """Redeemable discovery continues until the API returns a short page."""
+    """Redeemable discovery follows the cursor until the API stops paging."""
     monkeypatch.setattr(redeem, "POSITIONS_PAGE_LIMIT", 2)
-    seen = []
-
-    def fake_get(url, params=None):
-        seen.append(dict(params))
-        return {
-            0: [{"conditionId": "0x1"}, {"conditionId": "0x2"}],
-            2: [{"conditionId": "0x3"}],
-        }[params["offset"]]
-
+    settled = {"redeemable": True}
+    fake_get, seen = _paged(
+        {
+            None: _v2_page(
+                [{"conditionId": "0x1", **settled}, {"conditionId": "0x2", **settled}],
+                "c2",
+            ),
+            "c2": _v2_page([{"conditionId": "0x3", **settled}]),
+        }
+    )
     monkeypatch.setattr(pm, "http_get_json", fake_get)
 
     assert [p["conditionId"] for p in redeem._redeemable(_SweepCS({}))] == [
@@ -862,53 +907,47 @@ def test_redeemable_fetches_every_page(monkeypatch) -> None:
         "0x2",
         "0x3",
     ]
-    assert [params["offset"] for params in seen] == [0, 2]
-    assert all(params["limit"] == 2 for params in seen)
+    assert [params.get("cursor") for params in seen] == [None, "c2"]
+    assert all(params["status"] == "REDEEMABLE" for params in seen)
 
 
-def test_redeemable_fails_at_api_offset_ceiling(monkeypatch) -> None:
-    """A full final addressable page must not be mistaken for completion."""
-    monkeypatch.setattr(redeem, "POSITIONS_PAGE_LIMIT", 2)
-    monkeypatch.setattr(redeem, "POSITIONS_MAX_OFFSET", 2)
+def test_redeemable_fails_on_a_repeated_cursor(monkeypatch) -> None:
+    """A cursor the API already served stops the read instead of looping."""
     monkeypatch.setattr(
         pm,
         "http_get_json",
-        lambda url, params=None: [{"conditionId": "0x1"}, {"conditionId": "0x2"}],
+        lambda url, params=None: _v2_page([{"conditionId": "0x1"}], "same"),
     )
 
-    with pytest.raises(SystemExit, match="pagination limit"):
+    with pytest.raises(SystemExit, match="repeated a pagination cursor"):
         redeem._redeemable(_SweepCS({}))
 
 
 def test_positions_command_fetches_every_page(monkeypatch, capsys) -> None:
     """Portfolio reporting pages through instead of showing only page one."""
     monkeypatch.setattr(positions, "POSITIONS_PAGE_LIMIT", 2)
-    seen = []
-
-    def fake_get(url, params=None):
-        seen.append(dict(params))
-        return {
-            0: [{"asset": "11"}, {"asset": "12"}],
-            2: [{"asset": "13"}],
-        }[params["offset"]]
-
+    fake_get, seen = _paged(
+        {
+            None: _v2_page([{"asset": "11"}, {"asset": "12"}], "c2"),
+            "c2": _v2_page([{"asset": "13"}]),
+        }
+    )
     monkeypatch.setattr(pm, "http_get_json", fake_get)
 
     positions.cmd_positions(_SweepCS({}), "safe", False, None, False)
 
     reported = json.loads(capsys.readouterr().out)
     assert [p["token_id"] for p in reported["positions"]] == ["11", "12", "13"]
-    assert [params["offset"] for params in seen] == [0, 2]
+    assert [params.get("cursor") for params in seen] == [None, "c2"]
 
 
-@pytest.mark.parametrize("payload", [None, {"positions": []}])
-def test_positions_command_rejects_non_list_page(monkeypatch, payload) -> None:
+@pytest.mark.parametrize("payload", [None, {"positions": []}, [{"asset": "12"}]])
+def test_positions_command_rejects_malformed_page(monkeypatch, payload) -> None:
     """A malformed portfolio page must not read as an empty portfolio."""
-    monkeypatch.setattr(positions, "POSITIONS_PAGE_LIMIT", 1)
-    pages = iter(([{"asset": "11"}], payload))
+    pages = iter((_v2_page([{"asset": "11"}], "c2"), payload))
     monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: next(pages))
 
-    with pytest.raises(SystemExit, match="expected a list"):
+    with pytest.raises(SystemExit, match="malformed data"):
         positions.cmd_positions(_SweepCS({}), "safe", False)
 
 
@@ -935,7 +974,9 @@ def _positions_mocks(monkeypatch, *, indexed, chain_balances, dw=DW_HELD):
     wallet, and a mock that ignored the owner would pass whichever address the
     code read — which is how a safe/DW mix-up stayed invisible.
     """
-    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: list(indexed))
+    monkeypatch.setattr(
+        pm, "http_get_json", lambda url, params=None: _v2_page(list(indexed))
+    )
     monkeypatch.setattr(positions, "_resolve_dw", lambda cs: dw)
     monkeypatch.setattr(
         pm,
@@ -1317,7 +1358,9 @@ def test_an_rpc_failure_does_not_discard_the_portfolio(
     cs = _ChainCS(tmp_path)
     pm.record_dw_token(cs, 77)
     monkeypatch.setattr(
-        pm, "http_get_json", lambda url, params=None: [{"asset": "55", "size": 2}]
+        pm,
+        "http_get_json",
+        lambda url, params=None: _v2_page([{"asset": "55", "size": 2}]),
     )
 
     def boom(_cs):
@@ -1343,7 +1386,9 @@ def test_a_failed_read_never_calls_a_token_gone(monkeypatch, capsys, tmp_path) -
     cs = _ChainCS(tmp_path)
     pm.record_dw_token(cs, 77)
     monkeypatch.setattr(
-        pm, "http_get_json", lambda url, params=None: [{"asset": "77", "size": 5.0}]
+        pm,
+        "http_get_json",
+        lambda url, params=None: _v2_page([{"asset": "77", "size": 5.0}]),
     )
 
     def boom(_cs):
@@ -1365,7 +1410,7 @@ def test_positions_no_onchain_flag_trusts_the_indexer(
     cs = _ChainCS(tmp_path)
     pm.record_dw_token(cs, 77)
     called = []
-    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: [])
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page([]))
     monkeypatch.setattr(
         pm,
         "erc1155_balance_of",
@@ -1395,7 +1440,7 @@ def test_parse_token_ids_rejects_junk() -> None:
 
 def test_trades_discloses_the_same_lag(monkeypatch, capsys, tmp_path) -> None:
     """Trade history is indexed too, so an empty answer proves nothing."""
-    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: [])
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page([]))
 
     positions.cmd_trades(_ChainCS(tmp_path), "safe", 10)
 
@@ -1404,14 +1449,13 @@ def test_trades_discloses_the_same_lag(monkeypatch, capsys, tmp_path) -> None:
     assert "lags the chain" in out["note"]
 
 
-@pytest.mark.parametrize("payload", [None, {"positions": []}])
-def test_redeemable_rejects_non_list_page(monkeypatch, payload) -> None:
+@pytest.mark.parametrize("payload", [None, {"positions": []}, [{"conditionId": "0x2"}]])
+def test_redeemable_rejects_malformed_page(monkeypatch, payload) -> None:
     """A malformed later page cannot masquerade as pagination completion."""
-    monkeypatch.setattr(redeem, "POSITIONS_PAGE_LIMIT", 1)
-    pages = iter(([{"conditionId": "0x1"}], payload))
+    pages = iter((_v2_page([{"conditionId": "0x1"}], "c2"), payload))
     monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: next(pages))
 
-    with pytest.raises(SystemExit, match="expected a list"):
+    with pytest.raises(SystemExit, match="malformed data"):
         redeem._redeemable(_SweepCS({}))
 
 
@@ -1829,9 +1873,9 @@ def test_cmd_list_drops_markets_gamma_should_have_filtered(monkeypatch, capsys) 
         pm,
         "http_get_json",
         lambda url, params=None: [
-            {"question": "resolves soon", "endDate": soon},
-            {"question": "resolves next year", "endDate": far_future},
-            {"question": "no end date at all"},
+            {"question": "resolves soon", "endDate": soon, "version": "v1"},
+            {"question": "resolves next year", "endDate": far_future, "version": "v1"},
+            {"question": "no end date at all", "version": "v1"},
         ],
     )
     markets.cmd_list(10, None, None, "48h")
@@ -2046,6 +2090,10 @@ def test_cmd_price_fails_loudly_when_the_clob_says_nothing(monkeypatch) -> None:
 
 
 def _search_payload(*events):
+    """Wrap events as a public-search response; markets default to version v1."""
+    for event in events:
+        for market in event.get("markets") or []:
+            market.setdefault("version", pm.SUPPORTED_MARKET_VERSION)
     return {"events": list(events)}
 
 
@@ -2853,3 +2901,294 @@ def test_skill_no_longer_teaches_the_inverted_dns_rule() -> None:
     doc = (_SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
     assert "one address for all three means" not in doc
     assert "Identical IP addresses across the three hosts are normal" in doc
+
+
+# --- data API v2: positions and trades ------------------------------------------
+
+V2_POSITION_ROW = {
+    "proxy_wallet": SAFE_ADDR,
+    "token_id": "1948",  # nosec B105
+    "condition_id": "0x61c2",
+    "current_size": 1705.62,
+    "avg_price": 0.0193,
+    "entry_cost_usdc": 33.0839,
+    "current_value": 0.0,
+    "unrealized_pnl": -33.0839,
+    "current_price": 0.0,
+    "redeemable": True,
+    "status": "REDEEMABLE",
+    "archived": False,
+    "title": "US x Iran Effective Ceasefire by August 31?",
+    "outcome": "No",
+    "outcome_index": 1,
+    "negative_risk": False,
+    "mergeable": False,
+    "slug": "us-x-iran-ceasefire",
+    "event_slug": "us-x-iran",
+    "end_date": "2026-08-31",
+    "total_pnl": -33.0839,
+}
+
+
+def _literal_page(rows, next_cursor=None):
+    """One data-API v2 page of rows exactly as the API returns them."""
+    return {"data": rows, "pagination": {"next_cursor": next_cursor}}
+
+
+def test_positions_map_v2_rows_to_the_names_the_scripts_read(monkeypatch) -> None:
+    """Each field a script reads arrives under its v1 name with its value."""
+    monkeypatch.setattr(
+        pm, "http_get_json", lambda url, params=None: _literal_page([V2_POSITION_ROW])
+    )
+
+    assert pm.fetch_all_positions({"user": SAFE_ADDR}, label="t", page_limit=10) == [
+        {
+            "proxyWallet": SAFE_ADDR,
+            "asset": "1948",
+            "conditionId": "0x61c2",
+            "size": 1705.62,
+            "avgPrice": 0.0193,
+            "initialValue": 33.0839,
+            "currentValue": 0.0,
+            "cashPnl": -33.0839,
+            "curPrice": 0.0,
+            "redeemable": True,
+            "title": "US x Iran Effective Ceasefire by August 31?",
+            "outcome": "No",
+            "outcomeIndex": 1,
+            "negativeRisk": False,
+            "mergeable": False,
+            "slug": "us-x-iran-ceasefire",
+            "eventSlug": "us-x-iran",
+            "endDate": "2026-08-31",
+        }
+    ]
+
+
+def test_positions_query_reads_every_holding(monkeypatch) -> None:
+    """v2 is asked for dust too, with no v1 parameters and no archived markets."""
+    fake_get, seen = _paged({None: _literal_page([])})
+    urls = []
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: urls.append(url) or fake_get(url, params),
+    )
+
+    pm.fetch_all_positions({"user": SAFE_ADDR}, label="t", page_limit=7)
+
+    assert urls == [f"{pm.DATA_API}/v2/positions"]
+    assert seen == [
+        {
+            "user": SAFE_ADDR,
+            "limit": 7,
+            "filter_type": "TOKENS",
+            "filter_amount": 0,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("redeemable", "status", "archived", "kept"),
+    [(True, "REDEEMABLE", "true", [True]), (False, None, None, [True, False])],
+)
+def test_redeemable_selects_rows_whatever_the_server_sends(
+    monkeypatch, redeemable, status, archived, kept
+) -> None:
+    """v2 ignores a `redeemable` parameter, so the row flag decides.
+
+    Only the redeemable read reaches into archived markets: a settled position
+    there is still redeemed, while an open one has no order book to sell into.
+    """
+    open_row = {**V2_POSITION_ROW, "token_id": "2"}  # nosec B105
+    rows = [V2_POSITION_ROW, {**open_row, "redeemable": False}]
+    fake_get, seen = _paged({None: _literal_page(rows)})
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    found = pm.fetch_all_positions(
+        {"user": SAFE_ADDR}, label="t", page_limit=10, redeemable=redeemable
+    )
+
+    assert seen[0].get("status") == status
+    assert seen[0].get("include_archived") == archived
+    assert [p["redeemable"] for p in found] == kept
+
+
+def test_null_data_is_an_empty_portfolio(monkeypatch) -> None:
+    """`data: null` is the API's documented miss, not malformed data."""
+    monkeypatch.setattr(
+        pm, "http_get_json", lambda url, params=None: _literal_page(None)
+    )
+
+    assert pm.fetch_all_positions({"user": SAFE_ADDR}, label="t", page_limit=10) == []
+
+
+def test_trades_read_v2_and_keep_the_v1_names(monkeypatch, capsys, tmp_path) -> None:
+    """Trade history comes from /v2/trades, renamed to the v1 field names."""
+    calls = []
+    row = {
+        "side": "BUY",
+        "token_id": "1948",  # nosec B105
+        "condition_id": "0x61c2",
+        "size": 150.0,
+        "price": 0.3,
+        "outcome_index": 1,
+        "transaction_hash": "0x85eb",
+        "pseudonym": "Admirable-Child",
+    }
+
+    def fake_get(url, params=None):
+        calls.append((url, dict(params)))
+        return _literal_page([row])
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    positions.cmd_trades(_ChainCS(tmp_path), "safe", 10)
+
+    assert calls == [(f"{pm.DATA_API}/v2/trades", {"user": SAFE_ADDR, "limit": 10})]
+    assert json.loads(capsys.readouterr().out)["trades"] == [
+        {
+            "side": "BUY",
+            "asset": "1948",
+            "conditionId": "0x61c2",
+            "size": 150.0,
+            "price": 0.3,
+            "outcomeIndex": 1,
+            "transactionHash": "0x85eb",
+        }
+    ]
+
+
+def _trade_rows(*sizes):
+    """Literal v2 trade rows, one per size."""
+    return [{"side": "BUY", "size": size} for size in sizes]
+
+
+def test_trades_follow_the_cursor_up_to_the_limit(monkeypatch, capsys, tmp_path):
+    """`--limit` is met across pages and the extra row is not reported."""
+    fake_get, seen = _paged(
+        {
+            None: _literal_page(_trade_rows(1.0, 2.0), "c2"),
+            "c2": _literal_page(_trade_rows(3.0, 4.0), "c3"),
+        }
+    )
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    positions.cmd_trades(_ChainCS(tmp_path), "safe", 3)
+
+    trades = json.loads(capsys.readouterr().out)["trades"]
+    assert [t["size"] for t in trades] == [1.0, 2.0, 3.0]
+    assert [params.get("cursor") for params in seen] == [None, "c2"]
+
+
+def test_trades_stop_once_the_limit_is_met(monkeypatch, capsys, tmp_path):
+    """A full first page ends the read even when the API has more."""
+    fake_get, seen = _paged({None: _literal_page(_trade_rows(1.0, 2.0), "c2")})
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    positions.cmd_trades(_ChainCS(tmp_path), "safe", 2)
+
+    assert len(json.loads(capsys.readouterr().out)["trades"]) == 2
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(("limit", "page_size"), [(50, 50), (1000, 1000), (5000, 1000)])
+def test_trades_never_ask_for_a_page_above_the_api_max(
+    monkeypatch, tmp_path, limit, page_size
+):
+    """v2 rejects a `limit` above 1000, so larger asks page instead."""
+    fake_get, seen = _paged({None: _literal_page([])})
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+
+    positions.cmd_trades(_ChainCS(tmp_path), "safe", limit)
+
+    assert seen[0]["limit"] == page_size
+
+
+@pytest.mark.parametrize("payload", [[{"side": "BUY"}], None, {"trades": []}])
+def test_trades_reject_a_malformed_page(monkeypatch, tmp_path, payload) -> None:
+    """A v1-shaped or broken trades page is refused, not shown as no trades."""
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: payload)
+
+    with pytest.raises(SystemExit, match="malformed data"):
+        positions.cmd_trades(_ChainCS(tmp_path), "safe", 10)
+
+
+# --- Gamma market version: only v1 markets are tradeable -------------------------
+
+
+@pytest.mark.parametrize(
+    ("version", "tradeable"),
+    [("v1", True), ("v2", False), ("V1", False), ("", False), (None, False)],
+)
+def test_only_supported_version_markets_are_tradeable(version, tradeable) -> None:
+    """Markets on another protocol version, or with none, are not tradeable."""
+    market = {"active": True, "closed": False}
+    if version is not None:
+        market["version"] = version
+
+    assert markets._tradeable(market) is tradeable
+
+
+def test_cmd_list_fills_the_limit_past_markets_of_another_version(
+    monkeypatch, capsys
+) -> None:
+    """Gamma is over-asked, so v2 markets ranked first don't shorten the list."""
+    seen = []
+
+    def fake_get(url, params=None):
+        seen.append(dict(params))
+        ranked = [{"question": f"v2 {i}", "version": "v2"} for i in range(3)]
+        return ranked + [{"question": f"v1 {i}", "version": "v1"} for i in range(3)]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    markets.cmd_list(3, None, None, None, False)
+
+    assert [m["question"] for m in json.loads(capsys.readouterr().out)] == [
+        "v1 0",
+        "v1 1",
+        "v1 2",
+    ]
+    assert seen[0]["limit"] == 100
+
+
+def test_cmd_list_drops_markets_of_another_version(monkeypatch, capsys) -> None:
+    """The volume listing never offers a market this skill cannot trade."""
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: [
+            {"question": "v1 market", "version": "v1"},
+            {"question": "v2 market", "version": "v2"},
+            {"question": "unversioned"},
+        ],
+    )
+    markets.cmd_list(10, None, None, None, False)
+
+    assert [m["question"] for m in json.loads(capsys.readouterr().out)] == ["v1 market"]
+
+
+def test_require_supported_market_accepts_a_v1_token(monkeypatch) -> None:
+    """A token an open v1 market lists passes, looked up by its CLOB id."""
+    seen = []
+
+    def fake_get(url, params=None):
+        seen.append((url, dict(params)))
+        return [{"version": "v1"}]
+
+    monkeypatch.setattr(pm, "http_get_json", fake_get)
+    pm.require_supported_market("1948")
+
+    lookup = {"clob_token_ids": "1948"}  # nosec B105
+    assert seen == [(f"{pm.GAMMA_API}/markets", lookup)]
+
+
+@pytest.mark.parametrize(
+    "listed",
+    [[{"version": "v2"}], [], None, [{"version": "v1"}, {"version": "v2"}], [{}]],
+)
+def test_require_supported_market_refuses_anything_else(monkeypatch, listed) -> None:
+    """Another version, no open market, or an ambiguous answer is refused."""
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: listed)
+
+    with pytest.raises(SystemExit, match="no open v1 market lists token 1948"):
+        pm.require_supported_market("1948")

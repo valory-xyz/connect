@@ -51,6 +51,15 @@ import remote_signer  # noqa: E402
 import trade  # noqa: E402
 from py_clob_client_v2.exceptions import PolyApiException  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _gamma_lists_tokens_on_v1_markets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer the order commands' market-version lookup without the network."""
+    monkeypatch.setattr(
+        trade.pm, "http_get_json", lambda url, params=None: [{"version": "v1"}]
+    )
+
+
 # --- trade._auth_failed ---------------------------------------------------------
 
 

@@ -134,6 +134,14 @@ Before any buy, `trade.py quote --token-id <id> --usd <n>` returns the fill
 price, the taker fee, the estimated shares and `shortfall_usd` — the exact
 amount to pass to `funds.py top-up`.
 
+### Only v1 markets are tradeable
+
+Polymarket also lists markets on a newer protocol version, which settle on
+contracts this skill does not sign for. Gamma names a market's version in
+`version`; only `v1` markets are traded here. `markets.py list` leaves the
+others out, and `trade.py quote/buy/sell/limit` refuses a token that no open
+v1 market lists. Relay that refusal to the user rather than retrying.
+
 ### Portfolio reads lag the chain
 
 `positions.py` reads Polymarket's indexer, which trails the chain by seconds

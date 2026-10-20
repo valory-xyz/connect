@@ -156,6 +156,7 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
     a flat reserve both over- and under-shoots).
     """
     ot = _order_type(order_type)
+    pm.require_supported_market(token_id)
 
     def op(client, dw):
         balance = pm.units_to_usd(pm.erc20_balance_of(cs.w3, pm.PUSD, dw))
@@ -203,6 +204,8 @@ def cmd_quote(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) 
     """
     ot = _order_type(order_type)
 
+    pm.require_supported_market(token_id)
+
     def op(client, dw):
         balance = pm.units_to_usd(pm.erc20_balance_of(cs.w3, pm.PUSD, dw))
         return pm.quote_buy(client, token_id, usd, balance, ot)
@@ -221,6 +224,7 @@ def cmd_sell(
     the DW when the order matches (sell before sweeping them to the safe).
     """
     ot = _order_type(order_type)
+    pm.require_supported_market(token_id)
 
     def op(client, dw):
         order = client.create_market_order(
@@ -262,6 +266,7 @@ def cmd_limit(  # pylint: disable=too-many-arguments
         if not expires_in:
             raise SystemExit("--expires-in <seconds> is required for gtd orders")
         expiration = int(time.time()) + expires_in
+    pm.require_supported_market(token_id)
 
     def op(client, dw):
         order = client.create_order(
