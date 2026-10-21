@@ -840,10 +840,11 @@ def quote_buy(  # pylint: disable=protected-access
 ) -> dict:
     """Price a buy against the live book: fill price, fee, shares, top-up.
 
-    Every number comes from the CLOB SDK's own sizing rather than a
-    reimplementation, so a quote and the buy that follows it cannot disagree.
-    The per-market taker fee is measured, not derived: it is whatever the SDK
-    declines to spend when the balance is exactly the order amount.
+    Every number comes from the client's own sizing, the calls `trade.py buy`
+    sizes its order with, so a quote and the buy that follows it cannot
+    disagree. The per-market taker fee is measured, not derived: it is
+    whatever the client declines to spend when the balance is exactly the
+    order amount.
 
     `client` is duck-typed on purpose — this lives here, away from trade.py's
     SDK imports, so the arithmetic can be tested without installing the SDK.

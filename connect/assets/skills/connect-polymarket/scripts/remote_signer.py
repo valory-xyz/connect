@@ -19,141 +19,122 @@
 
 """CLOB SDK client with signing routed through the connect signer.
 
-``py_clob_client_v2``'s ``Signer`` interface is ``address()``,
-``get_chain_id()`` and ``sign(message_hash)``; L1 auth funnels through
-``sign``. The order builders, however, bypass it and call
-``Account._sign_hash / Account.sign_message`` with ``signer.private_key``
-directly — so besides :class:`RemoteSigner` (the interface duck-type), the
-builder modules' ``Account`` symbol is patched with a shim that routes to
-connect when the "key" is a RemoteSigner sentinel. Both paths end in the
-same remote ECDSA over a digest; no key material exists in this process.
+The unified SDK (``polymarket-client``) signs with the signer object its
+client holds: it reads ``address`` and calls ``sign_typed_data`` for orders
+and the CLOB's L1 auth. :class:`RemoteSigner` hashes the typed data locally
+and has connect sign the digest, so no key material exists in this process.
 """
 
-from eth_account import Account as _RealAccount
-from eth_account.messages import _hash_eip191_message
-from hexbytes import HexBytes
-from pm_common import (
-    CHAIN_ID,
-    CLOB_HOST,
-    ConnectSigner,
-    load_state,
-    save_state,
-)
-from py_clob_client_v2 import ClobClient
-from py_clob_client_v2.clob_types import ApiCreds
-from py_clob_client_v2.order_builder.builder import OrderBuilder
-from py_clob_client_v2.order_utils import exchange_order_builder_v1 as _builder_v1
-from py_clob_client_v2.order_utils import exchange_order_builder_v2 as _builder_v2
+import time
 
-# CLOB v2 order-signing scheme: POLY_1271 (smart-contract 1271 signatures)
-# with the DepositWallet as funder.
-SIGNATURE_TYPE_POLY_1271 = 3
-
-
-class RemoteSigner:
-    """Duck-type of the SDK ``Signer`` that signs through the connect signer."""
-
-    def __init__(self, cs: ConnectSigner, chain_id: int = CHAIN_ID) -> None:
-        """Initialize with a connect signer client."""
-        self._cs = cs
-        self._chain_id = chain_id
-        self._address = cs.agent_eoa
-
-    def address(self) -> str:
-        """Return the agent EOA address."""
-        return self._address
-
-    def get_chain_id(self) -> int:
-        """Return the EVM chain id orders are signed for."""
-        return self._chain_id
-
-    def sign(self, message_hash) -> str:
-        """Sign a 32-byte message hash (0x-hex or bytes) via connect."""
-        return self._cs.sign_digest(message_hash)
-
-    @property
-    def private_key(self) -> "RemoteSigner":
-        """Sentinel for the SDK's direct-Account paths (see _AccountShim)."""
-        return self
+from eth_account.messages import _hash_eip191_message, encode_typed_data
+from pm_common import ConnectSigner, load_state, save_state
+from polymarket import ApiKeyCreds, PRODUCTION, SecureClient
+from polymarket._internal.actions.auth import create_or_derive_api_key_sync
+from polymarket._internal.environment import get_environment_config
+from polymarket._internal.l1_auth import sign_api_key_auth
+from polymarket.clients._transport import SyncTransport
 
 
 class _Signed:
     """The one attribute the SDK reads off eth_account's signed result."""
 
     def __init__(self, signature_hex: str) -> None:
-        self.signature = HexBytes(signature_hex)
+        self.signature = bytes.fromhex(signature_hex.removeprefix("0x"))
 
 
-class _AccountShim:
-    """Drop-in for the order builders' ``Account``: remote-signs sentinels.
+class RemoteSigner:
+    """The SDK's signer object, signing through the connect signer."""
 
-    The builders call ``Account._sign_hash(digest, private_key=...)`` (the
-    POLY_1271 ERC-7739 path) and ``Account.sign_message(encoded, ...)``
-    (the EOA path) with ``signer.private_key``. With a RemoteSigner sentinel
-    the digest is signed through connect; a real key delegates to
-    eth_account unchanged.
+    def __init__(self, cs: ConnectSigner) -> None:
+        """Initialize with a connect signer client."""
+        self._cs = cs
+        self.address = cs.agent_eoa
+
+    def sign_typed_data(self, full_message: dict) -> _Signed:
+        """Sign EIP-712 typed data (an order or the L1 auth) via connect."""
+        signable = encode_typed_data(full_message=full_message)
+        return _Signed(self._cs.sign_digest(_hash_eip191_message(signable)))
+
+
+class ConnectClient(SecureClient):
+    """The SDK client plus the buy sizing ``pm.quote_buy`` and ``buy`` share."""
+
+    def calculate_market_price(
+        self, token_id: str, side: str, amount: float, order_type: str
+    ) -> float:
+        """Price level a market order of ``amount`` reaches on the live book."""
+        return float(
+            self.estimate_market_price(
+                token_id=token_id, side=side, amount=amount, order_type=order_type
+            )
+        )
+
+    def _adjust_buy_amount_for_balance(
+        self, token_id: str, amount: float, price: float, balance: float, _builder: None
+    ) -> float:
+        """Spend what ``balance`` covers once the market's taker fee is held back.
+
+        The fee is charged on min(amount, balance) and taken out of the
+        balance, so a balance of exactly ``amount`` leaves amount - fee.
+        """
+        market = self._ctx.order_metadata.resolve_market(self._ctx, token_id=token_id)
+        fee_info = market.fee_info
+        rate = float(fee_info.rate) * (price * (1 - price)) ** float(fee_info.exponent)
+        fee = min(amount, balance) / price * rate
+        if balance > amount + fee:
+            return amount
+        return max(balance - fee, 0.0)
+
+
+def make_clob_client(cs: ConnectSigner, funder: str) -> ConnectClient:
+    """Build an SDK client signing POLY_1271 orders funded by ``funder`` (the DW).
+
+    The agent EOA signs as the DW's owner, the signature the DW validates;
+    it is set here rather than left to the SDK, which treats a DW it cannot
+    derive from the EOA as a session key's. API creds are tied to the signer
+    EOA (not the funder, matching the production trader); they are derived
+    once via an L1 signature and cached in the workspace state (revocable
+    API creds, not key material).
     """
-
-    @staticmethod
-    def _sign_hash(digest, private_key=None):
-        if isinstance(private_key, RemoteSigner):
-            return _Signed(private_key.sign(digest))
-        return _RealAccount._sign_hash(digest, private_key=private_key)
-
-    @staticmethod
-    def sign_message(encoded, private_key=None):
-        if isinstance(private_key, RemoteSigner):
-            return _Signed(private_key.sign(_hash_eip191_message(encoded)))
-        return _RealAccount.sign_message(encoded, private_key=private_key)
-
-
-_builder_v1.Account = _AccountShim
-_builder_v2.Account = _AccountShim
-
-
-def make_clob_client(cs: ConnectSigner, funder: str) -> ClobClient:
-    """Build a ClobClient signing POLY_1271 orders funded by ``funder`` (the DW).
-
-    The client is built key-less, then its signer and order builder are bound
-    to the :class:`RemoteSigner`. API creds are tied to the signer EOA (not
-    the funder — matches the production trader); they are derived once via an
-    L1 signature and cached in the workspace state (revocable API creds, not
-    key material).
-    """
-    client = ClobClient(
-        CLOB_HOST,
-        chain_id=CHAIN_ID,
-        signature_type=SIGNATURE_TYPE_POLY_1271,
-        funder=funder,
-    )
     signer = RemoteSigner(cs)
-    client.signer = signer
-    client.builder = OrderBuilder(
-        signer=signer, signature_type=SIGNATURE_TYPE_POLY_1271, funder=funder
-    )
-    client.mode = client._get_client_mode()  # L1 now that a signer is bound
-
+    config = get_environment_config(PRODUCTION)
     state = load_state(cs)
     cached = state.get("clob_creds")
     if cached:
-        creds = ApiCreds(
-            api_key=cached["api_key"],
-            api_secret=cached["api_secret"],
-            api_passphrase=cached["api_passphrase"],
+        creds = ApiKeyCreds(
+            key=cached["api_key"],
+            secret=cached["api_secret"],
+            passphrase=cached["api_passphrase"],
         )
     else:
-        # create_or_derive tries create first and falls back to derive; the
-        # SDK logs a harmless ERROR on the create path for an existing key.
-        creds = client.create_or_derive_api_key()
+        # creates the key, or derives it when one exists; nonce 0 as before
+        auth = sign_api_key_auth(
+            signer, chain_id=config.chain_id, timestamp=int(time.time()), nonce=0
+        )
+        clob = SyncTransport(base_url=config.clob_url)
+        try:
+            creds = create_or_derive_api_key_sync(clob, auth)
+        finally:
+            clob.close()
         state["clob_creds"] = {
-            "api_key": creds.api_key,
-            "api_secret": creds.api_secret,
-            "api_passphrase": creds.api_passphrase,
+            "api_key": creds.key,
+            "api_secret": creds.secret,
+            "api_passphrase": creds.passphrase,
         }
         save_state(cs, state)
-    client.set_api_creds(creds)
-    client.mode = client._get_client_mode()  # L2 with creds bound
-    return client
+    return ConnectClient._construct_for_wallet(
+        signer=signer,
+        wallet=funder,
+        wallet_type="DEPOSIT_WALLET",
+        signer_type="OWNER",
+        environment=PRODUCTION,
+        config=config,
+        credentials=creds,
+        api_key=None,
+        logger=None,
+        on_rate_limit_update=None,
+    )
 
 
 def clear_cached_creds(cs: ConnectSigner) -> None:

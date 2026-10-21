@@ -26,4 +26,4 @@ if [ ! -f "$SHARED" ]; then
   exit 1
 fi
 exec bash "$SHARED" connect-polymarket CONNECT_POLYMARKET_VENV .bootstrap-complete \
-  "py-clob-client-v2==1.0.2" "web3>=7.15,<8" requests certifi
+  "polymarket-client==0.13.0" "web3>=7.15,<8" requests certifi
