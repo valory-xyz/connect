@@ -201,7 +201,10 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   the one safe→balance-tracker payment a 402 top-up would send, single-use,
   shape-checked (bare native transfer or `deposit(uint256)` with no inner
   value) and capped at the same bound mech-client itself enforces on the
-  shortfall (10× the mech's per-request rate). The MechMarketplace contract per chain
+  shortfall (10× the mech's per-request rate). The server's own agent
+  top-up (see [Agent top-up](#agent-top-up)) arms a third, the same way: one
+  bare native transfer from the safe to the agent EOA itself, capped at the
+  amount it computed. The MechMarketplace contract per chain
   (imported from the pinned mech-client) is whitelisted by default — the only
   contract the safe calls in the on-chain mech flow — so mech requests work out
   of the box. Balance trackers and payment tokens are deliberately not
@@ -253,6 +256,38 @@ whitelist is not editable through the API yet — a patch replaces it wholesale
 across all chains and only its address *format* can be validated here, so it
 stays frozen at the defaults (a `whitelist` in a patch is a 422) until those
 semantics are designed.
+
+## Agent top-up
+
+`CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS` is
+`{chain: {"agent" | "safe": {asset: requirement}}}`, where a requirement is
+`{"threshold", "topup", "min_tx_balance"?}` in wei (decimal strings or
+integers; `min_tx_balance` only means something on the agent's native entry)
+or, as before, a bare amount read as `threshold = topup`.
+
+Beside the run-window job, the server checks the agent EOA's native balance at
+start and then every hour (`AGENT_TOPUP_INTERVAL_SECONDS`; a restart always
+checks). On every chain with a safe, when the EOA is below its native
+`threshold`, it needs `topup - balance`. If the EOA holds at least
+`min_tx_balance` (enough to pay for the transfer), the safe sends it that much
+native token in one plain `execTransaction` CALL (no calldata, no MultiSend),
+or all it holds when that is less. Without `min_tx_balance` on a chain nothing
+moves there. Tokens never move. Each top-up is audited as `agent_topup`; in
+restricted mode it passes through the one-shot allowance described under
+[Guardrail](#guardrail).
+
+`GET /funds-status` reports what is left once the top-up has run, from the same
+rule, as soon as the balances are read:
+
+| Agent EOA ≥ `min_tx_balance` | Safe native | Agent EOA deficit | Safe deficit |
+|---|---|---|---|
+| no | any | `topup - balance` | `threshold - balance`, as before |
+| yes | ≥ what the EOA needs | 0 | `threshold - balance`, as before |
+| yes | less, but not 0 | 0 | the EOA's shortfall + the safe's `topup` |
+| yes | 0 | 0 | the EOA's need + the safe's `topup` |
+
+Every other entry, and every chain without `min_tx_balance`, still reports
+`threshold - balance`.
 
 ## Threat-model notes
 

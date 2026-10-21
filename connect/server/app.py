@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from connect import wallet
 from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import AppConfig
 from connect.guard import Guard
@@ -43,7 +44,7 @@ from connect.server.auth import (
     require_local_origin,
 )
 from connect.server.mcp_tools import build_mcp
-from connect.settings import SettingsStore
+from connect.settings import MODE_RESTRICTED, SettingsStore
 from connect.signer import Signer
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
@@ -54,6 +55,10 @@ logger = logging.getLogger("agent")
 # session's edit of activity_goal.target waits to take effect
 PERFORMANCE_REFRESH_SECONDS = 15.0
 
+# how often the agent EOA's native balance is checked against its funding
+# requirement; a restart always checks first
+AGENT_TOPUP_INTERVAL_SECONDS = 3600.0
+
 
 async def refresh_performance(activity: ActivityLog) -> None:
     """Rewrite agent_performance.json periodically, until cancelled."""
@@ -63,6 +68,50 @@ async def refresh_performance(activity: ActivityLog) -> None:
             await asyncio.to_thread(activity.write_performance)
         except Exception:  # pylint: disable=broad-exception-caught
             logger.exception("could not refresh %s", PERFORMANCE_FILE)
+
+
+def top_up_agent_signer(
+    config: AppConfig, signer: Signer, guard: Guard, activity: ActivityLog
+) -> None:
+    """Move native token from the safe to the agent EOA where the rule says so.
+
+    One plain safe CALL per chain. A failure on one chain is logged and the
+    others still run.
+    """
+    for chain, topup in wallet.agent_topup(config, signer).items():
+        if topup.action is wallet.TopUpAction.NONE:
+            continue
+        if topup.action is not wallet.TopUpAction.MOVE:
+            logger.info("agent top-up on %s: %s", chain, topup.action.value)
+            continue
+        try:
+            # armed only while restricted: one armed in unrestricted mode would
+            # outlive a switch back to restricted for its TTL
+            if guard.mode() == MODE_RESTRICTED:
+                guard.allow_agent_topup_once(chain=chain, amount_cap=topup.move)
+            tx_hash = signer.send_via_safe(
+                chain, signer.address, value=topup.move, data="0x"
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("agent top-up of %d wei on %s failed", topup.move, chain)
+            continue
+        activity.record(
+            "agent_topup", chain=chain, value=str(topup.move), tx_hash=tx_hash
+        )
+
+
+async def top_up_agent(
+    config: AppConfig, signer: Signer, guard: Guard, activity: ActivityLog
+) -> None:
+    """Top up the agent EOA at start, then hourly, until cancelled."""
+    while True:
+        try:
+            await asyncio.to_thread(
+                top_up_agent_signer, config, signer, guard, activity
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("agent top-up check failed")
+        await asyncio.sleep(AGENT_TOPUP_INTERVAL_SECONDS)
 
 
 def create_app(  # pylint: disable=too-many-arguments
@@ -88,14 +137,19 @@ def create_app(  # pylint: disable=too-many-arguments
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> t.AsyncIterator[None]:
-        refresher = asyncio.create_task(refresh_performance(activity))
+        tasks = (
+            asyncio.create_task(refresh_performance(activity)),
+            asyncio.create_task(top_up_agent(config, signer, guard, activity)),
+        )
         try:
             async with mcp.session_manager.run():
                 yield
         finally:
-            refresher.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await refresher
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     app = FastAPI(title="connect", lifespan=lifespan)
     # DNS-rebinding defense: a rebound hostname reaches the socket with the
