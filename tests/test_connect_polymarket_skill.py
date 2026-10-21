@@ -5007,6 +5007,51 @@ def test_sweep_refuses_when_a_later_page_cannot_be_read(clob) -> None:
     assert clob.order_cursors == [_FIRST_CURSOR, "Mg=="]
 
 
+@pytest.mark.parametrize(
+    "row", ["not an order", 7, None, []], ids=["str", "int", "null", "list"]
+)
+@pytest.mark.parametrize("later_page", [False, True], ids=["first", "later"])
+def test_sweep_refuses_a_page_holding_a_row_that_is_not_an_order(
+    clob, row, later_page
+) -> None:
+    """A page whose list holds a non-object row refuses the sweep as malformed.
+
+    The row sits beside a real order, on the first page or on a later one
+    after a page that held an order of its own. Neither a count of the rows
+    that did parse nor a crash may stand in for the refusal.
+    """
+    _remote_signer()
+    first_id, second_id = _order_ids(8, 9)
+    bad_page = {
+        "data": [dict(_OPEN_ORDER, id=second_id), row],
+        "next_cursor": _END_CURSOR,
+    }
+    if later_page:
+        clob.order_pages = {
+            _FIRST_CURSOR: {
+                "data": [dict(_OPEN_ORDER, id=first_id)],
+                "next_cursor": "Mg==",
+            },
+            "Mg==": bad_page,
+        }
+        cursors = [_FIRST_CURSOR, "Mg=="]
+    else:
+        clob.order_pages = {_FIRST_CURSOR: bad_page}
+        cursors = [_FIRST_CURSOR]
+
+    with pytest.raises(SystemExit) as refused:
+        funds._abort_if_open_orders(clob.cs, _AGENT_DW)
+
+    message = str(refused.value)
+    assert message.startswith(
+        "could not verify open CLOB orders before sweeping "
+        "(malformed /data/orders page"
+    )
+    assert "open CLOB order(s) rest against the DW" not in message
+    assert clob.order_cursors == cursors
+    assert clob.server.requests == []  # nothing was signed
+
+
 @pytest.mark.usefixtures("_fixed_orders")
 def test_trade_market_buy_spends_the_usd_asked_for(clob, monkeypatch, capsys) -> None:
     """`trade.py buy` signs a FOK market BUY of exactly --usd and posts it once.
