@@ -64,11 +64,7 @@ from eth_utils import is_address, keccak, to_checksum_address
 # and websockets; tox -e unit-tests runs this file with it (`uv run --with`).
 pytest.importorskip("polymarket")
 
-from polymarket import (  # noqa: E402
-    InsufficientLiquidityError,
-    RequestRejectedError,
-    TransportError,
-)
+from polymarket import RequestRejectedError, TransportError  # noqa: E402
 from polymarket._internal.actions.orders import cache as sdk_order_cache  # noqa: E402
 from polymarket._internal.actions.orders import orders as sdk_orders  # noqa: E402
 from polymarket._internal.actions.orders.market_data import (  # noqa: E402
@@ -2580,18 +2576,12 @@ def test_quote_works_against_an_empty_deposit_wallet(clob, monkeypatch, capsys) 
     assert dust["shortfall_usd"] == pytest.approx(quote["shortfall_usd"] - 0.004)
 
 
-def test_quote_does_not_divide_by_a_zero_price(clob, monkeypatch) -> None:
-    """An empty book ends a quote with the SDK's no-liquidity error.
+def test_quote_does_not_divide_by_a_zero_price() -> None:
+    """A zero fill price gives no share estimate rather than a ZeroDivisionError."""
+    quote = pm.quote_buy("7", 10.0, 50.0, "FOK", 0.0, lambda funds: min(funds, 10))
 
-    Not a ZeroDivisionError on a zero price: nothing is signed or posted.
-    """
-    clob.book = dict(_BOOK, asks=[])
-    _dw_holds(clob, monkeypatch, 50.0)
-
-    with pytest.raises(InsufficientLiquidityError):
-        _script("trade").cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
-
-    assert clob.orders == clob.digests == []
+    assert quote["estimated_shares"] is None
+    assert quote["fill_price"] == 0.0
 
 
 # --- netcheck: the DNS heuristic was inverted (OPE-1862 #7) ---------------------
@@ -3585,9 +3575,9 @@ class _Clob:
 
     Records every request and each digest Connect signs. Creating an API key
     answers `create` (issue `issued`, an error status, or raise); deriving
-    issues `issued`. ``POST /order`` answers `placed`; ``GET /data/orders``
-    serves `pages` by cursor, the first page without one. A request made with
-    `refused_key` gets `refusal`.
+    issues `issued`. ``POST /order`` answers `placed`, or raises it;
+    ``GET /data/orders`` serves `pages` by cursor, the first page without one.
+    A request made with `refused_key` gets `refusal`.
     """
 
     def __init__(self, cs) -> None:
@@ -3623,6 +3613,8 @@ class _Clob:
             return reply(*self.refusal[::-1])
         if (method, path) == ("POST", "/order"):
             self.orders.append(json.loads(request.content)["order"])
+            if isinstance(self.placed, Exception):
+                raise self.placed
             return reply(self.placed)
         if (method, path) == ("DELETE", "/order"):
             assert json.loads(request.content) == {"orderID": _ORDER_ID}
@@ -4065,7 +4057,7 @@ def _assert_uncertain(clob, command, code, told) -> None:
     assert code not in (None, 0)
     assert "uncertain" in told
     assert "positions" in told
-    if command[0] != "sell":
+    if "sell" not in command:
         assert int(_V1_TOKEN) in pm.dw_pending_buy_tokens(clob.cs)
 
 
@@ -4075,8 +4067,9 @@ def _assert_uncertain(clob, command, code, told) -> None:
         ("buy", 10.0, "fok"),
         ("limit", "buy", 0.5, 10.0, "gtc", None),
         ("sell", 12.5, "fak"),
+        ("limit", "sell", 0.5, 10.0, "gtc", None),
     ],
-    ids=["market", "limit", "sell"],
+    ids=["market", "limit", "sell", "limit-sell"],
 )
 def test_an_unmatched_order_is_uncertain_and_another_rejection_is_not(
     clob, monkeypatch, capsys, command
@@ -4092,7 +4085,7 @@ def test_an_unmatched_order_is_uncertain_and_another_rejection_is_not(
     _dw_holds(clob, monkeypatch, 100.0)
     clob.placed = _UNMATCHED
     _assert_uncertain(clob, command, *_post_outcome(clob, capsys, command))
-    if command[0] == "sell":
+    if "sell" in command:
         return
 
     clob.placed = _REFUSED
@@ -4104,29 +4097,44 @@ def test_an_unmatched_order_is_uncertain_and_another_rejection_is_not(
     assert len(clob.orders) == 2
 
 
-_READABLE_BUT_NOT_PLACED = [  # success: true, yet the SDK's code is "unknown"
-    dict(_PLACED, status="pending"),
-    dict(_PLACED, errorMsg="order is being processed"),
-    dict(_PLACED, orderID=""),
-]
+def test_a_buy_post_with_no_answer_keeps_its_pending_marker(
+    clob, monkeypatch, capsys
+) -> None:
+    """A buy whose post times out may still be placed: its pending marker stays.
+
+    The command exits non-zero with the SDK's error.
+    """
+    _dw_holds(clob, monkeypatch, 100.0)
+    clob.placed = httpx.ReadTimeout("read timed out")
+
+    code, told = _post_outcome(clob, capsys, ("buy", 10.0, "fok"))
+
+    assert code not in (None, 0)
+    assert "timed out" in told
+    assert int(_V1_TOKEN) in pm.dw_pending_buy_tokens(clob.cs)
+
+
 _UNREADABLE = {k: v for k, v in _PLACED.items() if k != "takingAmount"}
 
 
 @pytest.mark.parametrize(
     ("command", "reply"),
-    [(("buy", 10.0, "fok"), reply) for reply in _READABLE_BUT_NOT_PLACED]
-    + [(("buy", 10.0, "fok"), _UNREADABLE), (("sell", 12.5, "fak"), _UNREADABLE)],
-    ids=["odd-status", "error-message", "no-order-id", "unreadable", "unreadable-sell"],
+    [
+        # success: true with a status the SDK does not know: code "unknown"
+        (("buy", 10.0, "fok"), dict(_PLACED, status="pending")),
+        (("buy", 10.0, "fok"), _UNREADABLE),
+        (("sell", 12.5, "fak"), _UNREADABLE),
+    ],
+    ids=["odd-status", "unreadable", "unreadable-sell"],
 )
-def test_a_post_reply_short_of_success_false_leaves_placement_uncertain(
+def test_a_post_reply_the_sdk_cannot_classify_leaves_placement_uncertain(
     clob, monkeypatch, capsys, command, reply
 ) -> None:
-    """Only ``success: false`` proves an order was not placed.
+    """Only a refusal code the SDK assigns proves an order was not placed.
 
-    A ``success: true`` reply the SDK reads as a rejection with code
-    "unknown" (a status it does not know, an error message, no order id), or
-    a reply it cannot read at all, arrives after the CLOB has the order. It
-    is treated like "unmatched": a non-zero exit, placement uncertain, check
+    A reply the SDK reads as a rejection it cannot classify (code "unknown"),
+    or cannot read at all, arrives after the CLOB has the order. It is
+    treated like "unmatched": a non-zero exit, placement uncertain, check
     positions before retrying, and a buy's pending marker kept.
     """
     _dw_holds(clob, monkeypatch, 100.0)
