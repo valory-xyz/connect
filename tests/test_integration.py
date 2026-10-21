@@ -420,7 +420,9 @@ def test_funds_status_reports_live_balance(
 ) -> None:
     """/funds-status reflects the on-chain balance against the threshold."""
     fork_config.fund_requirements = {
-        "gnosis": {"agent": {"0x" + "00" * 20: 2 * 10**18}}
+        "gnosis": {
+            "agent": {"0x" + "00" * 20: {"threshold": 2 * 10**18, "topup": 2 * 10**18}}
+        }
     }
     app = _fork_app(funded_signer, fork_config, fork_store, store_path, "t")
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:

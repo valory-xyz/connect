@@ -97,15 +97,81 @@ def test_store_path_required(tmp_path: Path) -> None:
         load_config(env)
 
 
-def test_fund_requirements(tmp_path: Path) -> None:
-    """Test fund requirements."""
+NATIVE = "0x" + "00" * 20
+
+
+def test_fund_requirements_bare_amount_is_threshold_and_topup(tmp_path: Path) -> None:
+    """A bare amount, string or int, is read as threshold = topup."""
+    reqs = {"gnosis": {"agent": {NATIVE: "100"}, "safe": {NATIVE: 5}}}
+    env = base_env(tmp_path) | {FUND_REQUIREMENTS_ENV: json.dumps(reqs)}
+    config = load_config(env)
+    assert config.fund_requirements["gnosis"] == {
+        "agent": {NATIVE: {"threshold": 100, "topup": 100}},
+        "safe": {NATIVE: {"threshold": 5, "topup": 5}},
+    }
+
+
+def test_fund_requirements_funds_manager_shape(tmp_path: Path) -> None:
+    """The funds-manager shape parses to ints; min_tx_balance stays optional."""
     reqs = {
-        "gnosis": {"agent": {"0x" + "00" * 20: "100"}, "safe": {"0x" + "00" * 20: 5}}
+        "Polygon": {
+            "agent": {
+                NATIVE: {
+                    "threshold": "1600000000000000000",
+                    "topup": "8000000000000000000",
+                    "min_tx_balance": "100000000000000000",
+                }
+            },
+            "safe": {NATIVE: {"threshold": "3", "topup": 15}},
+        }
     }
     env = base_env(tmp_path) | {FUND_REQUIREMENTS_ENV: json.dumps(reqs)}
     config = load_config(env)
-    assert config.fund_requirements["gnosis"]["agent"]["0x" + "00" * 20] == 100
-    assert config.fund_requirements["gnosis"]["safe"]["0x" + "00" * 20] == 5
+    assert config.fund_requirements == {
+        "polygon": {
+            "agent": {
+                NATIVE: {
+                    "threshold": 16 * 10**17,
+                    "topup": 8 * 10**18,
+                    "min_tx_balance": 10**17,
+                }
+            },
+            "safe": {NATIVE: {"threshold": 3, "topup": 15}},
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("requirement", "match"),
+    [
+        ({"threshold": "1"}, r"missing \['topup'\]"),
+        ({"topup": "1"}, r"missing \['threshold'\]"),
+        ({"threshold": "1", "topup": "1", "top_up": "1"}, r"unknown \['top_up'\]"),
+        ({"threshold": "1", "topup": "1.5"}, "topup must be a whole number"),
+        ({"threshold": "-1", "topup": "1"}, "threshold must be >= 0"),
+        ({"threshold": "1", "topup": "1", "min_tx_balance": None}, "whole number"),
+        (True, "must be a whole number"),
+        (1.0, "must be a whole number"),
+        ("ten", "must be a whole number"),
+    ],
+)
+def test_fund_requirements_bad_requirement_raises(
+    tmp_path: Path, requirement: object, match: str
+) -> None:
+    """A malformed requirement fails loudly, naming the var and the entry."""
+    reqs = {"gnosis": {"agent": {NATIVE: requirement}}}
+    env = base_env(tmp_path) | {FUND_REQUIREMENTS_ENV: json.dumps(reqs)}
+    with pytest.raises(ValueError, match=FUND_REQUIREMENTS_ENV) as error:
+        load_config(env)
+    assert f"agent {NATIVE} on gnosis" in str(error.value)
+    error.match(match)
+
+
+def test_fund_requirements_non_dict_role_entry_raises(tmp_path: Path) -> None:
+    """A role mapped to anything but an asset object fails loudly."""
+    env = base_env(tmp_path) | {FUND_REQUIREMENTS_ENV: '{"gnosis": {"agent": 5}}'}
+    with pytest.raises(ValueError, match="asset -> requirement"):
+        load_config(env)
 
 
 def test_fund_requirements_non_dict_chain_entry_raises(tmp_path: Path) -> None:

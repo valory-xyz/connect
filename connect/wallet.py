@@ -70,11 +70,11 @@ def funds_status(config: AppConfig, signer: Signer) -> dict:
                 address = config.chains[chain].safe_address
             if not address:  # no safe configured on this chain
                 continue
-            for asset, threshold in assets.items():
+            for asset, requirement in assets.items():
                 balance, decimals = asset_balance(w3, asset, address, chain)
                 report.setdefault(chain, {}).setdefault(address, {})[asset] = {
                     "balance": str(balance),
-                    "deficit": str(max(0, threshold - balance)),
+                    "deficit": str(max(0, requirement["threshold"] - balance)),
                     "decimals": decimals,
                 }
     return report

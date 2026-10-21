@@ -330,7 +330,9 @@ class TestOpenEndpoints:
         self, client: TestClient, app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Test funds status shape."""
-        app_config.fund_requirements = {"testchain": {"agent": {"0x" + "00" * 20: 100}}}
+        app_config.fund_requirements = {
+            "testchain": {"agent": {"0x" + "00" * 20: {"threshold": 100, "topup": 100}}}
+        }
         monkeypatch.setattr(wallet_module, "asset_balance", lambda *a, **k: (40, 18))
         response = client.get("/funds-status")
         assert response.status_code == 200

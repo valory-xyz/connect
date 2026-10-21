@@ -413,7 +413,7 @@ Run standalone (mimicking the Pearl runner):
 export CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS=<rpc-url>
 export CONNECTION_CONFIGS_CONFIG_STORE_PATH=/path/to/persistent_data
 export CONNECTION_CONFIGS_CONFIG_SAFE_CONTRACT_ADDRESSES='{"gnosis":"0x..."}'
-export CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS='{"gnosis":{"agent":{"0x0000000000000000000000000000000000000000":"1000000000000000000"}}}'
+export CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS='{"gnosis":{"agent":{"0x0000000000000000000000000000000000000000":{"threshold":"10000000000000000","topup":"50000000000000000","min_tx_balance":"1000000000000000"}},"safe":{"0x0000000000000000000000000000000000000000":{"threshold":"1000000000000000000","topup":"5000000000000000000"}}}}'
 # cwd must contain ethereum_private_key.txt (encrypted web3 keystore JSON)
 uv run python -m connect --password-stdin   # prompts "Enter password:" on a TTY
 # legacy (password lands in /proc/<pid>/cmdline, readable by any local user):
