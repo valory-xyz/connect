@@ -66,12 +66,14 @@ _API_ERRORS = (
     UnexpectedResponseError,
 )
 
-# The SDK reads a CLOB reply of status "unmatched" as a rejection and drops
-# its order id, though the order may still have been placed.
+# Order-reply codes that don't prove the order was not placed: the SDK reads
+# a CLOB reply of status "unmatched", or a success it cannot classify, as a
+# rejection and drops its order id.
+_UNCERTAIN_CODES = ("unmatched", "unknown")
 _UNCERTAIN = (
-    'placement uncertain: the CLOB answered "unmatched" ({}), so the order '
-    "may still have been placed; check positions (positions.py positions "
-    "--wallet dw) before retrying"
+    "placement uncertain: the CLOB's reply does not show whether the order was "
+    "placed ({}); check positions (positions.py positions --wallet dw) before "
+    "retrying"
 )
 
 
@@ -132,9 +134,17 @@ def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
     pm.print_json(result)
 
 
-def _placed(response):
-    """Return an SDK order reply, refusing one whose placement is uncertain."""
-    if not response.ok and response.code == "unmatched":
+def _post(client, order):
+    """Post a signed order; refuse when its reply leaves placement uncertain.
+
+    A reply the SDK cannot read arrives after the CLOB has the order, so it
+    is uncertain too.
+    """
+    try:
+        response = client.post_order(order)
+    except UnexpectedResponseError as e:
+        raise SystemExit(_UNCERTAIN.format(e)) from e
+    if not response.ok and response.code in _UNCERTAIN_CODES:
         raise SystemExit(_UNCERTAIN.format(response.message))
     return response
 
@@ -163,9 +173,9 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
     on-chain balance directly instead of depending on the lagging data API.
 
     A rejected order reply or status-code 401 authentication rejection proves
-    that no order was submitted; an "unmatched" reply may still be placed, so
-    it keeps the marker. Other exceptions remain ambiguous: a timeout, rate
-    limit, intermediary or unreadable response, or message-only auth error
+    that no order was submitted; a reply that leaves placement uncertain
+    (see `_post`) keeps the marker. Other exceptions remain ambiguous: a
+    timeout, rate limit, intermediary response, or message-only auth error
     may arrive after the request reached the CLOB. A harmless
     zero-balance hint is safer than an undiscoverable filled position.
     """
@@ -174,12 +184,12 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
     # the submission rather than proceed without the recovery hint.
     pm.record_dw_buy_intent(cs, token_id_int)
     try:
-        response = client.post_order(order)
+        response = _post(client, order)
     except _API_ERRORS as e:
         if _definitive_auth_rejection(e):
             pm.reject_dw_buy_intent(cs, token_id_int)
         raise
-    if not _placed(response).ok:
+    if not response.ok:
         pm.reject_dw_buy_intent(cs, token_id_int)
         raise SystemExit(response.message)
     try:
@@ -281,7 +291,7 @@ def cmd_sell(
         order = client.create_market_order(
             token_id=token_id, side="SELL", shares=shares, order_type=ot
         )
-        return _placed(client.post_order(order))
+        return _post(client, order)
 
     _run_client(cs, op, retry_auth=False)
 
@@ -324,7 +334,7 @@ def cmd_limit(  # pylint: disable=too-many-arguments
         )
         if order_side == pm.BUY_SIDE:
             return _post_buy_with_recovery_hint(client, cs, token_id, order)
-        return _placed(client.post_order(order))
+        return _post(client, order)
 
     _run_client(cs, op, retry_auth=False)
 
