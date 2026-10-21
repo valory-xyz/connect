@@ -38,7 +38,7 @@ Run standalone (mimicking the Pearl runner) — see README "Development" for the
 ## Constraints CI enforces
 
 - **100% test coverage** on `connect/`, including the shared agent-runtime modules under `connect/assets/lib/`. Only the bundled skills under `connect/assets/skills/` are omitted: they run in the agent's environment, not the server's, and have their own tests.
-- mypy with `--disallow-untyped-defs`; `connect/assets/skills/connect-polymarket/` is excluded (depends on `py_clob_client_v2`, not a repo dep). `connect/assets/lib/` is excluded from the *scan* but sits on `mypy_path` and is still fully checked as an import of the skill scripts — without the exclude mypy resolves it under two module names and halts.
+- mypy with `--disallow-untyped-defs`; `connect/assets/skills/connect-polymarket/` is excluded (depends on the Polymarket CLOB SDK, which the agent's environment installs; the repo has it only as a dev dependency for the skill tests). `connect/assets/lib/` is excluded from the *scan* but sits on `mypy_path` and is still fully checked as an import of the skill scripts — without the exclude mypy resolves it under two module names and halts.
 - flake8 includes docstring rules (D) and pytest style (PT); every module/function needs a docstring.
 - Copyright headers (Valory AG, Apache 2.0) on every source file — `tox -e fix-copyright` adds them.
 - `packages/valory/connections/`, `packages/valory/protocols/`, `packages/open_aea/` are vendored third-party code, excluded from all linters — don't edit or reformat them.

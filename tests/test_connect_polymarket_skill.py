@@ -23,25 +23,47 @@ These lock the bytes/behaviour a silent bug would corrupt: calldata encoders,
 the EIP-712 DepositWallet batch digest, the dollar↔units conversion, the
 approval-set decision, ``contract_owner``'s RPC-vs-revert distinction, the
 relayer tx record selection, and ``_resolve_dw``'s safety branches. No
-network, no funds, no ``py_clob_client_v2`` dependency (order/SDK paths are
-covered by the live e2e, not here).
+network and no funds. The order-signing tests run the pinned unified SDK
+(``polymarket-client``, a dev dependency) against a stand-in for the Connect
+signer, so the signatures they check are the SDK's own.
 """
 
 # The skill modules are imported at runtime via a sys.path insert (they ship
-# as bundled assets, not an installed package) and pull in py_clob_client_v2,
-# which has no type stubs — mypy can follow none of this, so skip the file.
+# as bundled assets, not an installed package) and pull in the CLOB SDK —
+# mypy can follow none of this, so skip the file.
 # mypy: ignore-errors
 
+import importlib
 import json
 import os
+import random
+import re
 import subprocess  # nosec B404 - runs the skill's own bootstrap script
 import sys
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
+import requests
 from eth_abi import decode as abi_decode
-from eth_utils import is_address, to_checksum_address
+from eth_abi import encode as abi_encode
+from eth_account import Account
+from eth_account.messages import (
+    _hash_eip191_message,
+    encode_defunct,
+    encode_typed_data,
+)
+from eth_account.signers.local import LocalAccount
+from eth_keys import keys as eth_keys
+from eth_utils import is_address, keccak, to_checksum_address
+from polymarket import SecureClient
+from polymarket._internal.actions.orders import cache as sdk_order_cache
+from polymarket._internal.actions.orders import orders as sdk_orders
+from polymarket._internal.actions.orders.market_data import MarketInfo, PlatformFeeInfo
+from polymarket._internal.l1_auth import build_api_key_auth_typed_data
+from polymarket.environments import PRODUCTION
 from web3.exceptions import ContractLogicError, TimeExhausted
 
 from connect import workspace
@@ -94,6 +116,21 @@ ADDR_A = to_checksum_address("0x" + "11" * 20)
 ADDR_B = to_checksum_address("0x" + "22" * 20)
 DW_ADDR = to_checksum_address("0x" + "d0" * 20)
 SAFE_ADDR = to_checksum_address("0x" + "5a" * 20)
+
+# Polygon mainnet addresses, written out rather than read from the skill so a
+# wrong constant there fails these tests instead of cancelling out. They match
+# Polymarket's published deployments and the pinned SDK's production config
+# (checked in test_dw_setup_includes_v2_approvals).
+_PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+_CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+_CTF_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
+_NEG_RISK_CTF_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
+_NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+_EXCHANGE_V3 = "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa"
+_POSITION_MANAGER = "0x006F54F7f9A22e0000CC2AB60031000000ae9fEF"
+_V2_ROUTER = "0x12121212006e4CD160D18e3f00711DA5c3372600"
+_AUTO_REDEEMER = "0xa1200000d0002264C9a1698e001292D00E1b00af"
+_MAX_UINT256 = 2**256 - 1
 
 
 # The data API's v2 name for each v1 field the fixtures are written in. Kept
@@ -233,17 +270,23 @@ def test_record_dw_token_best_effort_swallows_failure(
 def test_missing_approval_calls_when_nothing_is_granted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """All-missing yields 3 pUSD approvals + 3 CTF operator grants, no more."""
+    """All-missing yields 3 pUSD approvals and 3 operator grants, no more.
+
+    pUSD goes to both current exchanges and ExchangeV3; the CTF grants go to
+    the two current exchanges, and the PositionManager grant to ExchangeV3.
+    """
     monkeypatch.setattr(pm, "erc20_allowance", lambda *a: 0)
     monkeypatch.setattr(pm, "is_approved_for_all", lambda *a: False)
     calls = pm.missing_approval_calls(None, ADDR_A)
     assert len(calls) == 6
     pusd_calls = [c for c in calls if c["target"] == pm.PUSD]
     ctf_calls = [c for c in calls if c["target"] == pm.CTF]
-    assert len(pusd_calls) == len(pm.APPROVAL_SPENDERS_PUSD) == 3
-    assert len(ctf_calls) == len(pm.APPROVAL_OPERATORS_CTF) == 3
+    position_calls = [c for c in calls if c["target"] == _POSITION_MANAGER]
+    assert len(pusd_calls) == 3
+    assert len(ctf_calls) == 2
+    assert len(position_calls) == 1
     assert all(c["data"].startswith("0x095ea7b3") for c in pusd_calls)
-    assert all(c["data"].startswith("0xa22cb465") for c in ctf_calls)
+    assert all(c["data"].startswith("0xa22cb465") for c in ctf_calls + position_calls)
 
 
 def test_missing_approval_calls_skips_already_granted(
@@ -1577,12 +1620,16 @@ def test_constants_report_publishes_the_addresses_and_hosts() -> None:
         c.address for c in pm.CONTRACTS
     ]
     assert pm.CLOB_HOST in report["api_hosts"].values()
-    # the approval set, named — the DW's three venues, not the two adapters
-    assert set(report["dw_trading_approvals"]["pusd_allowances"].values()) == {
+    # the approval set, named: the DW's three venues, not the two adapters,
+    # and not the retired NegRiskAdapter
+    approvals = report["dw_trading_approvals"]
+    assert set(approvals["pusd_allowances"].values()) == {
         "CTFExchange",
         "NegRiskCTFExchange",
-        "NegRiskAdapter",
+        "ExchangeV3",
     }
+    named = {name for section in approvals.values() for name in section.values()}
+    assert named == {"CTFExchange", "NegRiskCTFExchange", "ExchangeV3"}
 
 
 def test_status_prints_the_labels_beside_the_approvals(monkeypatch, capsys) -> None:
@@ -3192,3 +3239,845 @@ def test_require_supported_market_refuses_anything_else(monkeypatch, listed) -> 
 
     with pytest.raises(SystemExit, match="no open v1 market lists token 1948"):
         pm.require_supported_market("1948")
+
+
+# --- Protocol V2 trading approvals on the DepositWallet ---------------------------
+
+_SEL_APPROVE = keccak(text="approve(address,uint256)")[:4]
+_SEL_SET_APPROVAL_FOR_ALL = keccak(text="setApprovalForAll(address,bool)")[:4]
+_SEL_ALLOWANCE = keccak(text="allowance(address,address)")[:4]
+_SEL_IS_APPROVED_FOR_ALL = keccak(text="isApprovedForAll(address,address)")[:4]
+_SEL_OWNER = keccak(text="owner()")[:4]
+_SEL_NONCE = keccak(text="nonce()")[:4]
+
+# Each approval is (standard, token, spender-or-operator).
+_V1_APPROVALS = (
+    ("erc20", _PUSD, _CTF_EXCHANGE),
+    ("erc20", _PUSD, _NEG_RISK_CTF_EXCHANGE),
+    ("erc1155", _CTF, _CTF_EXCHANGE),
+    ("erc1155", _CTF, _NEG_RISK_CTF_EXCHANGE),
+)
+_V2_APPROVALS = (
+    ("erc20", _PUSD, _EXCHANGE_V3),
+    ("erc1155", _POSITION_MANAGER, _EXCHANGE_V3),
+)
+_DW_APPROVALS = _V1_APPROVALS + _V2_APPROVALS
+# Granted by the code before Protocol V2; no longer part of the set.
+_RETIRED_APPROVALS = (
+    ("erc20", _PUSD, _NEG_RISK_ADAPTER),
+    ("erc1155", _CTF, _NEG_RISK_ADAPTER),
+)
+# The Router approvals belong to the trading change, and the AutoRedeemer is
+# never approved: none of these may come out of the DW setup.
+_NEVER_FROM_DW_SETUP = (
+    ("erc20", _PUSD, _V2_ROUTER),
+    ("erc1155", _POSITION_MANAGER, _V2_ROUTER),
+    ("erc1155", _CTF, _AUTO_REDEEMER),
+    ("erc1155", _POSITION_MANAGER, _AUTO_REDEEMER),
+)
+
+
+def _hex_bytes(data) -> bytes:
+    """Bytes of 0x-hex or raw calldata, however the caller spelled it."""
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    return bytes.fromhex(str(data).removeprefix("0x"))
+
+
+def _word(address: str) -> str:
+    """Return an address as one left-padded ABI word, lowercase hex."""
+    return "0" * 24 + address.removeprefix("0x").lower()
+
+
+def _expected_call(approval: tuple) -> tuple:
+    """Return the exact (target, calldata) that grants one approval.
+
+    Spelled out byte by byte rather than through the skill's encoders, so a
+    wrong selector, spender, amount or flag there cannot cancel out here.
+    """
+    standard, token, party = approval
+    if standard == "erc20":  # approve(party, MaxUint256)
+        return token, "0x095ea7b3" + _word(party) + "f" * 64
+    return token, "0xa22cb465" + _word(party) + "0" * 63 + "1"  # (party, true)
+
+
+def _as_calls(calls: list) -> list:
+    """Normalise {"target", "data"[, "value"]} calls to sorted (target, data)."""
+    for call in calls:
+        assert int(call.get("value", 0)) == 0, call
+    return sorted(
+        (to_checksum_address(c["target"]), "0x" + _hex_bytes(c["data"]).hex())
+        for c in calls
+    )
+
+
+class _ApprovalChain:
+    """Polygon as the approval flow reads it, and as a mined batch changes it.
+
+    Holds ERC-20 allowances and ERC-1155 operator grants keyed by (token,
+    owner, spender-or-operator), plus each DW's owner(); nonce() reads 0. Any
+    other eth_call fails the test, so a read nobody planned for is caught.
+    Passed wherever the code expects a web3 instance: it is its own ``eth``.
+    """
+
+    def __init__(self) -> None:
+        self.allowances: dict = {}
+        self.operators: dict = {}
+        self.owners: dict = {}
+        self.eth = self
+
+    def grant(self, approval: tuple, owner: str) -> None:
+        """Record one approval as already granted by `owner`."""
+        standard, token, party = approval
+        if standard == "erc20":
+            self.allowances[(token, owner, party)] = _MAX_UINT256
+        else:
+            self.operators[(token, owner, party)] = True
+
+    def call(self, tx: dict, *args, **kwargs) -> bytes:
+        """Answer one eth_call from the recorded state."""
+        to = to_checksum_address(tx["to"])
+        data = _hex_bytes(tx["data"])
+        selector, body = data[:4], data[4:]
+        if selector in (_SEL_ALLOWANCE, _SEL_IS_APPROVED_FOR_ALL):
+            owner, party = (
+                to_checksum_address(a) for a in abi_decode(["address", "address"], body)
+            )
+            if selector == _SEL_ALLOWANCE:
+                value = self.allowances.get((to, owner, party), 0)
+            else:
+                value = int(self.operators.get((to, owner, party), False))
+            return value.to_bytes(32, "big")
+        if selector == _SEL_OWNER and to in self.owners:
+            return bytes(12) + _hex_bytes(self.owners[to])
+        if selector == _SEL_NONCE:
+            return bytes(32)
+        raise AssertionError(f"unexpected eth_call to {to}: 0x{data.hex()}")
+
+    def apply(self, owner: str, calls: list) -> None:
+        """Mine a DW batch: every call must be a value-0 approval."""
+        for call in calls:
+            assert int(call.get("value", 0)) == 0, call
+            target = to_checksum_address(call["target"])
+            data = _hex_bytes(call["data"])
+            selector, body = data[:4], data[4:]
+            if selector == _SEL_APPROVE:
+                spender, amount = abi_decode(["address", "uint256"], body)
+                self.allowances[(target, owner, to_checksum_address(spender))] = amount
+            elif selector == _SEL_SET_APPROVAL_FOR_ALL:
+                operator, approved = abi_decode(["address", "bool"], body)
+                self.operators[(target, owner, to_checksum_address(operator))] = (
+                    approved
+                )
+            else:
+                raise AssertionError(f"DW batch call is not an approval: {call}")
+
+
+class _EnsureCS:
+    """The signer surface `deposit_wallet.py ensure` touches, on a fake chain."""
+
+    agent_eoa = _StubCS.agent_eoa
+
+    def __init__(self, chain: _ApprovalChain, workspace: Path) -> None:
+        """Bind the fake chain and a workspace for the state file."""
+        self.w3 = chain
+        self.workspace = workspace
+
+    def wait_receipt(self, tx_hash: str, timeout: float = 300) -> dict:
+        """Every relayed batch confirms."""
+        return {"tx_hash": tx_hash, "status": 1}
+
+    def personal_sign(self, message: str) -> str:
+        """Return a placeholder challenge signature (the relayer is a fake)."""
+        return "0x" + "11" * 65
+
+    def sign_digest(self, digest) -> str:
+        """Return a placeholder batch signature (the relayer is a fake)."""
+        return "0x" + "22" * 65
+
+
+class _MiningRelayer:
+    """Relayer proxy stand-in that mines each batch onto the fake chain."""
+
+    def __init__(self, chain: _ApprovalChain) -> None:
+        """Start with no batches relayed."""
+        self.chain = chain
+        self.batches: list = []
+
+    def exec_wallet_batch(self, dw, nonce, calls, deadline=None) -> str:
+        """Record and mine the batch; return a relayer tx id."""
+        self.batches.append(list(calls))
+        self.chain.apply(to_checksum_address(dw), calls)
+        return f"relayer-tx-{len(self.batches)}"
+
+    def wait_terminal(self, tx_id: str) -> tuple:
+        """Every batch mines."""
+        return True, "STATE_MINED", "0x" + "ab" * 32
+
+
+def _last_json(out: str) -> dict:
+    """Parse the JSON report a command printed after its progress lines."""
+    return json.loads(out[out.index("{") :])
+
+
+def test_dw_setup_includes_v2_approvals() -> None:
+    """A fresh DW gets both V2 approvals and the V1 set, none to the NegRiskAdapter.
+
+    The pUSD approval to ExchangeV3 must be exactly MaxUint256: Polymarket's
+    relayer refuses the whole batch for anything less ("approve to exchange
+    0xe3333700... must be MaxUint256").
+    """
+    sdk_config = PRODUCTION._config  # noqa: SLF001 - the pinned SDK's addresses
+    assert to_checksum_address(sdk_config.exchange_v3) == _EXCHANGE_V3
+    assert to_checksum_address(sdk_config.position_manager) == _POSITION_MANAGER
+
+    calls = pm.missing_approval_calls(_ApprovalChain(), DW_ADDR)
+
+    assert _as_calls(calls) == sorted(_expected_call(a) for a in _DW_APPROVALS)
+    (v3_approval,) = (
+        c
+        for c in calls
+        if to_checksum_address(c["target"]) == _PUSD
+        and _hex_bytes(c["data"])[:4] == _SEL_APPROVE
+        and to_checksum_address(
+            abi_decode(["address", "uint256"], _hex_bytes(c["data"])[4:])[0]
+        )
+        == _EXCHANGE_V3
+    )
+    _, amount = abi_decode(["address", "uint256"], _hex_bytes(v3_approval["data"])[4:])
+    assert amount == 2**256 - 1
+    (v3_operator,) = (
+        c for c in calls if to_checksum_address(c["target"]) == _POSITION_MANAGER
+    )
+    assert abi_decode(["address", "bool"], _hex_bytes(v3_operator["data"])[4:]) == (
+        _EXCHANGE_V3.lower(),
+        True,
+    )
+    retired = _NEG_RISK_ADAPTER.removeprefix("0x").lower()
+    for call in calls:
+        assert to_checksum_address(call["target"]) != _NEG_RISK_ADAPTER
+        assert retired not in _hex_bytes(call["data"]).hex()
+
+
+def test_existing_wallet_gets_v2_approvals_once(monkeypatch, tmp_path, capsys) -> None:
+    """A DW holding the pre-V2 set gets exactly the two V2 approvals, then nothing.
+
+    Driven through `deposit_wallet.py ensure`, the command that grants them,
+    on a workspace that already recorded its approvals as done: the first run
+    relays one batch of the two V2 calls, the second relays nothing.
+    """
+    chain = _ApprovalChain()
+    chain.owners[DW_ADDR] = _EnsureCS.agent_eoa
+    for approval in _V1_APPROVALS + _RETIRED_APPROVALS:
+        chain.grant(approval, DW_ADDR)
+    v2_calls = sorted(_expected_call(a) for a in _V2_APPROVALS)
+    assert _as_calls(pm.missing_approval_calls(chain, DW_ADDR)) == v2_calls
+
+    cs = _EnsureCS(chain, tmp_path)
+    pm.save_state(
+        cs,
+        {
+            "deposit_wallet": {"address": DW_ADDR, "owner": cs.agent_eoa},
+            "approvals_done": True,
+        },
+    )
+    relayer = _MiningRelayer(chain)
+    monkeypatch.setattr(deposit_wallet, "RelayerProxyClient", lambda cs: relayer)
+
+    deposit_wallet.cmd_ensure(cs)
+    first = _last_json(capsys.readouterr().out)
+    assert [_as_calls(batch) for batch in relayer.batches] == [v2_calls]
+    assert first["deposit_wallet"] == DW_ADDR
+    assert first["deployed_now"] is False
+
+    deposit_wallet.cmd_ensure(cs)
+    second = _last_json(capsys.readouterr().out)
+    assert len(relayer.batches) == 1
+    assert second["approvals"] == "already complete"
+    assert pm.missing_approval_calls(chain, DW_ADDR) == []
+
+
+def test_v2_approvals_missing_calls_randomized() -> None:
+    """Every set/unset mix of the DW approvals yields exactly the missing calls.
+
+    All 64 combinations of the six approvals the DW needs, each under four
+    random owners and random states of approvals that must never matter (the
+    retired NegRiskAdapter pair, the Router, the AutoRedeemer), from a fixed
+    seed: 256 cases. Once the returned calls are mined, none are missing.
+    """
+    rng = random.Random(20260806)  # nosec B311 - test data, not secrets
+    irrelevant = _RETIRED_APPROVALS + _NEVER_FROM_DW_SETUP
+    cases = 0
+    for mask in range(2 ** len(_DW_APPROVALS)):
+        for _ in range(4):
+            owner = to_checksum_address(rng.getrandbits(160).to_bytes(20, "big"))
+            chain = _ApprovalChain()
+            unset = []
+            for bit, approval in enumerate(_DW_APPROVALS):
+                if mask >> bit & 1:
+                    chain.grant(approval, owner)
+                else:
+                    unset.append(approval)
+            for approval in irrelevant:
+                if rng.random() < 0.5:
+                    chain.grant(approval, owner)
+
+            calls = pm.missing_approval_calls(chain, owner)
+            assert _as_calls(calls) == sorted(_expected_call(a) for a in unset), (
+                mask,
+                owner,
+            )
+            chain.apply(owner, calls)
+            assert pm.missing_approval_calls(chain, owner) == [], (mask, owner)
+            cases += 1
+    assert cases >= 200
+
+
+# --- relayer proxy errors keep the relayer's own words ----------------------------
+
+# What Polymarket's relayer answered, through the proxy, to a bounded pUSD
+# approval of ExchangeV3.
+_RELAYER_REFUSAL_REASON = (
+    "call blocked: call[0] blocked: approve to exchange "
+    "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa must be MaxUint256"
+)
+_RELAYER_REFUSAL = json.dumps({"error": _RELAYER_REFUSAL_REASON}, separators=(",", ":"))
+
+
+class _RelayerHttp:
+    """Answers every request the relayer proxy client sends with one response."""
+
+    def __init__(self, status: int, reason: str, body: str, content_type: str) -> None:
+        """Fix the response every request gets."""
+        self.status, self.reason = status, reason
+        self.body, self.content_type = body, content_type
+        self.paths: list = []
+
+    def send(self, request: requests.PreparedRequest) -> requests.Response:
+        """Stand in for HTTPAdapter.send: no socket, the canned response."""
+        self.paths.append(requests.utils.urlparse(request.url).path)
+        response = requests.Response()
+        response.status_code = self.status
+        response.reason = self.reason
+        response._content = self.body.encode("utf-8")  # noqa: SLF001
+        response.headers["Content-Type"] = self.content_type
+        response.encoding = "utf-8"
+        response.url = request.url
+        response.request = request
+        return response
+
+
+def test_relayer_error_body_surfaced(monkeypatch, tmp_path, capsys) -> None:
+    """A 4xx from the relayer proxy shows what it said, not only the status.
+
+    The approval batch `deposit_wallet.py ensure` relays is refused with the
+    relayer's JSON reason, which must reach the error the command ends with;
+    a plain-text 403 on a read must reach the RelayerProxyError the same way.
+    """
+    monkeypatch.delenv("POLYMARKET_RELAYER_PROXY_URL", raising=False)
+    chain = _ApprovalChain()
+    chain.owners[DW_ADDR] = _EnsureCS.agent_eoa
+    cs = _EnsureCS(chain, tmp_path)
+    pm.save_state(cs, {"deposit_wallet": {"address": DW_ADDR}})
+
+    refusal = _RelayerHttp(400, "Bad Request", _RELAYER_REFUSAL, "application/json")
+    monkeypatch.setattr(
+        requests.adapters.HTTPAdapter,
+        "send",
+        lambda adapter, request, **kwargs: refusal.send(request),
+    )
+    with pytest.raises((relayer_proxy.RelayerProxyError, SystemExit)) as refused:
+        deposit_wallet.cmd_ensure(cs)
+    printed = capsys.readouterr()
+    shown = " ".join([str(refused.value), printed.out, printed.err])
+    assert refusal.paths == ["/polymarket/relayer/exec_wallet_batch"]
+    assert _RELAYER_REFUSAL_REASON in shown
+    assert "400" in shown
+
+    body = "wallet signature rejected: challenge timestamp outside the window"
+    forbidden = _RelayerHttp(403, "Forbidden", body, "text/plain")
+    monkeypatch.setattr(
+        requests.adapters.HTTPAdapter,
+        "send",
+        lambda adapter, request, **kwargs: forbidden.send(request),
+    )
+    with pytest.raises(relayer_proxy.RelayerProxyError) as rejected:
+        relayer_proxy.RelayerProxyClient(cs).deployed(DW_ADDR)
+    assert forbidden.paths == ["/polymarket/relayer/deployed"]
+    assert body in str(rejected.value)
+    assert "403" in str(rejected.value)
+
+
+# --- remote signer on the unified SDK ----------------------------------------------
+
+# A throwaway, publicly known test key. Only the Connect stand-in below holds
+# it, the way the Connect server is the only holder of the agent's key.
+_CONNECT_KEY = bytes.fromhex(
+    "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+)
+_AGENT_EOA = "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+# The DepositWallet Polymarket's factory derives for _AGENT_EOA, its owner.
+_AGENT_DW = "0xd2C50736787e5eeefA6c2E81496AE56d51D6b7B1"
+_V1_TOKEN = (  # nosec B105 - an outcome token id, not a password
+    "71321045679252212594626385532706912750332728571942532289631379312455583992563"
+)
+# A protocol V2 position id: module 1, the reserved bits clear, outcome 0.
+_V2_TOKEN = str(int("01" + "ab" * 18 + "00" * 13, 16))
+_ORDER_SALT = 123456789
+_ORDER_TIMESTAMP_MS = 1_800_000_000_000
+_CACHED_CREDS = {
+    "api_key": "cached-key",
+    "api_secret": "Y2FjaGVkLXNlY3JldA==",  # nosec B105 - a fake, base64 like a real one
+    "api_passphrase": "cached-passphrase",  # nosec B105
+}
+
+# Captured from the code this replaces (RemoteSigner on py_clob_client_v2
+# 1.0.2, POLY_1271 funded by _AGENT_DW): the digest Connect was asked to sign
+# and the order signature it produced for a GTC BUY of 10 _V1_TOKEN at 0.50
+# with _ORDER_SALT and _ORDER_TIMESTAMP_MS. A V1 order on the new SDK must
+# match both, byte for byte.
+_V1_GOLDEN_DIGEST = "0x5253886c32ea78ebf65a8a427ba9e2b9933c5e947f15b7e5be7bff836a099fa2"
+_V1_GOLDEN_SIGNATURE = (
+    "0xf30cb504a98efc00e00d1d6adf9907082af48a5c291e253d5ab9bec39515464d5e8feef8568e"
+    "84b9df2e200be08116dc62d235ee22d574d2db0e78eab023c8531b3264e159346253e26a64e00b"
+    "69032db0e7d32f94628de3e6eecb50304d7af3d2f2e81f819fc723d708509aa07d9b8300a86396"
+    "585213189e722a5e0da4d252394f726465722875696e743235362073616c742c61646472657373"
+    "206d616b65722c61646472657373207369676e65722c75696e7432353620746f6b656e49642c75"
+    "696e74323536206d616b6572416d6f756e742c75696e743235362074616b6572416d6f756e742c"
+    "75696e743820736964652c75696e7438207369676e6174757265547970652c75696e7432353620"
+    "74696d657374616d702c62797465733332206d657461646174612c62797465733332206275696c"
+    "6465722900ba"
+)
+
+_ORDER_TYPE = (
+    "Order(uint256 salt,address maker,address signer,uint256 tokenId,"
+    "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,"
+    "uint256 timestamp,bytes32 metadata,bytes32 builder)"
+)
+_TYPED_DATA_SIGN_TYPE = (
+    "TypedDataSign(Order contents,string name,string version,uint256 chainId,"
+    "address verifyingContract,bytes32 salt)" + _ORDER_TYPE
+)
+_DOMAIN_TYPE = (
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+)
+
+
+def _exchange_domain_separator(version: str, exchange: str) -> bytes:
+    """EIP-712 domain separator of a Polymarket exchange on Polygon."""
+    return keccak(
+        abi_encode(
+            ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+            [
+                keccak(text=_DOMAIN_TYPE),
+                keccak(text="Polymarket CTF Exchange"),
+                keccak(text=version),
+                137,
+                exchange,
+            ],
+        )
+    )
+
+
+def _order_contents_hash(token_id: str) -> bytes:
+    """Struct hash of the fixed test order: BUY 10 at 0.50, made by the agent DW."""
+    return keccak(
+        abi_encode(
+            [
+                "bytes32",
+                "uint256",
+                "address",
+                "address",
+                "uint256",
+                "uint256",
+                "uint256",
+                "uint8",
+                "uint8",
+                "uint256",
+                "bytes32",
+                "bytes32",
+            ],
+            [
+                keccak(text=_ORDER_TYPE),
+                _ORDER_SALT,
+                _AGENT_DW,  # maker
+                _AGENT_DW,  # signer: the DW itself under POLY_1271
+                int(token_id),
+                5_000_000,  # makerAmount: 5 pUSD
+                10_000_000,  # takerAmount: 10 shares
+                0,  # BUY
+                3,  # POLY_1271
+                _ORDER_TIMESTAMP_MS,
+                bytes(32),
+                bytes(32),
+            ],
+        )
+    )
+
+
+def _poly_1271_digest(version: str, exchange: str, token_id: str) -> bytes:
+    """Return the digest the DW owner signs: the order in the DW's TypedDataSign."""
+    struct_hash = keccak(
+        abi_encode(
+            [
+                "bytes32",
+                "bytes32",
+                "bytes32",
+                "bytes32",
+                "uint256",
+                "address",
+                "bytes32",
+            ],
+            [
+                keccak(text=_TYPED_DATA_SIGN_TYPE),
+                _order_contents_hash(token_id),
+                keccak(text="DepositWallet"),
+                keccak(text="1"),
+                137,
+                _AGENT_DW,
+                bytes(32),
+            ],
+        )
+    )
+    return keccak(
+        b"\x19\x01" + _exchange_domain_separator(version, exchange) + struct_hash
+    )
+
+
+def _poly_1271_trailer(version: str, exchange: str, token_id: str) -> str:
+    """Return what the DepositWallet wrapping appends to the owner's signature."""
+    return (
+        _exchange_domain_separator(version, exchange).hex()
+        + _order_contents_hash(token_id).hex()
+        + _ORDER_TYPE.encode("utf-8").hex()
+        + f"{len(_ORDER_TYPE):04x}"
+    )
+
+
+def _connect_sign(digest: bytes) -> str:
+    """Sign a raw digest the way connect/signer.py does: unprefixed, v in {27, 28}."""
+    sig = eth_keys.PrivateKey(_CONNECT_KEY).sign_msg_hash(digest)
+    return (
+        "0x"
+        + sig.r.to_bytes(32, "big").hex()
+        + sig.s.to_bytes(32, "big").hex()
+        + f"{sig.v + 27:02x}"
+    )
+
+
+class _ConnectServer:
+    """Stand-in for the Connect server, the only holder of the agent key.
+
+    Answers ``POST /sign-message`` as connect/signer.py does and records each
+    request, so a test sees exactly what Connect was asked to sign.
+    """
+
+    def __init__(self) -> None:
+        """Start with no requests."""
+        self.requests: list = []
+
+    def post(self, path: str, payload: dict) -> dict:
+        """Answer the signer client's one HTTP call in-process."""
+        self.requests.append((path, dict(payload)))
+        assert path == "/sign-message", f"unexpected Connect request {path}"
+        return {"signature": _connect_sign(_hex_bytes(payload["digest"]))}
+
+    @property
+    def digests(self) -> list:
+        """Each digest Connect signed, as 0x-hex, in order."""
+        return ["0x" + _hex_bytes(p["digest"]).hex() for _, p in self.requests]
+
+
+def _connect_signer(tmp_path, monkeypatch, server, creds=_CACHED_CREDS):
+    """Build a real ConnectSigner whose HTTP hop lands on `server`.
+
+    `creds`, when given, are stored the way the workspace keeps them today.
+    """
+    cs = pm.ConnectSigner("http://127.0.0.1:8716", "test-bearer", tmp_path)
+    cs._info = {"agent_eoa": _AGENT_EOA}  # noqa: SLF001 - /wallet, pre-answered
+    monkeypatch.setattr(cs, "_post", server.post)
+    if creds is not None:
+        pm.save_state(cs, {"clob_creds": dict(creds)})
+    return cs
+
+
+_DERIVE_PATHS = ("/auth/api-key", "/auth/derive-api-key")
+
+
+class _SdkHttp:
+    """Every HTTP request the SDK makes, answered with no network.
+
+    Credential creation or derivation issues `issued`; a credentials check
+    (``GET /auth/api-keys``) lists `active`; a DepositWallet deployment check
+    reads deployed. Anything else fails the test.
+    """
+
+    def __init__(self) -> None:
+        """Start with no requests and nothing to issue."""
+        self.requests: list = []
+        self.issued: dict | None = None
+        self.active: list = [_CACHED_CREDS["api_key"]]
+
+    def send(self, request: httpx.Request) -> httpx.Response:
+        """Answer one request."""
+        self.requests.append(request)
+        path = request.url.path
+        if path in _DERIVE_PATHS and self.issued is not None:
+            return httpx.Response(200, json=self.issued, request=request)
+        if path == "/auth/api-keys":
+            return httpx.Response(200, json={"apiKeys": self.active}, request=request)
+        if path == "/deployed":
+            return httpx.Response(200, json={"deployed": True}, request=request)
+        raise AssertionError(f"unexpected SDK request: {request.method} {request.url}")
+
+    def derivations(self) -> list:
+        """Return the requests that created or derived API credentials."""
+        return [r for r in self.requests if r.url.path in _DERIVE_PATHS]
+
+
+@pytest.fixture
+def sdk_http(monkeypatch: pytest.MonkeyPatch) -> _SdkHttp:
+    """Route the SDK's HTTP client to an in-process fake."""
+    http = _SdkHttp()
+    monkeypatch.setattr(
+        httpx.Client, "send", lambda self, request, **kwargs: http.send(request)
+    )
+    return http
+
+
+@pytest.fixture
+def _fixed_orders(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin each order's salt and timestamp, and answer the SDK's market lookups."""
+    monkeypatch.setattr(sdk_orders, "_generate_salt", lambda: _ORDER_SALT)
+    monkeypatch.setattr(
+        sdk_orders, "_current_timestamp_ms", lambda: _ORDER_TIMESTAMP_MS
+    )
+    market = MarketInfo(
+        fee_info=PlatformFeeInfo(rate=Decimal(0), exponent=Decimal(1)),
+        neg_risk=False,
+        tick_size=Decimal("0.01"),
+        token_ids=frozenset({_V1_TOKEN, _V2_TOKEN}),
+    )
+    monkeypatch.setattr(
+        sdk_order_cache,
+        "resolve_condition_by_token_sync",
+        lambda ctx, token_id: "0x" + "cd" * 32,
+    )
+    monkeypatch.setattr(
+        sdk_order_cache, "fetch_market_info_sync", lambda ctx, condition_id: market
+    )
+
+
+_PY_CLOB_IMPORT = re.compile(r"^\s*(from|import)\s+py_clob_client_v2\b", re.MULTILINE)
+
+
+def _remote_signer():
+    """Import remote_signer, which must stand on polymarket-client alone."""
+    source = (_SCRIPTS / "remote_signer.py").read_text(encoding="utf-8")
+    assert not _PY_CLOB_IMPORT.search(source), (
+        "remote_signer.py still imports py_clob_client_v2; it must build its "
+        "client on polymarket-client==0.13.0"
+    )
+    return importlib.import_module("remote_signer")
+
+
+def _limit_buy(client, token_id: str):
+    """Sign, without posting, the fixed test order: BUY 10 at 0.50."""
+    return client.create_limit_order(
+        token_id=token_id, price="0.5", size="10", side="BUY"
+    )
+
+
+@pytest.mark.usefixtures("_fixed_orders")
+def test_remote_signer_signs_v1_and_v2_orders(tmp_path, monkeypatch, sdk_http) -> None:
+    """Both order kinds sign through RemoteSigner, each on its own exchange domain.
+
+    The V1 order is byte-identical to what the py_clob_client_v2 path signed
+    for the same order. The V2 order signs the V2 domain: version "3" on
+    ExchangeV3. Both carry the DepositWallet POLY_1271 wrapping the SDK
+    applies: the owner's signature, then the exchange's domain separator, the
+    order's contents hash, the Order type string and its length.
+    """
+    remote_signer = _remote_signer()
+    server = _ConnectServer()
+    cs = _connect_signer(tmp_path, monkeypatch, server)
+    client = remote_signer.make_clob_client(cs, _AGENT_DW)
+    assert isinstance(client, SecureClient)
+    assert client.wallet == _AGENT_DW
+
+    v1 = _limit_buy(client, _V1_TOKEN)
+    assert server.digests == [_V1_GOLDEN_DIGEST]
+    assert v1.signature == _V1_GOLDEN_SIGNATURE
+    # the golden is that same wrapping, on the current exchange's version "2"
+    assert _poly_1271_digest("2", _CTF_EXCHANGE, _V1_TOKEN).hex() == (
+        _V1_GOLDEN_DIGEST.removeprefix("0x")
+    )
+    assert v1.signature == (
+        _connect_sign(_hex_bytes(_V1_GOLDEN_DIGEST))
+        + _poly_1271_trailer("2", _CTF_EXCHANGE, _V1_TOKEN)
+    )
+
+    v2 = _limit_buy(client, _V2_TOKEN)
+    v2_digest = _poly_1271_digest("3", _EXCHANGE_V3, _V2_TOKEN)
+    assert server.digests == [_V1_GOLDEN_DIGEST, "0x" + v2_digest.hex()]
+    assert v2.signature == (
+        _connect_sign(v2_digest) + _poly_1271_trailer("3", _EXCHANGE_V3, _V2_TOKEN)
+    )
+
+    for order, token_id, digest in (
+        (v1, _V1_TOKEN, _hex_bytes(_V1_GOLDEN_DIGEST)),
+        (v2, _V2_TOKEN, v2_digest),
+    ):
+        assert to_checksum_address(order.maker) == _AGENT_DW
+        assert to_checksum_address(order.signer) == _AGENT_DW
+        assert order.signature_type == 3
+        assert str(order.token_id) == token_id
+        assert (order.maker_amount, order.taker_amount) == (5_000_000, 10_000_000)
+        assert (order.salt, order.timestamp) == (_ORDER_SALT, _ORDER_TIMESTAMP_MS)
+        owner_signature = _hex_bytes(order.signature)[:65]
+        assert Account._recover_hash(digest, signature=owner_signature) == _AGENT_EOA
+
+
+@pytest.mark.usefixtures("_fixed_orders")
+def test_no_private_key_in_process(tmp_path, monkeypatch, sdk_http) -> None:
+    """The SDK holds a RemoteSigner, and every signature it gets is Connect's.
+
+    Every eth_account entry point that takes a key fails the test if reached,
+    yet the client is built and signs a typed message, an EIP-191 message and
+    an order, each through Connect's ``/sign-message`` with only a digest.
+    """
+
+    def key_used(*args, **kwargs):
+        raise AssertionError("key material was used in the skill's process")
+
+    for name in (
+        "create",
+        "create_with_mnemonic",
+        "decrypt",
+        "from_key",
+        "from_mnemonic",
+        "_sign_hash",
+        "sign_message",
+        "sign_transaction",
+        "sign_typed_data",
+        "unsafe_sign_hash",
+    ):
+        monkeypatch.setattr(Account, name, key_used)
+    monkeypatch.setattr(LocalAccount, "__init__", key_used)
+
+    remote_signer = _remote_signer()
+    server = _ConnectServer()
+    cs = _connect_signer(tmp_path, monkeypatch, server)
+    client = remote_signer.make_clob_client(cs, _AGENT_DW)
+
+    held = client._ctx.signer  # noqa: SLF001 - the object the SDK signs with
+    assert isinstance(held, remote_signer.RemoteSigner)
+    assert not isinstance(held, LocalAccount)
+    assert held.address == _AGENT_EOA
+    assert client.signer == _AGENT_EOA
+    for name in ("key", "private_key", "_private_key"):
+        assert not isinstance(getattr(held, name, None), (bytes, bytearray, str, int))
+    assert server.requests == []  # cached creds: building asked Connect nothing
+
+    typed = build_api_key_auth_typed_data(
+        address=_AGENT_EOA, chain_id=137, timestamp=1_800_000_000, nonce=0
+    )
+    typed_digest = _hash_eip191_message(encode_typed_data(full_message=typed))
+    signed = held.sign_typed_data(full_message=typed)
+    assert server.digests == ["0x" + typed_digest.hex()]
+    assert "0x" + signed.signature.hex() == _connect_sign(typed_digest)
+
+    text = b"Connect holds the key"
+    message_digest = keccak(
+        b"\x19Ethereum Signed Message:\n" + str(len(text)).encode() + text
+    )
+    signed = held.sign_message(encode_defunct(primitive=text))
+    assert server.digests[-1] == "0x" + message_digest.hex()
+    assert "0x" + signed.signature.hex() == _connect_sign(message_digest)
+
+    _limit_buy(client, _V2_TOKEN)
+    order_digest = _poly_1271_digest("3", _EXCHANGE_V3, _V2_TOKEN)
+    assert server.digests[-1] == "0x" + order_digest.hex()
+    assert len(server.requests) == 3
+    assert all(set(payload) == {"digest"} for _, payload in server.requests)
+
+
+def test_cached_api_credentials_reused(tmp_path, monkeypatch, sdk_http) -> None:
+    """Workspace creds are reused as they are, run after run, never re-derived.
+
+    Only a workspace without creds derives them: once, with an L1 signature
+    Connect makes, kept in the same workspace format for the next run.
+    """
+    remote_signer = _remote_signer()
+    server = _ConnectServer()
+    cs = _connect_signer(tmp_path, monkeypatch, server)
+    stored = pm.state_path(cs).read_bytes()
+    for _ in range(2):
+        creds = remote_signer.make_clob_client(cs, _AGENT_DW).credentials
+        assert (creds.key, creds.secret, creds.passphrase) == (
+            _CACHED_CREDS["api_key"],
+            _CACHED_CREDS["api_secret"],
+            _CACHED_CREDS["api_passphrase"],
+        )
+    assert sdk_http.derivations() == []
+    assert server.requests == []  # no L1 signature: nothing was derived
+    assert pm.state_path(cs).read_bytes() == stored
+
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    fresh_server = _ConnectServer()
+    fresh_cs = _connect_signer(fresh, monkeypatch, fresh_server, creds=None)
+    sdk_http.issued = {
+        "apiKey": "derived-key",
+        "secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
+        "passphrase": "derived-passphrase",  # nosec B105
+    }
+    sdk_http.active = ["derived-key"]
+    for _ in range(2):
+        creds = remote_signer.make_clob_client(fresh_cs, _AGENT_DW).credentials
+        assert (creds.key, creds.secret, creds.passphrase) == (
+            "derived-key",
+            "ZGVyaXZlZC1zZWNyZXQ=",
+            "derived-passphrase",
+        )
+    (derivation,) = sdk_http.derivations()
+    assert pm.load_state(fresh_cs)["clob_creds"] == {
+        "api_key": "derived-key",
+        "api_secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
+        "api_passphrase": "derived-passphrase",  # nosec B105
+    }
+    # the derivation was authorised by Connect's signature over the ClobAuth
+    # message for the agent EOA
+    clob_auth = build_api_key_auth_typed_data(
+        address=_AGENT_EOA,
+        chain_id=137,
+        timestamp=int(derivation.headers["POLY_TIMESTAMP"]),
+        nonce=int(derivation.headers["POLY_NONCE"]),
+    )
+    clob_auth_digest = _hash_eip191_message(encode_typed_data(full_message=clob_auth))
+    assert fresh_server.digests == ["0x" + clob_auth_digest.hex()]
+    assert derivation.headers["POLY_ADDRESS"] == _AGENT_EOA
+    assert derivation.headers["POLY_SIGNATURE"] == _connect_sign(clob_auth_digest)
+
+
+# --- one SDK across the skill --------------------------------------------------------
+
+
+def test_bootstrap_installs_the_unified_sdk_only() -> None:
+    """The agent's venv gets polymarket-client at the pinned version, not the old SDK."""
+    script = BOOTSTRAP.read_text(encoding="utf-8")
+    assert '"polymarket-client==0.13.0"' in script
+    assert "py-clob-client-v2" not in script
+
+
+def test_no_skill_file_mentions_py_clob_client_v2() -> None:
+    """No script imports the old SDK, and no doc tells the agent to use it."""
+    skill = _SCRIPTS.parent
+    mentions = [
+        str(path.relative_to(skill))
+        for path in sorted(skill.rglob("*"))
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and "py_clob_client_v2" in path.read_text(encoding="utf-8", errors="replace")
+    ]
+    assert mentions == []
