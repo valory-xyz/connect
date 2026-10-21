@@ -3002,6 +3002,160 @@ def test_bootstrap_emits_only_shell_assignments_on_stdout(tmp_path) -> None:
     )
 
 
+# polymarket-client 0.13.0 declares Requires-Python >=3.11. On an older
+# interpreter pip answers "No matching distribution found", which reads like a
+# network problem, so the skill checks the interpreter itself first.
+
+_STAND_IN_PYTHON = """#!{executable}
+import collections
+import os
+import sys
+
+NAME = {name!r}
+VERSION = {version!r}
+with open({log!r}, "a", encoding="utf-8") as log:
+    log.write(" ".join([NAME, *sys.argv[1:]]) + "\\n")
+args = sys.argv[1:]
+if any(arg in ("--version", "-V", "-VV") for arg in args):
+    print("Python " + VERSION)
+    sys.exit(0)
+if "-m" in args:
+    sys.stderr.write(NAME + " stand-in: will not run " + " ".join(args) + "\\n")
+    sys.exit(1)
+parts = [int(part) for part in VERSION.split(".")]
+Info = collections.namedtuple("version_info", "major minor micro releaselevel serial")
+sys.version_info = Info(parts[0], parts[1], parts[2], "final", 0)
+sys.version = VERSION + " (main, Jan  1 2026, 00:00:00) [GCC 11.4.0]"
+sys.hexversion = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | 0xF0
+code_at = next(
+    (
+        i
+        for i, arg in enumerate(args)
+        if arg.startswith("-") and not arg.startswith("--") and arg.endswith("c")
+    ),
+    None,
+)
+if code_at is not None:
+    source = args[code_at + 1]
+    sys.argv = ["-c", *args[code_at + 2 :]]
+else:
+    files = [arg for arg in args if not arg.startswith("-") and os.path.isfile(arg)]
+    if files:
+        with open(files[0], encoding="utf-8") as script:
+            source = script.read()
+        sys.argv = args[args.index(files[0]) :]
+    else:
+        source = sys.stdin.read()
+        sys.argv = ["-"]
+exec(compile(source, "<stand-in>", "exec"), {{"__name__": "__main__"}})
+"""
+
+
+def _stand_in_pythons(root: Path, python3_version: str) -> tuple:
+    """Put a `python3` that reports `python3_version` first on PATH.
+
+    It answers `--version` and runs `-c` code, a script or stdin with
+    `sys.version_info`, `sys.version` and `sys.hexversion` set to that
+    version, and logs every call. It refuses `-m` (venv, pip), so a run that
+    reaches venv creation shows in the log. A `python` beside it reports a
+    supported version, so a check of the wrong interpreter passes the old one.
+    Returns the bootstrap env and the call log.
+    """
+    bin_dir = root / "stand-in-bin"
+    bin_dir.mkdir(exist_ok=True)
+    log = root / "stand-in-python.log"
+    for name, version in (("python3", python3_version), ("python", "3.12.4")):
+        stand_in = bin_dir / name
+        stand_in.write_text(
+            _STAND_IN_PYTHON.format(
+                executable=sys.executable, name=name, version=version, log=str(log)
+            ),
+            encoding="utf-8",
+        )
+        stand_in.chmod(0o755)
+    return {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}, log
+
+
+def _evaled(stdout: str):
+    """Run the caller's `eval` of what the bootstrap printed."""
+    return subprocess.run(  # nosec B603 B607 - fixed argv, test-controlled input
+        ["bash", "-c", f"eval \"$(cat <<'EOF'\n{stdout}\nEOF\n)\""],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _assert_refused_for_old_python(result, log: Path) -> None:
+    """Assert the bootstrap stopped on the interpreter, before any venv or pip work."""
+    assert result.returncode != 0
+    assert "export PY=" not in result.stdout
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    assert not [call for call in calls if " -m " in f" {call} "], calls
+    evaled = _evaled(result.stdout)
+    assert evaled.returncode != 0
+    assert "connect-polymarket" in evaled.stderr
+    assert re.search(r"Python 3\.11", evaled.stderr), evaled.stderr
+    assert "No matching distribution" not in result.stderr + evaled.stderr
+
+
+@requires_posix_shell
+@pytest.mark.parametrize("old_version", ["3.10.12", "3.9.18"])
+def test_bootstrap_refuses_a_python_older_than_3_11(tmp_path, old_version) -> None:
+    """A fresh workspace on Python 3.10 or older gets a clear refusal, no venv.
+
+    The shared bootstrap creates the venv with the `python3` on PATH, so that
+    is the interpreter checked. 3.9 is in the set because "3.9" sorts after
+    "3.11" as a string.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    env, log = _stand_in_pythons(tmp_path, old_version)
+
+    result = _run_bootstrap(tmp_path, env)
+
+    _assert_refused_for_old_python(result, log)
+    assert not (tmp_path / ".venv").exists()
+
+
+@requires_posix_shell
+@pytest.mark.parametrize("old_version", ["3.10.12", "3.9.18"])
+def test_bootstrap_checks_python_before_pip_and_accepts_3_11(
+    tmp_path, old_version
+) -> None:
+    """A half-built venv is not installed into on an old Python; 3.11.0 is.
+
+    The venv's own `bin/python` is a stub that answers anything, so only a
+    check of `python3`, made before pip runs, refuses here. Swapping the same
+    workspace to Python 3.11.0 lets the bootstrap finish unchanged.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _fake_venv(tmp_path, complete=False)
+    pip_log = tmp_path / "pip.log"
+    pip = venv / "bin" / "pip"
+    pip.write_text(f'#!/bin/sh\necho "$@" >> "{pip_log}"\n', encoding="utf-8")
+    env, log = _stand_in_pythons(tmp_path, old_version)
+
+    result = _run_bootstrap(tmp_path, env)
+
+    _assert_refused_for_old_python(result, log)
+    assert not pip_log.exists(), pip_log.read_text(encoding="utf-8")
+    assert not (venv / SENTINEL).exists()
+
+    env, log = _stand_in_pythons(tmp_path, "3.11.0")
+    result = _run_bootstrap(tmp_path, env)
+
+    assert result.returncode == 0, result.stderr
+    assert f"export PY={venv / 'bin' / 'python'}" in result.stdout
+    assert "polymarket-client==0.13.0" in pip_log.read_text(encoding="utf-8").split()
+    assert (venv / SENTINEL).is_file()
+
+
+def test_skill_states_the_python_floor() -> None:
+    """SKILL.md tells the agent the skill needs Python 3.11 or newer."""
+    doc = (_SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+    assert re.search(r"Python 3\.11(\+| or (newer|later))", doc)
+
+
 def test_workspace_gitignores_the_skill_venv() -> None:
     """A `git init` in the workspace must not be able to stage the venv."""
     assert ".venv/" in workspace.GITIGNORE_ENTRIES
@@ -4432,6 +4586,10 @@ class _ClobHttp(_SdkHttp):
         self.refused_key: str | None = None
         self.refusal: tuple = (401, {"error": "Unauthorized"})
         self.book: dict = _BOOK
+        # ``GET /data/orders`` pages keyed by the next_cursor asked for; each
+        # value is a body or a (status, body). None serves `open_orders` once.
+        self.order_pages: dict | None = None
+        self.order_cursors: list = []
 
     def send(self, request: httpx.Request) -> httpx.Response:
         """Answer an order request, or defer to the SDK fake."""
@@ -4466,6 +4624,15 @@ class _ClobHttp(_SdkHttp):
             return httpx.Response(200, json=self.book, request=request)
         if request.method == "GET" and path == "/data/orders":
             self.requests.append(request)
+            cursor = request.url.params.get("next_cursor")
+            self.order_cursors.append(cursor)
+            if self.order_pages is not None:
+                if cursor not in self.order_pages:
+                    body = {"error": f"unexpected next_cursor {cursor!r}"}
+                    return httpx.Response(400, json=body, request=request)
+                reply = self.order_pages[cursor]
+                status, body = reply if isinstance(reply, tuple) else (200, reply)
+                return httpx.Response(status, json=body, request=request)
             body = {"data": self.open_orders, "next_cursor": "LTE="}
             return httpx.Response(200, json=body, request=request)
         return super().send(request)
@@ -4691,6 +4858,153 @@ def test_sweep_names_the_first_five_open_orders(clob) -> None:
         f"6 open CLOB order(s) rest against the DW ({', '.join(ids[:5])}) "
     )
     assert ids[5] not in message
+
+
+# The open-orders check reads the CLOB's rows as it sends them. A row the SDK's
+# strict order model rejects (a null `associate_trades`, missing fields) is
+# still an order resting against the DW, so the sweep names it rather than
+# reporting that the orders could not be verified. Pages follow the CLOB's
+# cursor from "MA==" until it answers the end marker "LTE=".
+
+_FIRST_CURSOR = "MA=="  # the CLOB's start-of-list cursor
+_END_CURSOR = "LTE="  # the CLOB's no-more-pages marker
+
+
+def _order_ids(*numbers: int) -> list:
+    """Distinct order ids, one per number."""
+    return ["0x" + f"{n:02x}" * 32 for n in numbers]
+
+
+def _orders_requests(clob) -> list:
+    """Return the ``GET /data/orders`` requests the fake CLOB answered."""
+    return [r for r in clob.requests if r.url.path == "/data/orders"]
+
+
+def test_sweep_names_open_orders_the_sdk_model_rejects(clob) -> None:
+    """Rows with null trades, missing fields or no id still block the sweep.
+
+    The count covers every row and the refusal names each id, "?" for a row
+    without one, read with the workspace's API credentials.
+    """
+    _remote_signer()
+    null_trades, sparse = _order_ids(1, 2)
+    page = {
+        "data": [
+            dict(_OPEN_ORDER, id=null_trades, associate_trades=None),
+            {"id": sparse, "status": "LIVE"},
+            {"status": "LIVE", "side": "SELL"},
+        ],
+        "next_cursor": _END_CURSOR,
+    }
+    # the paging tests pin the first cursor; this one is about the rows
+    clob.order_pages = {_FIRST_CURSOR: page, None: page}
+
+    with pytest.raises(SystemExit) as refused:
+        funds._abort_if_open_orders(clob.cs, _AGENT_DW)
+
+    assert str(refused.value).startswith(
+        f"3 open CLOB order(s) rest against the DW ({null_trades}, {sparse}, ?) "
+    )
+    assert len(clob.order_cursors) == 1
+    (read,) = _orders_requests(clob)
+    assert read.headers.get("POLY_API_KEY") == _CACHED_CREDS["api_key"]
+    assert read.headers.get("POLY_ADDRESS")
+    assert clob.server.requests == []  # a read signs nothing
+
+
+def test_sweep_reads_every_page_of_open_orders(clob, monkeypatch, capsys) -> None:
+    """`funds.py sweep` counts and names orders from every page, in order.
+
+    The first page is empty and the strict-model-rejected rows sit on later
+    pages, so reading one page, or giving up on a row the SDK rejects, lets
+    the sweep go on or refuses for the wrong reason. Reading stops at the end
+    marker; `--force` skips the read altogether.
+    """
+    _remote_signer()
+    ids = _order_ids(1, 2, 3, 4, 5, 6)
+    clob.order_pages = {
+        _FIRST_CURSOR: {"data": [], "next_cursor": "Mg=="},
+        "Mg==": {
+            "data": [
+                dict(_OPEN_ORDER, id=ids[0], associate_trades=None),
+                dict(_OPEN_ORDER, id=ids[1]),
+            ],
+            "next_cursor": "NA==",
+        },
+        "NA==": {
+            "data": [
+                {"id": ids[2], "status": "LIVE"},
+                dict(_OPEN_ORDER, id=ids[3]),
+                dict(_OPEN_ORDER, id=ids[4], associate_trades=None),
+                {"id": ids[5]},
+            ],
+            "next_cursor": _END_CURSOR,
+        },
+    }
+
+    with pytest.raises(SystemExit) as refused:
+        funds.cmd_sweep(clob.cs, None)
+
+    message = str(refused.value)
+    assert message.startswith(
+        f"6 open CLOB order(s) rest against the DW ({', '.join(ids[:5])}) "
+    )
+    assert ids[5] not in message
+    assert clob.order_cursors == [_FIRST_CURSOR, "Mg==", "NA=="]
+
+    clob.order_cursors.clear()
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 0)
+    monkeypatch.setattr(pm, "dw_open_tokens", lambda cs: [])
+    monkeypatch.setattr(pm, "dw_pending_buy_tokens", lambda cs: [])
+    monkeypatch.setattr(funds, "_dw_position_token_ids", lambda dw: [])
+    monkeypatch.setattr(type(clob.cs), "safe_address", SAFE_ADDR)
+    clob.cs._w3 = object()  # noqa: SLF001 - balance reads are stubbed above
+
+    funds.cmd_sweep(clob.cs, None, force=True)
+
+    assert json.loads(capsys.readouterr().out)["swept"] is False
+    assert clob.order_cursors == []
+
+
+def test_sweep_lets_go_only_after_the_last_page_is_empty(clob) -> None:
+    """Empty pages up to the end marker let the sweep go on, every page read."""
+    _remote_signer()
+    clob.order_pages = {
+        _FIRST_CURSOR: {"data": [], "next_cursor": "Mg=="},
+        "Mg==": {"data": [], "next_cursor": _END_CURSOR},
+    }
+
+    try:
+        funds._abort_if_open_orders(clob.cs, _AGENT_DW)
+    except SystemExit as refused:
+        pytest.fail(f"no order rests, yet the sweep refused: {refused}")
+    assert clob.order_cursors == [_FIRST_CURSOR, "Mg=="]
+
+
+def test_sweep_refuses_when_a_later_page_cannot_be_read(clob) -> None:
+    """A failed page read refuses the sweep: no partial count, no "no orders".
+
+    The first page is read and holds an order the SDK model rejects; the
+    second answers 503. Neither the first page's order alone nor an empty
+    list may stand in for the orders that could not be read.
+    """
+    _remote_signer()
+    (order_id,) = _order_ids(7)
+    clob.order_pages = {
+        _FIRST_CURSOR: {
+            "data": [dict(_OPEN_ORDER, id=order_id, associate_trades=None)],
+            "next_cursor": "Mg==",
+        },
+        "Mg==": (503, {"error": "service unavailable"}),
+    }
+
+    with pytest.raises(SystemExit) as refused:
+        funds._abort_if_open_orders(clob.cs, _AGENT_DW)
+
+    message = str(refused.value)
+    assert message.startswith("could not verify open CLOB orders before sweeping (")
+    assert "open CLOB order(s) rest against the DW" not in message
+    assert clob.order_cursors == [_FIRST_CURSOR, "Mg=="]
 
 
 @pytest.mark.usefixtures("_fixed_orders")
