@@ -19,7 +19,7 @@
 
 """Place, inspect and cancel CLOB orders (POLY_1271, funded by the DW).
 
-Prerequisites: `deposit_wallet.py ensure` once, then `funds.py top-up` with
+Prerequisites: `deposit_wallet.py ensure` first, then `funds.py top-up` with
 the pUSD the buy will spend. After trading, ALWAYS `funds.py sweep` — the
 funds-flow contract keeps persistent assets in the recoverable service safe.
 
@@ -118,8 +118,8 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
     even if its response is lost. A later sweep can then check the DW's
     on-chain balance directly instead of depending on the lagging data API.
 
-    A rejected-order response or status-code 401 authentication rejection
-    proves that no order was submitted. Other HTTP exceptions remain
+    A structured ``success: false`` response or status-code 401 authentication
+    rejection proves that no order was submitted. Other HTTP exceptions remain
     ambiguous: a timeout, rate limit, intermediary response, or message-only
     auth error may arrive after the request reached the CLOB. A harmless
     zero-balance hint is safer than an undiscoverable filled position.
@@ -134,9 +134,10 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
         if _definitive_auth_rejection(e):
             pm.reject_dw_buy_intent(cs, token_id_int)
         raise
-    if response.ok is False:
+    if isinstance(response, dict) and response.get("success") is False:
         pm.reject_dw_buy_intent(cs, token_id_int)
-        raise SystemExit(response.message)
+        detail = response.get("errorMsg") or "CLOB rejected the buy"
+        raise SystemExit(str(detail))
     try:
         pm.confirm_dw_buy_intent(cs, token_id_int)
     except Exception as e:  # noqa: BLE001 - post succeeded; retain pending marker
@@ -186,8 +187,13 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
         amount = client._adjust_buy_amount_for_balance(
             token_id, usd, price, balance, None
         )
+        # at the price the requested --usd reaches, not re-priced for `amount`
         order = client.create_market_order(
-            token_id=token_id, side=pm.BUY_SIDE, amount=amount, order_type=ot
+            token_id=token_id,
+            side=pm.BUY_SIDE,
+            amount=amount,
+            max_price=price,
+            order_type=ot,
         )
         return _post_buy_with_recovery_hint(client, cs, token_id, order)
 

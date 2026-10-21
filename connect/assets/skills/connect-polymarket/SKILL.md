@@ -67,7 +67,7 @@ Run them from anywhere in the workspace (they locate `.mcp.json` upwards).
 
 | Script | What it does |
 |---|---|
-| `deposit_wallet.py status\|ensure` | Deploy the DW via the relayer proxy and grant its trading approvals (idempotent one-time setup) |
+| `deposit_wallet.py status\|ensure` | Deploy the DW via the relayer proxy and grant its trading approvals (idempotent: run it before trading, it adds any approval the DW lacks) |
 | `funds.py balances\|wrap\|top-up\|sweep\|return-position` | Treasury flows between safe and DW; `return-position` stages an already-swept position back in the DW for selling |
 | `markets.py list\|market\|group\|book\|price` | Market discovery and prices (public reads); `list --query` searches, `list --ends-within 48h\|7d\|2w` filters by resolution date, `group` lists a neg-risk market's siblings |
 | `trade.py quote\|buy\|sell\|limit\|order\|cancel` | CLOB orders (POLY_1271, DW-funded); `quote` prices a buy without placing it; market orders take `--order-type fok\|fak`, limit orders `gtc\|gtd --expires-in` |
@@ -102,7 +102,7 @@ A typical first session, with `$PY` exported as above:
 
 ```bash
 "$PY" scripts/netcheck.py                  # optional: prove the network works
-"$PY" scripts/deposit_wallet.py ensure     # once: DW + approvals
+"$PY" scripts/deposit_wallet.py ensure     # before trading: DW + approvals
 "$PY" scripts/funds.py wrap                # USDC.e → pUSD in the safe
 "$PY" scripts/markets.py list --query "bitcoin"
 "$PY" scripts/trade.py quote --token-id <id> --usd 10   # fee, shares, top-up

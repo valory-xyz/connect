@@ -31,7 +31,8 @@ import time
 from eth_account.messages import _hash_eip191_message, encode_typed_data
 from pm_common import ConnectSigner, load_state, save_state
 from polymarket import ApiKeyCreds, PRODUCTION, SecureClient
-from polymarket._internal.actions.auth import create_or_derive_api_key_sync
+from polymarket._internal.actions.auth import create_api_key_sync, derive_api_key_sync
+from polymarket._internal.actions.orders.post import build_post_order_request
 from polymarket._internal.environment import get_environment_config
 from polymarket._internal.l1_auth import sign_api_key_auth
 from polymarket.clients._transport import SyncTransport
@@ -62,7 +63,25 @@ class RemoteSigner:
 
 
 class ConnectClient(SecureClient):
-    """The SDK client plus the buy sizing ``pm.quote_buy`` and ``buy`` share."""
+    """The SDK client, answering order calls with the CLOB's own JSON.
+
+    Also carries the buy sizing ``pm.quote_buy`` and ``buy`` share.
+    """
+
+    def post_order(self, signed_order) -> dict:
+        """Post a signed order; return the CLOB's reply as it sent it.
+
+        The SDK's reply model renames the fields, and it reads a placed
+        ``success: true, status: unmatched`` order as a rejection.
+        """
+        path, payload = build_post_order_request(
+            signed_order, owner_api_key=self._ctx.credentials.key
+        )
+        return self._ctx.secure_clob.post_json(path, json=payload)
+
+    def get_order(self, *, order_id: str) -> dict:
+        """One order's status, as the CLOB's JSON (times as it sent them)."""
+        return self._ctx.secure_clob.get_json(f"/data/order/{order_id}")
 
     def calculate_market_price(
         self, token_id: str, side: str, amount: float, order_type: str
@@ -112,13 +131,16 @@ def make_clob_client(cs: ConnectSigner, funder: str) -> ConnectClient:
             passphrase=cached["api_passphrase"],
         )
     else:
-        # creates the key, or derives it when one exists; nonce 0 as before
+        # creates the key, or derives it when creating fails for any reason
+        # (one exists already, or no answer); nonce 0 as before
         auth = sign_api_key_auth(
             signer, chain_id=config.chain_id, timestamp=int(time.time()), nonce=0
         )
         clob = SyncTransport(base_url=config.clob_url)
         try:
-            creds = create_or_derive_api_key_sync(clob, auth)
+            creds = create_api_key_sync(clob, auth)
+        except Exception:  # noqa: BLE001 - as the old client, on any failure
+            creds = derive_api_key_sync(clob, auth)
         finally:
             clob.close()
         state["clob_creds"] = {

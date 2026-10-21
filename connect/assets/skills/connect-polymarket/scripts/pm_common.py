@@ -150,7 +150,10 @@ CONTRACTS: tuple[Contract, ...] = (
     Contract(
         name="NegRiskAdapter",
         address=NEG_RISK_ADAPTER,
-        role="Wraps neg-risk positions (CLOB v1, deprecated); holds no DW approval",
+        role=(
+            "Wraps neg-risk positions (CLOB v1, deprecated); "
+            "no longer granted a DW approval"
+        ),
     ),
     Contract(
         name="ExchangeV3",
