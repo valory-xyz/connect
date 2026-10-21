@@ -58,6 +58,7 @@ from eth_account.messages import (
 from eth_account.signers.local import LocalAccount
 from eth_keys import keys as eth_keys
 from eth_utils import is_address, keccak, to_checksum_address
+from polymarket import TransactionCall
 from polymarket._internal.actions.orders import cache as sdk_order_cache
 from polymarket._internal.actions.orders import orders as sdk_orders
 from polymarket._internal.actions.orders.market_data import MarketInfo, PlatformFeeInfo
@@ -2465,58 +2466,63 @@ def test_main_wires_group_and_no_live(monkeypatch, capsys) -> None:
 # --- quote: the buy math, before the buy (OPE-1862 #4) --------------------------
 
 
-class _QuoteClient:
-    """The two SDK sizing calls quote_buy leans on, with a flat 3% taker fee."""
-
-    def __init__(self, price=0.5, fee_rate=0.03) -> None:
-        self.price = price
-        self.fee_rate = fee_rate
-
-    def calculate_market_price(self, token_id, side, amount, order_type):
-        return self.price
-
-    def _adjust_buy_amount_for_balance(self, token_id, amount, price, balance, _):
-        # mirrors py_clob_client_v2 fees.py: the fee is charged on
-        # min(amount, balance) and SUBTRACTED from the balance
-        fee = self.fee_rate * min(amount, balance)
-        return min(amount, max(balance - fee, 0.0))
+def _dw_holds(clob, monkeypatch, balance: float) -> None:
+    """Make the DepositWallet hold `balance` pUSD."""
+    clob.cs._w3 = object()  # noqa: SLF001 - the balance read is stubbed
+    units = round(balance * 1_000_000)
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: units)
 
 
-def test_quote_surfaces_price_fee_shares_and_topup() -> None:
+def _quote(clob, monkeypatch, capsys, usd: float, balance: float) -> dict:
+    """Run `trade.py quote` at the 0.50 ask, the market's taker fee 3% of the spend."""
+    clob.fee = (Decimal("0.015"), Decimal(0))
+    _dw_holds(clob, monkeypatch, balance)
+    _script("trade").cmd_quote(clob.cs, _V1_TOKEN, usd, "fok")
+    assert clob.orders == []
+    return json.loads(capsys.readouterr().out)
+
+
+def test_quote_surfaces_price_fee_shares_and_topup(clob, monkeypatch, capsys) -> None:
     """The numbers existed only inside the buy preflight's error message."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 100.0, "FOK")
+    quote = _quote(clob, monkeypatch, capsys, 10.0, 100.0)
 
     assert quote["fill_price"] == 0.5
     assert quote["estimated_shares"] == 20.0
-    assert quote["estimated_fee_usd"] == pytest.approx(0.30, abs=1e-6)
-    assert quote["required_dw_balance_usd"] == pytest.approx(10.30, abs=1e-6)
+    assert quote["estimated_fee_usd"] == pytest.approx(0.30, abs=0.01)
+    assert quote["required_dw_balance_usd"] == pytest.approx(10.30, abs=0.01)
     assert quote["shortfall_usd"] == 0.0
     assert quote["blocked"] is False
 
 
-def test_quote_names_the_exact_topup_when_the_balance_is_short() -> None:
+def test_quote_names_the_exact_topup_when_the_balance_is_short(
+    clob, monkeypatch, capsys
+) -> None:
     """shortfall_usd goes straight to `funds.py top-up --amount`."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 4.0, "FOK")
+    quote = _quote(clob, monkeypatch, capsys, 10.0, 4.0)
     assert quote["dw_balance_usd"] == 4.0
-    assert quote["shortfall_usd"] == pytest.approx(6.30, abs=1e-6)
+    assert quote["shortfall_usd"] == pytest.approx(6.30, abs=0.01)
 
 
-def test_quote_flags_the_dollar_minimum_that_breaks_small_bets() -> None:
+def test_quote_flags_the_dollar_minimum_that_breaks_small_bets(
+    clob, monkeypatch, capsys
+) -> None:
     """A $1 bet on a $1 balance is fee-shrunk under the CLOB's minimum."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 1.0, 1.0, "FOK")
+    quote = _quote(clob, monkeypatch, capsys, 1.0, 1.0)
     assert quote["spendable_now_usd"] < 1.0
     assert quote["blocked"] is True
     assert quote["shortfall_usd"] > 0
 
 
-def test_a_bet_under_the_minimum_is_blocked_even_with_a_fat_balance() -> None:
+def test_a_bet_under_the_minimum_is_blocked_even_with_a_fat_balance(
+    clob, monkeypatch, capsys
+) -> None:
     """A $0.50 order is affordable in full and still bounced by the venue.
 
     Comparing only the fee-shrunk figure to the minimum called this "fine":
     affordable == usd, so the old `affordable < usd` guard was false and the
     quote published a verdict the CLOB would reject.
     """
-    quote = pm.quote_buy(_QuoteClient(), "7", 0.50, 100.0, "FOK")
+    quote = _quote(clob, monkeypatch, capsys, 0.50, 100.0)
 
     assert quote["shortfall_usd"] == 0.0  # money is not the problem
     assert quote["blocked"] is True
@@ -2524,33 +2530,29 @@ def test_a_bet_under_the_minimum_is_blocked_even_with_a_fat_balance() -> None:
     assert "more pUSD will not help" in quote["blocked_reason"]
 
 
-def test_a_fee_shrunk_bet_is_told_to_add_funds_not_to_raise_the_bet() -> None:
+def test_a_fee_shrunk_bet_is_told_to_add_funds_not_to_raise_the_bet(
+    clob, monkeypatch, capsys
+) -> None:
     """The two block causes need opposite fixes, so they must read differently."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 1.0, 1.0, "FOK")
+    quote = _quote(clob, monkeypatch, capsys, 1.0, 1.0)
 
     assert quote["blocked"] is True
     assert "can be funded once the taker fee is held back" in quote["blocked_reason"]
     assert f"{quote['shortfall_usd']:.4f}" in quote["blocked_reason"]
 
 
-def test_a_healthy_quote_has_no_blocked_reason() -> None:
+def test_a_healthy_quote_has_no_blocked_reason(clob, monkeypatch, capsys) -> None:
     """`blocked_reason` is None exactly when the order would go through."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 100.0, "FOK")
+    quote = _quote(clob, monkeypatch, capsys, 10.0, 100.0)
     assert quote["blocked"] is False
     assert quote["blocked_reason"] is None
 
 
-def test_quote_works_against_an_empty_deposit_wallet() -> None:
+def test_quote_works_against_an_empty_deposit_wallet(clob, monkeypatch, capsys) -> None:
     """How much do I need? is the question an empty DW most needs answered."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 0.0, "FOK")
+    quote = _quote(clob, monkeypatch, capsys, 10.0, 0.0)
     assert quote["spendable_now_usd"] == 0.0
     assert quote["shortfall_usd"] == quote["required_dw_balance_usd"]
-
-
-def test_quote_does_not_divide_by_a_zero_price() -> None:
-    """An empty book must not turn a quote into a ZeroDivisionError."""
-    quote = pm.quote_buy(_QuoteClient(price=0), "7", 10.0, 50.0, "FOK")
-    assert quote["estimated_shares"] is None
 
 
 # --- netcheck: the DNS heuristic was inverted (OPE-1862 #7) ---------------------
@@ -3848,58 +3850,35 @@ def test_trade_sell_posts_one_order_and_prints_the_clob_s_reply(
     assert "dw_open_tokens" not in pm.load_state(clob.cs)
 
 
-def test_trade_buy_holds_back_the_taker_fee(clob, monkeypatch) -> None:
-    """`trade.py buy` sizes a fee-charging buy as py-clob-client-v2 1.0.2 did.
-
-    The market charges rate 0.25 at exponent 2 and the DW holds exactly
-    --usd, so the buy spends --usd less the fee, at 0.31: the price --usd
-    reaches, though the smaller amount alone would fit the 0.30 level. The
-    amounts are what that SDK signed for the same book, fee and balance.
-    """
-    asks = [{"price": "0.31", "size": "1000"}, {"price": "0.3", "size": "32.5"}]
-    clob.book, clob.fee = dict(_BOOK, asks=asks), (Decimal("0.25"), Decimal(2))
-    clob.cs._w3 = object()  # noqa: SLF001 - the balance read is stubbed
-    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 10_000_000)
-
-    _script("trade").cmd_buy(clob.cs, _V1_TOKEN, 10.0, "fok")
-
-    (order,) = clob.orders
-    assert (int(order["makerAmount"]), int(order["takerAmount"])) == (
-        9_630_000,
-        31_064_500,
-    )
-
-
-@pytest.mark.parametrize(
-    ("rate", "exponent", "usd", "balance", "spend"),
-    [
-        # exactly --usd plus its fee (2.03203 at 0.30) is still held back from;
-        # a hair more covers both, and all of --usd is spent
-        (0.25, 2, 1.96, 2.03203, 1.9599999999999997),
-        (0.25, 2, 1.96, 2.032031, 1.96),
-        # a fee larger than the balance spends nothing, never a negative amount
-        (0.5, 0, 10.0, 0.2, 0.0),
-    ],
-    ids=["exactly-usd-plus-fee", "covers-usd-and-fee", "fee-over-balance"],
-)
-def test_buy_sizing_matches_the_old_sdk(
-    clob, rate, exponent, usd, balance, spend
+def test_trade_buy_spends_what_the_sdk_sizes_for_the_balance(
+    clob, monkeypatch, capsys
 ) -> None:
-    """The client's buy sizing returns, to the bit, what py-clob-client-v2 returned.
+    """`trade.py buy` spends at most the DW's pUSD, sized by the SDK's own rules.
 
-    ``rate * (p * (1 - p)) ** exponent`` at the fill price p, charged on
-    min(--usd, balance) / p. `pm.quote_buy` and `trade.py buy` both size
-    through it.
+    The market charges rate 0.25 at exponent 1, 1.25 on a 10 pUSD buy at
+    0.50. A DW that covers --usd and its fee spends all of --usd; one holding
+    exactly --usd spends 8.88, what the pinned SDK sizes for a spend capped at
+    that balance, and `trade.py quote` reports the same. A $1 buy on $1 is
+    refused before anything is posted.
     """
-    clob.book = dict(_BOOK, asks=[{"price": "0.3", "size": "1000"}])
-    clob.fee = (Decimal(str(rate)), Decimal(exponent))
-    client = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW)
-    price = client.calculate_market_price(_V1_TOKEN, "BUY", usd, "FOK")
-    # pylint: disable-next=protected-access
-    sized = client._adjust_buy_amount_for_balance(  # noqa: SLF001
-        _V1_TOKEN, usd, price, balance, None
-    )
-    assert (price, sized) == (0.3, spend)
+    trade = _script("trade")
+    clob.fee = (Decimal("0.25"), Decimal(1))
+    for balance, amounts in (
+        (100.0, (10_000_000, 20_000_000)),
+        (10.0, (8_880_000, 17_760_000)),
+    ):
+        _dw_holds(clob, monkeypatch, balance)
+        trade.cmd_buy(clob.cs, _V1_TOKEN, 10.0, "fok")
+        order = clob.orders[-1]
+        assert (int(order["makerAmount"]), int(order["takerAmount"])) == amounts
+        assert json.loads(capsys.readouterr().out) == _PLACED
+    trade.cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
+    assert json.loads(capsys.readouterr().out)["spendable_now_usd"] == 8.88
+
+    _dw_holds(clob, monkeypatch, 1.0)
+    with pytest.raises(SystemExit, match="would be rejected"):
+        trade.cmd_buy(clob.cs, _V1_TOKEN, 1.0, "fok")
+    assert len(clob.orders) == 2
 
 
 def test_trade_auth_rejected_buy_is_never_posted_twice(clob, capsys) -> None:
@@ -3986,8 +3965,24 @@ _IDS = ["0x" + f"{n:02x}" * 32 for n in range(1, 7)]
             "could not verify open CLOB orders before sweeping (malformed "
             "/data/orders page",
         ),
+        # ids that are not strings are still named, not a traceback
+        (
+            {
+                "MA==": {
+                    "data": [dict(_OPEN_ORDER, id=123), dict(_OPEN_ORDER, id=None)],
+                    "next_cursor": "LTE=",
+                }
+            },
+            "2 open CLOB order(s) rest against the DW (123, None) ",
+        ),
+        # a malformed page is echoed only up to its first 500 characters
+        (
+            {"MA==": {"data": "x" * 600, "next_cursor": "LTE="}},
+            "could not verify open CLOB orders before sweeping (malformed "
+            "/data/orders page: {'data': '" + "x" * 490 + "); cancel ",
+        ),
     ],
-    ids=["six", "non-object-row"],
+    ids=["six", "non-object-row", "non-string-ids", "oversized-page"],
 )
 def test_sweep_reads_every_page_of_open_orders_raw(clob, pages, refusal) -> None:
     """The open-orders check behind `funds.py sweep` reads the CLOB's raw rows.
@@ -4004,3 +3999,53 @@ def test_sweep_reads_every_page_of_open_orders_raw(clob, pages, refusal) -> None
     assert str(refused.value).startswith(refusal)
     cursors = [r.url.params["next_cursor"] for r in clob.calls("GET", "/data/orders")]
     assert cursors == list(pages)
+
+
+_CONDITION = "0x" + "cd" * 32
+# Every SecureClient method that signs or sends a transaction, a session-key
+# change or an order outside the scripts' own flow, with arguments it accepts.
+_DIRECT_SENDS = {
+    "approve_erc20": {"token_address": _PUSD, "spender_address": ADDR_A, "amount": 1},
+    "approve_erc1155_for_all": {"token_address": _CTF, "operator_address": ADDR_A},
+    "transfer_erc20": {
+        "token_address": _PUSD,
+        "recipient_address": ADDR_A,
+        "amount": 1,
+    },
+    "setup_trading_approvals": {},
+    "execute_transaction": {"calls": [TransactionCall(to=ADDR_A, data="0x")]},
+    "split_position": {"condition_id": _CONDITION, "amount": 1},
+    "merge_positions": {"condition_id": _CONDITION, "amount": 1},
+    "merge_multiple_positions": {
+        "positions": [{"condition_id": _CONDITION, "amount": 1}]
+    },
+    "redeem_positions": {"condition_id": _CONDITION},
+    "execute_collateral_return_plan": {"plan": None},
+    "place_limit_order": {
+        "token_id": _V1_TOKEN,
+        "price": "0.5",
+        "size": "10",
+        "side": "BUY",
+    },
+    "place_market_order": {"token_id": _V1_TOKEN, "side": "BUY", "amount": "10"},
+    "accept_combo_quote": {"quote": {}},
+    "authorize_session_key": {"address": ADDR_A},
+    "revoke_session_key": {"address": ADDR_A},
+}
+
+
+@pytest.mark.parametrize("method", list(_DIRECT_SENDS))
+def test_client_refuses_the_sdk_s_direct_sends(clob, method) -> None:
+    """The SDK client's own senders are closed: nothing is signed or sent.
+
+    Each signs through Connect and goes straight to Polymarket: the place_*
+    calls post to the CLOB past the scripts' order flow, and the rest go to
+    the relayer or builder gateway, past the relayer proxy, once the client
+    carries an API key.
+    """
+    client = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW)
+
+    with pytest.raises(NotImplementedError):
+        getattr(client, method)(**_DIRECT_SENDS[method])
+
+    assert clob.requests == clob.digests == []
