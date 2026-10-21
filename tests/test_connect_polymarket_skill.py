@@ -65,8 +65,8 @@ from eth_utils import is_address, keccak, to_checksum_address
 pytest.importorskip("polymarket")
 
 from polymarket import (  # noqa: E402
+    InsufficientLiquidityError,
     RequestRejectedError,
-    TransactionCall,
     TransportError,
 )
 from polymarket._internal.actions.orders import cache as sdk_order_cache  # noqa: E402
@@ -2581,18 +2581,16 @@ def test_quote_works_against_an_empty_deposit_wallet(clob, monkeypatch, capsys) 
 
 
 def test_quote_does_not_divide_by_a_zero_price(clob, monkeypatch) -> None:
-    """An empty book ends a quote without a ZeroDivisionError, and signs nothing.
+    """An empty book ends a quote with the SDK's no-liquidity error.
 
-    The SDK's own error for a book with no asks is fine; nothing is posted.
+    Not a ZeroDivisionError on a zero price: nothing is signed or posted.
     """
     clob.book = dict(_BOOK, asks=[])
     _dw_holds(clob, monkeypatch, 50.0)
-    try:
+
+    with pytest.raises(InsufficientLiquidityError):
         _script("trade").cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
-    except ZeroDivisionError:
-        pytest.fail("an empty book divided by a zero price")
-    except (Exception, SystemExit):  # noqa: BLE001 # nosec B110 - the SDK's error
-        pass
+
     assert clob.orders == clob.digests == []
 
 
@@ -3548,7 +3546,9 @@ _PLACED = {  # the CLOB's reply to a placed order
 # Marketable but delayed: the order may still be placed, though the SDK reads
 # the reply as a rejection with code "unmatched" and drops its order id.
 _UNMATCHED = dict(_PLACED, status="unmatched")
-_REFUSED = dict(_PLACED, success=False, errorMsg="not enough balance", orderID="")
+_REFUSED = dict(
+    _PLACED, success=False, errorMsg="not enough balance / allowance", orderID=""
+)
 # One level each side: asks at 0.50, bids at 0.40.
 _BOOK = {
     "market": "0x" + "cd" * 32,
@@ -4048,6 +4048,27 @@ def test_trade_refuses_an_order_reply_it_cannot_read(clob, capsys) -> None:
     assert "x" * 501 not in printed
 
 
+def _post_outcome(clob, capsys, command) -> tuple:
+    """Run one order command; return its exit code and all it told the agent."""
+    name, *args = command
+    try:
+        getattr(_script("trade"), f"cmd_{name}")(clob.cs, _V1_TOKEN, *args)
+        code = None
+    except SystemExit as e:
+        code = e.code
+    out = capsys.readouterr()
+    return code, (out.out + out.err + str(code)).lower()
+
+
+def _assert_uncertain(clob, command, code, told) -> None:
+    """Assert the agent hears placement is uncertain, and a buy keeps its marker."""
+    assert code not in (None, 0)
+    assert "uncertain" in told
+    assert "positions" in told
+    if command[0] != "sell":
+        assert int(_V1_TOKEN) in pm.dw_pending_buy_tokens(clob.cs)
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -4060,39 +4081,58 @@ def test_trade_refuses_an_order_reply_it_cannot_read(clob, capsys) -> None:
 def test_an_unmatched_order_is_uncertain_and_another_rejection_is_not(
     clob, monkeypatch, capsys, command
 ) -> None:
-    """An order the CLOB answers "unmatched" may be placed; any other rejection is not.
+    """An order the CLOB answers "unmatched" may be placed; a refusal is not.
 
     The SDK reads ``success: true, status: unmatched`` as a rejection with code
-    "unmatched". The agent is told the placement is uncertain and to check
-    positions before retrying, and a buy's token stays where the sweep looks
-    for positions. A refused buy (``not enough balance``) exits with the
-    CLOB's message and leaves no pending buy behind.
+    "unmatched". The command exits non-zero, tells the agent the placement is
+    uncertain and to check positions before retrying, and a buy keeps its
+    pending marker. A ``success: false`` refusal (``not enough balance /
+    allowance``) exits with the CLOB's message and resolves its own marker.
     """
-    trade = _script("trade")
-    name, *args = command
     _dw_holds(clob, monkeypatch, 100.0)
-    token = int(_V1_TOKEN)
-
     clob.placed = _UNMATCHED
-    try:
-        getattr(trade, f"cmd_{name}")(clob.cs, _V1_TOKEN, *args)
-        exited = ""
-    except SystemExit as e:
-        exited = str(e.code)
-    out = capsys.readouterr()
-    told = (out.out + out.err + exited).lower()
-    assert "uncertain" in told
-    assert "positions" in told
-    if name == "sell":
+    _assert_uncertain(clob, command, *_post_outcome(clob, capsys, command))
+    if command[0] == "sell":
         return
-    assert token in pm.dw_open_tokens(clob.cs) + pm.dw_pending_buy_tokens(clob.cs)
 
     clob.placed = _REFUSED
-    pending = pm.dw_pending_buy_tokens(clob.cs)
-    with pytest.raises(SystemExit, match="not enough balance"):
-        getattr(trade, f"cmd_{name}")(clob.cs, _V1_TOKEN, *args)
-    assert pm.dw_pending_buy_tokens(clob.cs) == pending
+    pending = pm._dw_pending_buy_counts(pm.load_state(clob.cs))  # noqa: SLF001
+    code, told = _post_outcome(clob, capsys, command)
+    assert code not in (None, 0)
+    assert "not enough balance / allowance" in told
+    assert pm._dw_pending_buy_counts(pm.load_state(clob.cs)) == pending  # noqa: SLF001
     assert len(clob.orders) == 2
+
+
+_READABLE_BUT_NOT_PLACED = [  # success: true, yet the SDK's code is "unknown"
+    dict(_PLACED, status="pending"),
+    dict(_PLACED, errorMsg="order is being processed"),
+    dict(_PLACED, orderID=""),
+]
+_UNREADABLE = {k: v for k, v in _PLACED.items() if k != "takingAmount"}
+
+
+@pytest.mark.parametrize(
+    ("command", "reply"),
+    [(("buy", 10.0, "fok"), reply) for reply in _READABLE_BUT_NOT_PLACED]
+    + [(("buy", 10.0, "fok"), _UNREADABLE), (("sell", 12.5, "fak"), _UNREADABLE)],
+    ids=["odd-status", "error-message", "no-order-id", "unreadable", "unreadable-sell"],
+)
+def test_a_post_reply_short_of_success_false_leaves_placement_uncertain(
+    clob, monkeypatch, capsys, command, reply
+) -> None:
+    """Only ``success: false`` proves an order was not placed.
+
+    A ``success: true`` reply the SDK reads as a rejection with code
+    "unknown" (a status it does not know, an error message, no order id), or
+    a reply it cannot read at all, arrives after the CLOB has the order. It
+    is treated like "unmatched": a non-zero exit, placement uncertain, check
+    positions before retrying, and a buy's pending marker kept.
+    """
+    _dw_holds(clob, monkeypatch, 100.0)
+    clob.placed = reply
+
+    _assert_uncertain(clob, command, *_post_outcome(clob, capsys, command))
 
 
 _IDS = ["0x" + f"{n:02x}" * 32 for n in range(1, 7)]
@@ -4164,40 +4204,28 @@ def test_sweep_reads_every_page_of_open_orders_raw(clob, pages, refusal) -> None
     assert "x" * 501 not in str(refused.value)
 
 
-_CONDITION = "0x" + "cd" * 32
 # Every SecureClient method that signs or sends a transaction, a session-key
-# change or an order outside the scripts' own flow, with arguments it accepts.
-_DIRECT_SENDS = {
-    "approve_erc20": {"token_address": _PUSD, "spender_address": ADDR_A, "amount": 1},
-    "approve_erc1155_for_all": {"token_address": _CTF, "operator_address": ADDR_A},
-    "transfer_erc20": {
-        "token_address": _PUSD,
-        "recipient_address": ADDR_A,
-        "amount": 1,
-    },
-    "setup_trading_approvals": {},
-    "execute_transaction": {"calls": [TransactionCall(to=ADDR_A, data="0x")]},
-    "split_position": {"condition_id": _CONDITION, "amount": 1},
-    "merge_positions": {"condition_id": _CONDITION, "amount": 1},
-    "merge_multiple_positions": {
-        "positions": [{"condition_id": _CONDITION, "amount": 1}]
-    },
-    "redeem_positions": {"condition_id": _CONDITION},
-    "execute_collateral_return_plan": {"plan": None},
-    "place_limit_order": {
-        "token_id": _V1_TOKEN,
-        "price": "0.5",
-        "size": "10",
-        "side": "BUY",
-    },
-    "place_market_order": {"token_id": _V1_TOKEN, "side": "BUY", "amount": "10"},
-    "accept_combo_quote": {"quote": {}},
-    "authorize_session_key": {"address": ADDR_A},
-    "revoke_session_key": {"address": ADDR_A},
-}
+# change or an order outside the scripts' own flow.
+_DIRECT_SENDS = [
+    "approve_erc20",
+    "approve_erc1155_for_all",
+    "transfer_erc20",
+    "setup_trading_approvals",
+    "execute_transaction",
+    "split_position",
+    "merge_positions",
+    "merge_multiple_positions",
+    "redeem_positions",
+    "execute_collateral_return_plan",
+    "place_limit_order",
+    "place_market_order",
+    "accept_combo_quote",
+    "authorize_session_key",
+    "revoke_session_key",
+]
 
 
-@pytest.mark.parametrize("method", list(_DIRECT_SENDS))
+@pytest.mark.parametrize("method", _DIRECT_SENDS)
 def test_client_refuses_the_sdk_s_direct_sends(clob, method) -> None:
     """The SDK client's own senders are closed: nothing is signed or sent.
 
@@ -4209,6 +4237,6 @@ def test_client_refuses_the_sdk_s_direct_sends(clob, method) -> None:
     client = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW)
 
     with pytest.raises(NotImplementedError):
-        getattr(client, method)(**_DIRECT_SENDS[method])
+        getattr(client, method)()
 
     assert clob.requests == clob.digests == []
