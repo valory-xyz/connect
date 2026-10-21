@@ -88,6 +88,10 @@ eval "$(bash scripts/bootstrap_env.sh)"   # sets $PY, SSL_CERT_FILE, REQUESTS_CA
 "$PY" scripts/markets.py list             # run every script with "$PY"
 ```
 
+The skill needs Python 3.11+ (the `python3` the venv is built with): on an
+older one the bootstrap refuses and the `eval` fails. Retrying will not help,
+so tell the user a newer `python3` is needed.
+
 Don't skip the `eval`: `SSL_CERT_FILE` points at certifi's CA bundle, without
 which a pyenv or source-built Python fails every HTTPS call with
 `CERTIFICATE_VERIFY_FAILED` — an error that reads like a venue outage but is
