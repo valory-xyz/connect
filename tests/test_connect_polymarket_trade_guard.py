@@ -36,6 +36,9 @@ from pathlib import Path
 
 import pytest
 
+# trade.py imports the SDK, which only tox -e unit-tests installs (`uv run --with`).
+pytest.importorskip("polymarket")
+
 _SCRIPTS = (
     Path(__file__).resolve().parent.parent
     / "connect"

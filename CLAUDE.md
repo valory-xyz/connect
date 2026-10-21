@@ -18,6 +18,7 @@ CLAUDE.md and README.md must be kept updated with any change in the repo — the
 uv sync                                     # install deps (uv-managed venv)
 uv run pytest -m "not integration"          # unit tests
 uv run pytest tests/test_endpoints.py -k <name>   # single test
+uv run --with polymarket-client==0.13.0 pytest tests/test_connect_polymarket_skill.py tests/test_connect_polymarket_trade_guard.py   # skill tests on the real SDK (skipped above)
 tox -e unit-tests-coverage                  # unit tests, enforces 100% coverage
 GNOSIS_RPC=<gnosis-rpc-url> tox -e integration-tests
 tox -e launch-tests                         # opens a real terminal: codex_cli launch, stand-in codex
@@ -38,7 +39,7 @@ Run standalone (mimicking the Pearl runner) — see README "Development" for the
 ## Constraints CI enforces
 
 - **100% test coverage** on `connect/`, including the shared agent-runtime modules under `connect/assets/lib/`. Only the bundled skills under `connect/assets/skills/` are omitted: they run in the agent's environment, not the server's, and have their own tests.
-- mypy with `--disallow-untyped-defs`; `connect/assets/skills/connect-polymarket/` is excluded (depends on the Polymarket CLOB SDK, which the agent's environment installs; the repo has it only as a dev dependency for the skill tests). `connect/assets/lib/` is excluded from the *scan* but sits on `mypy_path` and is still fully checked as an import of the skill scripts — without the exclude mypy resolves it under two module names and halts.
+- mypy with `--disallow-untyped-defs`; `connect/assets/skills/connect-polymarket/` is excluded (depends on the Polymarket CLOB SDK, which the agent's environment installs; the repo keeps it out of `uv.lock`, and `tox -e unit-tests` layers it on for the skill tests with `uv run --with`, so a plain `uv run pytest` skips them). `connect/assets/lib/` is excluded from the *scan* but sits on `mypy_path` and is still fully checked as an import of the skill scripts — without the exclude mypy resolves it under two module names and halts.
 - flake8 includes docstring rules (D) and pytest style (PT); every module/function needs a docstring.
 - Copyright headers (Valory AG, Apache 2.0) on every source file — `tox -e fix-copyright` adds them.
 - `packages/valory/connections/`, `packages/valory/protocols/`, `packages/open_aea/` are vendored third-party code, excluded from all linters — don't edit or reformat them.

@@ -394,6 +394,8 @@ flow or `request_context` is refused rather than answering the wrong question.
 ```bash
 uv sync
 uv run pytest -m "not integration"
+# the connect-polymarket skill tests run the real SDK, kept out of uv.lock:
+uv run --with polymarket-client==0.13.0 pytest tests/test_connect_polymarket_skill.py tests/test_connect_polymarket_trade_guard.py
 ```
 
 Linting and CI checks mirror olas-operate-middleware (tomte toolchain via tox):

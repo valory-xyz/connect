@@ -24,8 +24,9 @@ the EIP-712 DepositWallet batch digest, the dollar↔units conversion, the
 approval-set decision, ``contract_owner``'s RPC-vs-revert distinction, the
 relayer tx record selection, and ``_resolve_dw``'s safety branches. No
 network and no funds. The order-signing tests run the pinned unified SDK
-(``polymarket-client``, a dev dependency) against a stand-in for the Connect
-signer, so the signatures they check are the SDK's own.
+(``polymarket-client``, layered on by tox -e unit-tests; without it this file
+skips) against a stand-in for the Connect signer, so the signatures they check
+are the SDK's own.
 """
 
 # The skill modules are imported at runtime via a sys.path insert (they ship
@@ -58,14 +59,26 @@ from eth_account.messages import (
 from eth_account.signers.local import LocalAccount
 from eth_keys import keys as eth_keys
 from eth_utils import is_address, keccak, to_checksum_address
-from polymarket import TransactionCall
-from polymarket._internal.actions.orders import cache as sdk_order_cache
-from polymarket._internal.actions.orders import orders as sdk_orders
-from polymarket._internal.actions.orders.market_data import MarketInfo, PlatformFeeInfo
-from polymarket._internal.l1_auth import build_api_key_auth_typed_data
-from web3.exceptions import ContractLogicError, TimeExhausted
 
-from connect import workspace
+# The SDK stays out of uv.lock, where it would move the server's own eth-utils
+# and websockets; tox -e unit-tests runs this file with it (`uv run --with`).
+pytest.importorskip("polymarket")
+
+from polymarket import (  # noqa: E402
+    RequestRejectedError,
+    TransactionCall,
+    TransportError,
+)
+from polymarket._internal.actions.orders import cache as sdk_order_cache  # noqa: E402
+from polymarket._internal.actions.orders import orders as sdk_orders  # noqa: E402
+from polymarket._internal.actions.orders.market_data import (  # noqa: E402
+    MarketInfo,
+    PlatformFeeInfo,
+)
+from polymarket._internal.l1_auth import build_api_key_auth_typed_data  # noqa: E402
+from web3.exceptions import ContractLogicError, TimeExhausted  # noqa: E402
+
+from connect import workspace  # noqa: E402
 
 # The skill ships as bundled assets, not an installed package; put its scripts
 # dir on the path so we can import the modules under test. pm_common locates
@@ -2474,11 +2487,14 @@ def _dw_holds(clob, monkeypatch, balance: float) -> None:
 
 
 def _quote(clob, monkeypatch, capsys, usd: float, balance: float) -> dict:
-    """Run `trade.py quote` at the 0.50 ask, the market's taker fee 3% of the spend."""
+    """Run `trade.py quote` at the 0.50 ask, the market's taker fee 3% of the spend.
+
+    A quote places nothing and asks Connect for no signature.
+    """
     clob.fee = (Decimal("0.015"), Decimal(0))
     _dw_holds(clob, monkeypatch, balance)
     _script("trade").cmd_quote(clob.cs, _V1_TOKEN, usd, "fok")
-    assert clob.orders == []
+    assert clob.orders == clob.digests == []
     return json.loads(capsys.readouterr().out)
 
 
@@ -2488,9 +2504,11 @@ def test_quote_surfaces_price_fee_shares_and_topup(clob, monkeypatch, capsys) ->
 
     assert quote["fill_price"] == 0.5
     assert quote["estimated_shares"] == 20.0
-    assert quote["estimated_fee_usd"] == pytest.approx(0.30, abs=0.01)
-    assert quote["required_dw_balance_usd"] == pytest.approx(10.30, abs=0.01)
+    # signed amounts are whole cents: never under, at most a cent over
+    assert 0.30 - 1e-6 <= quote["estimated_fee_usd"] <= 0.31
+    assert 10.30 - 1e-6 <= quote["required_dw_balance_usd"] <= 10.31
     assert quote["shortfall_usd"] == 0.0
+    assert quote["spendable_now_usd"] == 10.0
     assert quote["blocked"] is False
 
 
@@ -2500,7 +2518,7 @@ def test_quote_names_the_exact_topup_when_the_balance_is_short(
     """shortfall_usd goes straight to `funds.py top-up --amount`."""
     quote = _quote(clob, monkeypatch, capsys, 10.0, 4.0)
     assert quote["dw_balance_usd"] == 4.0
-    assert quote["shortfall_usd"] == pytest.approx(6.30, abs=0.01)
+    assert 6.30 - 1e-6 <= quote["shortfall_usd"] <= 6.31
 
 
 def test_quote_flags_the_dollar_minimum_that_breaks_small_bets(
@@ -2549,10 +2567,33 @@ def test_a_healthy_quote_has_no_blocked_reason(clob, monkeypatch, capsys) -> Non
 
 
 def test_quote_works_against_an_empty_deposit_wallet(clob, monkeypatch, capsys) -> None:
-    """How much do I need? is the question an empty DW most needs answered."""
+    """How much do I need? is the question an empty DW most needs answered.
+
+    Dust worth less than a cent of shares is as good as empty.
+    """
     quote = _quote(clob, monkeypatch, capsys, 10.0, 0.0)
     assert quote["spendable_now_usd"] == 0.0
     assert quote["shortfall_usd"] == quote["required_dw_balance_usd"]
+
+    dust = _quote(clob, monkeypatch, capsys, 10.0, 0.004)
+    assert dust["blocked"] is True
+    assert dust["shortfall_usd"] == pytest.approx(quote["shortfall_usd"] - 0.004)
+
+
+def test_quote_does_not_divide_by_a_zero_price(clob, monkeypatch) -> None:
+    """An empty book ends a quote without a ZeroDivisionError, and signs nothing.
+
+    The SDK's own error for a book with no asks is fine; nothing is posted.
+    """
+    clob.book = dict(_BOOK, asks=[])
+    _dw_holds(clob, monkeypatch, 50.0)
+    try:
+        _script("trade").cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
+    except ZeroDivisionError:
+        pytest.fail("an empty book divided by a zero price")
+    except (Exception, SystemExit):  # noqa: BLE001 # nosec B110 - the SDK's error
+        pass
+    assert clob.orders == clob.digests == []
 
 
 # --- netcheck: the DNS heuristic was inverted (OPE-1862 #7) ---------------------
@@ -3482,23 +3523,32 @@ _ORDER_TYPE = (
 _ORDER_ID = "0x" + "0e" * 32
 _OPEN_ORDER = {  # one row of the CLOB's /data/orders, and its /data/order reply
     "id": _ORDER_ID,
+    "market": "0x" + "cd" * 32,
     "asset_id": _V1_TOKEN,
+    "owner": "cached-key",
+    "maker_address": _AGENT_DW,
     "side": "BUY",
     "price": "0.5",
+    "original_size": "10",
+    "size_matched": "0",
+    "outcome": "Yes",
+    "order_type": "GTC",
     "status": "LIVE",
-    "associate_trades": None,  # the SDK's own order model refuses this row
+    "associate_trades": [],
     "created_at": 1_800_000_000,
 }
-# "unmatched": marketable but delayed. Placement still succeeded, though the
-# SDK's reply model reads it as a rejection.
-_PLACED = {
+_PLACED = {  # the CLOB's reply to a placed order
     "success": True,
     "errorMsg": "",
     "orderID": _ORDER_ID,
-    "status": "unmatched",
+    "status": "live",
     "makingAmount": "",
     "takingAmount": "",
 }
+# Marketable but delayed: the order may still be placed, though the SDK reads
+# the reply as a rejection with code "unmatched" and drops its order id.
+_UNMATCHED = dict(_PLACED, status="unmatched")
+_REFUSED = dict(_PLACED, success=False, errorMsg="not enough balance", orderID="")
 # One level each side: asks at 0.50, bids at 0.40.
 _BOOK = {
     "market": "0x" + "cd" * 32,
@@ -3535,8 +3585,9 @@ class _Clob:
 
     Records every request and each digest Connect signs. Creating an API key
     answers `create` (issue `issued`, an error status, or raise); deriving
-    issues `issued`. ``POST /order`` places the order; ``GET /data/orders``
-    serves `pages` by cursor. A request made with `refused_key` gets `refusal`.
+    issues `issued`. ``POST /order`` answers `placed`; ``GET /data/orders``
+    serves `pages` by cursor, the first page without one. A request made with
+    `refused_key` gets `refusal`.
     """
 
     def __init__(self, cs) -> None:
@@ -3544,6 +3595,7 @@ class _Clob:
         self.cs, self.requests, self.digests = cs, [], []
         self.create, self.issued = 200, None
         self.orders, self.book, self.fee = [], _BOOK, (Decimal(0), Decimal(1))
+        self.placed, self.order = _PLACED, _OPEN_ORDER
         self.pages, self.refused_key, self.refusal = {}, None, None
 
     def sign(self, path: str, payload: dict) -> dict:
@@ -3571,15 +3623,15 @@ class _Clob:
             return reply(*self.refusal[::-1])
         if (method, path) == ("POST", "/order"):
             self.orders.append(json.loads(request.content)["order"])
-            return reply(_PLACED)
+            return reply(self.placed)
         if (method, path) == ("DELETE", "/order"):
             assert json.loads(request.content) == {"orderID": _ORDER_ID}
             return reply({"canceled": [_ORDER_ID], "not_canceled": {}})
         if path == f"/data/order/{_ORDER_ID}":
-            return reply(_OPEN_ORDER)
+            return reply(self.order)
         if path == "/book":
             return reply(self.book)
-        return reply(self.pages[request.url.params["next_cursor"]])
+        return reply(self.pages[request.url.params.get("next_cursor", "MA==")])
 
     def calls(self, method: str, path: str) -> list:
         """Return the requests sent to one endpoint."""
@@ -3786,30 +3838,37 @@ def test_cached_api_credentials_reused(clob) -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [500, httpx.ConnectError("connection reset by peer")],
-    ids=["500", "no-answer"],
-)
-def test_first_credentials_are_derived_when_creating_fails(clob, failure) -> None:
-    """Any failure to create the API key falls back to deriving it, once each.
+def test_first_credentials_derive_only_after_a_400_on_create(clob) -> None:
+    """Creating the first API key falls back to deriving it only after a 400.
 
-    As py-clob-client-v2's ``create_or_derive_api_key`` did: an answer or
-    none. The derived creds are used and kept.
+    The SDK's own rule: a 400 (the key exists already) derives it, and the
+    derived creds are used and kept. A 500, or no answer at all, is an error:
+    nothing is derived and nothing is kept.
     """
     fresh = _creds("fresh-key")
     clob.issued = _issued("fresh-key")
-    clob.create = failure
     pm.save_state(clob.cs, {})
+    make_clob_client = _script("remote_signer").make_clob_client
 
-    creds = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW).credentials
-
+    clob.create = 400
+    creds = make_clob_client(clob.cs, _AGENT_DW).credentials
     assert (creds.key, creds.secret, creds.passphrase) == tuple(fresh.values())
     assert [(r.method, r.url.path) for r in clob.requests] == [
         ("POST", "/auth/api-key"),
         ("GET", "/auth/derive-api-key"),
     ]
     assert pm.load_state(clob.cs) == {"clob_creds": fresh}
+
+    for failure in (500, httpx.ConnectError("connection reset by peer")):
+        pm.save_state(clob.cs, {})
+        clob.requests.clear()
+        clob.create = failure
+        with pytest.raises((RequestRejectedError, TransportError)):
+            make_clob_client(clob.cs, _AGENT_DW)
+        assert [(r.method, r.url.path) for r in clob.requests] == [
+            ("POST", "/auth/api-key")
+        ]
+        assert pm.load_state(clob.cs) == {}
 
 
 # --- trade.py and funds.py on the unified SDK ---------------------------------------
@@ -3826,11 +3885,10 @@ def test_first_credentials_are_derived_when_creating_fails(clob, failure) -> Non
 def test_trade_sell_posts_one_order_and_prints_the_clob_s_reply(
     clob, capsys, command, order_type, amounts
 ) -> None:
-    """A sell posts one signed order and prints the CLOB's reply as it sent it.
+    """A sell posts one signed order and prints the placed order's id.
 
-    A placed ``unmatched`` order, which the SDK's reply model reads as a
-    rejection, exits 0. A GTD order expires --expires-in from now. A sell
-    leaves no buy's recovery hint.
+    A GTD order expires --expires-in from now. A sell leaves no buy's
+    recovery hint.
     """
     name, *args = command
     start = int(time.time())
@@ -3846,7 +3904,7 @@ def test_trade_sell_posts_one_order_and_prints_the_clob_s_reply(
     assert json.loads(clob.requests[-1].content)["orderType"] == order_type
     if order_type == "GTD":
         assert start + 3600 <= int(order["expiration"]) <= time.time() + 3600
-    assert json.loads(capsys.readouterr().out) == _PLACED
+    assert _ORDER_ID in capsys.readouterr().out
     assert "dw_open_tokens" not in pm.load_state(clob.cs)
 
 
@@ -3858,27 +3916,61 @@ def test_trade_buy_spends_what_the_sdk_sizes_for_the_balance(
     The market charges rate 0.25 at exponent 1, 1.25 on a 10 pUSD buy at
     0.50. A DW that covers --usd and its fee spends all of --usd; one holding
     exactly --usd spends 8.88, what the pinned SDK sizes for a spend capped at
-    that balance, and `trade.py quote` reports the same. A $1 buy on $1 is
-    refused before anything is posted.
+    that balance, and `trade.py quote` reports the same without asking Connect
+    to sign anything; topping up by the quote's shortfall then spends all of
+    --usd. A $1 buy on $1, or on dust,
+    is refused before anything is posted.
     """
     trade = _script("trade")
     clob.fee = (Decimal("0.25"), Decimal(1))
     for balance, amounts in (
         (100.0, (10_000_000, 20_000_000)),
+        (10.5, (9_330_000, 18_660_000)),  # covers --usd, not its fee
         (10.0, (8_880_000, 17_760_000)),
     ):
         _dw_holds(clob, monkeypatch, balance)
         trade.cmd_buy(clob.cs, _V1_TOKEN, 10.0, "fok")
         order = clob.orders[-1]
         assert (int(order["makerAmount"]), int(order["takerAmount"])) == amounts
-        assert json.loads(capsys.readouterr().out) == _PLACED
+        assert _ORDER_ID in capsys.readouterr().out
+    signed = len(clob.digests)
     trade.cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
-    assert json.loads(capsys.readouterr().out)["spendable_now_usd"] == 8.88
+    quote = json.loads(capsys.readouterr().out)
+    assert len(clob.digests) == signed  # a quote asks Connect for no signature
+    assert 8.88 <= quote["spendable_now_usd"] < 8.89  # the buy's spend, to the cent
+    assert 1.25 - 1e-6 <= quote["shortfall_usd"] <= 1.26
+    # the shortfall is the top-up after which the buy spends all of --usd
+    _dw_holds(clob, monkeypatch, 10.0 + quote["shortfall_usd"])
+    trade.cmd_buy(clob.cs, _V1_TOKEN, 10.0, "fok")
+    assert int(clob.orders[-1]["makerAmount"]) == 10_000_000
+    capsys.readouterr()
 
-    _dw_holds(clob, monkeypatch, 1.0)
-    with pytest.raises(SystemExit, match="would be rejected"):
-        trade.cmd_buy(clob.cs, _V1_TOKEN, 1.0, "fok")
-    assert len(clob.orders) == 2
+    for balance in (1.0, 0.004):  # under the minimum once the fee is held back
+        _dw_holds(clob, monkeypatch, balance)
+        with pytest.raises(SystemExit, match="would be rejected"):
+            trade.cmd_buy(clob.cs, _V1_TOKEN, 1.0, "fok")
+    assert len(clob.orders) == 4
+
+
+def test_topping_up_by_the_quote_s_shortfall_buys_all_of_usd(
+    clob, monkeypatch, capsys
+) -> None:
+    """Topping the DW up by the quote's shortfall_usd is enough for all of --usd.
+
+    A market where the exact top-up meets the buy's cent rounding: rate 0.3489
+    at exponent 2 with the ask at 0.30, a 36.46 buy against 6.727721 pUSD.
+    """
+    trade = _script("trade")
+    clob.fee = (Decimal("0.3489"), Decimal(2))
+    clob.book = dict(_BOOK, asks=[{"price": "0.3", "size": "1000"}])
+    _dw_holds(clob, monkeypatch, 6.727721)
+    trade.cmd_quote(clob.cs, _V1_TOKEN, 36.46, "fok")
+    shortfall = json.loads(capsys.readouterr().out)["shortfall_usd"]
+
+    _dw_holds(clob, monkeypatch, 6.727721 + shortfall)
+    trade.cmd_buy(clob.cs, _V1_TOKEN, 36.46, "fok")
+
+    assert int(clob.orders[-1]["makerAmount"]) == 36_460_000
 
 
 def test_trade_auth_rejected_buy_is_never_posted_twice(clob, capsys) -> None:
@@ -3926,10 +4018,12 @@ def test_trade_prints_the_clob_s_refusal_as_its_error(
 
 
 def test_trade_order_and_cancel_print_the_clob_s_reply(clob, capsys) -> None:
-    """`trade.py order` and `cancel` print the CLOB's reply as it sent it."""
+    """`trade.py order` prints the order's id and status; `cancel` the CLOB's reply."""
     trade = _script("trade")
     trade.cmd_order(clob.cs, _ORDER_ID)
-    assert json.loads(capsys.readouterr().out) == _OPEN_ORDER
+    printed = capsys.readouterr().out
+    assert _ORDER_ID in printed
+    assert "LIVE" in printed
     trade.cmd_cancel(clob.cs, _ORDER_ID)
     assert json.loads(capsys.readouterr().out) == {
         "canceled": [_ORDER_ID],
@@ -3937,18 +4031,85 @@ def test_trade_order_and_cancel_print_the_clob_s_reply(clob, capsys) -> None:
     }
 
 
+def test_trade_refuses_an_order_reply_it_cannot_read(clob, capsys) -> None:
+    """An order whose reply the SDK cannot read prints an error and exits 1.
+
+    The CLOB sends rows with a null ``associate_trades``; the SDK's order
+    model refuses them, and the script says so rather than crashing, quoting
+    no more than 500 characters of the reply.
+    """
+    clob.order = dict(_OPEN_ORDER, associate_trades=None, outcome="x" * 600)
+
+    with pytest.raises(SystemExit, match="^1$"):
+        _script("trade").cmd_order(clob.cs, _ORDER_ID)
+
+    printed = capsys.readouterr().out
+    assert "error" in json.loads(printed)
+    assert "x" * 501 not in printed
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("buy", 10.0, "fok"),
+        ("limit", "buy", 0.5, 10.0, "gtc", None),
+        ("sell", 12.5, "fak"),
+    ],
+    ids=["market", "limit", "sell"],
+)
+def test_an_unmatched_order_is_uncertain_and_another_rejection_is_not(
+    clob, monkeypatch, capsys, command
+) -> None:
+    """An order the CLOB answers "unmatched" may be placed; any other rejection is not.
+
+    The SDK reads ``success: true, status: unmatched`` as a rejection with code
+    "unmatched". The agent is told the placement is uncertain and to check
+    positions before retrying, and a buy's token stays where the sweep looks
+    for positions. A refused buy (``not enough balance``) exits with the
+    CLOB's message and leaves no pending buy behind.
+    """
+    trade = _script("trade")
+    name, *args = command
+    _dw_holds(clob, monkeypatch, 100.0)
+    token = int(_V1_TOKEN)
+
+    clob.placed = _UNMATCHED
+    try:
+        getattr(trade, f"cmd_{name}")(clob.cs, _V1_TOKEN, *args)
+        exited = ""
+    except SystemExit as e:
+        exited = str(e.code)
+    out = capsys.readouterr()
+    told = (out.out + out.err + exited).lower()
+    assert "uncertain" in told
+    assert "positions" in told
+    if name == "sell":
+        return
+    assert token in pm.dw_open_tokens(clob.cs) + pm.dw_pending_buy_tokens(clob.cs)
+
+    clob.placed = _REFUSED
+    pending = pm.dw_pending_buy_tokens(clob.cs)
+    with pytest.raises(SystemExit, match="not enough balance"):
+        getattr(trade, f"cmd_{name}")(clob.cs, _V1_TOKEN, *args)
+    assert pm.dw_pending_buy_tokens(clob.cs) == pending
+    assert len(clob.orders) == 2
+
+
 _IDS = ["0x" + f"{n:02x}" * 32 for n in range(1, 7)]
+
+
+_UNVERIFIED = "could not verify open CLOB orders before sweeping ("
 
 
 @pytest.mark.parametrize(
     ("pages", "refusal"),
     [
-        # six orders on later pages, one with no id: counted, the first five named
+        # six orders on later pages: counted, the first five named
         (
             {
                 "MA==": {"data": [], "next_cursor": "Mg=="},
                 "Mg==": {
-                    "data": [dict(_OPEN_ORDER, id=_IDS[0]), {"status": "LIVE"}],
+                    "data": [dict(_OPEN_ORDER, id=i) for i in _IDS[:2]],
                     "next_cursor": "NA==",
                 },
                 "NA==": {
@@ -3956,16 +4117,15 @@ _IDS = ["0x" + f"{n:02x}" * 32 for n in range(1, 7)]
                     "next_cursor": "LTE=",
                 },
             },
-            f"6 open CLOB order(s) rest against the DW ({_IDS[0]}, ?, "
-            f"{', '.join(_IDS[2:5])}) ",
+            f"6 open CLOB order(s) rest against the DW ({', '.join(_IDS[:5])}) ",
         ),
-        # a page holding a row that is not an order
+        # rows the SDK cannot read: one that is not an order, ids that are not
+        # strings, the null trades the CLOB sends, a page that is not a list;
+        # whatever the refusal quotes of them stops at 500 characters
         (
-            {"MA==": {"data": [_OPEN_ORDER, "not an order"], "next_cursor": "LTE="}},
-            "could not verify open CLOB orders before sweeping (malformed "
-            "/data/orders page",
+            {"MA==": {"data": [_OPEN_ORDER, "x" * 600], "next_cursor": "LTE="}},
+            _UNVERIFIED,
         ),
-        # ids that are not strings are still named, not a traceback
         (
             {
                 "MA==": {
@@ -3973,23 +4133,27 @@ _IDS = ["0x" + f"{n:02x}" * 32 for n in range(1, 7)]
                     "next_cursor": "LTE=",
                 }
             },
-            "2 open CLOB order(s) rest against the DW (123, None) ",
+            _UNVERIFIED,
         ),
-        # a malformed page is echoed only up to its first 500 characters
         (
-            {"MA==": {"data": "x" * 600, "next_cursor": "LTE="}},
-            "could not verify open CLOB orders before sweeping (malformed "
-            "/data/orders page: {'data': '" + "x" * 490 + "); cancel ",
+            {
+                "MA==": {
+                    "data": [dict(_OPEN_ORDER, associate_trades=None)],
+                    "next_cursor": "LTE=",
+                }
+            },
+            _UNVERIFIED,
         ),
+        ({"MA==": {"data": "x" * 600, "next_cursor": "LTE="}}, _UNVERIFIED),
     ],
-    ids=["six", "non-object-row", "non-string-ids", "oversized-page"],
+    ids=["six", "non-object-row", "non-string-ids", "null-trades", "oversized-page"],
 )
 def test_sweep_reads_every_page_of_open_orders_raw(clob, pages, refusal) -> None:
-    """The open-orders check behind `funds.py sweep` reads the CLOB's raw rows.
+    """The open-orders check behind `funds.py sweep` reads every page.
 
-    Page by page from the CLOB's start cursor to its end marker. Rows the
-    SDK's strict order model refuses are still orders resting against the DW;
-    a page holding a row that is not an order refuses the sweep.
+    Orders on any page block the sweep. A reply the SDK cannot read refuses
+    it too, rather than reading as no orders, and echoes no more than 500
+    characters of what the CLOB sent.
     """
     clob.pages = pages
 
@@ -3997,8 +4161,7 @@ def test_sweep_reads_every_page_of_open_orders_raw(clob, pages, refusal) -> None
         funds._abort_if_open_orders(clob.cs, _AGENT_DW)
 
     assert str(refused.value).startswith(refusal)
-    cursors = [r.url.params["next_cursor"] for r in clob.calls("GET", "/data/orders")]
-    assert cursors == list(pages)
+    assert "x" * 501 not in str(refused.value)
 
 
 _CONDITION = "0x" + "cd" * 32
