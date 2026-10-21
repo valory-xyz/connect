@@ -34,12 +34,14 @@ signer, so the signatures they check are the SDK's own.
 # mypy: ignore-errors
 
 import importlib
+import importlib.util
 import json
 import os
 import random
 import re
 import subprocess  # nosec B404 - runs the skill's own bootstrap script
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -3754,9 +3756,14 @@ def _poly_1271_trailer(version: str, exchange: str, token_id: str) -> str:
     )
 
 
+# Built once, up front, so the tests that forbid creating a key in the
+# skill's process can still answer as Connect.
+_CONNECT_PRIVATE_KEY = eth_keys.PrivateKey(_CONNECT_KEY)
+
+
 def _connect_sign(digest: bytes) -> str:
     """Sign a raw digest the way connect/signer.py does: unprefixed, v in {27, 28}."""
-    sig = eth_keys.PrivateKey(_CONNECT_KEY).sign_msg_hash(digest)
+    sig = _CONNECT_PRIVATE_KEY.sign_msg_hash(digest)
     return (
         "0x"
         + sig.r.to_bytes(32, "big").hex()
@@ -3938,7 +3945,36 @@ def test_remote_signer_signs_v1_and_v2_orders(tmp_path, monkeypatch, sdk_http) -
         assert Account._recover_hash(digest, signature=owner_signature) == _AGENT_EOA
 
 
-@pytest.mark.usefixtures("_fixed_orders")
+@pytest.fixture
+def _no_local_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if the skill creates, loads or signs with a key itself.
+
+    Covers eth_account's key entry points and eth_keys' PrivateKey, which
+    eth_account builds every LocalAccount on. Connect's stand-in signs with a
+    key object made before this runs.
+    """
+
+    def key_used(*args, **kwargs):
+        raise AssertionError("key material was used in the skill's process")
+
+    for name in (
+        "create",
+        "create_with_mnemonic",
+        "decrypt",
+        "from_key",
+        "from_mnemonic",
+        "_sign_hash",
+        "sign_message",
+        "sign_transaction",
+        "sign_typed_data",
+        "unsafe_sign_hash",
+    ):
+        monkeypatch.setattr(Account, name, key_used)
+    monkeypatch.setattr(LocalAccount, "__init__", key_used)
+    monkeypatch.setattr(eth_keys.PrivateKey, "__init__", key_used)
+
+
+@pytest.mark.usefixtures("_fixed_orders", "_no_local_keys")
 def test_no_private_key_in_process(tmp_path, monkeypatch, sdk_http) -> None:
     """The SDK holds a RemoteSigner, and every signature it gets is Connect's.
 
@@ -4002,11 +4038,13 @@ def test_no_private_key_in_process(tmp_path, monkeypatch, sdk_http) -> None:
     assert all(set(payload) == {"digest"} for _, payload in server.requests)
 
 
+@pytest.mark.usefixtures("_no_local_keys")
 def test_cached_api_credentials_reused(tmp_path, monkeypatch, sdk_http) -> None:
     """Workspace creds are reused as they are, run after run, never re-derived.
 
     Only a workspace without creds derives them: once, with an L1 signature
-    Connect makes, kept in the same workspace format for the next run.
+    Connect makes, kept in the same workspace format for the next run, next to
+    whatever else the workspace state already holds.
     """
     remote_signer = _remote_signer()
     server = _ConnectServer()
@@ -4027,6 +4065,8 @@ def test_cached_api_credentials_reused(tmp_path, monkeypatch, sdk_http) -> None:
     fresh.mkdir()
     fresh_server = _ConnectServer()
     fresh_cs = _connect_signer(fresh, monkeypatch, fresh_server, creds=None)
+    dw_record = {"address": _AGENT_DW, "owner": _AGENT_EOA}
+    pm.save_state(fresh_cs, {"deposit_wallet": dict(dw_record)})
     sdk_http.issued = {
         "apiKey": "derived-key",
         "secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
@@ -4041,13 +4081,20 @@ def test_cached_api_credentials_reused(tmp_path, monkeypatch, sdk_http) -> None:
             "derived-passphrase",
         )
     (derivation,) = sdk_http.derivations()
-    assert pm.load_state(fresh_cs)["clob_creds"] == {
-        "api_key": "derived-key",
-        "api_secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
-        "api_passphrase": "derived-passphrase",  # nosec B105
+    # stored beside, not over, the rest of the workspace state
+    assert pm.load_state(fresh_cs) == {
+        "deposit_wallet": dw_record,
+        "clob_creds": {
+            "api_key": "derived-key",
+            "api_secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
+            "api_passphrase": "derived-passphrase",  # nosec B105
+        },
     }
     # the derivation was authorised by Connect's signature over the ClobAuth
-    # message for the agent EOA
+    # message for the agent EOA: nonce 0, the one the workspace's key was
+    # always derived with, signed now
+    assert derivation.headers["POLY_NONCE"] == "0"
+    assert abs(int(derivation.headers["POLY_TIMESTAMP"]) - time.time()) < 300
     clob_auth = build_api_key_auth_typed_data(
         address=_AGENT_EOA,
         chain_id=137,
@@ -4081,3 +4128,447 @@ def test_no_skill_file_mentions_py_clob_client_v2() -> None:
         and "py_clob_client_v2" in path.read_text(encoding="utf-8", errors="replace")
     ]
     assert mentions == []
+
+
+# --- trade.py and funds.py on the unified SDK ---------------------------------------
+
+_ORDER_ID = "0x" + "0e" * 32
+_ACCEPTED = {
+    "success": True,
+    "errorMsg": "",
+    "orderID": _ORDER_ID,
+    "status": "live",
+    "makingAmount": "",
+    "takingAmount": "",
+    "tradeIDs": [],
+    "transactionsHashes": [],
+}
+_OPEN_ORDER = {
+    "id": _ORDER_ID,
+    "market": "0x" + "cd" * 32,
+    "asset_id": _V1_TOKEN,
+    "owner": _CACHED_CREDS["api_key"],
+    "maker_address": _AGENT_DW,
+    "side": "BUY",
+    "price": "0.5",
+    "original_size": "10",
+    "size_matched": "0",
+    "outcome": "Yes",
+    "order_type": "GTC",
+    "status": "LIVE",
+    "associate_trades": [],
+    "created_at": 1_800_000_000,
+    "expiration": "0",
+}
+
+# One level each side, deep enough for every test order: asks at 0.50, bids
+# at 0.40.
+_BOOK = {
+    "market": "0x" + "cd" * 32,
+    "asset_id": _V1_TOKEN,
+    "timestamp": "1800000000000",
+    "hash": "0x" + "00" * 20,
+    "bids": [{"price": "0.4", "size": "1000"}],
+    "asks": [{"price": "0.5", "size": "1000"}],
+    "min_order_size": "1",
+    "tick_size": "0.01",
+    "neg_risk": False,
+}
+
+
+class _ClobHttp(_SdkHttp):
+    """The CLOB's order endpoints on top of the SDK fake, recording each call.
+
+    ``POST /order`` answers `posted` (accepted by default) and snapshots the
+    workspace state at that moment, so a test can see what was persisted
+    before the order left; reads and cancels answer for `_ORDER_ID`. A
+    request sent with the API key in `refused_key` is answered with the
+    `refusal` (status, JSON body) instead.
+    """
+
+    def __init__(self, cs, open_orders: list) -> None:
+        """Bind the workspace the snapshots read; start with nothing posted."""
+        super().__init__()
+        self.cs = cs
+        self.open_orders = open_orders
+        self.posted = dict(_ACCEPTED)
+        self.orders: list = []
+        self.state_at_post: list = []
+        self.calls: list = []
+        self.refused_key: str | None = None
+        self.refusal: tuple = (401, {"error": "Unauthorized"})
+
+    def send(self, request: httpx.Request) -> httpx.Response:
+        """Answer an order request, or defer to the SDK fake."""
+        path = request.url.path
+        self.calls.append((request.method, path))
+        if request.method == "POST" and path == "/order":
+            self.requests.append(request)
+            self.orders.append(json.loads(request.content))
+            self.state_at_post.append(pm.load_state(self.cs))
+        refused = self.refused_key is not None and path not in (
+            *_DERIVE_PATHS,
+            "/auth/api-keys",
+            "/deployed",
+        )
+        if refused and request.headers.get("POLY_API_KEY") == self.refused_key:
+            if path != "/order" or request.method != "POST":
+                self.requests.append(request)
+            status, body = self.refusal
+            return httpx.Response(status, json=body, request=request)
+        if request.method == "POST" and path == "/order":
+            return httpx.Response(200, json=self.posted, request=request)
+        if request.method == "GET" and path == f"/data/order/{_ORDER_ID}":
+            self.requests.append(request)
+            return httpx.Response(200, json=_OPEN_ORDER, request=request)
+        if request.method == "DELETE" and path == "/order":
+            self.requests.append(request)
+            assert json.loads(request.content) == {"orderID": _ORDER_ID}
+            body = {"canceled": [_ORDER_ID], "not_canceled": {}}
+            return httpx.Response(200, json=body, request=request)
+        if request.method == "GET" and path == "/book":
+            self.requests.append(request)
+            return httpx.Response(200, json=_BOOK, request=request)
+        if request.method == "GET" and path == "/data/orders":
+            self.requests.append(request)
+            body = {"data": self.open_orders, "next_cursor": "LTE="}
+            return httpx.Response(200, json=body, request=request)
+        return super().send(request)
+
+
+def _clob_script(name: str):
+    """Import a skill script that trades through the SDK client.
+
+    The script and the remote signer it builds its client with must stand on
+    polymarket-client alone.
+    """
+    _remote_signer()
+    path = _SCRIPTS / f"{name}.py"
+    assert not _PY_CLOB_IMPORT.search(path.read_text(encoding="utf-8")), (
+        f"{name}.py still imports py_clob_client_v2; it must call "
+        "polymarket-client==0.13.0"
+    )
+    # loaded under its own name: connect-pons' scripts, first on sys.path in
+    # the shared conftest, have a trade.py of their own
+    spec = importlib.util.spec_from_file_location(f"connect_polymarket_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def clob(tmp_path, monkeypatch, _no_local_keys):
+    """Return a workspace with cached creds and a DW, its CLOB faked over HTTP."""
+    server = _ConnectServer()
+    cs = _connect_signer(tmp_path, monkeypatch, server)
+    http = _ClobHttp(cs, open_orders=[])
+    monkeypatch.setattr(
+        httpx.Client, "send", lambda self, request, **kwargs: http.send(request)
+    )
+    monkeypatch.setattr(deposit_wallet, "_resolve_dw", lambda cs: _AGENT_DW)
+    monkeypatch.setattr(
+        pm,
+        "http_get_json",
+        lambda url, params=None: [{"version": pm.SUPPORTED_MARKET_VERSION}],
+    )
+    http.server = server
+    return http
+
+
+def _printed_json(out: str):
+    """Parse what a command printed as its result."""
+    return json.loads(out)
+
+
+def _mentions(value, needle: str) -> bool:
+    """Whether a parsed JSON value holds `needle` as one of its strings."""
+    if isinstance(value, dict):
+        return any(_mentions(v, needle) for v in value.values())
+    if isinstance(value, list):
+        return any(_mentions(v, needle) for v in value)
+    return isinstance(value, str) and value.lower() == needle.lower()
+
+
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_limit_buy_posts_the_signed_order_once(clob, capsys) -> None:
+    """`trade.py limit` BUY signs on the SDK and posts one GTC order.
+
+    The order is the one the signer test pins (BUY 10 at 0.50 on the current
+    exchange), so its signature is the golden. The buy's recovery hint is in
+    the workspace before the order leaves, and resolved once it is accepted.
+    The command prints the CLOB's answer as a JSON object.
+    """
+    trade = _clob_script("trade")
+    trade.cmd_limit(clob.cs, _V1_TOKEN, "buy", 0.5, 10.0, "gtc", None)
+
+    (posted,) = clob.orders
+    assert posted["orderType"] == "GTC"
+    assert posted["owner"] == _CACHED_CREDS["api_key"]
+    order = posted["order"]
+    assert to_checksum_address(order["maker"]) == _AGENT_DW
+    assert to_checksum_address(order["signer"]) == _AGENT_DW
+    assert str(order["tokenId"]) == _V1_TOKEN
+    assert (str(order["makerAmount"]), str(order["takerAmount"])) == (
+        "5000000",
+        "10000000",
+    )
+    assert str(order["side"]).upper() in ("BUY", "0")
+    assert int(order["signatureType"]) == 3
+    assert str(order["expiration"]) == "0"
+    assert order["signature"] == _V1_GOLDEN_SIGNATURE
+    assert clob.server.digests == [_V1_GOLDEN_DIGEST]
+
+    (before,) = clob.state_at_post
+    token = int(_V1_TOKEN)
+    assert token in before["dw_open_tokens"]
+    assert pm._dw_pending_buy_counts(before) == {token: 1}  # noqa: SLF001
+    after = pm.load_state(clob.cs)
+    assert token in after["dw_open_tokens"]
+    assert pm._dw_pending_buy_counts(after) == {}  # noqa: SLF001
+    assert after["clob_creds"] == _CACHED_CREDS
+
+    printed = _printed_json(capsys.readouterr().out)
+    assert isinstance(printed, dict)
+    assert _mentions(printed, _ORDER_ID)
+
+
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_limit_sell_gtd_carries_its_expiry_and_no_buy_hint(clob, capsys) -> None:
+    """`trade.py limit` SELL GTD signs a sell expiring --expires-in from now.
+
+    A sell is not a buy: no recovery hint is written for it.
+    """
+    trade = _clob_script("trade")
+    start = int(time.time())
+    trade.cmd_limit(clob.cs, _V1_TOKEN, "sell", 0.42, 7.0, "gtd", 3600)
+    end = int(time.time())
+
+    (posted,) = clob.orders
+    assert posted["orderType"] == "GTD"
+    order = posted["order"]
+    assert to_checksum_address(order["maker"]) == _AGENT_DW
+    assert str(order["tokenId"]) == _V1_TOKEN
+    # a SELL gives 7 shares for 7 x 0.42 pUSD
+    assert (str(order["makerAmount"]), str(order["takerAmount"])) == (
+        "7000000",
+        "2940000",
+    )
+    assert str(order["side"]).upper() in ("SELL", "1")
+    assert start + 3600 <= int(order["expiration"]) <= end + 3600
+    assert int(order["signatureType"]) == 3
+    (digest,) = clob.server.digests
+    owner_signature = _hex_bytes(order["signature"])[:65]
+    assert Account._recover_hash(_hex_bytes(digest), signature=owner_signature) == (
+        _AGENT_EOA
+    )
+
+    state = pm.load_state(clob.cs)
+    assert not state.get("dw_open_tokens")
+    assert pm._dw_pending_buy_counts(state) == {}  # noqa: SLF001
+    assert _mentions(_printed_json(capsys.readouterr().out), _ORDER_ID)
+
+
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_rejected_buy_reports_the_clob_and_drops_its_marker(clob, capsys) -> None:
+    """A buy the CLOB answers with ``success: false`` ends with its reason.
+
+    The pending marker written before the post is resolved, as for any
+    definitive answer, and the order is not posted a second time.
+    """
+    trade = _clob_script("trade")
+    reason = "not enough balance / allowance"
+    clob.posted = {
+        "success": False,
+        "errorMsg": reason,
+        "orderID": "",
+        "status": "",
+        "makingAmount": "",
+        "takingAmount": "",
+    }
+    with pytest.raises(SystemExit) as rejected:
+        trade.cmd_limit(clob.cs, _V1_TOKEN, "buy", 0.5, 10.0, "gtc", None)
+    printed = capsys.readouterr()
+    assert reason in " ".join([str(rejected.value.code), printed.out, printed.err])
+    assert rejected.value.code not in (None, 0)
+    assert len(clob.orders) == 1
+    token = int(_V1_TOKEN)
+    assert pm._dw_pending_buy_counts(clob.state_at_post[0]) == {
+        token: 1
+    }  # noqa: SLF001
+    assert pm._dw_pending_buy_counts(pm.load_state(clob.cs)) == {}  # noqa: SLF001
+
+
+def test_trade_order_status_and_cancel_go_through_the_sdk(clob, capsys) -> None:
+    """`trade.py order` reads one order and `trade.py cancel` cancels it, by id."""
+    trade = _clob_script("trade")
+
+    trade.cmd_order(clob.cs, _ORDER_ID)
+    status = _printed_json(capsys.readouterr().out)
+    assert isinstance(status, dict)
+    assert _mentions(status, _ORDER_ID)
+
+    trade.cmd_cancel(clob.cs, _ORDER_ID)
+    cancelled = _printed_json(capsys.readouterr().out)
+    assert isinstance(cancelled, dict)
+    assert _mentions(cancelled, _ORDER_ID)
+
+    order_calls = [c for c in clob.calls if c[1] not in ("/auth/api-keys", "/deployed")]
+    assert order_calls == [
+        ("GET", f"/data/order/{_ORDER_ID}"),
+        ("DELETE", "/order"),
+    ]
+    assert clob.server.requests == []  # reads and cancels sign nothing
+
+
+def test_sweep_refuses_while_orders_rest_against_the_dw(clob) -> None:
+    """The open-orders check behind `funds.py sweep` reads the CLOB on the SDK.
+
+    No open order lets the sweep go on; one names the order and refuses; a
+    CLOB that cannot be read refuses too, rather than sweeping blind.
+    """
+    _remote_signer()
+
+    assert funds._abort_if_open_orders(clob.cs, _AGENT_DW) is None
+    assert ("GET", "/data/orders") in clob.calls
+
+    other_id = "0x" + "0f" * 32
+    clob.open_orders = [_OPEN_ORDER, dict(_OPEN_ORDER, id=other_id)]
+    with pytest.raises(SystemExit, match=r"2 open CLOB order\(s\)") as refused:
+        funds._abort_if_open_orders(clob.cs, _AGENT_DW)
+    assert f"({_ORDER_ID}, {other_id})" in str(refused.value)
+
+    clob.open_orders = "not a list"
+    with pytest.raises(SystemExit, match="could not verify open CLOB orders"):
+        funds._abort_if_open_orders(clob.cs, _AGENT_DW)
+
+
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_market_buy_spends_the_usd_asked_for(clob, monkeypatch, capsys) -> None:
+    """`trade.py buy` signs a FOK market BUY of exactly --usd and posts it once.
+
+    The DW holds far more pUSD than the buy and the market charges no fee, so
+    nothing is held back: 7.30 pUSD at the 0.50 ask buys 14.6 shares. The recovery
+    hint is in place before the post and resolved after it.
+    """
+    trade = _clob_script("trade")
+    clob.cs._w3 = object()  # noqa: SLF001 - balance reads are stubbed below
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 500_000_000)
+
+    trade.cmd_buy(clob.cs, _V1_TOKEN, 7.3, "fok")
+
+    (posted,) = clob.orders
+    assert posted["orderType"] == "FOK"
+    order = posted["order"]
+    assert to_checksum_address(order["maker"]) == _AGENT_DW
+    assert str(order["tokenId"]) == _V1_TOKEN
+    assert str(order["side"]).upper() in ("BUY", "0")
+    assert (str(order["makerAmount"]), str(order["takerAmount"])) == (
+        "7300000",
+        "14600000",
+    )
+    token = int(_V1_TOKEN)
+    assert pm._dw_pending_buy_counts(clob.state_at_post[0]) == {
+        token: 1
+    }  # noqa: SLF001
+    assert pm._dw_pending_buy_counts(pm.load_state(clob.cs)) == {}  # noqa: SLF001
+    assert _mentions(_printed_json(capsys.readouterr().out), _ORDER_ID)
+
+
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_market_sell_moves_the_shares_asked_for(clob, capsys) -> None:
+    """`trade.py sell` signs a FAK market SELL of exactly --shares, no buy hint."""
+    trade = _clob_script("trade")
+
+    trade.cmd_sell(clob.cs, _V1_TOKEN, 12.5, "fak")
+
+    (posted,) = clob.orders
+    assert posted["orderType"] == "FAK"
+    order = posted["order"]
+    assert to_checksum_address(order["maker"]) == _AGENT_DW
+    assert str(order["tokenId"]) == _V1_TOKEN
+    assert str(order["side"]).upper() in ("SELL", "1")
+    # 12.5 shares at the 0.40 bid
+    assert (str(order["makerAmount"]), str(order["takerAmount"])) == (
+        "12500000",
+        "5000000",
+    )
+    assert not pm.load_state(clob.cs).get("dw_open_tokens")
+    assert _mentions(_printed_json(capsys.readouterr().out), _ORDER_ID)
+
+
+_NOT_REPLAY_SAFE = "not attempted automatically: operation is not replay-safe"
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "definitive"),
+    [
+        (401, "Unauthorized/Invalid api key", True),
+        (403, "unauthorized: api key revoked", False),
+    ],
+)
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_auth_rejected_buy_is_never_posted_twice(
+    clob, capsys, status, reason, definitive
+) -> None:
+    """A buy the CLOB refuses for its credentials is not retried automatically.
+
+    The creds are cleared so an operator's retry derives fresh ones, and the
+    command exits 1 saying why it did not retry. Only a 401 proves nothing was
+    submitted, so only a 401 resolves the pending marker; any other auth
+    refusal keeps it and warns that the outcome may be ambiguous.
+    """
+    trade = _clob_script("trade")
+    clob.refused_key = _CACHED_CREDS["api_key"]
+    clob.refusal = (status, {"error": reason})
+
+    with pytest.raises(SystemExit) as exited:
+        trade.cmd_limit(clob.cs, _V1_TOKEN, "buy", 0.5, 10.0, "gtc", None)
+
+    assert exited.value.code == 1
+    assert len(clob.orders) == 1
+    assert clob.server.digests == [_V1_GOLDEN_DIGEST]  # one order, nothing derived
+    assert clob.derivations() == []
+    state = pm.load_state(clob.cs)
+    assert "clob_creds" not in state
+    token = int(_V1_TOKEN)
+    pending = {} if definitive else {token: 1}
+    assert pm._dw_pending_buy_counts(state) == pending  # noqa: SLF001
+    printed = _printed_json(capsys.readouterr().out)
+    assert printed["retry"] == _NOT_REPLAY_SAFE
+    assert reason in printed["error"]
+    assert ("warning" in printed) is not definitive
+
+
+def test_trade_auth_failed_cancel_rederives_and_retries_once(clob, capsys) -> None:
+    """A cancel refused with 401 retries once, on freshly derived creds.
+
+    Cancelling is replay-safe, so the stale creds are dropped, new ones are
+    derived through Connect and kept, and the cancel is sent once more. The
+    401 alone marks the failure as an auth one, whatever its message says.
+    """
+    trade = _clob_script("trade")
+    clob.refused_key = _CACHED_CREDS["api_key"]
+    clob.refusal = (401, {"error": "request rejected"})
+    clob.issued = {
+        "apiKey": "derived-key",
+        "secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
+        "passphrase": "derived-passphrase",  # nosec B105
+    }
+    clob.active = ["derived-key"]
+
+    trade.cmd_cancel(clob.cs, _ORDER_ID)
+
+    cancels = [
+        r.headers.get("POLY_API_KEY")
+        for r in clob.requests
+        if (r.method, r.url.path) == ("DELETE", "/order")
+    ]
+    assert cancels == [_CACHED_CREDS["api_key"], "derived-key"]
+    assert len(clob.derivations()) == 1
+    assert len(clob.server.requests) == 1  # the ClobAuth signature, nothing else
+    assert pm.load_state(clob.cs)["clob_creds"] == {
+        "api_key": "derived-key",
+        "api_secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
+        "api_passphrase": "derived-passphrase",  # nosec B105
+    }
+    assert _mentions(_printed_json(capsys.readouterr().out), _ORDER_ID)

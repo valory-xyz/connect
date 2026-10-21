@@ -604,3 +604,16 @@ __all__ = [
     "uniswap",
     "web",
 ]
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """End a run that stopped on a failed collection with exit 1, not 2.
+
+    A test module that cannot import the code under test is a failing test.
+    The mutation run (mutmut 2.5.1) counts only exit status 1 as a caught
+    mutant and reads any other status as "survived", so without this a mutant
+    that breaks a module-level constant, such as an address, would look like
+    one the tests missed.
+    """
+    if exitstatus == pytest.ExitCode.INTERRUPTED and session.testsfailed:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
