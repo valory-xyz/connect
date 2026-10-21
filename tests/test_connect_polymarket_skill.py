@@ -2769,6 +2769,10 @@ def test_skill_ships_the_scripts_its_docs_reference() -> None:
 
 
 BOOTSTRAP = _SCRIPTS / "bootstrap_env.sh"
+# The ready sentinel names the SDK pin, so a venv built for an older pin is not
+# mistaken for a ready one. OLD_SENTINEL is what py-clob-client-v2 venvs carry.
+SENTINEL = ".bootstrap-complete-polymarket-client-0.13.0"
+OLD_SENTINEL = ".bootstrap-complete"
 
 
 def _posix_shell_available() -> bool:
@@ -2820,7 +2824,7 @@ def _fake_venv(root: Path, complete: bool = True) -> Path:
     python.chmod(0o755)
     _fake_pip(venv)  # creation is gated on pip, so the stub needs one
     if complete:
-        (venv / ".bootstrap-complete").touch()
+        (venv / SENTINEL).touch()
     return venv
 
 
@@ -2889,10 +2893,34 @@ def test_bootstrap_retries_a_venv_whose_install_died_partway(tmp_path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "installing dependencies" in result.stderr
-    assert (venv / ".bootstrap-complete").is_file()
+    assert (venv / SENTINEL).is_file()
 
 
 @requires_posix_shell
+def test_a_venv_built_for_the_old_sdk_is_upgraded_not_reused(tmp_path) -> None:
+    """A venv from before the polymarket-client pin has no `import polymarket`.
+
+    It carries the old sentinel, and reusing it would leave every trade script
+    failing on import. The bootstrap has to install the pinned SDK into it and
+    mark it ready under the new sentinel.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _fake_venv(tmp_path, complete=False)
+    (venv / OLD_SENTINEL).touch()
+    log = tmp_path / "pip.log"
+    pip = venv / "bin" / "pip"
+    pip.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n', encoding="utf-8")
+
+    result = _run_bootstrap(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "installing dependencies" in result.stderr
+    assert "reusing venv" not in result.stderr
+    installs = log.read_text(encoding="utf-8").split()
+    assert "polymarket-client==0.13.0" in installs
+    assert (venv / SENTINEL).is_file()
+
+
 @requires_posix_shell
 def test_a_venv_without_pip_is_rebuilt_not_reused(tmp_path) -> None:
     """An interpreter alone does not prove a venv works.
@@ -2915,10 +2943,12 @@ def test_bootstrap_failure_makes_the_callers_eval_fail(tmp_path) -> None:
     """`eval "$(...)"` discards the exit status, so stdout has to carry it.
 
     Without this the caller sees exit 0 and an unset $PY after a failed
-    install.
+    install. The venv starts out built for the old SDK, so a failed upgrade
+    must fail too rather than fall back to the venv that cannot import it.
     """
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
     venv = _fake_venv(tmp_path, complete=False)
+    (venv / OLD_SENTINEL).touch()
     _fake_pip(venv, exit_code=1)
 
     result = _run_bootstrap(tmp_path)
@@ -2926,7 +2956,7 @@ def test_bootstrap_failure_makes_the_callers_eval_fail(tmp_path) -> None:
     assert result.returncode != 0
     assert "false" in result.stdout  # eval'ing this fails the caller too
     assert "export PY=" not in result.stdout
-    assert not (venv / ".bootstrap-complete").exists()
+    assert not (venv / SENTINEL).exists()
 
     # prove the emitted snippet really does fail the caller's eval
     evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test-controlled input
@@ -2949,12 +2979,14 @@ def test_bootstrap_override_wins_over_the_workspace(tmp_path) -> None:
     python = elsewhere / "bin" / "python"
     python.write_text("#!/bin/sh\necho /other/cacert.pem\n", encoding="utf-8")
     python.chmod(0o755)
-    (elsewhere / ".bootstrap-complete").touch()
+    _fake_pip(elsewhere)  # without pip the bootstrap rebuilds the venv
+    (elsewhere / SENTINEL).touch()
 
     result = _run_bootstrap(tmp_path, {"CONNECT_POLYMARKET_VENV": str(elsewhere)})
 
     assert result.returncode == 0, result.stderr
     assert f"export PY={python}" in result.stdout
+    assert "reusing venv" in result.stderr
 
 
 @requires_posix_shell
