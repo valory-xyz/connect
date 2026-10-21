@@ -1634,6 +1634,33 @@ def test_constants_report_publishes_the_addresses_and_hosts() -> None:
     assert named == {"CTFExchange", "NegRiskCTFExchange", "ExchangeV3"}
 
 
+def test_constants_report_describes_the_protocol_v2_contracts() -> None:
+    """The published rows for the V2 venue, its positions and the retired adapter.
+
+    These are the rows Protocol V2 adds or changes, and the roles are what
+    tells them apart: two settle orders, one holds positions, one holds no
+    approval any more.
+    """
+    rows = {entry["name"]: entry for entry in pm.constants_report()["contracts"]}
+    assert rows["ExchangeV3"] == {
+        "name": "ExchangeV3",
+        "address": pm.EXCHANGE_V3,
+        "role": "CLOB settlement for Protocol V2 markets",
+    }
+    assert rows["PositionManager"] == {
+        "name": "PositionManager",
+        "address": pm.POSITION_MANAGER,
+        "role": "The ERC-1155 holding every Protocol V2 position",
+    }
+    assert rows["NegRiskAdapter"] == {
+        "name": "NegRiskAdapter",
+        "address": pm.NEG_RISK_ADAPTER,
+        "role": "Wraps neg-risk positions (CLOB v1, deprecated); holds no DW approval",
+    }
+    assert pm.contract_label(pm.POSITION_MANAGER) == "PositionManager"
+    assert pm.contract_label(pm.EXCHANGE_V3) == "ExchangeV3"
+
+
 def test_status_prints_the_labels_beside_the_approvals(monkeypatch, capsys) -> None:
     """The one production caller: names must actually reach the printed report.
 
@@ -3610,6 +3637,38 @@ def test_relayer_error_body_surfaced(monkeypatch, tmp_path, capsys) -> None:
     assert "403" in str(rejected.value)
 
 
+def test_relayer_error_names_the_call_then_the_body(monkeypatch, tmp_path) -> None:
+    """The error reads ``Relayer proxy <method> <endpoint> failed: <error>: <body>``.
+
+    With no response at all (the proxy unreachable) there is no body to add,
+    and the message ends at the error.
+    """
+    monkeypatch.delenv("POLYMARKET_RELAYER_PROXY_URL", raising=False)
+    cs = _EnsureCS(_ApprovalChain(), tmp_path)
+    body = "wallet signature rejected: challenge timestamp outside the window"
+    forbidden = _RelayerHttp(403, "Forbidden", body, "text/plain")
+    monkeypatch.setattr(
+        requests.adapters.HTTPAdapter,
+        "send",
+        lambda adapter, request, **kwargs: forbidden.send(request),
+    )
+    with pytest.raises(relayer_proxy.RelayerProxyError) as rejected:
+        relayer_proxy.RelayerProxyClient(cs).deployed(DW_ADDR)
+    assert re.fullmatch(
+        r"Relayer proxy GET deployed failed: 403 Client Error: Forbidden for url: "
+        rf"\S+/polymarket/relayer/deployed\?\S+: {re.escape(body)}",
+        str(rejected.value),
+    )
+
+    def unreachable(adapter, request, **kwargs):
+        raise requests.exceptions.ConnectionError("proxy unreachable")
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", unreachable)
+    with pytest.raises(relayer_proxy.RelayerProxyError) as failed:
+        relayer_proxy.RelayerProxyClient(cs).deployed(DW_ADDR)
+    assert str(failed.value) == "Relayer proxy GET deployed failed: proxy unreachable"
+
+
 # --- remote signer on the unified SDK ----------------------------------------------
 
 # A throwaway, publicly known test key. Only the Connect stand-in below holds
@@ -4181,7 +4240,8 @@ class _ClobHttp(_SdkHttp):
 
     ``POST /order`` answers `posted` (accepted by default) and snapshots the
     workspace state at that moment, so a test can see what was persisted
-    before the order left; reads and cancels answer for `_ORDER_ID`. A
+    before the order left; reads and cancels answer for `_ORDER_ID`, and
+    ``GET /book`` answers `book` (`_BOOK` by default). A
     request sent with the API key in `refused_key` is answered with the
     `refusal` (status, JSON body) instead.
     """
@@ -4197,6 +4257,7 @@ class _ClobHttp(_SdkHttp):
         self.calls: list = []
         self.refused_key: str | None = None
         self.refusal: tuple = (401, {"error": "Unauthorized"})
+        self.book: dict = _BOOK
 
     def send(self, request: httpx.Request) -> httpx.Response:
         """Answer an order request, or defer to the SDK fake."""
@@ -4228,7 +4289,7 @@ class _ClobHttp(_SdkHttp):
             return httpx.Response(200, json=body, request=request)
         if request.method == "GET" and path == "/book":
             self.requests.append(request)
-            return httpx.Response(200, json=_BOOK, request=request)
+            return httpx.Response(200, json=self.book, request=request)
         if request.method == "GET" and path == "/data/orders":
             self.requests.append(request)
             body = {"data": self.open_orders, "next_cursor": "LTE="}
@@ -4442,6 +4503,22 @@ def test_sweep_refuses_while_orders_rest_against_the_dw(clob) -> None:
         funds._abort_if_open_orders(clob.cs, _AGENT_DW)
 
 
+def test_sweep_names_the_first_five_open_orders(clob) -> None:
+    """More than five open orders: the refusal counts them all, names five."""
+    _remote_signer()
+    ids = ["0x" + f"{n:02x}" * 32 for n in range(1, 7)]
+    clob.open_orders = [dict(_OPEN_ORDER, id=order_id) for order_id in ids]
+
+    with pytest.raises(SystemExit) as refused:
+        funds._abort_if_open_orders(clob.cs, _AGENT_DW)
+
+    message = str(refused.value)
+    assert message.startswith(
+        f"6 open CLOB order(s) rest against the DW ({', '.join(ids[:5])}) "
+    )
+    assert ids[5] not in message
+
+
 @pytest.mark.usefixtures("_fixed_orders")
 def test_trade_market_buy_spends_the_usd_asked_for(clob, monkeypatch, capsys) -> None:
     """`trade.py buy` signs a FOK market BUY of exactly --usd and posts it once.
@@ -4496,6 +4573,130 @@ def test_trade_market_sell_moves_the_shares_asked_for(clob, capsys) -> None:
     assert _mentions(_printed_json(capsys.readouterr().out), _ORDER_ID)
 
 
+# A market that charges a taker fee: rate 0.25 at exponent 2, priced off the
+# 0.50 midpoint (asks at 0.30), so p * (1 - p) differs from every nearby
+# expression. py-clob-client-v2==1.0.2, the SDK the skill used before, sized
+# each market buy below from the same rate, exponent, book and balance; its
+# results are the literal amounts these tests pin.
+_FEE_RATE = Decimal("0.25")
+_FEE_EXPONENT = Decimal(2)
+_FEE_BOOK = dict(_BOOK, asks=[{"price": "0.3", "size": "1000"}])
+
+
+def _fee_market(monkeypatch, clob, rate=_FEE_RATE, exponent=_FEE_EXPONENT) -> None:
+    """Answer the SDK's market lookups with a fee-charging market at a 0.30 ask."""
+    market = MarketInfo(
+        fee_info=PlatformFeeInfo(rate=rate, exponent=exponent),
+        neg_risk=False,
+        tick_size=Decimal("0.01"),
+        token_ids=frozenset({_V1_TOKEN, _V2_TOKEN}),
+    )
+    monkeypatch.setattr(
+        sdk_order_cache, "fetch_market_info_sync", lambda ctx, condition_id: market
+    )
+    clob.book = _FEE_BOOK
+
+
+@pytest.mark.parametrize(
+    ("usd", "balance_units", "maker_amount", "taker_amount"),
+    [
+        # the balance covers the buy and its fee: the whole --usd is spent
+        (10.0, 500_000_000, "10000000", "33333300"),
+        # a balance of exactly --usd spends --usd less the fee (0.3675)
+        (10.0, 10_000_000, "9630000", "32100000"),
+        # short of --usd: the fee is charged on the balance, then held back
+        (10.0, 9_500_000, "9150000", "30500000"),
+        # exactly --usd plus its fee (2.03203) is still held back from
+        (1.96, 2_032_030, "1950000", "6500000"),
+        # one base unit more covers it, and the whole --usd is spent
+        (1.96, 2_032_031, "1960000", "6533300"),
+    ],
+)
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_market_buy_holds_back_the_taker_fee(
+    clob, monkeypatch, capsys, usd, balance_units, maker_amount, taker_amount
+) -> None:
+    """`trade.py buy` sizes a fee-charging buy exactly as the old SDK did.
+
+    The fee rate is ``rate * (p * (1 - p)) ** exponent`` at the fill price p,
+    charged on what the buy spends, in shares: min(--usd, balance) / p times
+    the rate. A balance above --usd plus that fee spends --usd; any other
+    balance spends what is left of it once the fee is held back.
+    """
+    trade = _clob_script("trade")
+    _fee_market(monkeypatch, clob)
+    clob.cs._w3 = object()  # noqa: SLF001 - balance reads are stubbed below
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: balance_units)
+
+    trade.cmd_buy(clob.cs, _V1_TOKEN, usd, "fok")
+
+    (posted,) = clob.orders
+    order = posted["order"]
+    assert str(order["tokenId"]) == _V1_TOKEN
+    assert (str(order["makerAmount"]), str(order["takerAmount"])) == (
+        maker_amount,
+        taker_amount,
+    )
+    assert _mentions(_printed_json(capsys.readouterr().out), _ORDER_ID)
+
+
+@pytest.mark.parametrize(
+    ("rate", "exponent", "usd", "balance", "spend"),
+    [
+        (_FEE_RATE, _FEE_EXPONENT, 10.0, 500.0, 10.0),
+        (_FEE_RATE, _FEE_EXPONENT, 10.0, 10.0, 9.6325),
+        (_FEE_RATE, _FEE_EXPONENT, 10.0, 9.5, 9.150875),
+        (_FEE_RATE, _FEE_EXPONENT, 10.0, 0.2, 0.19265000000000002),
+        # the balance is exactly --usd plus the fee: the fee is still held back
+        (_FEE_RATE, _FEE_EXPONENT, 1.96, 2.03203, 1.9599999999999997),
+        (_FEE_RATE, _FEE_EXPONENT, 1.96, 2.032031, 1.96),
+        (Decimal("0.0175"), Decimal(1), 10.0, 10.0, 9.8775),
+        # a fee larger than the balance spends nothing, never a negative amount
+        (Decimal("0.5"), Decimal(0), 10.0, 0.2, 0.0),
+    ],
+)
+@pytest.mark.usefixtures("_fixed_orders")
+def test_buy_sizing_matches_the_old_sdk(
+    clob, monkeypatch, rate, exponent, usd, balance, spend
+) -> None:
+    """The client's buy sizing returns, to the bit, what the old SDK returned.
+
+    `pm.quote_buy` and `trade.py buy` both size through it, so a quote, the
+    preflight and the order agree only while this holds.
+    """
+    remote_signer = _remote_signer()
+    _fee_market(monkeypatch, clob, rate, exponent)
+    client = remote_signer.make_clob_client(clob.cs, _AGENT_DW)
+    price = client.calculate_market_price(_V1_TOKEN, pm.BUY_SIDE, usd, "FOK")
+    assert price == 0.3
+    # pylint: disable-next=protected-access
+    sized = client._adjust_buy_amount_for_balance(  # noqa: SLF001
+        _V1_TOKEN, usd, price, balance, None
+    )
+    assert sized == spend
+
+
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_quote_prices_the_taker_fee(clob, monkeypatch, capsys) -> None:
+    """`trade.py quote` reports the fee and the top-up a short balance needs."""
+    trade = _clob_script("trade")
+    _fee_market(monkeypatch, clob)
+    clob.cs._w3 = object()  # noqa: SLF001 - balance reads are stubbed below
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 9_500_000)
+
+    trade.cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
+
+    quote = _printed_json(capsys.readouterr().out)
+    assert quote["fill_price"] == 0.3
+    assert quote["estimated_shares"] == 33.333333
+    assert quote["estimated_fee_usd"] == 0.3675
+    assert quote["required_dw_balance_usd"] == 10.3675
+    assert quote["shortfall_usd"] == 0.8675
+    assert quote["spendable_now_usd"] == 9.150875
+    assert quote["blocked"] is False
+    assert clob.orders == []
+
+
 _NOT_REPLAY_SAFE = "not attempted automatically: operation is not replay-safe"
 
 
@@ -4537,6 +4738,56 @@ def test_trade_auth_rejected_buy_is_never_posted_twice(
     assert printed["retry"] == _NOT_REPLAY_SAFE
     assert reason in printed["error"]
     assert ("warning" in printed) is not definitive
+
+
+def test_trade_prints_a_clob_refusal_as_its_error(clob, capsys) -> None:
+    """A refusal that is not about credentials prints ``{"error": ...}``, exit 1.
+
+    The cached creds stay: nothing about the refusal says they are stale.
+    """
+    trade = _clob_script("trade")
+    clob.refused_key = _CACHED_CREDS["api_key"]
+    clob.refusal = (400, {"error": "order lookup refused"})
+
+    with pytest.raises(SystemExit) as exited:
+        trade.cmd_order(clob.cs, _ORDER_ID)
+
+    assert exited.value.code == 1
+    printed = _printed_json(capsys.readouterr().out)
+    assert list(printed) == ["error"]
+    assert "order lookup refused" in printed["error"]
+    assert clob.derivations() == []
+    assert pm.load_state(clob.cs)["clob_creds"] == _CACHED_CREDS
+
+
+def test_trade_prints_the_retry_s_refusal_as_its_error(clob, capsys) -> None:
+    """A cancel refused again on re-derived creds prints that second refusal.
+
+    The CLOB issues the same key it refused, so the one retry the replay-safe
+    cancel gets is refused too: the command prints ``{"error": ...}`` for it
+    and exits 1, without a third attempt.
+    """
+    trade = _clob_script("trade")
+    clob.refused_key = _CACHED_CREDS["api_key"]
+    clob.refusal = (401, {"error": "request rejected"})
+    clob.issued = {
+        "apiKey": _CACHED_CREDS["api_key"],
+        "secret": _CACHED_CREDS["api_secret"],
+        "passphrase": _CACHED_CREDS["api_passphrase"],
+    }
+
+    with pytest.raises(SystemExit) as exited:
+        trade.cmd_cancel(clob.cs, _ORDER_ID)
+
+    assert exited.value.code == 1
+    cancels = [
+        r for r in clob.requests if (r.method, r.url.path) == ("DELETE", "/order")
+    ]
+    assert len(cancels) == 2
+    assert len(clob.derivations()) == 1
+    printed = _printed_json(capsys.readouterr().out)
+    assert list(printed) == ["error"]
+    assert "request rejected" in printed["error"]
 
 
 def test_trade_auth_failed_cancel_rederives_and_retries_once(clob, capsys) -> None:
