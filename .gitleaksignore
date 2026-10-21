@@ -1,0 +1,10 @@
+# Fake base64 API secrets ("derived-secret", "cached-secret") in the
+# connect-polymarket skill test fixtures, pinned per commit and line.
+b341d116a1660e6b24b97061b49599dd02c84d24:tests/test_connect_polymarket_skill.py:generic-api-key:4089
+b341d116a1660e6b24b97061b49599dd02c84d24:tests/test_connect_polymarket_skill.py:generic-api-key:4554
+b341d116a1660e6b24b97061b49599dd02c84d24:tests/test_connect_polymarket_skill.py:generic-api-key:4571
+c3ee42b22ff67cf334d04b9c7df0db2276e364f8:tests/test_connect_polymarket_skill.py:generic-api-key:4207
+c3ee42b22ff67cf334d04b9c7df0db2276e364f8:tests/test_connect_polymarket_skill.py:generic-api-key:4296
+c45314535389508526443136dcaaa0baa9261e7b:tests/test_connect_polymarket_skill.py:generic-api-key:3630
+c45314535389508526443136dcaaa0baa9261e7b:tests/test_connect_polymarket_skill.py:generic-api-key:4032
+c45314535389508526443136dcaaa0baa9261e7b:tests/test_connect_polymarket_skill.py:generic-api-key:4046
