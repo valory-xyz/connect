@@ -1655,7 +1655,10 @@ def test_constants_report_describes_the_protocol_v2_contracts() -> None:
     assert rows["NegRiskAdapter"] == {
         "name": "NegRiskAdapter",
         "address": pm.NEG_RISK_ADAPTER,
-        "role": "Wraps neg-risk positions (CLOB v1, deprecated); holds no DW approval",
+        "role": (
+            "Wraps neg-risk positions (CLOB v1, deprecated); "
+            "no longer granted a DW approval"
+        ),
     }
     assert pm.contract_label(pm.POSITION_MANAGER) == "PositionManager"
     assert pm.contract_label(pm.EXCHANGE_V3) == "ExchangeV3"
@@ -3669,6 +3672,39 @@ def test_relayer_error_names_the_call_then_the_body(monkeypatch, tmp_path) -> No
     assert str(failed.value) == "Relayer proxy GET deployed failed: proxy unreachable"
 
 
+def test_relayer_error_bounds_a_huge_body(monkeypatch, tmp_path) -> None:
+    """A huge error page is cut down: the error keeps its start, not 100 KB.
+
+    A proxy or gateway in front of the relayer can answer with a whole HTML
+    page. The agent reads the error the command prints, so the message names
+    the call and the status in full, then only the first few hundred
+    characters of the body.
+    """
+    monkeypatch.delenv("POLYMARKET_RELAYER_PROXY_URL", raising=False)
+    cs = _EnsureCS(_ApprovalChain(), tmp_path)
+    head = (
+        "<html><head><title>502 Bad Gateway</title></head><body>"
+        "<h1>502 Bad Gateway</h1><p>The upstream relayer did not answer in time."
+        "</p><p>Request id 7f3a9c2e41b8d605; retry after a short wait.</p>"
+    )
+    body = head + "<!-- padding -->" * (100_000 // 16) + "</body></html>"
+    assert len(body) > 100_000
+    gateway = _RelayerHttp(502, "Bad Gateway", body, "text/html")
+    monkeypatch.setattr(
+        requests.adapters.HTTPAdapter,
+        "send",
+        lambda adapter, request, **kwargs: gateway.send(request),
+    )
+    with pytest.raises(relayer_proxy.RelayerProxyError) as failed:
+        relayer_proxy.RelayerProxyClient(cs).deployed(DW_ADDR)
+    message = str(failed.value)
+    assert message.startswith(
+        "Relayer proxy GET deployed failed: 502 Server Error: Bad Gateway for url: "
+    )
+    assert head[:200] in message
+    assert len(message) < 1200, f"the error carries {len(message)} characters"
+
+
 # --- remote signer on the unified SDK ----------------------------------------------
 
 # A throwaway, publicly known test key. Only the Connect stand-in below holds
@@ -4163,6 +4199,112 @@ def test_cached_api_credentials_reused(tmp_path, monkeypatch, sdk_http) -> None:
     clob_auth_digest = _hash_eip191_message(encode_typed_data(full_message=clob_auth))
     assert fresh_server.digests == ["0x" + clob_auth_digest.hex()]
     assert derivation.headers["POLY_ADDRESS"] == _AGENT_EOA
+    assert derivation.headers["POLY_SIGNATURE"] == _connect_sign(clob_auth_digest)
+
+
+_DERIVED_CREDS = {
+    "apiKey": "derived-key",
+    "secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
+    "passphrase": "derived-passphrase",  # nosec B105
+}
+
+
+class _CreateFails(_SdkHttp):
+    """The SDK fake, but creating an API key fails the way `failure` says.
+
+    Deriving (``GET /auth/derive-api-key``) still issues `issued`.
+    """
+
+    def __init__(self, failure) -> None:
+        """Fail every ``POST /auth/api-key`` with `failure(request)`."""
+        super().__init__()
+        self.failure = failure
+
+    def send(self, request: httpx.Request) -> httpx.Response:
+        """Answer a create with the failure, anything else as the SDK fake."""
+        if (request.method, request.url.path) == ("POST", "/auth/api-key"):
+            self.requests.append(request)
+            return self.failure(request)
+        return super().send(request)
+
+
+def _create_answers(status: int, body: dict | str):
+    """Return a failure that answers the create with `status` and `body`."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if isinstance(body, dict):
+            return httpx.Response(status, json=body, request=request)
+        return httpx.Response(
+            status, text=body, headers={"Content-Type": "text/html"}, request=request
+        )
+
+    return answer
+
+
+def _create_unreachable(request: httpx.Request) -> httpx.Response:
+    """Fail the create before any answer arrives."""
+    raise httpx.ConnectError("connection reset by peer", request=request)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _create_answers(500, {"error": "internal server error"}),
+        _create_answers(503, "<html><body>503 Service Unavailable</body></html>"),
+        _create_unreachable,
+        # answered, but with no credentials in it
+        _create_answers(200, {}),
+    ],
+    ids=["500", "503", "transport-error", "no-credentials"],
+)
+@pytest.mark.usefixtures("_no_local_keys")
+def test_first_credentials_are_derived_when_creating_fails(
+    tmp_path, monkeypatch, failure
+) -> None:
+    """Any failure to create the workspace's API key falls back to deriving it.
+
+    py-clob-client-v2==1.0.2's ``create_or_derive_api_key`` derived after any
+    failure of the create, not only a 400. The derived creds are the ones the
+    client uses, and they are kept, so the next run derives nothing.
+    """
+    remote_signer = _remote_signer()
+    http = _CreateFails(failure)
+    http.issued = dict(_DERIVED_CREDS)
+    http.active = ["derived-key"]
+    monkeypatch.setattr(
+        httpx.Client, "send", lambda self, request, **kwargs: http.send(request)
+    )
+    server = _ConnectServer()
+    cs = _connect_signer(tmp_path, monkeypatch, server, creds=None)
+
+    for _ in range(2):
+        try:
+            creds = remote_signer.make_clob_client(cs, _AGENT_DW).credentials
+        except Exception as error:  # noqa: BLE001 - the failure under test
+            pytest.fail(f"a failed create did not fall back to a derive: {error!r}")
+        assert (creds.key, creds.secret, creds.passphrase) == (
+            "derived-key",
+            "ZGVyaXZlZC1zZWNyZXQ=",
+            "derived-passphrase",
+        )
+    assert [(r.method, r.url.path) for r in http.derivations()] == [
+        ("POST", "/auth/api-key"),
+        ("GET", "/auth/derive-api-key"),
+    ]
+    assert pm.load_state(cs)["clob_creds"] == {
+        "api_key": "derived-key",
+        "api_secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
+        "api_passphrase": "derived-passphrase",  # nosec B105
+    }
+    derivation = http.derivations()[-1]
+    clob_auth = build_api_key_auth_typed_data(
+        address=_AGENT_EOA,
+        chain_id=137,
+        timestamp=int(derivation.headers["POLY_TIMESTAMP"]),
+        nonce=0,
+    )
+    clob_auth_digest = _hash_eip191_message(encode_typed_data(full_message=clob_auth))
+    assert derivation.headers["POLY_NONCE"] == "0"
     assert derivation.headers["POLY_SIGNATURE"] == _connect_sign(clob_auth_digest)
 
 
@@ -4822,4 +4964,170 @@ def test_trade_auth_failed_cancel_rederives_and_retries_once(clob, capsys) -> No
         "api_secret": "ZGVyaXZlZC1zZWNyZXQ=",  # nosec B105
         "api_passphrase": "derived-passphrase",  # nosec B105
     }
+    assert _mentions(_printed_json(capsys.readouterr().out), _ORDER_ID)
+
+
+# --- trade.py keeps the CLOB's own answer --------------------------------------------
+
+# Polymarket documents "unmatched" as an order that "was marketable but failed
+# to delay. Placement still succeeded." (docs.polymarket.com, create order).
+_UNMATCHED = dict(_ACCEPTED, status="unmatched")
+_MATCHED = dict(
+    _ACCEPTED,
+    status="matched",
+    makingAmount="5",
+    takingAmount="10",
+    tradeIDs=["2c7f5e1a-4b9d-4e3a-8f61-0d2b7c9e5a14"],
+    transactionsHashes=["0x" + "ab" * 32],
+)
+
+
+def _exit_code(command):
+    """Run `command`; return the code it exited with, or None if it returned."""
+    try:
+        command()
+    except SystemExit as exited:
+        return exited.code
+    return None
+
+
+def _printed_reply(out: str) -> dict:
+    """Parse the one JSON object a command printed as its result."""
+    assert out.strip(), "the command printed nothing"
+    printed = json.loads(out)
+    assert isinstance(printed, dict)
+    return printed
+
+
+def _trade_command(trade, cs, command: str):
+    """Return one of trade.py's order commands, bound to its fixed test order."""
+    return {
+        "buy": lambda: trade.cmd_buy(cs, _V1_TOKEN, 7.3, "fok"),
+        "limit-buy": lambda: trade.cmd_limit(
+            cs, _V1_TOKEN, "buy", 0.5, 10.0, "gtc", None
+        ),
+        "sell": lambda: trade.cmd_sell(cs, _V1_TOKEN, 12.5, "fak"),
+        "limit-sell": lambda: trade.cmd_limit(
+            cs, _V1_TOKEN, "sell", 0.42, 7.0, "gtc", None
+        ),
+    }[command]
+
+
+@pytest.mark.parametrize("command", ["buy", "limit-buy"])
+@pytest.mark.usefixtures("_fixed_orders")
+def test_an_unmatched_buy_is_placed_and_keeps_its_hint(
+    clob, monkeypatch, capsys, command
+) -> None:
+    """A buy answered ``success: true, status: unmatched`` was placed.
+
+    It is reported like any placed order: the command prints it and exits 0,
+    and the recovery hint is resolved the way a placed buy's is, with the
+    holdings hint kept. Only ``success: false`` is a rejection.
+    """
+    trade = _clob_script("trade")
+    clob.cs._w3 = object()  # noqa: SLF001 - balance reads are stubbed below
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 500_000_000)
+    clob.posted = dict(_UNMATCHED)
+
+    code = _exit_code(_trade_command(trade, clob.cs, command))
+
+    out = capsys.readouterr().out
+    assert code in (None, 0), f"an unmatched (placed) buy exited {code!r}"
+    assert len(clob.orders) == 1
+    token = int(_V1_TOKEN)
+    assert pm._dw_pending_buy_counts(clob.state_at_post[0]) == {
+        token: 1
+    }  # noqa: SLF001
+    after = pm.load_state(clob.cs)
+    assert pm._dw_pending_buy_counts(after) == {}  # noqa: SLF001
+    assert token in after["dw_open_tokens"]
+    assert _mentions(_printed_reply(out), _ORDER_ID)
+
+
+@pytest.mark.parametrize("reply", [_MATCHED, _UNMATCHED], ids=["matched", "unmatched"])
+@pytest.mark.parametrize("command", ["buy", "limit-buy", "sell", "limit-sell"])
+@pytest.mark.usefixtures("_fixed_orders")
+def test_trade_prints_the_clob_s_order_reply_under_its_own_names(
+    clob, monkeypatch, capsys, command, reply
+) -> None:
+    """A placed order prints what the CLOB answered, under the CLOB's names.
+
+    The agent reads this output: ``orderID``, ``success``, ``status``,
+    ``errorMsg``, ``makingAmount``, ``takingAmount`` and the rest keep the
+    names and the values of the CLOB's own reply, as they always have.
+    """
+    trade = _clob_script("trade")
+    clob.cs._w3 = object()  # noqa: SLF001 - balance reads are stubbed below
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 500_000_000)
+    clob.posted = dict(reply)
+
+    code = _exit_code(_trade_command(trade, clob.cs, command))
+
+    printed = _printed_reply(capsys.readouterr().out)
+    assert {key: printed.get(key) for key in reply} == reply
+    assert code in (None, 0)
+
+
+def test_trade_order_and_cancel_print_the_clob_s_reply(clob, capsys) -> None:
+    """`trade.py order` and `cancel` print the CLOB's reply under its own names.
+
+    The order's fields are the CLOB's (``expiration``, ``created_at`` as the
+    CLOB sent it, ``market``...), not a reshaped copy.
+    """
+    trade = _clob_script("trade")
+
+    trade.cmd_order(clob.cs, _ORDER_ID)
+    status = _printed_reply(capsys.readouterr().out)
+    assert {key: status.get(key) for key in _OPEN_ORDER} == _OPEN_ORDER
+
+    trade.cmd_cancel(clob.cs, _ORDER_ID)
+    cancelled = _printed_reply(capsys.readouterr().out)
+    assert cancelled == {"canceled": [_ORDER_ID], "not_canceled": {}}
+
+
+# The 0.30 level holds 9.75 pUSD of shares: a 10 pUSD buy reaches the 0.31
+# level behind it, but the same buy less its taker fee would not. CLOB books
+# list asks from the worst price to the best.
+_TWO_LEVEL_FEE_BOOK = dict(
+    _BOOK,
+    asks=[{"price": "0.31", "size": "1000"}, {"price": "0.3", "size": "32.5"}],
+)
+
+
+@pytest.mark.parametrize(
+    ("balance_units", "maker_amount", "taker_amount"),
+    [
+        # 10 pUSD less the fee at 0.31 (9.6310225), still priced at 0.31
+        (10_000_000, "9630000", "31064500"),
+        # what is left of a 9.50 balance once that fee is held back (9.149...)
+        (9_500_000, "9140000", "29483800"),
+    ],
+)
+@pytest.mark.usefixtures("_fixed_orders")
+def test_fee_held_back_buy_keeps_the_price_of_the_requested_amount(
+    clob, monkeypatch, capsys, balance_units, maker_amount, taker_amount
+) -> None:
+    """A fee-held-back buy is priced once, for the --usd asked for.
+
+    py-clob-client-v2==1.0.2 priced a market buy at the level the requested
+    amount reaches, then held the fee back from the amount and built the
+    order at that same price. Pricing the smaller amount again would move the
+    order to a better level the requested amount does not fit in. The amounts
+    are the ones that SDK signed for this book, fee and balance.
+    """
+    trade = _clob_script("trade")
+    _fee_market(monkeypatch, clob)
+    clob.book = _TWO_LEVEL_FEE_BOOK
+    clob.cs._w3 = object()  # noqa: SLF001 - balance reads are stubbed below
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: balance_units)
+
+    trade.cmd_buy(clob.cs, _V1_TOKEN, 10.0, "fok")
+
+    (posted,) = clob.orders
+    order = posted["order"]
+    assert str(order["tokenId"]) == _V1_TOKEN
+    assert (str(order["makerAmount"]), str(order["takerAmount"])) == (
+        maker_amount,
+        taker_amount,
+    )
     assert _mentions(_printed_json(capsys.readouterr().out), _ORDER_ID)
