@@ -20,9 +20,10 @@
 """CLOB SDK client with signing routed through the connect signer.
 
 The unified SDK (``polymarket-client``) signs with the signer object its
-client holds: it reads ``address`` and calls ``sign_typed_data`` for orders
-and the CLOB's L1 auth. :class:`RemoteSigner` hashes the typed data locally
-and has connect sign the digest, so no key material exists in this process.
+client holds: it reads ``address`` and calls ``sign_typed_data`` (orders,
+the CLOB's L1 auth) or ``sign_message``. :class:`RemoteSigner` hashes each
+locally and has connect sign the digest, so no key material exists in this
+process.
 """
 
 import time
@@ -53,7 +54,10 @@ class RemoteSigner:
 
     def sign_typed_data(self, full_message: dict) -> _Signed:
         """Sign EIP-712 typed data (an order or the L1 auth) via connect."""
-        signable = encode_typed_data(full_message=full_message)
+        return self.sign_message(encode_typed_data(full_message=full_message))
+
+    def sign_message(self, signable) -> _Signed:
+        """Sign an EIP-191 signable message via connect."""
         return _Signed(self._cs.sign_digest(_hash_eip191_message(signable)))
 
 
