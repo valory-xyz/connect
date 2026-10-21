@@ -83,6 +83,28 @@ class ConnectClient(SecureClient):
         """One order's status, as the CLOB's JSON (times as it sent them)."""
         return self._ctx.secure_clob.get_json(f"/data/order/{order_id}")
 
+    def get_open_orders(self) -> list:
+        """Every open order, as the CLOB's JSON rows, read page by page.
+
+        The SDK's strict order model rejects rows the CLOB does send (a null
+        ``associate_trades``, missing fields), and those are still orders.
+        Pages run from the CLOB's start cursor until its end marker; a page
+        that is not a list of rows raises rather than reading as no orders.
+        """
+        orders: list = []
+        cursor = "MA=="  # the CLOB's start-of-list cursor
+        while cursor != "LTE=":  # the CLOB's no-more-pages marker
+            page = self._ctx.secure_clob.get_json(
+                "/data/orders", params={"next_cursor": cursor}
+            )
+            rows, cursor = page["data"], page["next_cursor"]
+            if not isinstance(rows, list) or not all(
+                isinstance(row, dict) for row in rows
+            ):
+                raise ValueError(f"malformed /data/orders page: {page!r}")
+            orders.extend(rows)
+        return orders
+
     def calculate_market_price(
         self, token_id: str, side: str, amount: float, order_type: str
     ) -> float:
