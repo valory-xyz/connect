@@ -150,8 +150,10 @@ class RelayerProxyClient:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
+            # the relayer's own reason (e.g. a refused call) is in the body
+            body = f": {e.response.text}" if e.response is not None else ""
             raise RelayerProxyError(
-                f"Relayer proxy {method} {endpoint} failed: {e}"
+                f"Relayer proxy {method} {endpoint} failed: {e}{body}"
             ) from e
         except ValueError as e:
             raise RelayerProxyError(

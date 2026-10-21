@@ -76,6 +76,8 @@ NEG_RISK_CTF_EXCHANGE = to_checksum_address(
     "0xe2222d279d744050d28e00520010520000310F59"
 )
 NEG_RISK_ADAPTER = to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+EXCHANGE_V3 = to_checksum_address("0xe3333700cA9d93003F00f0F71f8515005F6c00Aa")
+POSITION_MANAGER = to_checksum_address("0x006F54F7f9A22e0000CC2AB60031000000ae9fEF")
 CTF_COLLATERAL_ADAPTER = to_checksum_address(
     "0xAdA100Db00Ca00073811820692005400218FcE1f"
 )
@@ -148,7 +150,17 @@ CONTRACTS: tuple[Contract, ...] = (
     Contract(
         name="NegRiskAdapter",
         address=NEG_RISK_ADAPTER,
-        role="Wraps neg-risk positions; third holder of the DW's trading approvals",
+        role="Wraps neg-risk positions (CLOB v1, deprecated); holds no DW approval",
+    ),
+    Contract(
+        name="ExchangeV3",
+        address=EXCHANGE_V3,
+        role="CLOB settlement for Protocol V2 markets",
+    ),
+    Contract(
+        name="PositionManager",
+        address=POSITION_MANAGER,
+        role="The ERC-1155 holding every Protocol V2 position",
     ),
     Contract(
         name="CtfCollateralAdapter",
@@ -675,18 +687,18 @@ def contract_owner(w3: Web3, address: str) -> str | None:
 
 # --- canonical approval set ------------------------------------------------------------
 
-# The trading rights the DepositWallet needs: 3 pUSD allowances and 3 CTF
-# operator grants, one pair per exchange venue (CTF Exchange, NegRisk CTF
-# Exchange, NegRisk Adapter). The two *collateral adapters* are deliberately
-# NOT here: redemption runs from the service safe, never the DW (see
-# redeem.py, which grants those to the safe itself), so granting the DW
-# operator rights over contracts it never calls would be needless authority.
-APPROVAL_SPENDERS_PUSD = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, NEG_RISK_ADAPTER)
-APPROVAL_OPERATORS_CTF = (
-    CTF_EXCHANGE,
-    NEG_RISK_CTF_EXCHANGE,
-    NEG_RISK_ADAPTER,
-)
+# The trading rights the DepositWallet needs, one pair per exchange venue: a
+# pUSD allowance, and an operator grant on the ERC-1155 the venue settles
+# (the CTF for CTF Exchange and NegRisk CTF Exchange, the PositionManager for
+# ExchangeV3). Polymarket's relayer refuses a pUSD approval to ExchangeV3
+# for anything but MaxUint256, the amount every allowance here is granted.
+# The two *collateral adapters* are deliberately NOT here: redemption runs
+# from the service safe, never the DW (see redeem.py, which grants those to
+# the safe itself), so granting the DW operator rights over contracts it
+# never calls would be needless authority.
+APPROVAL_SPENDERS_PUSD = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, EXCHANGE_V3)
+APPROVAL_OPERATORS_CTF = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE)
+APPROVAL_OPERATORS_POSITION_MANAGER = (EXCHANGE_V3,)
 
 
 def approval_contracts() -> dict:
@@ -698,6 +710,7 @@ def approval_contracts() -> dict:
     return {
         "pusd_allowances": labelled(APPROVAL_SPENDERS_PUSD),
         "ctf_operators": labelled(APPROVAL_OPERATORS_CTF),
+        "position_manager_operators": labelled(APPROVAL_OPERATORS_POSITION_MANAGER),
     }
 
 
@@ -711,6 +724,10 @@ def approvals_status(w3: Web3, owner: str) -> dict:
         "ctf_operators": {
             operator: is_approved_for_all(w3, CTF, owner, operator)
             for operator in APPROVAL_OPERATORS_CTF
+        },
+        "position_manager_operators": {
+            operator: is_approved_for_all(w3, POSITION_MANAGER, owner, operator)
+            for operator in APPROVAL_OPERATORS_POSITION_MANAGER
         },
     }
 
@@ -729,6 +746,10 @@ def missing_approval_calls(w3: Web3, owner: str) -> list:
             calls.append(
                 {"target": CTF, "data": encode_set_approval_for_all(operator, True)}
             )
+    for operator, ok in status["position_manager_operators"].items():
+        if not ok:
+            data = encode_set_approval_for_all(operator, True)
+            calls.append({"target": POSITION_MANAGER, "data": data})
     return calls
 
 
