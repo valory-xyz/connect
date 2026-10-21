@@ -158,7 +158,7 @@ def _abort_if_open_orders(cs: pm.ConnectSigner, dw: str) -> None:
     from remote_signer import make_clob_client  # SDK import only needed here
 
     try:
-        open_orders = make_clob_client(cs, dw).get_open_orders()
+        open_orders = list(make_clob_client(cs, dw).list_open_orders().iter_items())
     except Exception as e:  # noqa: BLE001 - can't verify → don't sweep blind
         raise SystemExit(
             f"could not verify open CLOB orders before sweeping ({e}); cancel "
@@ -166,7 +166,7 @@ def _abort_if_open_orders(cs: pm.ConnectSigner, dw: str) -> None:
             "are certain none rest against the DW"
         ) from e
     if open_orders:
-        ids = ", ".join(o.get("id", "?") for o in open_orders[:5])
+        ids = ", ".join(o.id for o in open_orders[:5])
         raise SystemExit(
             f"{len(open_orders)} open CLOB order(s) rest against the DW ({ids}) "
             "— sweeping could strand their collateral or shares and leave them "

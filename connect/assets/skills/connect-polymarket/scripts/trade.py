@@ -44,14 +44,35 @@ shares ("--shares").
 import argparse
 import sys
 import time
+from decimal import Decimal
 
 import pm_common as pm
 from deposit_wallet import dw_or_exit
-from polymarket.errors import RateLimitError, RequestRejectedError, TransportError
+from polymarket._internal.actions.orders.market import adjust_buy_amount_for_fees
+from polymarket.errors import (
+    RateLimitError,
+    RequestRejectedError,
+    TransportError,
+    UnexpectedResponseError,
+)
 from remote_signer import clear_cached_creds, make_clob_client
 
-# The SDK's errors for a request the CLOB refused, or that got no answer.
-_API_ERRORS = (RequestRejectedError, RateLimitError, TransportError)
+# The SDK's errors for a request the CLOB refused, that got no answer, or
+# whose reply it cannot read.
+_API_ERRORS = (
+    RequestRejectedError,
+    RateLimitError,
+    TransportError,
+    UnexpectedResponseError,
+)
+
+# The SDK reads a CLOB reply of status "unmatched" as a rejection and drops
+# its order id, though the order may still have been placed.
+_UNCERTAIN = (
+    'placement uncertain: the CLOB answered "unmatched" ({}), so the order '
+    "may still have been placed; check positions (positions.py positions "
+    "--wallet dw) before retrying"
+)
 
 
 def _order_type(name: str) -> str:
@@ -111,6 +132,29 @@ def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
     pm.print_json(result)
 
 
+def _placed(response):
+    """Return an SDK order reply, refusing one whose placement is uncertain."""
+    if not response.ok and response.code == "unmatched":
+        raise SystemExit(_UNCERTAIN.format(response.message))
+    return response
+
+
+def _quote(client, token_id: str, usd: float, balance: float, order_type: str):
+    """`pm.quote_buy` on the SDK's price estimate and fee-aware buy sizing."""
+    price = client.estimate_market_price(
+        token_id=token_id, side=pm.BUY_SIDE, amount=usd, order_type=order_type
+    )
+    # pylint: disable-next=protected-access
+    market = client._ctx.order_metadata.resolve_market(client._ctx, token_id=token_id)
+
+    def spend(funds: Decimal) -> Decimal:
+        return adjust_buy_amount_for_fees(
+            amount=Decimal(str(usd)), price=price, max_spend=funds, fee=market.fee_info
+        )
+
+    return pm.quote_buy(token_id, usd, balance, order_type, float(price), spend)
+
+
 def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
     """Post a buy while preserving enough state to recover an unknown outcome.
 
@@ -118,10 +162,11 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
     even if its response is lost. A later sweep can then check the DW's
     on-chain balance directly instead of depending on the lagging data API.
 
-    A structured ``success: false`` response or status-code 401 authentication
-    rejection proves that no order was submitted. Other HTTP exceptions remain
-    ambiguous: a timeout, rate limit, intermediary response, or message-only
-    auth error may arrive after the request reached the CLOB. A harmless
+    A rejected order reply or status-code 401 authentication rejection proves
+    that no order was submitted; an "unmatched" reply may still be placed, so
+    it keeps the marker. Other exceptions remain ambiguous: a timeout, rate
+    limit, intermediary or unreadable response, or message-only auth error
+    may arrive after the request reached the CLOB. A harmless
     zero-balance hint is safer than an undiscoverable filled position.
     """
     token_id_int = int(token_id)
@@ -134,10 +179,9 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
         if _definitive_auth_rejection(e):
             pm.reject_dw_buy_intent(cs, token_id_int)
         raise
-    if isinstance(response, dict) and response.get("success") is False:
+    if not _placed(response).ok:
         pm.reject_dw_buy_intent(cs, token_id_int)
-        detail = response.get("errorMsg") or "CLOB rejected the buy"
-        raise SystemExit(str(detail))
+        raise SystemExit(response.message)
     try:
         pm.confirm_dw_buy_intent(cs, token_id_int)
     except Exception as e:  # noqa: BLE001 - post succeeded; retain pending marker
@@ -152,9 +196,10 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
 def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) -> None:
     """Market buy: spend `usd` pUSD on an outcome token (default FOK).
 
-    The order is sized against the DW's live pUSD balance to amount - exact
-    fee, the way `pm.quote_buy` prices it (the CLOB fee is price-dependent;
-    a flat reserve both over- and under-shoots).
+    The DW's live pUSD balance is the SDK's spend cap, so it sizes the order
+    to what the balance covers once the exact fee is held back, the way
+    `pm.quote_buy` prices it (the CLOB fee is price-dependent; a flat reserve
+    both over- and under-shoots).
     """
     ot = _order_type(order_type)
     pm.require_supported_market(token_id)
@@ -168,7 +213,7 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
         # Preflight with the SDK's own sizing (see pm.MIN_MARKETABLE_USD) so
         # the error names the exact top-up, not just the CLOB's bare refusal.
         try:
-            quote = pm.quote_buy(client, token_id, usd, balance, ot)
+            quote = _quote(client, token_id, usd, balance, ot)
             if quote["blocked"]:
                 raise SystemExit(
                     f"a ${usd:.2f} buy against a {balance:.6f} pUSD balance "
@@ -182,17 +227,18 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
         # let the CLOB itself validate the order.
         except Exception:  # noqa: BLE001 # nosec B110
             pass
-        price = client.calculate_market_price(token_id, pm.BUY_SIDE, usd, ot)
-        # pylint: disable-next=protected-access
-        amount = client._adjust_buy_amount_for_balance(
-            token_id, usd, price, balance, None
-        )
-        # at the price the requested --usd reaches, not re-priced for `amount`
+        # dust: the SDK would size the order to nothing
+        if balance < pm.MIN_MARKETABLE_USD:
+            raise SystemExit(
+                f"a ${usd:.2f} buy against a {balance:.6f} pUSD balance would be "
+                f"rejected: under the CLOB's ${pm.MIN_MARKETABLE_USD:.0f} "
+                "marketable minimum — run `funds.py top-up` first"
+            )
         order = client.create_market_order(
             token_id=token_id,
             side=pm.BUY_SIDE,
-            amount=amount,
-            max_price=price,
+            amount=usd,
+            max_spend=balance,
             order_type=ot,
         )
         return _post_buy_with_recovery_hint(client, cs, token_id, order)
@@ -213,7 +259,7 @@ def cmd_quote(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) 
 
     def op(client, dw):
         balance = pm.units_to_usd(pm.erc20_balance_of(cs.w3, pm.PUSD, dw))
-        return pm.quote_buy(client, token_id, usd, balance, ot)
+        return _quote(client, token_id, usd, balance, ot)
 
     _run_client(cs, op)
 
@@ -235,7 +281,7 @@ def cmd_sell(
         order = client.create_market_order(
             token_id=token_id, side="SELL", shares=shares, order_type=ot
         )
-        return client.post_order(order)
+        return _placed(client.post_order(order))
 
     _run_client(cs, op, retry_auth=False)
 
@@ -278,7 +324,7 @@ def cmd_limit(  # pylint: disable=too-many-arguments
         )
         if order_side == pm.BUY_SIDE:
             return _post_buy_with_recovery_hint(client, cs, token_id, order)
-        return client.post_order(order)
+        return _placed(client.post_order(order))
 
     _run_client(cs, op, retry_auth=False)
 

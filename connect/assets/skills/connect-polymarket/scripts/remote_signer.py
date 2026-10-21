@@ -31,8 +31,7 @@ import time
 from eth_account.messages import _hash_eip191_message, encode_typed_data
 from pm_common import ConnectSigner, load_state, save_state
 from polymarket import ApiKeyCreds, PRODUCTION, SecureClient
-from polymarket._internal.actions.auth import create_api_key_sync, derive_api_key_sync
-from polymarket._internal.actions.orders.post import build_post_order_request
+from polymarket._internal.actions.auth import create_or_derive_api_key_sync
 from polymarket._internal.environment import get_environment_config
 from polymarket._internal.l1_auth import sign_api_key_auth
 from polymarket.clients._transport import SyncTransport
@@ -62,74 +61,28 @@ class RemoteSigner:
         return _Signed(self._cs.sign_digest(_hash_eip191_message(signable)))
 
 
-class ConnectClient(SecureClient):
-    """The SDK client, answering order calls with the CLOB's own JSON.
+def _refuse_direct_send(*args, **kwargs):
+    """Refuse an SDK call that would send past Connect's relayer proxy."""
+    raise NotImplementedError(
+        "sends a transaction or order outside Connect's relayer proxy; use the "
+        "skill's scripts instead"
+    )
 
-    Also carries the buy sizing ``pm.quote_buy`` and ``buy`` share.
+
+class ConnectClient(SecureClient):
+    """The SDK client, with its own senders closed.
+
+    Each signs through Connect and goes straight to Polymarket: the place_*
+    calls post past the scripts' order flow, and the rest go to the relayer
+    or builder gateway rather than through Connect's relayer proxy.
     """
 
-    def post_order(self, signed_order) -> dict:
-        """Post a signed order; return the CLOB's reply as it sent it.
-
-        The SDK's reply model renames the fields, and it reads a placed
-        ``success: true, status: unmatched`` order as a rejection.
-        """
-        path, payload = build_post_order_request(
-            signed_order, owner_api_key=self._ctx.credentials.key
-        )
-        return self._ctx.secure_clob.post_json(path, json=payload)
-
-    def get_order(self, *, order_id: str) -> dict:
-        """One order's status, as the CLOB's JSON (times as it sent them)."""
-        return self._ctx.secure_clob.get_json(f"/data/order/{order_id}")
-
-    def get_open_orders(self) -> list:
-        """Every open order, as the CLOB's JSON rows, read page by page.
-
-        The SDK's strict order model rejects rows the CLOB does send (a null
-        ``associate_trades``, missing fields), and those are still orders.
-        Pages run from the CLOB's start cursor until its end marker; a page
-        that is not a list of rows raises rather than reading as no orders.
-        """
-        orders: list = []
-        cursor = "MA=="  # the CLOB's start-of-list cursor
-        while cursor != "LTE=":  # the CLOB's no-more-pages marker
-            page = self._ctx.secure_clob.get_json(
-                "/data/orders", params={"next_cursor": cursor}
-            )
-            rows, cursor = page["data"], page["next_cursor"]
-            if not isinstance(rows, list) or not all(
-                isinstance(row, dict) for row in rows
-            ):
-                raise ValueError(f"malformed /data/orders page: {page!r}")
-            orders.extend(rows)
-        return orders
-
-    def calculate_market_price(
-        self, token_id: str, side: str, amount: float, order_type: str
-    ) -> float:
-        """Price level a market order of ``amount`` reaches on the live book."""
-        return float(
-            self.estimate_market_price(
-                token_id=token_id, side=side, amount=amount, order_type=order_type
-            )
-        )
-
-    def _adjust_buy_amount_for_balance(
-        self, token_id: str, amount: float, price: float, balance: float, _builder: None
-    ) -> float:
-        """Spend what ``balance`` covers once the market's taker fee is held back.
-
-        The fee is charged on min(amount, balance) and taken out of the
-        balance, so a balance of exactly ``amount`` leaves amount - fee.
-        """
-        market = self._ctx.order_metadata.resolve_market(self._ctx, token_id=token_id)
-        fee_info = market.fee_info
-        rate = float(fee_info.rate) * (price * (1 - price)) ** float(fee_info.exponent)
-        fee = min(amount, balance) / price * rate
-        if balance > amount + fee:
-            return amount
-        return max(balance - fee, 0.0)
+    approve_erc20 = approve_erc1155_for_all = transfer_erc20 = _refuse_direct_send
+    setup_trading_approvals = execute_transaction = _refuse_direct_send
+    split_position = merge_positions = merge_multiple_positions = _refuse_direct_send
+    redeem_positions = execute_collateral_return_plan = _refuse_direct_send
+    place_limit_order = place_market_order = accept_combo_quote = _refuse_direct_send
+    authorize_session_key = revoke_session_key = _refuse_direct_send
 
 
 def make_clob_client(cs: ConnectSigner, funder: str) -> ConnectClient:
@@ -153,16 +106,14 @@ def make_clob_client(cs: ConnectSigner, funder: str) -> ConnectClient:
             passphrase=cached["api_passphrase"],
         )
     else:
-        # creates the key, or derives it when creating fails for any reason
-        # (one exists already, or no answer); nonce 0 as before
+        # the SDK's create-or-derive (derives once creating answers 400);
+        # nonce 0 as before
         auth = sign_api_key_auth(
             signer, chain_id=config.chain_id, timestamp=int(time.time()), nonce=0
         )
         clob = SyncTransport(base_url=config.clob_url)
         try:
-            creds = create_api_key_sync(clob, auth)
-        except Exception:  # noqa: BLE001 - as the old client, on any failure
-            creds = derive_api_key_sync(clob, auth)
+            creds = create_or_derive_api_key_sync(clob, auth)
         finally:
             clob.close()
         state["clob_creds"] = {
