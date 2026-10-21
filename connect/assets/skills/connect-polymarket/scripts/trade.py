@@ -66,9 +66,10 @@ _API_ERRORS = (
     UnexpectedResponseError,
 )
 
-# Order-reply codes that don't prove the order was not placed: the SDK reads
-# a CLOB reply of status "unmatched", or a success it cannot classify, as a
-# rejection and drops its order id.
+# Order-reply codes that leave placement uncertain. The SDK reads a CLOB
+# reply of status "unmatched", or one it cannot classify ("unknown"), as a
+# rejection and drops its order id and the reply's success flag; any other
+# refusal code it assigns proves the order was not placed.
 _UNCERTAIN_CODES = ("unmatched", "unknown")
 _UNCERTAIN = (
     "placement uncertain: the CLOB's reply does not show whether the order was "
@@ -137,8 +138,8 @@ def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
 def _post(client, order):
     """Post a signed order; refuse when its reply leaves placement uncertain.
 
-    A reply the SDK cannot read arrives after the CLOB has the order, so it
-    is uncertain too.
+    Uncertain: an "unmatched" or "unknown" code (see `_UNCERTAIN_CODES`), or
+    a reply the SDK cannot read, which arrives after the CLOB has the order.
     """
     try:
         response = client.post_order(order)
@@ -172,9 +173,9 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
     even if its response is lost. A later sweep can then check the DW's
     on-chain balance directly instead of depending on the lagging data API.
 
-    A rejected order reply or status-code 401 authentication rejection proves
-    that no order was submitted; a reply that leaves placement uncertain
-    (see `_post`) keeps the marker. Other exceptions remain ambiguous: a
+    A refusal code the SDK assigns to the reply, or a status-code 401
+    authentication rejection, proves that no order was submitted; a reply
+    that leaves placement uncertain (see `_post`) keeps the marker. Other exceptions remain ambiguous: a
     timeout, rate limit, intermediary response, or message-only auth error
     may arrive after the request reached the CLOB. A harmless
     zero-balance hint is safer than an undiscoverable filled position.
