@@ -50,14 +50,16 @@ safe's ERC-1271 SafeMessage hash, and registers exactly that digest
 For transactions, the same flow may pre-authorize the one deposit its 402
 top-up would send — the safe paying the mech balance tracker
 (allow_safe_deposit_once), shape-checked (a bare native transfer, or
-deposit(uint256) with no inner value) and bounded by an amount cap. Every
-allowance is single-use and short-lived. A live allowance is a bounded grant,
-not a promise about the caller: any matching request may consume it — for the
-deposit that means the agent could send the tracker payment itself, moving at
-most the cap into a balance the mech flow spends — which is accepted and
-audited, not prevented. A dry run (consume=False) makes that window and its
-cap observable rather than only guessable, which widens the odds of hitting
-it, not the grant itself.
+deposit(uint256) with no inner value) and bounded by an amount cap. The
+server's own agent top-up may pre-authorize the one native transfer it sends
+from the safe to the agent EOA itself (allow_agent_topup_once), capped at the
+amount it computed. Every allowance is single-use and short-lived. A live
+allowance is a bounded grant, not a promise about the caller: any matching
+request may consume it — for the deposit that means the agent could send the
+tracker payment itself, moving at most the cap into a balance the mech flow
+spends — which is accepted and audited, not prevented. A dry run
+(consume=False) makes that window and its cap observable rather than only
+guessable, which widens the odds of hitting it, not the grant itself.
 
 The modes are an operator concept, not an agent one: every agent-facing
 refusal names the rule it violated and where the operator can change it, but
@@ -120,6 +122,16 @@ class _DepositAllowance:
 
 
 @dataclass(frozen=True)
+class _AgentTopUpAllowance:
+    """One pre-authorized safe -> agent EOA native transfer, capped."""
+
+    chain: str
+    agent_signer: str  # lowercase; the signer's own address
+    amount_cap: int
+    expires: float
+
+
+@dataclass(frozen=True)
 class _SafeExec:
     """The execTransaction fields this gate has an opinion about."""
 
@@ -159,15 +171,20 @@ class _SafeExec:
 class Guard:
     """Mode/whitelist enforcement backed by the tamper-evident settings store."""
 
-    def __init__(self, store: SettingsStore, config: AppConfig) -> None:
-        """Initialize."""
+    def __init__(
+        self, store: SettingsStore, config: AppConfig, *, agent_signer: str
+    ) -> None:
+        """Initialize; `agent_signer` is the address of the key that signs."""
         self._store = store
         self._config = config
+        self._agent_signer = agent_signer.lower()
         self._allowance_lock = threading.Lock()
         # digest -> monotonic expiry; entries are consumed by check_sign_digest
         self._allowed_digests: dict[bytes, float] = {}
         # pre-authorized deposits; entries are consumed by check_transaction
         self._deposit_allowances: list[_DepositAllowance] = []
+        # pre-authorized agent top-ups; consumed by check_transaction
+        self._agent_topup_allowances: list[_AgentTopUpAllowance] = []
 
     def mode(self) -> str:
         """Return the currently enforced mode."""
@@ -214,6 +231,28 @@ class Guard:
                 )
             )
 
+    def allow_agent_topup_once(self, *, chain: str, amount_cap: int) -> None:
+        """Permit one restricted-mode native transfer from the safe to the agent EOA.
+
+        Server-side callers only (the agent top-up task, with the amount it
+        computed from the funding requirements). The recipient is always the
+        signer's own address, so the allowance can only move funds between
+        the two accounts this key already controls.
+        """
+        with self._allowance_lock:
+            self._purge_expired()
+            self._agent_topup_allowances = [
+                a for a in self._agent_topup_allowances if a.chain != chain.lower()
+            ]
+            self._agent_topup_allowances.append(
+                _AgentTopUpAllowance(
+                    chain=chain.lower(),
+                    agent_signer=self._agent_signer,
+                    amount_cap=amount_cap,
+                    expires=time.monotonic() + ALLOWANCE_TTL,
+                )
+            )
+
     def _purge_expired(self) -> None:
         """Drop expired allowances — loudly; the caller holds the allowance lock.
 
@@ -235,6 +274,14 @@ class Guard:
                 )
         self._deposit_allowances = [
             a for a in self._deposit_allowances if a.expires > now
+        ]
+        for topup in self._agent_topup_allowances:
+            if topup.expires <= now:
+                logger.warning(
+                    "agent top-up allowance on %s expired unconsumed", topup.chain
+                )
+        self._agent_topup_allowances = [
+            a for a in self._agent_topup_allowances if a.expires > now
         ]
 
     def check_sign_digest(self, digest: bytes) -> None:
@@ -367,6 +414,8 @@ class Guard:
         if exec_call.to.lower() not in whitelist.get(chain, ()):
             if self._consume_deposit_allowance(chain, exec_call, consume=consume):
                 return
+            if self._consume_agent_topup_allowance(chain, exec_call, consume=consume):
+                return
             # the whitelist is not editable through the API yet, so pointing at
             # it would send the operator down a path that does not exist
             raise GuardError(
@@ -405,5 +454,27 @@ class Guard:
                 if matches:
                     if consume:
                         del self._deposit_allowances[index]
+                    return True
+        return False
+
+    def _consume_agent_topup_allowance(
+        self, chain: str, exec_call: "_SafeExec", *, consume: bool
+    ) -> bool:
+        """Consume the agent top-up allowance this safe call matches, if any.
+
+        Only a bare native transfer to the agent EOA within the cap matches;
+        anything else consumes nothing, as for deposits.
+        """
+        with self._allowance_lock:
+            self._purge_expired()
+            for index, allowance in enumerate(self._agent_topup_allowances):
+                if (
+                    allowance.chain == chain
+                    and allowance.agent_signer == exec_call.to.lower()
+                    and exec_call.data == "0x"
+                    and exec_call.value <= allowance.amount_cap
+                ):
+                    if consume:
+                        del self._agent_topup_allowances[index]
                     return True
         return False

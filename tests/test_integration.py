@@ -156,7 +156,7 @@ def funded_signer_fixture(
         account=account,
         config=fork_config,
         activity=ActivityLog(store_path),
-        guard=Guard(fork_store, fork_config),
+        guard=Guard(fork_store, fork_config, agent_signer=account.address),
     )
 
 
@@ -168,7 +168,7 @@ def _fork_app(
     token: str,
 ) -> FastAPI:
     activity = ActivityLog(store_path)
-    guard = Guard(store, config)
+    guard = Guard(store, config, agent_signer=signer.address)
     return create_app(
         signer=signer,
         config=config,
@@ -681,7 +681,7 @@ def test_offchain_preflight_refuses_an_unreachable_mech_on_fork(
     fork_store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
 
     activity = ActivityLog(store_path)
-    guard = Guard(fork_store, fork_config)
+    guard = Guard(fork_store, fork_config, agent_signer=funded_signer.address)
     assert guard.mode() == MODE_UNRESTRICTED  # the guardrail is not what refuses here
     mech_service = MechService(funded_signer, fork_config, activity, guard)
 
@@ -733,7 +733,7 @@ def test_mech_request_on_fork_restricted_mode(
     # restricted mode is an operator opt-in now; set it explicitly, keeping
     # the default whitelist so the marketplace flow stays reachable
     fork_store.patch({"protected": {"mode": "restricted"}})
-    guard = Guard(fork_store, fork_config)
+    guard = Guard(fork_store, fork_config, agent_signer=funded_signer.address)
     assert guard.mode() == "restricted"
     mech_service = MechService(funded_signer, fork_config, activity, guard)
 
@@ -992,7 +992,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     # restricted mode is an operator opt-in now; set it explicitly, keeping
     # the default whitelist so the marketplace flow stays reachable
     fork_store.patch({"protected": {"mode": "restricted"}})
-    guard = Guard(fork_store, fork_config)
+    guard = Guard(fork_store, fork_config, agent_signer=account.address)
     signer = Signer(account=account, config=fork_config, activity=activity, guard=guard)
     safe_address = _deploy_safe(rpc_url, signer, account)
     _set_balance(rpc_url, safe_address, 10**18)

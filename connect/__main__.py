@@ -194,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     settings_store = SettingsStore(
         config.store_path / SETTINGS_FILE, derive_mac_key(account), activity
     )
-    guard = Guard(settings_store, config)
+    guard = Guard(settings_store, config, agent_signer=account.address)
     signer = Signer(account=account, config=config, activity=activity, guard=guard)
     mech = MechService(signer, config, activity, guard)
     logger.info("guardrail mode: %s", guard.mode())
