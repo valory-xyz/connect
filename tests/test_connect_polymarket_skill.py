@@ -273,16 +273,16 @@ def test_record_dw_token_best_effort_swallows_failure(
 def test_missing_approval_calls_when_nothing_is_granted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """All-missing yields 3 pUSD approvals and 3 operator grants (2 CTF, 1 V2)."""
+    """All-missing yields 4 pUSD approvals and 4 operator grants (3 CTF, 1 V2)."""
     monkeypatch.setattr(pm, "erc20_allowance", lambda *a: 0)
     monkeypatch.setattr(pm, "is_approved_for_all", lambda *a: False)
     calls = pm.missing_approval_calls(None, ADDR_A)
-    assert len(calls) == 6
+    assert len(calls) == 8
     pusd_calls = [c for c in calls if c["target"] == pm.PUSD]
     ctf_calls = [c for c in calls if c["target"] == pm.CTF]
     position_calls = [c for c in calls if c["target"] == _POSITION_MANAGER]
-    assert len(pusd_calls) == 3
-    assert len(ctf_calls) == 2
+    assert len(pusd_calls) == 4
+    assert len(ctf_calls) == 3
     assert len(position_calls) == 1
     assert all(c["data"].startswith("0x095ea7b3") for c in pusd_calls)
     assert all(c["data"].startswith("0xa22cb465") for c in ctf_calls + position_calls)
@@ -309,7 +309,7 @@ def test_missing_approval_calls_partial(monkeypatch: pytest.MonkeyPatch) -> None
     )
     monkeypatch.setattr(pm, "is_approved_for_all", lambda *a: True)
     calls = pm.missing_approval_calls(None, ADDR_A)
-    assert len(calls) == 2  # the two pUSD spenders that are NOT yet approved
+    assert len(calls) == 3  # the three pUSD spenders that are NOT yet approved
     assert all(c["target"] == pm.PUSD for c in calls)
 
 
@@ -1619,24 +1619,22 @@ def test_constants_report_publishes_the_addresses_and_hosts() -> None:
         c.address for c in pm.CONTRACTS
     ]
     assert pm.CLOB_HOST in report["api_hosts"].values()
-    # the approval set, named: the DW's three venues, not the two adapters,
-    # and not the retired NegRiskAdapter
+    # the approval set, named: the DW's three venues and the NegRiskAdapter
+    # neg-risk orders need, not the two collateral adapters
+    venues = {"CTFExchange", "NegRiskCTFExchange", "NegRiskAdapter", "ExchangeV3"}
     approvals = report["dw_trading_approvals"]
-    assert set(approvals["pusd_allowances"].values()) == {
-        "CTFExchange",
-        "NegRiskCTFExchange",
-        "ExchangeV3",
-    }
+    assert set(approvals["pusd_allowances"].values()) == venues
     named = {name for section in approvals.values() for name in section.values()}
-    assert named == {"CTFExchange", "NegRiskCTFExchange", "ExchangeV3"}
+    assert named == venues
 
 
 def test_constants_report_describes_the_protocol_v2_contracts() -> None:
-    """The rows Protocol V2 adds, and the NegRiskAdapter marked as no longer approved."""
+    """The rows Protocol V2 adds, and the NegRiskAdapter still listed as granted."""
     rows = {c["name"]: c for c in pm.constants_report()["contracts"]}
     assert rows["ExchangeV3"]["address"] == _EXCHANGE_V3
     assert rows["PositionManager"]["address"] == _POSITION_MANAGER
-    assert "no longer granted a DW approval" in rows["NegRiskAdapter"]["role"]
+    assert rows["NegRiskAdapter"]["address"] == _NEG_RISK_ADAPTER
+    assert "no longer granted" not in rows["NegRiskAdapter"]["role"]
 
 
 def test_status_prints_the_labels_beside_the_approvals(monkeypatch, capsys) -> None:
@@ -2795,16 +2793,22 @@ def _fake_pip(venv: Path, exit_code: int = 0) -> Path:
     return pip
 
 
-def _fake_venv(root: Path, complete: bool = True) -> Path:
+def _fake_venv(root: Path, complete: bool = True, built_by: str = "python3") -> Path:
     """Build a venv stub whose python answers the certifi query.
 
     `complete=False` reproduces a venv whose pip install died partway: the
-    interpreter exists, the sentinel does not.
+    interpreter exists, the sentinel does not. Anything else is run by
+    `built_by`, by default the `python3` on PATH, so the venv's version is that
+    interpreter's.
     """
     venv = root / ".venv"
     (venv / "bin").mkdir(parents=True)
     python = venv / "bin" / "python"
-    python.write_text("#!/bin/sh\necho /fake/cacert.pem\n", encoding="utf-8")
+    python.write_text(
+        f'#!/bin/sh\ncase "$*" in *certifi*) echo /fake/cacert.pem ;;\n'
+        f'*) exec "{built_by}" "$@" ;; esac\n',
+        encoding="utf-8",
+    )
     python.chmod(0o755)
     _fake_pip(venv)  # creation is gated on pip, so the stub needs one
     if complete:
@@ -2961,19 +2965,34 @@ def test_bootstrap_emits_only_shell_assignments_on_stdout(tmp_path) -> None:
 
 
 # A `python3` stand-in that reports `version`: it answers `--version` and runs
-# `-c` code under that `sys.version_info`, and refuses anything else (such as
-# `-m venv`), so a run that gets past the version check shows.
+# `-c` code under that `sys.version_info`, logs `-m venv --clear` to `log`, and
+# refuses anything else, so a run that gets past the version check shows.
 _PYTHON3 = """#!{executable}
-import sys
+import collections, sys
 VERSION = "{version}"
 if sys.argv[1] == "--version":
     print("Python " + VERSION)
 elif sys.argv[1] == "-c":
-    sys.version_info = tuple(int(part) for part in VERSION.split("."))
+    version_info = collections.namedtuple("version_info", "major minor micro")
+    sys.version_info = version_info(*(int(part) for part in VERSION.split(".")))
     exec(sys.argv[2])
+elif sys.argv[1:4] == ["-m", "venv", "--clear"]:
+    with open("{log}", "a") as log:
+        print(*sys.argv[1:], file=log)
 else:
     sys.exit("stand-in python3 will not run " + " ".join(sys.argv[1:]))
 """
+
+
+def _python3(directory: Path, version: str, log: Path) -> Path:
+    """Write the `python3` stand-in reporting `version` into `directory`."""
+    directory.mkdir(exist_ok=True)
+    python3 = directory / "python3"
+    python3.write_text(
+        _PYTHON3.format(executable=sys.executable, version=version, log=log)
+    )
+    python3.chmod(0o755)
+    return python3
 
 
 @requires_posix_shell
@@ -2991,11 +3010,7 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
     (venv / OLD_SENTINEL).touch()
     pip_log = tmp_path / "pip.log"
     (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho "$@" >> "{pip_log}"\n')
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    python3 = bin_dir / "python3"
-    python3.write_text(_PYTHON3.format(executable=sys.executable, version=version))
-    python3.chmod(0o755)
+    bin_dir = _python3(tmp_path / "bin", version, pip_log).parent
 
     result = _run_bootstrap(
         tmp_path, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
@@ -3016,6 +3031,45 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
         assert "polymarket-client==0.13.0" in installs
         assert not [name for name in installs if "py-clob-client" in name]
         assert (venv / SENTINEL).is_file()
+
+
+@requires_posix_shell
+@pytest.mark.parametrize(
+    ("built_with", "rebuilt"), [("3.10.12", True), ("3.11.2", False)]
+)
+def test_bootstrap_rebuilds_a_venv_another_python3_made(
+    tmp_path, built_with, rebuilt
+) -> None:
+    """A venv an older python3 built is rebuilt before the install, not reused.
+
+    A user who upgrades python3 to install the SDK must not stay stuck on the
+    old venv, whose pip finds no polymarket-client for its Python. One built by
+    the same minor version is installed into as it is.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    log = tmp_path / "commands.log"
+    old = _python3(tmp_path / "old", built_with, log)
+    venv = _fake_venv(tmp_path, complete=False, built_by=str(old))
+    (venv / OLD_SENTINEL).touch()
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho pip "$@" >> "{log}"\n')
+    bin_dir = _python3(tmp_path / "bin", "3.11.9", log).parent
+
+    result = _run_bootstrap(
+        tmp_path, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    )
+
+    assert result.returncode == 0, result.stderr
+    commands = log.read_text(encoding="utf-8").splitlines()
+    install = next(
+        i for i, c in enumerate(commands) if "polymarket-client==0.13.0" in c
+    )
+    venv_runs = [i for i, c in enumerate(commands) if c.startswith("-m venv")]
+    rebuilds = [f"-m venv --clear {venv}"] if rebuilt else []
+    assert [commands[i] for i in venv_runs] == rebuilds
+    assert all(i < install for i in venv_runs)
+    notice = f"rebuilding venv at {venv} with Python 3.11.9"
+    assert (notice in result.stderr) is rebuilt
+    assert (venv / SENTINEL).is_file()
 
 
 def test_workspace_gitignores_the_skill_venv() -> None:
@@ -3323,16 +3377,17 @@ def test_require_supported_market_refuses_anything_else(monkeypatch, listed) -> 
 
 # --- Protocol V2 trading approvals on the DepositWallet ---------------------------
 
-# (token, spender or operator) of each approval the DW needs, and of the two
-# the code granted the retired NegRiskAdapter before Protocol V2.
+# (token, spender or operator) of each approval the DW needs: the pre-V2 set,
+# which includes the NegRiskAdapter neg-risk orders need, and the V2 pair.
 _V1_APPROVALS = (
     (_PUSD, _CTF_EXCHANGE),
     (_PUSD, _NEG_RISK_CTF_EXCHANGE),
+    (_PUSD, _NEG_RISK_ADAPTER),
     (_CTF, _CTF_EXCHANGE),
     (_CTF, _NEG_RISK_CTF_EXCHANGE),
+    (_CTF, _NEG_RISK_ADAPTER),
 )
 _V2_APPROVALS = ((_PUSD, _EXCHANGE_V3), (_POSITION_MANAGER, _EXCHANGE_V3))
-_RETIRED_APPROVALS = ((_PUSD, _NEG_RISK_ADAPTER), (_CTF, _NEG_RISK_ADAPTER))
 
 
 def _approval_calls(approvals) -> list:
@@ -3366,7 +3421,7 @@ def _approvals_on_chain(monkeypatch, granted: set) -> None:
 
 
 def test_dw_setup_includes_v2_approvals(monkeypatch) -> None:
-    """A fresh DW gets the V1 set and both V2 approvals, none to the NegRiskAdapter.
+    """A fresh DW gets the V1 set, NegRiskAdapter included, and both V2 approvals.
 
     The pUSD approval to ExchangeV3 is MaxUint256: Polymarket's relayer
     refuses the whole batch for anything less.
@@ -3378,7 +3433,7 @@ def test_dw_setup_includes_v2_approvals(monkeypatch) -> None:
 
 def test_existing_wallet_gets_v2_approvals_once(monkeypatch) -> None:
     """A DW holding the pre-V2 set gets exactly the two V2 approvals, then none."""
-    granted = set(_V1_APPROVALS + _RETIRED_APPROVALS)
+    granted = set(_V1_APPROVALS)
     _approvals_on_chain(monkeypatch, granted)
     calls = pm.missing_approval_calls(None, DW_ADDR)
     assert sorted(calls, key=str) == _approval_calls(_V2_APPROVALS)
