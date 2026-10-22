@@ -270,7 +270,10 @@ less, in one plain `execTransaction` CALL (no calldata, no MultiSend). Tokens
 never move. An EOA that cannot pay the gas fails the send at estimation, which
 costs nothing. A top-up that is mined successfully is audited as
 `agent_topup`; one that is refused, fails to send, reverts or is not mined in
-time, as `agent_topup_failed`. In restricted mode the send passes through a
+time, as `agent_topup_failed`. Those two entries are the top-up's whole audit:
+it is not a `transaction`, `send_failed` or `blocked` entry, it does not count
+towards the `transactions` metric in `agent_performance.json`, and it never
+becomes its `last_activity`. In restricted mode the send passes through a
 one-shot allowance for exactly that transfer, capped at the amount sent.
 
 `GET /funds-status` reports `threshold - balance` for every entry, except the

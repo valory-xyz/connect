@@ -224,11 +224,13 @@ class Signer:
         data: str = "0x",
         request_id: str | None = None,
         gas: int | None = None,
+        audit: bool = True,
     ) -> str:
         """Fill, sign and broadcast one EOA transaction; returns the tx hash.
 
         With a request_id the call is idempotent: repeating a completed send
-        returns the original tx hash without rebroadcasting.
+        returns the original tx hash without rebroadcasting. audit=False is for
+        a caller that audits the outcome itself, under its own kind.
         """
         stamp = _call_stamp(chain, to, value, data)
         if request_id is not None:
@@ -238,7 +240,9 @@ class Signer:
             cached = self._requests.cached(request_id, stamp)
             if cached is not None:
                 return cached
-        self._check_transaction(chain=chain, to=to, value=value, data=data)
+        self._check_transaction(
+            chain=chain, to=to, value=value, data=data, audit=audit
+        )
 
         def broadcast() -> str:
             return self._send(
@@ -248,6 +252,7 @@ class Signer:
                 data=data,
                 gas=gas,
                 request_id=request_id,
+                audit=audit,
             )
 
         if request_id is None:
@@ -290,6 +295,7 @@ class Signer:
         data: str = "0x",
         request_id: str | None = None,
         gas: int | None = None,
+        audit: bool = True,
     ) -> str:
         """Act as the service safe: wrap one inner call and send it.
 
@@ -311,6 +317,7 @@ class Signer:
             # the EOA path is a different logical action and must not collide
             request_id=None if request_id is None else f"safe:{request_id}",
             gas=gas,
+            audit=audit,
         )
 
     def refusal_reason(
@@ -378,6 +385,7 @@ class Signer:
         data: str,
         gas: int | None,
         request_id: str | None,
+        audit: bool,
     ) -> str:
         """Fill, sign and broadcast under the chain's nonce lock."""
         state = self._chains.get(chain)
@@ -397,20 +405,26 @@ class Signer:
                 # (e.g. "nonce too low" after a pool drop): forget it so the
                 # next send resyncs from the node's pending count.
                 state.next_nonce = None
-                self._activity.record(
-                    "send_failed", chain=chain, to=to, value=str(value), error=str(e)
-                )
+                if audit:
+                    self._activity.record(
+                        "send_failed",
+                        chain=chain,
+                        to=to,
+                        value=str(value),
+                        error=str(e),
+                    )
                 raise SignerError(f"send failed: {e}") from e
             state.next_nonce = tx["nonce"] + 1
-        self._activity.record(
-            "transaction",
-            chain=chain,
-            to=to,
-            value=str(value),
-            data_size=len((data or "0x").removeprefix("0x")) // 2,
-            tx_hash=tx_hash,
-            request_id=request_id,
-        )
+        if audit:
+            self._activity.record(
+                "transaction",
+                chain=chain,
+                to=to,
+                value=str(value),
+                data_size=len((data or "0x").removeprefix("0x")) // 2,
+                tx_hash=tx_hash,
+                request_id=request_id,
+            )
         return tx_hash
 
     def _fill_transaction(
@@ -444,21 +458,24 @@ class Signer:
             tx["gasPrice"] = w3.eth.gas_price
         return tx
 
-    def _check_transaction(self, *, chain: str, to: str, value: int, data: str) -> None:
+    def _check_transaction(  # pylint: disable=too-many-arguments
+        self, *, chain: str, to: str, value: int, data: str, audit: bool
+    ) -> None:
         """Consult the guardrail; a denial is audited and surfaced as SignerError."""
         if self._guard is None:
             return
         try:
             self._guard.check_transaction(chain, to, value, data)
         except GuardError as e:
-            self._activity.record(
-                "blocked",
-                action="send",
-                chain=chain,
-                to=to,
-                value=str(value),
-                reason=str(e),
-            )
+            if audit:
+                self._activity.record(
+                    "blocked",
+                    action="send",
+                    chain=chain,
+                    to=to,
+                    value=str(value),
+                    reason=str(e),
+                )
             raise SignerError(str(e)) from e
 
     def sign_digest(self, digest: bytes) -> str:

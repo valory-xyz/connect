@@ -85,7 +85,11 @@ def _send_agent_topup(  # pylint: disable=too-many-arguments,too-many-positional
         # outlive a switch back to restricted for its TTL
         if guard.mode() == MODE_RESTRICTED:
             guard.allow_agent_topup_once(chain=chain, amount_cap=amount)
-        tx_hash = signer.send_via_safe(chain, signer.address, value=amount, data="0x")
+        # audited below under its own kind, so Pearl's transactions metric and
+        # last_activity show only what the agent did
+        tx_hash = signer.send_via_safe(
+            chain, signer.address, value=amount, data="0x", audit=False
+        )
         receipt = signer.w3(chain).eth.wait_for_transaction_receipt(
             HexBytes(tx_hash),
             timeout=MAX_RECEIPT_TIMEOUT,

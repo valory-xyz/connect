@@ -20,6 +20,7 @@
 """The agent top-up: the rule, the /funds-status deficits it leaves, the task."""
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -30,7 +31,7 @@ from fastapi.testclient import TestClient
 from web3 import Web3
 
 from connect import wallet
-from connect.activity import ActivityLog
+from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import AppConfig, ChainConfig, FundRequirement, NATIVE_ASSET
 from connect.guard import Guard
 from connect.server import app as app_module
@@ -270,6 +271,13 @@ def _audited(app_config: AppConfig, kind: str) -> list[dict]:
     return [e for e in audit_entries(app_config.store_path) if e["kind"] == kind]
 
 
+def _performance_card(app_config: AppConfig) -> tuple[int, str | None]:
+    """Return the transactions metric and last_activity, as Pearl reads them."""
+    payload = json.loads((app_config.store_path / PERFORMANCE_FILE).read_text())
+    (metric,) = payload["metrics"]
+    return metric["value"], payload["last_activity"]
+
+
 class TestTopUpAgentSigner:
     """One check: a plain safe CALL per chain that has something to move."""
 
@@ -342,6 +350,29 @@ class TestTopUpAgentSigner:
         (entry,) = _audited(app_config, "agent_topup")
         assert (entry["chain"], entry["value"]) == ("testchain", "401")
         assert entry["tx_hash"].startswith("0x")
+
+    def test_a_topup_is_not_the_agent_s_activity(  # pylint: disable=too-many-arguments
+        self,
+        app_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        sends: list,
+    ) -> None:
+        """A top-up is audited only as itself; Pearl's card shows the agent's last act."""
+        signer = _signer_on(
+            test_signer, BalancesW3({test_signer.address: 99, SAFE: 10_000})
+        )
+        signer.set_guard(guard)
+        app_config.fund_requirements = {"testchain": REQUIREMENTS}
+        activity.record("sign_message", digest="0x" + "ab" * 32)
+        app_module.top_up_agent_signer(app_config, signer, guard, activity, set())
+        assert len(sends) == 1
+        assert [e["kind"] for e in audit_entries(app_config.store_path)] == [
+            "sign_message",
+            "agent_topup",
+        ]
+        assert _performance_card(app_config) == (0, "sign_message")
 
     def test_restricted_arms_the_allowance_it_spends(  # pylint: disable=too-many-arguments
         self,
@@ -458,6 +489,8 @@ class TestTopUpAgentSigner:
         (failed,) = _audited(app_config, "agent_topup_failed")
         assert (failed["chain"], failed["tx_hash"]) == ("broken", None)
         assert "nonce too low" in failed["error"]
+        assert not _audited(app_config, "send_failed")
+        assert _performance_card(app_config) == (0, None)
 
     def test_a_guard_refusal_does_not_stop_the_others(  # pylint: disable=too-many-arguments
         self,
@@ -488,6 +521,8 @@ class TestTopUpAgentSigner:
         (failed,) = _audited(app_config, "agent_topup_failed")
         assert failed["chain"] == "broken"
         assert "do not allow the safe to call" in failed["error"]
+        assert not _audited(app_config, "blocked")
+        assert _performance_card(app_config) == (0, None)
 
     def test_an_unreadable_chain_does_not_stop_the_others(  # pylint: disable=too-many-arguments
         self,
