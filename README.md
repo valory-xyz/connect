@@ -201,10 +201,9 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   the one safe→balance-tracker payment a 402 top-up would send, single-use,
   shape-checked (bare native transfer or `deposit(uint256)` with no inner
   value) and capped at the same bound mech-client itself enforces on the
-  shortfall (10× the mech's per-request rate). The server's own agent
-  top-up (see [Agent top-up](#agent-top-up)) arms a third, the same way: one
-  bare native transfer from the safe to the agent EOA itself, capped at the
-  amount it computed. The MechMarketplace contract per chain
+  shortfall (10× the mech's per-request rate). The
+  [agent top-up](#agent-top-up) arms the same bare native shape for the agent
+  EOA. The MechMarketplace contract per chain
   (imported from the pinned mech-client) is whitelisted by default — the only
   contract the safe calls in the on-chain mech flow — so mech requests work out
   of the box. Balance trackers and payment tokens are deliberately not
@@ -260,34 +259,29 @@ semantics are designed.
 ## Agent top-up
 
 `CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS` is
-`{chain: {"agent" | "safe": {asset: requirement}}}`, where a requirement is
-`{"threshold", "topup", "min_tx_balance"?}` in wei (decimal strings or
-integers; `min_tx_balance` only means something on the agent's native entry)
-or, as before, a bare amount read as `threshold = topup`.
+`{chain: {"agent" | "safe": {asset: {"threshold", "topup"}}}}`, amounts in wei
+as decimal strings or integers.
 
-Beside the run-window job, the server checks the agent EOA's native balance at
-start and then every hour (`AGENT_TOPUP_INTERVAL_SECONDS`; a restart always
-checks). On every chain with a safe, when the EOA is below its native
-`threshold`, it needs `topup - balance`. If the EOA holds at least
-`min_tx_balance` (enough to pay for the transfer), the safe sends it that much
-native token in one plain `execTransaction` CALL (no calldata, no MultiSend),
-or all it holds when that is less. Without `min_tx_balance` on a chain nothing
-moves there. Tokens never move. Each top-up is audited as `agent_topup`; in
-restricted mode it passes through the one-shot allowance described under
-[Guardrail](#guardrail).
+At start and then every `AGENT_TOPUP_INTERVAL_SECONDS`, on every chain with a
+safe and a native requirement for both roles, the server checks the agent
+EOA's native balance. Below its `threshold`, the EOA needs `topup - balance`,
+and the safe sends it that much native token, or all it holds when that is
+less, in one plain `execTransaction` CALL (no calldata, no MultiSend). Tokens
+never move. An EOA that cannot pay the gas fails the send at estimation, which
+costs nothing. A top-up that is mined successfully is audited as
+`agent_topup`; one that is refused, fails to send, reverts or is not mined in
+time, as `agent_topup_failed`. In restricted mode the send passes through a
+one-shot allowance for exactly that transfer, capped at the amount sent.
 
-`GET /funds-status` reports what is left once the top-up has run, from the same
-rule, as soon as the balances are read:
+`GET /funds-status` reports `threshold - balance` for every entry, except the
+native ones on a chain whose last top-up succeeded. There, an agent EOA below
+its `threshold` is left to the next top-up, and the safe is asked for what
+that needs:
 
-| Agent EOA ≥ `min_tx_balance` | Safe native | Agent EOA deficit | Safe deficit |
-|---|---|---|---|
-| no | any | `topup - balance` | `threshold - balance`, as before |
-| yes | ≥ what the EOA needs | 0 | `threshold - balance`, as before |
-| yes | less, but not 0 | 0 | the EOA's shortfall + the safe's `topup` |
-| yes | 0 | 0 | the EOA's need + the safe's `topup` |
-
-Every other entry, and every chain without `min_tx_balance`, still reports
-`threshold - balance`.
+| Safe native | Agent EOA deficit | Safe deficit |
+|---|---|---|
+| ≥ what the EOA needs | 0 | `threshold - balance` |
+| less | 0 | what the safe cannot cover + the safe's `topup` |
 
 ## Threat-model notes
 
@@ -448,7 +442,7 @@ Run standalone (mimicking the Pearl runner):
 export CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS=<rpc-url>
 export CONNECTION_CONFIGS_CONFIG_STORE_PATH=/path/to/persistent_data
 export CONNECTION_CONFIGS_CONFIG_SAFE_CONTRACT_ADDRESSES='{"gnosis":"0x..."}'
-export CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS='{"gnosis":{"agent":{"0x0000000000000000000000000000000000000000":{"threshold":"10000000000000000","topup":"50000000000000000","min_tx_balance":"1000000000000000"}},"safe":{"0x0000000000000000000000000000000000000000":{"threshold":"1000000000000000000","topup":"5000000000000000000"}}}}'
+export CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS='{"gnosis":{"agent":{"0x0000000000000000000000000000000000000000":{"threshold":"10000000000000000","topup":"50000000000000000"}},"safe":{"0x0000000000000000000000000000000000000000":{"threshold":"1000000000000000000","topup":"5000000000000000000"}}}}'
 # cwd must contain ethereum_private_key.txt (encrypted web3 keystore JSON)
 uv run python -m connect --password-stdin   # prompts "Enter password:" on a TTY
 # legacy (password lands in /proc/<pid>/cmdline, readable by any local user):

@@ -100,27 +100,12 @@ def test_store_path_required(tmp_path: Path) -> None:
 NATIVE = "0x" + "00" * 20
 
 
-def test_fund_requirements_bare_amount_is_threshold_and_topup(tmp_path: Path) -> None:
-    """A bare amount, string or int, is read as threshold = topup."""
-    reqs = {"gnosis": {"agent": {NATIVE: "100"}, "safe": {NATIVE: 5}}}
-    env = base_env(tmp_path) | {FUND_REQUIREMENTS_ENV: json.dumps(reqs)}
-    config = load_config(env)
-    assert config.fund_requirements["gnosis"] == {
-        "agent": {NATIVE: {"threshold": 100, "topup": 100}},
-        "safe": {NATIVE: {"threshold": 5, "topup": 5}},
-    }
-
-
 def test_fund_requirements_funds_manager_shape(tmp_path: Path) -> None:
-    """The funds-manager shape parses to ints; min_tx_balance stays optional."""
+    """The funds-manager shape parses to ints, from strings or ints."""
     reqs = {
         "Polygon": {
             "agent": {
-                NATIVE: {
-                    "threshold": "1600000000000000000",
-                    "topup": "8000000000000000000",
-                    "min_tx_balance": "100000000000000000",
-                }
+                NATIVE: {"threshold": "1600000000000000000", "topup": 8 * 10**18}
             },
             "safe": {NATIVE: {"threshold": "3", "topup": 15}},
         }
@@ -129,13 +114,7 @@ def test_fund_requirements_funds_manager_shape(tmp_path: Path) -> None:
     config = load_config(env)
     assert config.fund_requirements == {
         "polygon": {
-            "agent": {
-                NATIVE: {
-                    "threshold": 16 * 10**17,
-                    "topup": 8 * 10**18,
-                    "min_tx_balance": 10**17,
-                }
-            },
+            "agent": {NATIVE: {"threshold": 16 * 10**17, "topup": 8 * 10**18}},
             "safe": {NATIVE: {"threshold": 3, "topup": 15}},
         }
     }
@@ -144,15 +123,17 @@ def test_fund_requirements_funds_manager_shape(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("requirement", "match"),
     [
-        ({"threshold": "1"}, r"missing \['topup'\]"),
-        ({"topup": "1"}, r"missing \['threshold'\]"),
-        ({"threshold": "1", "topup": "1", "top_up": "1"}, r"unknown \['top_up'\]"),
+        ({"threshold": "1"}, "must be an object of exactly"),
+        ({"topup": "1"}, "must be an object of exactly"),
+        ({"threshold": "1", "topup": "1", "top_up": "1"}, "exactly"),
+        ({"threshold": "1", "topup": "1", "min_tx_balance": "1"}, "exactly"),
+        ("100", "must be an object of exactly"),
+        (100, "must be an object of exactly"),
         ({"threshold": "1", "topup": "1.5"}, "topup must be a whole number"),
         ({"threshold": "-1", "topup": "1"}, "threshold must be >= 0"),
-        ({"threshold": "1", "topup": "1", "min_tx_balance": None}, "whole number"),
-        (True, "must be a whole number"),
-        (1.0, "must be a whole number"),
-        ("ten", "must be a whole number"),
+        ({"threshold": True, "topup": "1"}, "threshold must be a whole number"),
+        ({"threshold": "1", "topup": 1.0}, "topup must be a whole number"),
+        ({"threshold": "ten", "topup": "1"}, "threshold must be a whole number"),
     ],
 )
 def test_fund_requirements_bad_requirement_raises(

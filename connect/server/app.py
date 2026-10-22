@@ -28,6 +28,7 @@ import typing as t
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Response
+from hexbytes import HexBytes
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from connect import wallet
@@ -43,7 +44,11 @@ from connect.server.auth import (
     RequireAuth,
     require_local_origin,
 )
-from connect.server.mcp_tools import build_mcp
+from connect.server.mcp_tools import (
+    MAX_RECEIPT_TIMEOUT,
+    RECEIPT_POLL_SECONDS,
+    build_mcp,
+)
 from connect.settings import MODE_RESTRICTED, SettingsStore
 from connect.signer import Signer
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
@@ -56,7 +61,7 @@ logger = logging.getLogger("agent")
 PERFORMANCE_REFRESH_SECONDS = 15.0
 
 # how often the agent EOA's native balance is checked against its funding
-# requirement; a restart always checks first
+# requirement
 AGENT_TOPUP_INTERVAL_SECONDS = 3600.0
 
 
@@ -70,44 +75,73 @@ async def refresh_performance(activity: ActivityLog) -> None:
             logger.exception("could not refresh %s", PERFORMANCE_FILE)
 
 
-def top_up_agent_signer(
-    config: AppConfig, signer: Signer, guard: Guard, activity: ActivityLog
+def _send_agent_topup(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    chain: str, amount: int, signer: Signer, guard: Guard, activity: ActivityLog
+) -> bool:
+    """Send one top-up and wait for it to be mined; audit it either way."""
+    tx_hash: str | None = None
+    try:
+        # armed only while restricted: one armed in unrestricted mode would
+        # outlive a switch back to restricted for its TTL
+        if guard.mode() == MODE_RESTRICTED:
+            guard.allow_agent_topup_once(chain=chain, amount_cap=amount)
+        tx_hash = signer.send_via_safe(chain, signer.address, value=amount, data="0x")
+        receipt = signer.w3(chain).eth.wait_for_transaction_receipt(
+            HexBytes(tx_hash),
+            timeout=MAX_RECEIPT_TIMEOUT,
+            poll_latency=RECEIPT_POLL_SECONDS,
+        )
+        if receipt["status"] != 1:
+            raise RuntimeError("the transaction reverted")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.exception("agent top-up of %d wei on %s failed", amount, chain)
+        activity.record(
+            "agent_topup_failed",
+            chain=chain,
+            value=str(amount),
+            tx_hash=tx_hash,
+            error=str(e),
+        )
+        return False
+    activity.record("agent_topup", chain=chain, value=str(amount), tx_hash=tx_hash)
+    return True
+
+
+def top_up_agent_signer(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    config: AppConfig,
+    signer: Signer,
+    guard: Guard,
+    activity: ActivityLog,
+    topped_up: set[str],
 ) -> None:
     """Move native token from the safe to the agent EOA where the rule says so.
 
-    One plain safe CALL per chain. A failure on one chain is logged and the
-    others still run.
+    `topped_up` keeps the chains whose last top-up succeeded, for /funds-status.
     """
     for chain, topup in wallet.agent_topup(config, signer).items():
-        if topup.action is wallet.TopUpAction.NONE:
+        if topup.need == 0:
             continue
-        if topup.action is not wallet.TopUpAction.MOVE:
-            logger.info("agent top-up on %s: %s", chain, topup.action.value)
+        if topup.move == 0:
+            logger.info("agent top-up on %s: the safe holds no native token", chain)
             continue
-        try:
-            # armed only while restricted: one armed in unrestricted mode would
-            # outlive a switch back to restricted for its TTL
-            if guard.mode() == MODE_RESTRICTED:
-                guard.allow_agent_topup_once(chain=chain, amount_cap=topup.move)
-            tx_hash = signer.send_via_safe(
-                chain, signer.address, value=topup.move, data="0x"
-            )
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.exception("agent top-up of %d wei on %s failed", topup.move, chain)
-            continue
-        activity.record(
-            "agent_topup", chain=chain, value=str(topup.move), tx_hash=tx_hash
-        )
+        if _send_agent_topup(chain, topup.move, signer, guard, activity):
+            topped_up.add(chain)
+        else:
+            topped_up.discard(chain)
 
 
-async def top_up_agent(
-    config: AppConfig, signer: Signer, guard: Guard, activity: ActivityLog
+async def top_up_agent(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    config: AppConfig,
+    signer: Signer,
+    guard: Guard,
+    activity: ActivityLog,
+    topped_up: set[str],
 ) -> None:
-    """Top up the agent EOA at start, then hourly, until cancelled."""
+    """Top up the agent EOA at start, then every interval, until cancelled."""
     while True:
         try:
             await asyncio.to_thread(
-                top_up_agent_signer, config, signer, guard, activity
+                top_up_agent_signer, config, signer, guard, activity, topped_up
             )
         except Exception:  # pylint: disable=broad-exception-caught
             logger.exception("agent top-up check failed")
@@ -136,10 +170,12 @@ def create_app(  # pylint: disable=too-many-arguments
     )
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> t.AsyncIterator[None]:
+    async def lifespan(running: FastAPI) -> t.AsyncIterator[None]:
         tasks = (
             asyncio.create_task(refresh_performance(activity)),
-            asyncio.create_task(top_up_agent(config, signer, guard, activity)),
+            asyncio.create_task(
+                top_up_agent(config, signer, guard, activity, running.state.topped_up)
+            ),
         )
         try:
             async with mcp.session_manager.run():
@@ -165,6 +201,8 @@ def create_app(  # pylint: disable=too-many-arguments
     app.state.auth_limiter = limiter
     app.state.workspace = workspace
     app.state.funds_cache = {"at": 0.0, "value": {}, "lock": threading.Lock()}
+    # chains whose last agent top-up succeeded, for /funds-status
+    app.state.topped_up = set()
 
     app.include_router(pearl_routes.router)
     app.include_router(

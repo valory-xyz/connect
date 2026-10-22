@@ -36,14 +36,14 @@ from connect.guard import Guard
 from connect.server import app as app_module
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import Signer, SignerError, _ChainState
-from connect.wallet import AgentTopUp, TopUpAction, plan_agent_topup
+from connect.wallet import AgentTopUp, plan_agent_topup
 
 from tests.conftest import FakeW3, audit_entries
 
 SAFE = "0x" + "22" * 20
 TOKEN = "0x" + "77" * 20
 
-AGENT_NATIVE = FundRequirement(threshold=100, topup=500, min_tx_balance=10)
+AGENT_NATIVE = FundRequirement(threshold=100, topup=500)
 SAFE_NATIVE = FundRequirement(threshold=1000, topup=5000)
 REQUIREMENTS = {
     "agent": {NATIVE_ASSET: AGENT_NATIVE},
@@ -52,13 +52,14 @@ REQUIREMENTS = {
 
 
 class BalancesW3(FakeW3):
-    """Fake Web3 answering a native balance per address."""
+    """Fake Web3 answering a native balance per address; sends are mined."""
 
     def __init__(self, balances: dict[str, int]) -> None:
         """Hold the balances, keyed by any-case address."""
         super().__init__()
         self.balances = {k.lower(): v for k, v in balances.items()}
         self.eth.get_balance = self._balance  # type: ignore[method-assign]
+        self.eth.receipt = {"status": 1}
 
     def _balance(self, address: str) -> int:
         """Return the address's balance."""
@@ -74,68 +75,34 @@ def _signer_on(test_signer: Signer, w3: FakeW3, chain: str = "testchain") -> Sig
 
 
 class TestRule:
-    """The per-chain table, mirroring funds-manager's get_agent_topup."""
+    """The per-chain rule, mirroring funds-manager's get_agent_topup."""
 
     @pytest.mark.parametrize(
         ("agent_balance", "safe_balance", "expected"),
         [
-            # unreadable balance: nothing moves, deficits as read
-            (None, 10_000, AgentTopUp(TopUpAction.NONE, 0, None, None)),
-            (50, None, AgentTopUp(TopUpAction.NONE, 0, None, None)),
             # at the threshold: nothing due
-            (100, 10_000, AgentTopUp(TopUpAction.NONE, 0, None, None)),
-            # below min_tx_balance: the agent EOA cannot pay for the transfer
-            (9, 10_000, AgentTopUp(TopUpAction.SIGNER_ALERT, 0, 491, None)),
-            # exactly min_tx_balance can pay
-            (10, 10_000, AgentTopUp(TopUpAction.MOVE, 490, 0, None)),
-            # the safe covers the need, also exactly
-            (99, 10_000, AgentTopUp(TopUpAction.MOVE, 401, 0, None)),
-            (99, 401, AgentTopUp(TopUpAction.MOVE, 401, 0, None)),
-            # the safe holds less: all of it moves, the safe asks for the rest
-            (99, 400, AgentTopUp(TopUpAction.MOVE, 400, 0, 1 + 5000)),
-            (99, 1, AgentTopUp(TopUpAction.MOVE, 1, 0, 400 + 5000)),
+            (100, 10_000, AgentTopUp(need=0, move=0)),
+            # below it: up to topup, also from an empty EOA
+            (99, 10_000, AgentTopUp(need=401, move=401)),
+            (0, 10_000, AgentTopUp(need=500, move=500)),
+            # the safe covers the need exactly
+            (99, 401, AgentTopUp(need=401, move=401)),
+            # the safe holds less: all of it moves
+            (99, 400, AgentTopUp(need=401, move=400)),
             # the safe is empty
-            (99, 0, AgentTopUp(TopUpAction.SAFE_ALERT, 0, 0, 401 + 5000)),
+            (99, 0, AgentTopUp(need=401, move=0)),
         ],
     )
     def test_table(
-        self, agent_balance: int | None, safe_balance: int | None, expected: AgentTopUp
+        self, agent_balance: int, safe_balance: int, expected: AgentTopUp
     ) -> None:
-        """Each row of the table, with its boundaries."""
-        assert plan_agent_topup(REQUIREMENTS, agent_balance, safe_balance) == expected
+        """Each row of the rule, with its boundaries."""
+        assert plan_agent_topup(AGENT_NATIVE, agent_balance, safe_balance) == expected
 
     def test_topup_below_balance_is_nothing_due(self) -> None:
         """A topup under the balance (a misconfiguration) never asks for less than 0."""
-        requirements = {
-            "agent": {
-                NATIVE_ASSET: FundRequirement(threshold=100, topup=50, min_tx_balance=0)
-            },
-            "safe": {NATIVE_ASSET: SAFE_NATIVE},
-        }
-        assert plan_agent_topup(requirements, 60, 10_000).action is TopUpAction.NONE
-
-    @pytest.mark.parametrize(
-        "requirements",
-        [
-            # no min_tx_balance: never move, report as today
-            {
-                "agent": {NATIVE_ASSET: FundRequirement(threshold=100, topup=500)},
-                "safe": {NATIVE_ASSET: SAFE_NATIVE},
-            },
-            # no native safe entry
-            {"agent": {NATIVE_ASSET: AGENT_NATIVE}, "safe": {TOKEN: SAFE_NATIVE}},
-            {"agent": {NATIVE_ASSET: AGENT_NATIVE}},
-            # no native agent entry: tokens never move
-            {"agent": {TOKEN: AGENT_NATIVE}, "safe": {NATIVE_ASSET: SAFE_NATIVE}},
-        ],
-    )
-    def test_no_rule_without_native_entries_and_min_tx_balance(
-        self, requirements: dict
-    ) -> None:
-        """Without both native entries and min_tx_balance, nothing moves."""
-        assert plan_agent_topup(requirements, 0, 10_000) == AgentTopUp(
-            TopUpAction.NONE, 0, None, None
-        )
+        requirement = FundRequirement(threshold=100, topup=50)
+        assert plan_agent_topup(requirement, 60, 10_000) == AgentTopUp(0, 0)
 
 
 class TestAgentTopup:
@@ -150,7 +117,7 @@ class TestAgentTopup:
         )
         app_config.fund_requirements = {"testchain": REQUIREMENTS}
         assert wallet.agent_topup(app_config, signer) == {
-            "testchain": AgentTopUp(TopUpAction.MOVE, 400, 0, 5001)
+            "testchain": AgentTopUp(need=401, move=400)
         }
 
     def test_only_configured_chains_with_a_safe(
@@ -164,30 +131,48 @@ class TestAgentTopup:
         app_config.chains["testchain"].safe_address = None
         assert not wallet.agent_topup(app_config, test_signer)
 
-    def test_unreadable_balance_moves_nothing(
+    @pytest.mark.parametrize(
+        "requirements",
+        [
+            # no native safe entry
+            {"agent": {NATIVE_ASSET: AGENT_NATIVE}, "safe": {TOKEN: SAFE_NATIVE}},
+            {"agent": {NATIVE_ASSET: AGENT_NATIVE}},
+            # no native agent entry: tokens never move
+            {"agent": {TOKEN: AGENT_NATIVE}, "safe": {NATIVE_ASSET: SAFE_NATIVE}},
+        ],
+    )
+    def test_no_rule_without_both_native_entries(
+        self, app_config: AppConfig, test_signer: Signer, requirements: dict
+    ) -> None:
+        """Without a native entry for both roles, the chain is not planned."""
+        signer = _signer_on(test_signer, BalancesW3({test_signer.address: 0, SAFE: 0}))
+        app_config.fund_requirements = {"testchain": requirements}
+        assert not wallet.agent_topup(app_config, signer)
+
+    def test_unreadable_balance_leaves_the_chain_out(
         self,
         app_config: AppConfig,
         test_signer: Signer,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """An RPC failure plans nothing, and says why in the log."""
+        """An RPC failure plans nothing on that chain, and says why in the log."""
         signer = _signer_on(test_signer, BalancesW3({test_signer.address: 0}))
         app_config.fund_requirements = {"testchain": REQUIREMENTS}
         with caplog.at_level(logging.WARNING, logger="agent"):
             plans = wallet.agent_topup(app_config, signer)
-        assert plans == {"testchain": AgentTopUp(TopUpAction.NONE, 0, None, None)}
+        assert not plans
         assert "could not read native balances on testchain" in caplog.text
 
 
 class TestFundsStatus:
-    """/funds-status reports what is left after the top-up."""
+    """/funds-status leaves the agent EOA to a top-up only once one has worked."""
 
     def _deficits(
-        self, app_config: AppConfig, signer: Signer, requirements: dict
+        self, app_config: AppConfig, signer: Signer, topped_up: set[str]
     ) -> tuple[str, str]:
         """Return the (agent, safe) native deficits funds_status reports."""
-        app_config.fund_requirements = {"testchain": requirements}
-        report = wallet.funds_status(app_config, signer)["testchain"]
+        app_config.fund_requirements = {"testchain": REQUIREMENTS}
+        report = wallet.funds_status(app_config, signer, topped_up)["testchain"]
         return (
             report[signer.address][NATIVE_ASSET]["deficit"],
             report[SAFE][NATIVE_ASSET]["deficit"],
@@ -196,14 +181,13 @@ class TestFundsStatus:
     @pytest.mark.parametrize(
         ("agent_balance", "safe_balance", "expected"),
         [
-            (100, 600, ("0", "400")),  # nothing due: the threshold rule as today
-            (9, 600, ("491", "400")),  # signer alert: topup - balance
-            (99, 600, ("0", "400")),  # moved; the safe's own threshold as today
-            (99, 400, ("0", str(1 + 5000))),  # moved all; safe asks for the rest
+            (100, 600, ("0", "400")),  # nothing due
+            (99, 600, ("0", "400")),  # the safe covers it: its own threshold
+            (99, 400, ("0", str(1 + 5000))),  # it does not: the rest + its topup
             (99, 0, ("0", str(401 + 5000))),  # safe empty
         ],
     )
-    def test_reports_after_the_topup(  # pylint: disable=too-many-arguments
+    def test_after_a_successful_topup(  # pylint: disable=too-many-arguments
         self,
         app_config: AppConfig,
         test_signer: Signer,
@@ -211,23 +195,34 @@ class TestFundsStatus:
         safe_balance: int,
         expected: tuple[str, str],
     ) -> None:
-        """Native deficits follow the rule; balances stay as read."""
+        """The safe is asked for what the next top-up needs; balances stay as read."""
         signer = _signer_on(
             test_signer,
             BalancesW3({test_signer.address: agent_balance, SAFE: safe_balance}),
         )
-        assert self._deficits(app_config, signer, REQUIREMENTS) == expected
+        assert self._deficits(app_config, signer, {"testchain"}) == expected
 
-    def test_without_min_tx_balance_reports_as_today(
-        self, app_config: AppConfig, test_signer: Signer
+    @pytest.mark.parametrize(
+        ("agent_balance", "safe_balance", "expected"),
+        [
+            (99, 10_000, ("1", "0")),
+            (40, 0, ("60", "1000")),
+        ],
+    )
+    def test_without_a_successful_topup(  # pylint: disable=too-many-arguments
+        self,
+        app_config: AppConfig,
+        test_signer: Signer,
+        agent_balance: int,
+        safe_balance: int,
+        expected: tuple[str, str],
     ) -> None:
-        """No min_tx_balance: threshold - balance on both, as before."""
-        signer = _signer_on(test_signer, BalancesW3({test_signer.address: 40, SAFE: 0}))
-        requirements = {
-            "agent": {NATIVE_ASSET: FundRequirement(threshold=100, topup=500)},
-            "safe": {NATIVE_ASSET: SAFE_NATIVE},
-        }
-        assert self._deficits(app_config, signer, requirements) == ("60", "1000")
+        """No success on the chain yet, or the last one failed: threshold - balance."""
+        signer = _signer_on(
+            test_signer,
+            BalancesW3({test_signer.address: agent_balance, SAFE: safe_balance}),
+        )
+        assert self._deficits(app_config, signer, {"other"}) == expected
 
     def test_tokens_keep_the_threshold_rule(
         self,
@@ -254,13 +249,29 @@ class TestFundsStatus:
             },
         }
         app_config.fund_requirements = {"testchain": requirements}
-        report = wallet.funds_status(app_config, signer)["testchain"]
+        report = wallet.funds_status(app_config, signer, {"testchain"})["testchain"]
         assert report[SAFE][TOKEN] == {"balance": "2", "deficit": "8", "decimals": 6}
         assert report[SAFE][NATIVE_ASSET]["deficit"] == str(401 + 5000)
 
+    def test_without_both_native_entries_reports_as_read(
+        self, app_config: AppConfig, test_signer: Signer
+    ) -> None:
+        """A chain the rule does not apply to keeps threshold - balance."""
+        signer = _signer_on(test_signer, BalancesW3({test_signer.address: 40}))
+        app_config.fund_requirements = {
+            "testchain": {"agent": {NATIVE_ASSET: AGENT_NATIVE}}
+        }
+        report = wallet.funds_status(app_config, signer, {"testchain"})["testchain"]
+        assert report[signer.address][NATIVE_ASSET]["deficit"] == "60"
+
+
+def _audited(app_config: AppConfig, kind: str) -> list[dict]:
+    """Return the audit entries of one kind."""
+    return [e for e in audit_entries(app_config.store_path) if e["kind"] == kind]
+
 
 class TestTopUpAgentSigner:
-    """One check: a plain safe CALL per chain that the rule says to move."""
+    """One check: a plain safe CALL per chain that has something to move."""
 
     @pytest.fixture
     def sends(
@@ -289,6 +300,21 @@ class TestTopUpAgentSigner:
         signer.set_guard(guard)
         return guard
 
+    def _two_chains(self, app_config: AppConfig, signer: Signer) -> BalancesW3:
+        """Add a "broken" chain before testchain, both due 401; return its fake."""
+        app_config.chains = {
+            "broken": ChainConfig(rpc_url="http://127.0.0.1:9", safe_address=SAFE),
+            "testchain": app_config.chains["testchain"],
+        }
+        broken = BalancesW3({signer.address: 99, SAFE: 10_000})
+        _signer_on(signer, broken, chain="broken")
+        _signer_on(signer, BalancesW3({signer.address: 99, SAFE: 10_000}))
+        app_config.fund_requirements = {
+            "broken": REQUIREMENTS,
+            "testchain": REQUIREMENTS,
+        }
+        return broken
+
     def test_moves_once_and_audits(  # pylint: disable=too-many-arguments
         self,
         app_config: AppConfig,
@@ -308,14 +334,12 @@ class TestTopUpAgentSigner:
             guard, "allow_agent_topup_once", lambda **k: armed.append(k)
         )
         app_config.fund_requirements = {"testchain": REQUIREMENTS}
-        app_module.top_up_agent_signer(app_config, signer, guard, activity)
+        topped_up: set[str] = set()
+        app_module.top_up_agent_signer(app_config, signer, guard, activity, topped_up)
         assert sends == [("testchain", signer.address, 401, "0x")]
         assert not armed
-        (entry,) = [
-            e
-            for e in audit_entries(app_config.store_path)
-            if e["kind"] == "agent_topup"
-        ]
+        assert topped_up == {"testchain"}
+        (entry,) = _audited(app_config, "agent_topup")
         assert (entry["chain"], entry["value"]) == ("testchain", "401")
         assert entry["tx_hash"].startswith("0x")
 
@@ -333,8 +357,10 @@ class TestTopUpAgentSigner:
         )
         guard = self._restricted_guard(settings_store, app_config, signer)
         app_config.fund_requirements = {"testchain": REQUIREMENTS}
-        app_module.top_up_agent_signer(app_config, signer, guard, activity)
+        topped_up: set[str] = set()
+        app_module.top_up_agent_signer(app_config, signer, guard, activity, topped_up)
         assert sends == [("testchain", signer.address, 400, "0x")]
+        assert topped_up == {"testchain"}
         with pytest.raises(SignerError, match="do not allow the safe to call"):
             signer.send_via_safe("testchain", signer.address, value=400, data="0x")
 
@@ -350,7 +376,7 @@ class TestTopUpAgentSigner:
         with pytest.raises(SignerError, match="do not allow the safe to call"):
             signer.send_via_safe("testchain", signer.address, value=1, data="0x")
 
-    def test_alerts_and_nothing_due_send_nothing(  # pylint: disable=too-many-arguments
+    def test_empty_safe_and_nothing_due_send_nothing(  # pylint: disable=too-many-arguments
         self,
         app_config: AppConfig,
         test_signer: Signer,
@@ -359,24 +385,54 @@ class TestTopUpAgentSigner:
         sends: list,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """An alert is logged and left to /funds-status; nothing is sent."""
-        w3 = BalancesW3({test_signer.address: 9, SAFE: 10_000})
+        """An empty safe is logged and left to /funds-status; nothing is sent."""
+        w3 = BalancesW3({test_signer.address: 99, SAFE: 0})
         signer = _signer_on(test_signer, w3)
         app_config.fund_requirements = {"testchain": REQUIREMENTS}
+        topped_up = {"testchain"}
         with caplog.at_level(logging.INFO, logger="agent"):
-            app_module.top_up_agent_signer(app_config, signer, guard, activity)
-            w3.balances[signer.address.lower()] = 99
-            w3.balances[SAFE] = 0
-            app_module.top_up_agent_signer(app_config, signer, guard, activity)
+            app_module.top_up_agent_signer(
+                app_config, signer, guard, activity, topped_up
+            )
             w3.balances[signer.address.lower()] = 100
-            app_module.top_up_agent_signer(app_config, signer, guard, activity)
+            app_module.top_up_agent_signer(
+                app_config, signer, guard, activity, topped_up
+            )
         assert not sends
-        assert "agent top-up on testchain: signer_alert" in caplog.text
-        assert "agent top-up on testchain: safe_alert" in caplog.text
+        assert topped_up == {"testchain"}  # no send, so no new outcome
         # nothing due is not worth a line every hour
-        assert caplog.text.count("agent top-up on testchain") == 2
+        assert caplog.text.count("agent top-up on testchain") == 1
+        assert "the safe holds no native token" in caplog.text
 
-    def test_a_failing_chain_does_not_stop_the_others(  # pylint: disable=too-many-arguments
+    @pytest.mark.parametrize(
+        ("receipt", "error"),
+        [({"status": 0}, "reverted"), (None, "not mined")],
+    )
+    def test_a_send_that_does_not_land_is_a_failure(  # pylint: disable=too-many-arguments
+        self,
+        app_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        receipt: dict | None,
+        error: str,
+    ) -> None:
+        """A reverted or unmined top-up is audited as failed, with its hash."""
+        w3 = BalancesW3({test_signer.address: 99, SAFE: 10_000})
+        w3.eth.receipt = receipt
+        signer = _signer_on(test_signer, w3)
+        signer.set_guard(guard)
+        app_config.fund_requirements = {"testchain": REQUIREMENTS}
+        topped_up = {"testchain"}
+        app_module.top_up_agent_signer(app_config, signer, guard, activity, topped_up)
+        assert not topped_up
+        assert not _audited(app_config, "agent_topup")
+        (entry,) = _audited(app_config, "agent_topup_failed")
+        assert (entry["chain"], entry["value"]) == ("testchain", "401")
+        assert entry["tx_hash"].startswith("0x")
+        assert error in entry["error"]
+
+    def test_a_failing_broadcast_does_not_stop_the_others(  # pylint: disable=too-many-arguments
         self,
         app_config: AppConfig,
         test_signer: Signer,
@@ -385,34 +441,77 @@ class TestTopUpAgentSigner:
         sends: list,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A send that fails on one chain is logged; the next chain still moves."""
-        app_config.chains = {
-            "broken": ChainConfig(rpc_url="http://127.0.0.1:9", safe_address=SAFE),
-            "testchain": app_config.chains["testchain"],
-        }
-        broken = BalancesW3({test_signer.address: 99, SAFE: 10_000})
-        broken.eth.fail_broadcast = True
-        signer = _signer_on(test_signer, broken, chain="broken")
-        _signer_on(signer, BalancesW3({signer.address: 99, SAFE: 10_000}))
-        signer.set_guard(guard)
-        app_config.fund_requirements = {
-            "broken": REQUIREMENTS,
-            "testchain": REQUIREMENTS,
-        }
+        """A send that fails on one chain is logged and audited; the next still moves."""
+        self._two_chains(app_config, test_signer).eth.fail_broadcast = True
+        test_signer.set_guard(guard)
+        topped_up = {"broken"}
         with caplog.at_level(logging.ERROR, logger="agent"):
-            app_module.top_up_agent_signer(app_config, signer, guard, activity)
+            app_module.top_up_agent_signer(
+                app_config, test_signer, guard, activity, topped_up
+            )
         assert [chain for chain, *_ in sends] == ["broken", "testchain"]
         assert "agent top-up of 401 wei on broken failed" in caplog.text
-        topups = [
-            e["chain"]
-            for e in audit_entries(app_config.store_path)
-            if e["kind"] == "agent_topup"
+        assert topped_up == {"testchain"}
+        assert [e["chain"] for e in _audited(app_config, "agent_topup")] == [
+            "testchain"
         ]
-        assert topups == ["testchain"]
+        (failed,) = _audited(app_config, "agent_topup_failed")
+        assert (failed["chain"], failed["tx_hash"]) == ("broken", None)
+        assert "nonce too low" in failed["error"]
+
+    def test_a_guard_refusal_does_not_stop_the_others(  # pylint: disable=too-many-arguments
+        self,
+        app_config: AppConfig,
+        test_signer: Signer,
+        settings_store: SettingsStore,
+        activity: ActivityLog,
+        sends: list,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Restricted: an allowance that never arms on one chain is refused there only."""
+        self._two_chains(app_config, test_signer)
+        guard = self._restricted_guard(settings_store, app_config, test_signer)
+        allow = guard.allow_agent_topup_once
+
+        def allow_but_broken(*, chain: str, amount_cap: int) -> None:
+            """Arm every chain but "broken"."""
+            if chain != "broken":
+                allow(chain=chain, amount_cap=amount_cap)
+
+        monkeypatch.setattr(guard, "allow_agent_topup_once", allow_but_broken)
+        topped_up: set[str] = set()
+        app_module.top_up_agent_signer(
+            app_config, test_signer, guard, activity, topped_up
+        )
+        assert [chain for chain, *_ in sends] == ["broken", "testchain"]
+        assert topped_up == {"testchain"}
+        (failed,) = _audited(app_config, "agent_topup_failed")
+        assert failed["chain"] == "broken"
+        assert "do not allow the safe to call" in failed["error"]
+
+    def test_an_unreadable_chain_does_not_stop_the_others(  # pylint: disable=too-many-arguments
+        self,
+        app_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        sends: list,
+    ) -> None:
+        """A balance read that fails on one chain skips it; the next still moves."""
+        broken = self._two_chains(app_config, test_signer)
+        del broken.balances[SAFE.lower()]
+        test_signer.set_guard(guard)
+        topped_up = {"broken"}
+        app_module.top_up_agent_signer(
+            app_config, test_signer, guard, activity, topped_up
+        )
+        assert [chain for chain, *_ in sends] == ["testchain"]
+        assert topped_up == {"broken", "testchain"}  # nothing was sent on broken
+        assert not _audited(app_config, "agent_topup_failed")
 
 
 class TestTopUpTask:
-    """The background job: at start, then hourly, until cancelled."""
+    """The background job: at start, then every interval, until cancelled."""
 
     def _run(
         self, monkeypatch: pytest.MonkeyPatch, check: t.Callable[..., None]
@@ -433,13 +532,15 @@ class TestTopUpTask:
 
         monkeypatch.setattr(app_module, "top_up_agent_signer", recorded_check)
         monkeypatch.setattr(app_module.asyncio, "sleep", sleep)
-        args = (None, None, None, None)
+        args: tuple = (None, None, None, None, set())
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(app_module.top_up_agent(*args))  # type: ignore[arg-type]
         return events
 
-    def test_checks_at_start_then_hourly(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The first check does not wait; each later one follows an hour's sleep."""
+    def test_checks_at_start_then_every_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The first check does not wait; each later one follows the interval."""
         events = self._run(monkeypatch, lambda *a: None)
         assert events == ["check", "sleep 3600.0", "check", "sleep 3600.0"]
 
@@ -477,8 +578,25 @@ class TestTopUpTask:
             while len(checks) < 2 and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert len(checks) >= 2
-        config, signer, guard, _ = checks[0]
+        config, signer, guard, _, topped_up = checks[0]
         assert (config, signer, guard) == (app_config, test_signer, app.state.guard)
+        assert topped_up is app.state.topped_up
         at_shutdown = len(checks)
         time.sleep(0.1)
         assert len(checks) == at_shutdown
+
+    def test_funds_status_reads_the_task_s_outcomes(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+    ) -> None:
+        """/funds-status leaves the agent EOA to the top-up once one succeeded."""
+        _signer_on(test_signer, BalancesW3({test_signer.address: 99, SAFE: 10_000}))
+        app_config.fund_requirements = {"testchain": REQUIREMENTS}
+        app = make_app(test_signer, app_config, activity)
+        app.state.topped_up.add("testchain")
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            report = client.get("/funds-status").json()["testchain"]
+        assert report[test_signer.address][NATIVE_ASSET]["deficit"] == "0"

@@ -29,7 +29,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 
 from connect.run_goal import check_target
 
@@ -55,15 +55,10 @@ DEFAULT_MINUTES_PER_RUN = 15
 
 
 class FundRequirement(TypedDict):
-    """One asset's funding rule for a role, in wei / smallest unit.
-
-    `min_tx_balance` only means something on the agent's native entry: the
-    balance the agent EOA needs to pay for the safe -> agent top-up itself.
-    """
+    """One asset's funding rule for a role, in wei / smallest unit."""
 
     threshold: int
     topup: int
-    min_tx_balance: NotRequired[int]
 
 
 @dataclass
@@ -116,7 +111,7 @@ def _parse_safes(raw: str) -> dict[str, str]:
 FUND_REQUIREMENT_ROLES = ("agent", "safe")
 
 
-FUND_REQUIREMENT_KEYS = ("threshold", "topup", "min_tx_balance")
+FUND_REQUIREMENT_KEYS = ("threshold", "topup")
 
 
 def _parse_amount(value: object, where: str) -> int:
@@ -141,27 +136,16 @@ def _parse_amount(value: object, where: str) -> int:
 
 
 def _parse_fund_requirement(value: object, where: str) -> FundRequirement:
-    """Parse one asset's requirement; a bare amount is both threshold and topup."""
-    if not isinstance(value, dict):
-        amount = _parse_amount(value, where)
-        return FundRequirement(threshold=amount, topup=amount)
-    unknown = set(value) - set(FUND_REQUIREMENT_KEYS)
-    missing = {"threshold", "topup"} - set(value)
-    if unknown or missing:
+    """Parse one asset's requirement, an object of exactly threshold and topup."""
+    if not isinstance(value, dict) or set(value) != set(FUND_REQUIREMENT_KEYS):
         raise ValueError(
-            f"{FUND_REQUIREMENTS_ENV} entry for {where} takes threshold, topup and "
-            f"optionally min_tx_balance; unknown {sorted(unknown)}, "
-            f"missing {sorted(missing)}"
+            f"{FUND_REQUIREMENTS_ENV} entry for {where} must be an object of "
+            f"exactly {list(FUND_REQUIREMENT_KEYS)}, got {value!r}"
         )
-    requirement = FundRequirement(
+    return FundRequirement(
         threshold=_parse_amount(value["threshold"], f"{where} threshold"),
         topup=_parse_amount(value["topup"], f"{where} topup"),
     )
-    if "min_tx_balance" in value:
-        requirement["min_tx_balance"] = _parse_amount(
-            value["min_tx_balance"], f"{where} min_tx_balance"
-        )
-    return requirement
 
 
 def _parse_fund_requirements(
@@ -169,9 +153,8 @@ def _parse_fund_requirements(
 ) -> dict[str, dict[str, dict[str, FundRequirement]]]:
     """Parse {chain: {"agent"|"safe": {asset: requirement}}}.
 
-    A requirement is {"threshold", "topup", "min_tx_balance"?}, the shape
-    funds-manager reads, or a bare amount read as threshold = topup. Amounts
-    arrive as decimal strings or ints.
+    A requirement is {"threshold", "topup"}, the shape funds-manager reads,
+    with amounts as decimal strings or ints.
 
     Keys are roles, not addresses: the service template is static and cannot
     know the per-user agent EOA / safe addresses; funds_status() resolves the

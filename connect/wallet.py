@@ -19,14 +19,13 @@
 
 """Balance queries shared by /funds-status, /wallet and the MCP wallet_info tool.
 
-Also the agent top-up rule: how much native token the safe moves to the agent
-EOA, and the deficits /funds-status reports once it has. It is Connect's own
-copy of funds-manager's get_agent_topup, so both report the same table.
+Also the agent top-up rule (README, "Agent top-up").
 """
 
 import logging
+import typing as t
+from collections.abc import Collection
 from dataclasses import dataclass
-from enum import Enum
 
 from web3 import Web3
 
@@ -67,84 +66,50 @@ def asset_balance(w3: Web3, asset: str, address: str, chain: str) -> tuple[int, 
     return token.functions.balanceOf(address).call(), _decimals_cache[key]
 
 
-class TopUpAction(str, Enum):
-    """What the agent top-up does on a chain."""
-
-    NONE = "none"  # nothing due, or a balance could not be read
-    MOVE = "move"  # move `move` wei from the safe to the agent EOA
-    SIGNER_ALERT = "signer_alert"  # agent EOA below min_tx_balance
-    SAFE_ALERT = "safe_alert"  # safe native at 0, agent EOA short
-
-
 @dataclass(frozen=True)
 class AgentTopUp:
-    """One chain's top-up; a deficit of None leaves the one read as it is."""
+    """One chain's top-up: what the agent EOA is short, and what the safe sends."""
 
-    action: TopUpAction
-    move: int  # wei; 0 unless action is MOVE
-    signer_deficit: int | None
-    safe_deficit: int | None
+    need: int  # wei up to the agent's topup; 0 unless it is under its threshold
+    move: int  # as much of `need` as the safe holds
 
 
-_NO_TOPUP = AgentTopUp(TopUpAction.NONE, 0, None, None)
-
-
-def _native_requirement(assets: dict[str, FundRequirement]) -> FundRequirement | None:
-    """Return the native-token requirement among a role's assets, if any."""
-    for asset, requirement in assets.items():
-        if asset.lower() == NATIVE_ASSET:
-            return requirement
-    return None
+def _agent_native_requirement(
+    requirements: dict[str, dict[str, FundRequirement]],
+) -> FundRequirement | None:
+    """Return the agent's native requirement; None unless the safe has one too."""
+    found: dict[str, FundRequirement] = {}
+    for role, assets in requirements.items():
+        for asset, requirement in assets.items():
+            if asset.lower() == NATIVE_ASSET:
+                found[role] = requirement
+    return found.get("agent") if "safe" in found else None
 
 
 def plan_agent_topup(
-    requirements: dict[str, dict[str, FundRequirement]],
-    agent_balance: int | None,
-    safe_balance: int | None,
+    agent: FundRequirement, agent_balance: int, safe_balance: int
 ) -> AgentTopUp:
-    """Apply the top-up rule to one chain's requirements and native balances.
-
-    Native token only. Without a `min_tx_balance` on the agent's native entry,
-    or a native entry for both roles, nothing moves and the deficits stay as
-    read. A balance of None is one that could not be read.
-    """
-    agent = _native_requirement(requirements.get("agent", {}))
-    safe = _native_requirement(requirements.get("safe", {}))
-    if (
-        agent is None
-        or safe is None
-        or "min_tx_balance" not in agent
-        or agent_balance is None
-        or safe_balance is None
-    ):
-        return _NO_TOPUP
+    """Apply the top-up rule to one chain's native balances."""
     need = (
         max(0, agent["topup"] - agent_balance)
         if agent_balance < agent["threshold"]
         else 0
     )
-    if need == 0:
-        return _NO_TOPUP
-    if agent_balance < agent["min_tx_balance"]:
-        return AgentTopUp(TopUpAction.SIGNER_ALERT, 0, need, None)
-    if safe_balance >= need:
-        return AgentTopUp(TopUpAction.MOVE, need, 0, None)
-    if safe_balance > 0:
-        return AgentTopUp(
-            TopUpAction.MOVE, safe_balance, 0, need - safe_balance + safe["topup"]
-        )
-    return AgentTopUp(TopUpAction.SAFE_ALERT, 0, 0, need + safe["topup"])
+    return AgentTopUp(need=need, move=min(need, safe_balance))
 
 
 def agent_topup(config: AppConfig, signer: Signer) -> dict[str, AgentTopUp]:
-    """Read native balances and plan the top-up on every chain with a safe."""
+    """Read native balances and plan the top-up on every chain it applies to.
+
+    That is every chain with a safe and a native requirement for both roles.
+    A chain whose balances cannot be read is logged and left out.
+    """
     plans: dict[str, AgentTopUp] = {}
     for chain, requirements in config.fund_requirements.items():
         chain_config = config.chains.get(chain)
-        if chain_config is None or not chain_config.safe_address:
+        agent = _agent_native_requirement(requirements)
+        if chain_config is None or not chain_config.safe_address or agent is None:
             continue
-        agent_balance: int | None = None
-        safe_balance: int | None = None
         try:
             w3 = signer.w3(chain)
             agent_balance = w3.eth.get_balance(Web3.to_checksum_address(signer.address))
@@ -157,22 +122,32 @@ def agent_topup(config: AppConfig, signer: Signer) -> dict[str, AgentTopUp]:
                 chain,
                 exc_info=True,
             )
-        plans[chain] = plan_agent_topup(requirements, agent_balance, safe_balance)
+            continue
+        plans[chain] = plan_agent_topup(agent, agent_balance, safe_balance)
     return plans
 
 
-def funds_status(config: AppConfig, signer: Signer) -> dict:
+class _NativeEntry(t.NamedTuple):
+    """One role's native line in a chain's report."""
+
+    address: str
+    asset: str
+    balance: int
+    requirement: FundRequirement
+
+
+def funds_status(config: AppConfig, signer: Signer, topped_up: Collection[str]) -> dict:
     """SDK-shape funding report: {chain: {address: {asset: {balance, deficit, decimals}}}}.
 
-    A deficit is what is left once the agent top-up has moved what it can.
+    Every deficit is `threshold - balance`, except the native ones on a chain
+    in `topped_up` (its last agent top-up succeeded): README, "Agent top-up".
     """
     report: dict = {}
     for chain, requirements in config.fund_requirements.items():
         if chain not in config.chains:
             continue
         w3 = signer.w3(chain)
-        # role -> (address, native asset key, native balance)
-        native: dict[str, tuple[str, str, int]] = {}
+        native: dict[str, _NativeEntry] = {}
         for role, assets in requirements.items():
             if role == "agent":
                 address: str | None = signer.address
@@ -188,23 +163,24 @@ def funds_status(config: AppConfig, signer: Signer) -> dict:
                     "decimals": decimals,
                 }
                 if asset.lower() == NATIVE_ASSET:
-                    native[role] = (address, asset, balance)
-        if "agent" in native and "safe" in native:
-            _report_after_topup(report[chain], requirements, native)
+                    native[role] = _NativeEntry(address, asset, balance, requirement)
+        if chain in topped_up and "agent" in native and "safe" in native:
+            _report_after_topup(report[chain], native["agent"], native["safe"])
     return report
 
 
 def _report_after_topup(
-    chain_report: dict,
-    requirements: dict[str, dict[str, FundRequirement]],
-    native: dict[str, tuple[str, str, int]],
+    chain_report: dict, agent: _NativeEntry, safe: _NativeEntry
 ) -> None:
-    """Replace the native deficits the top-up rule decides, in place."""
-    plan = plan_agent_topup(requirements, native["agent"][2], native["safe"][2])
-    for role, deficit in (("agent", plan.signer_deficit), ("safe", plan.safe_deficit)):
-        if deficit is not None:
-            address, asset, _ = native[role]
-            chain_report[address][asset]["deficit"] = str(deficit)
+    """Ask the safe, not the agent EOA, for what the next top-up needs; in place."""
+    plan = plan_agent_topup(agent.requirement, agent.balance, safe.balance)
+    if plan.need == 0:
+        return
+    chain_report[agent.address][agent.asset]["deficit"] = "0"
+    if plan.move < plan.need:
+        chain_report[safe.address][safe.asset]["deficit"] = str(
+            plan.need - plan.move + safe.requirement["topup"]
+        )
 
 
 def _not_actionable_because(safe: str | None, balances: dict) -> str | None:

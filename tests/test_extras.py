@@ -1489,7 +1489,7 @@ class TestWalletExtras:
                 "safe": {"0x" + "00" * 20: {"threshold": 99999, "topup": 99999}}
             }
         }
-        report = wallet.funds_status(app_config, test_signer)
+        report = wallet.funds_status(app_config, test_signer, set())
         safe = app_config.chains["testchain"].safe_address
         assert list(report["testchain"]) == [safe]
 
@@ -1506,7 +1506,7 @@ class TestWalletExtras:
                 "agent": {"0x" + "00" * 20: {"threshold": 99999, "topup": 99999}},
             },
         }
-        report = wallet.funds_status(app_config, test_signer)
+        report = wallet.funds_status(app_config, test_signer, set())
         assert list(report) == ["testchain"]
         entry = report["testchain"][test_signer.address]["0x" + "00" * 20]
         assert entry == {
@@ -1619,7 +1619,7 @@ class TestPearlRoutesExtras:
     ) -> None:
         """RPC failure yields {} instead of an error."""
         monkeypatch.setattr(
-            wallet, "funds_status", lambda c, s: (_ for _ in ()).throw(RuntimeError())
+            wallet, "funds_status", lambda *_: (_ for _ in ()).throw(RuntimeError())
         )
         app = make_app(test_signer, app_config, activity)
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
