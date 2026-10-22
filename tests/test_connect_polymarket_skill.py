@@ -56,8 +56,7 @@ from eth_account.signers.local import LocalAccount
 from eth_keys import keys as eth_keys
 from eth_utils import is_address, keccak, to_checksum_address
 
-# The SDK stays out of uv.lock, where it would move the server's own eth-utils
-# and websockets; tox -e unit-tests runs this file with it (`uv run --with`).
+# Without the SDK this file skips; see tox.ini, testenv:unit-tests.
 pytest.importorskip("polymarket")
 
 from polymarket import RequestRejectedError, TransportError  # noqa: E402
@@ -2538,7 +2537,7 @@ def test_a_healthy_quote_has_no_blocked_reason() -> None:
 def test_quote_works_against_an_empty_deposit_wallet() -> None:
     """How much do I need? is the question an empty DW most needs answered.
 
-    Dust worth less than a cent of shares is as good as empty.
+    A balance of less than a cent is as good as empty.
     """
     quote = _quote(10.0, 0.0)
     assert quote["spendable_now_usd"] == 0.0
@@ -3630,6 +3629,8 @@ class _Clob:
             self.orders.append(json.loads(request.content)["order"])
             if isinstance(self.placed, Exception):
                 raise self.placed
+            if isinstance(self.placed, tuple):  # (status, body)
+                return reply(*self.placed[::-1])
             return reply(self.placed)
         if (method, path) == ("DELETE", "/order"):
             assert json.loads(request.content) == {"orderID": _ORDER_ID}
@@ -3958,46 +3959,39 @@ def test_trade_auth_rejected_buy_is_never_posted_twice(clob, capsys) -> None:
     assert pm._dw_pending_buy_counts(state) == {}  # noqa: SLF001
 
 
-@pytest.mark.parametrize(
-    ("command", "status", "cancels"),
-    [
-        # not about credentials: printed as it is
-        ("order", 400, 0),
-        # a bare 401 on a cancel, which is replay-safe: retried once on
-        # re-derived creds (the same key, refused again), that refusal printed
-        ("cancel", 401, 2),
-    ],
-)
-def test_trade_prints_the_clob_s_refusal_as_its_error(
-    clob, capsys, command, status, cancels
-) -> None:
-    """A refused order read or cancel prints ``{"error": ...}`` and exits 1."""
-    clob.refused_key, clob.refusal = "cached-key", (status, {"error": "refused"})
-    clob.issued = _issued("cached-key")
+def test_trade_prints_the_clob_s_refusal_as_its_error(clob, capsys) -> None:
+    """A refusal not about credentials prints ``{"error": ...}`` and exits 1."""
+    clob.refused_key, clob.refusal = "cached-key", (400, {"error": "refused"})
 
     with pytest.raises(SystemExit, match="^1$"):
-        getattr(_script("trade"), f"cmd_{command}")(clob.cs, _ORDER_ID)
+        _script("trade").cmd_order(clob.cs, _ORDER_ID)
 
     assert json.loads(capsys.readouterr().out) == {"error": "refused"}
-    assert len(clob.calls("DELETE", "/order")) == cancels
 
 
 def test_trade_order_and_cancel_print_the_clob_s_reply(clob, capsys) -> None:
     """`trade.py order` prints the order's id and status; `cancel` the CLOB's reply.
 
-    An order reply the SDK's model refuses (the null ``associate_trades`` the
-    CLOB sends) prints an error and exits 1, quoting at most 500 characters.
+    A cancel, which is replay-safe, refused with a bare 401 is retried once on
+    re-derived creds, which are kept. An order reply the SDK's model refuses
+    (the null ``associate_trades`` the CLOB sends) prints an error and exits 1,
+    quoting at most 500 characters.
     """
     trade = _script("trade")
     trade.cmd_order(clob.cs, _ORDER_ID)
     printed = capsys.readouterr().out
     assert _ORDER_ID in printed
     assert "LIVE" in printed
+    clob.refused_key, clob.refusal = "cached-key", (401, {"error": "unauthorized"})
+    clob.issued = _issued("fresh-key")
     trade.cmd_cancel(clob.cs, _ORDER_ID)
     assert json.loads(capsys.readouterr().out) == {
         "canceled": [_ORDER_ID],
         "not_canceled": {},
     }
+    cancels = clob.calls("DELETE", "/order")
+    assert [r.headers["POLY_API_KEY"] for r in cancels] == ["cached-key", "fresh-key"]
+    assert pm.load_state(clob.cs)["clob_creds"] == _creds("fresh-key")
 
     clob.order = dict(_OPEN_ORDER, associate_trades=None, outcome="x" * 600)
     with pytest.raises(SystemExit, match="^1$"):
@@ -4027,19 +4021,20 @@ _NO_FUNDS = ("not enough balance / allowance",)
         (_SELL, _UNREADABLE, _UNCERTAIN, None),
         (_BUY, _REFUSED, _NO_FUNDS, False),
         (_LIMIT_BUY, _REFUSED, _NO_FUNDS, False),
-        (_BUY, httpx.ReadTimeout("read timed out"), ("timed out",), True),
+        (_BUY, httpx.ReadTimeout("read timed out"), _UNCERTAIN, True),
+        (_BUY, (503, {"error": "unavailable"}), _UNCERTAIN, True),
     ],
     ids="unmatched unmatched-limit unmatched-sell unmatched-limit-sell odd-status "
-    "unreadable unreadable-sell refused refused-limit timed-out".split(),
+    "unreadable unreadable-sell refused refused-limit timed-out 503".split(),
 )
 def test_only_a_refusal_code_proves_an_order_was_not_placed(
     clob, monkeypatch, capsys, command, reply, told_of, kept
 ) -> None:
     """Every outcome short of a placed order exits non-zero with its reason.
 
-    "unmatched", a reply the SDK cannot classify ("unknown") or cannot read
-    arrives after the CLOB has the order: placement is uncertain, and a buy
-    keeps its pending marker, as it does after a post that got no answer.
+    "unmatched", a reply the SDK cannot classify ("unknown") or cannot read,
+    no answer at all, or a 5xx may arrive after the CLOB has the order:
+    placement is uncertain, and a buy keeps its pending marker.
     Only a refusal code the SDK assigns proves no order, resolving the marker.
     """
     _dw_holds(clob, monkeypatch, 100.0)
