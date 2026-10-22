@@ -59,7 +59,7 @@ from eth_utils import is_address, keccak, to_checksum_address
 # Without the SDK this file skips; see tox.ini, testenv:unit-tests.
 pytest.importorskip("polymarket")
 
-from polymarket import RequestRejectedError, TransportError  # noqa: E402
+from polymarket import RequestRejectedError, SecureClient, TransportError  # noqa: E402
 from polymarket._internal.actions.orders import cache as sdk_order_cache  # noqa: E402
 from polymarket._internal.actions.orders import orders as sdk_orders  # noqa: E402
 from polymarket._internal.actions.orders.market import (  # noqa: E402
@@ -3973,7 +3973,7 @@ def test_trade_order_and_cancel_print_the_clob_s_reply(clob, capsys) -> None:
     """`trade.py order` prints the order's id and status; `cancel` the CLOB's reply.
 
     A cancel, which is replay-safe, refused with a bare 401 is retried once on
-    re-derived creds, which are kept. An order reply the SDK's model refuses
+    re-derived creds, which are kept; a second refusal is printed. An order reply the SDK's model refuses
     (the null ``associate_trades`` the CLOB sends) prints an error and exits 1,
     quoting at most 500 characters.
     """
@@ -4000,6 +4000,12 @@ def test_trade_order_and_cancel_print_the_clob_s_reply(clob, capsys) -> None:
     assert "error" in json.loads(printed)
     assert "x" * 501 not in printed
 
+    clob.refused_key = "fresh-key"  # the re-derived key is refused too
+    with pytest.raises(SystemExit, match="^1$"):
+        trade.cmd_cancel(clob.cs, _ORDER_ID)
+    assert json.loads(capsys.readouterr().out) == {"error": "unauthorized"}
+    assert len(clob.calls("DELETE", "/order")) == 4
+
 
 _UNREADABLE = {k: v for k, v in _PLACED.items() if k != "takingAmount"}
 
@@ -4022,10 +4028,10 @@ _NO_FUNDS = ("not enough balance / allowance",)
         (_BUY, _REFUSED, _NO_FUNDS, False),
         (_LIMIT_BUY, _REFUSED, _NO_FUNDS, False),
         (_BUY, httpx.ReadTimeout("read timed out"), _UNCERTAIN, True),
-        (_BUY, (503, {"error": "unavailable"}), _UNCERTAIN, True),
+        (_BUY, (500, {"error": "internal"}), _UNCERTAIN, True),
     ],
     ids="unmatched unmatched-limit unmatched-sell unmatched-limit-sell odd-status "
-    "unreadable unreadable-sell refused refused-limit timed-out 503".split(),
+    "unreadable unreadable-sell refused refused-limit timed-out 500".split(),
 )
 def test_only_a_refusal_code_proves_an_order_was_not_placed(
     clob, monkeypatch, capsys, command, reply, told_of, kept
@@ -4105,6 +4111,7 @@ def test_client_refuses_the_sdk_s_direct_sends(clob, method) -> None:
     Each would sign through Connect and go straight to Polymarket, past the
     scripts' order flow or the relayer proxy.
     """
+    assert callable(getattr(SecureClient, method))
     client = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW)
 
     with pytest.raises(NotImplementedError):
