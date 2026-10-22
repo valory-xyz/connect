@@ -138,13 +138,16 @@ def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
 def _post(client, order):
     """Post a signed order; refuse when its reply leaves placement uncertain.
 
-    Uncertain: an "unmatched" or "unknown" code (see `_UNCERTAIN_CODES`), or
-    a reply the SDK cannot read, which arrives after the CLOB has the order.
+    Uncertain: an `_UNCERTAIN_CODES` code, no reply, an unreadable one, or a 5xx.
     """
     try:
         response = client.post_order(order)
-    except UnexpectedResponseError as e:
+    except (TransportError, UnexpectedResponseError) as e:
         raise SystemExit(_UNCERTAIN.format(e)) from e
+    except RequestRejectedError as e:
+        if e.status >= 500:
+            raise SystemExit(_UNCERTAIN.format(e)) from e
+        raise
     if not response.ok and response.code in _UNCERTAIN_CODES:
         raise SystemExit(_UNCERTAIN.format(response.message))
     return response
@@ -167,19 +170,7 @@ def _quote(client, token_id: str, usd: float, balance: float, order_type: str):
 
 
 def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
-    """Post a buy while preserving enough state to recover an unknown outcome.
-
-    Persist the token before submission: the CLOB may accept and fill the order
-    even if its response is lost. A later sweep can then check the DW's
-    on-chain balance directly instead of depending on the lagging data API.
-
-    A refusal code the SDK assigns to the reply, or a status-code 401
-    authentication rejection, proves that no order was submitted; a reply
-    that leaves placement uncertain (see `_post`) keeps the marker. Other exceptions remain ambiguous: a
-    timeout, rate limit, intermediary response, or message-only auth error
-    may arrive after the request reached the CLOB. A harmless
-    zero-balance hint is safer than an undiscoverable filled position.
-    """
+    """Post a buy; only a refusal code or a 401 drops its pending marker."""
     token_id_int = int(token_id)
     # This happens before funds may move, so a state-write failure must abort
     # the submission rather than proceed without the recovery hint.
