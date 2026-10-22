@@ -182,10 +182,16 @@ class TestFundsStatus:
     @pytest.mark.parametrize(
         ("agent_balance", "safe_balance", "expected"),
         [
-            (100, 600, ("0", "400")),  # nothing due
-            (99, 600, ("0", "400")),  # the safe covers it: its own threshold
-            (99, 400, ("0", str(1 + 5000))),  # it does not: the rest + its topup
-            (99, 0, ("0", str(401 + 5000))),  # safe empty
+            # nothing due: the safe's own rule, up to its topup
+            (100, 600, ("0", str(5000 - 600))),
+            (100, 1000, ("0", "0")),
+            # a full move: the safe is judged on what it keeps
+            (99, 1401, ("0", "0")),
+            (99, 1400, ("0", str(5000 - 999))),
+            (99, 600, ("0", str(5000 - 199))),
+            # a short move: the shortfall joins the safe's topup
+            (99, 400, ("0", str(5000 + 1))),
+            (99, 0, ("0", str(5000 + 401))),
         ],
     )
     def test_after_a_successful_topup(  # pylint: disable=too-many-arguments
@@ -196,7 +202,7 @@ class TestFundsStatus:
         safe_balance: int,
         expected: tuple[str, str],
     ) -> None:
-        """The safe is asked for what the next top-up needs; balances stay as read."""
+        """The safe is reported as it stands after the move; balances stay as read."""
         signer = _signer_on(
             test_signer,
             BalancesW3({test_signer.address: agent_balance, SAFE: safe_balance}),
@@ -206,8 +212,9 @@ class TestFundsStatus:
     @pytest.mark.parametrize(
         ("agent_balance", "safe_balance", "expected"),
         [
-            (99, 10_000, ("1", "0")),
-            (40, 0, ("60", "1000")),
+            (100, 10_000, ("0", "0")),
+            (99, 10_000, ("401", "0")),
+            (40, 0, ("460", "5000")),
         ],
     )
     def test_without_a_successful_topup(  # pylint: disable=too-many-arguments
@@ -218,14 +225,14 @@ class TestFundsStatus:
         safe_balance: int,
         expected: tuple[str, str],
     ) -> None:
-        """No success on the chain yet, or the last one failed: threshold - balance."""
+        """No success on the chain yet, or the last one failed: each role's own rule."""
         signer = _signer_on(
             test_signer,
             BalancesW3({test_signer.address: agent_balance, SAFE: safe_balance}),
         )
         assert self._deficits(app_config, signer, {"other"}) == expected
 
-    def test_tokens_keep_the_threshold_rule(
+    def test_tokens_keep_their_own_rule(
         self,
         app_config: AppConfig,
         test_signer: Signer,
@@ -251,19 +258,19 @@ class TestFundsStatus:
         }
         app_config.fund_requirements = {"testchain": requirements}
         report = wallet.funds_status(app_config, signer, {"testchain"})["testchain"]
-        assert report[SAFE][TOKEN] == {"balance": "2", "deficit": "8", "decimals": 6}
-        assert report[SAFE][NATIVE_ASSET]["deficit"] == str(401 + 5000)
+        assert report[SAFE][TOKEN] == {"balance": "2", "deficit": "18", "decimals": 6}
+        assert report[SAFE][NATIVE_ASSET]["deficit"] == str(5000 + 401)
 
     def test_without_both_native_entries_reports_as_read(
         self, app_config: AppConfig, test_signer: Signer
     ) -> None:
-        """A chain the rule does not apply to keeps threshold - balance."""
+        """A chain the top-up does not apply to keeps the agent EOA's own deficit."""
         signer = _signer_on(test_signer, BalancesW3({test_signer.address: 40}))
         app_config.fund_requirements = {
             "testchain": {"agent": {NATIVE_ASSET: AGENT_NATIVE}}
         }
         report = wallet.funds_status(app_config, signer, {"testchain"})["testchain"]
-        assert report[signer.address][NATIVE_ASSET]["deficit"] == "60"
+        assert report[signer.address][NATIVE_ASSET]["deficit"] == "460"
 
 
 def _audited(app_config: AppConfig, kind: str) -> list[dict]:

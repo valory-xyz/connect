@@ -276,15 +276,15 @@ towards the `transactions` metric in `agent_performance.json`, and it never
 becomes its `last_activity`. In restricted mode the send passes through a
 one-shot allowance for exactly that transfer, capped at the amount sent.
 
-`GET /funds-status` reports `threshold - balance` for every entry, except the
-native ones on a chain whose last top-up succeeded. There, an agent EOA below
-its `threshold` is left to the next top-up, and the safe is asked for what
-that needs:
-
-| Safe native | Agent EOA deficit | Safe deficit |
-|---|---|---|
-| ≥ what the EOA needs | 0 | `threshold - balance` |
-| less | 0 | what the safe cannot cover + the safe's `topup` |
+`GET /funds-status` reports each entry's deficit as funds-manager does:
+`topup - balance` once the balance is below `threshold`, else 0. The
+exception is the native pair on a chain whose last top-up succeeded. There,
+an agent EOA below its `threshold` reports 0, since the next top-up covers
+it, and the safe is judged on what it keeps after sending the EOA's need:
+`remaining = safe balance - need`, and the safe's deficit is
+`topup - remaining` when `remaining` is below its `threshold`, else 0. When
+the safe holds less than the need, `remaining` is negative, so the shortfall
+is added to the safe's `topup`.
 
 ## Threat-model notes
 

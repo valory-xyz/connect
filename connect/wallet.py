@@ -86,15 +86,18 @@ def _agent_native_requirement(
     return found.get("agent") if "safe" in found else None
 
 
+def deficit(requirement: FundRequirement, balance: int) -> int:
+    """Return what funds-manager asks for: up to `topup` once under `threshold`."""
+    if balance >= requirement["threshold"]:
+        return 0
+    return max(0, requirement["topup"] - balance)
+
+
 def plan_agent_topup(
     agent: FundRequirement, agent_balance: int, safe_balance: int
 ) -> AgentTopUp:
     """Apply the top-up rule to one chain's native balances."""
-    need = (
-        max(0, agent["topup"] - agent_balance)
-        if agent_balance < agent["threshold"]
-        else 0
-    )
+    need = deficit(agent, agent_balance)
     return AgentTopUp(need=need, move=min(need, safe_balance))
 
 
@@ -138,8 +141,8 @@ class _NativeEntry(t.NamedTuple):
 def funds_status(config: AppConfig, signer: Signer, topped_up: Collection[str]) -> dict:
     """SDK-shape funding report: {chain: {address: {asset: {balance, deficit, decimals}}}}.
 
-    Every deficit is `threshold - balance`, except the native ones on a chain
-    in `topped_up` (its last agent top-up succeeded): README, "Agent top-up".
+    Every deficit is `deficit()`, except the native ones on a chain in
+    `topped_up` (its last agent top-up succeeded): README, "Agent top-up".
     """
     report: dict = {}
     for chain, requirements in config.fund_requirements.items():
@@ -158,7 +161,7 @@ def funds_status(config: AppConfig, signer: Signer, topped_up: Collection[str]) 
                 balance, decimals = asset_balance(w3, asset, address, chain)
                 report.setdefault(chain, {}).setdefault(address, {})[asset] = {
                     "balance": str(balance),
-                    "deficit": str(max(0, requirement["threshold"] - balance)),
+                    "deficit": str(deficit(requirement, balance)),
                     "decimals": decimals,
                 }
                 if asset.lower() == NATIVE_ASSET:
@@ -171,15 +174,16 @@ def funds_status(config: AppConfig, signer: Signer, topped_up: Collection[str]) 
 def _report_after_topup(
     chain_report: dict, agent: _NativeEntry, safe: _NativeEntry
 ) -> None:
-    """Ask the safe, not the agent EOA, for what the next top-up needs; in place."""
+    """Report the native deficits as they stand after the top-up; in place."""
     plan = plan_agent_topup(agent.requirement, agent.balance, safe.balance)
     if plan.need == 0:
         return
     chain_report[agent.address][agent.asset]["deficit"] = "0"
-    if plan.move < plan.need:
-        chain_report[safe.address][safe.asset]["deficit"] = str(
-            plan.need - plan.move + safe.requirement["topup"]
-        )
+    # negative when the safe is short, so the shortfall joins its deficit
+    remaining = safe.balance - plan.need
+    chain_report[safe.address][safe.asset]["deficit"] = str(
+        deficit(safe.requirement, remaining)
+    )
 
 
 def _not_actionable_because(safe: str | None, balances: dict) -> str | None:
