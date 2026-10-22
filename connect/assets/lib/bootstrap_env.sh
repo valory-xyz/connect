@@ -81,6 +81,25 @@ PY="$VENV/bin/python"
 # idempotent) instead of being reused forever with missing imports.
 READY="$VENV/$SENTINEL"
 
+# A venv keeps the interpreter that built it. One an older python3 made would
+# otherwise be reused forever, even after the user installs the newer python3
+# a skill's packages need, and pip in it keeps finding no matching
+# distribution. So when this skill still has to install, rebuild a venv whose
+# Python is not the python3 on PATH. --clear also drops every skill's
+# sentinel, so each skill reinstalls into the new venv once. Only a version
+# both interpreters actually report counts: one that can't answer is left to
+# the steps below, as before.
+VERSION_QUERY='import sys; print("Python %d.%d" % sys.version_info[:2])'
+if [ ! -f "$READY" ] && [ -x "$PY" ]; then
+  BUILT_WITH="$("$PY" -c "$VERSION_QUERY" 2>/dev/null || true)"
+  ON_PATH="$(python3 -c "$VERSION_QUERY" 2>/dev/null || true)"
+  if [[ $BUILT_WITH == "Python "* && $ON_PATH == "Python "* &&
+    $BUILT_WITH != "$ON_PATH" ]]; then
+    echo "$SKILL: rebuilding venv at $VENV with $(python3 --version)" >&2
+    python3 -m venv --clear "$VENV" >&2
+  fi
+fi
+
 # Gate on pip, not just the interpreter. A `python3 -m venv` that dies at the
 # ensurepip step (Debian/Ubuntu ship it as a separate python3-venv package)
 # still leaves an executable bin/python behind, so checking the interpreter
