@@ -17,14 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""CLOB SDK client with signing routed through the connect signer.
-
-The unified SDK (``polymarket-client``) signs with the signer object its
-client holds: it reads ``address`` and calls ``sign_typed_data`` (orders,
-the CLOB's L1 auth) or ``sign_message``. :class:`RemoteSigner` hashes each
-locally and has connect sign the digest, so no key material exists in this
-process.
-"""
+"""CLOB SDK client with signing routed through the connect signer."""
 
 import time
 
@@ -69,32 +62,35 @@ def _refuse_direct_send(*args, **kwargs):
     )
 
 
+_BLOCKED = (
+    "approve_erc20",
+    "approve_erc1155_for_all",
+    "transfer_erc20",
+    "setup_trading_approvals",
+    "execute_transaction",
+    "split_position",
+    "merge_positions",
+    "merge_multiple_positions",
+    "redeem_positions",
+    "execute_collateral_return_plan",
+    "place_limit_order",
+    "place_market_order",
+    "accept_combo_quote",
+    "authorize_session_key",
+    "revoke_session_key",
+)
+
+
 class ConnectClient(SecureClient):
-    """The SDK client, with its own senders closed.
+    """The SDK client with its direct senders refused."""
 
-    Each signs through Connect and goes straight to Polymarket: the place_*
-    calls post past the scripts' order flow, and the rest go to the relayer
-    or builder gateway rather than through Connect's relayer proxy.
-    """
 
-    approve_erc20 = approve_erc1155_for_all = transfer_erc20 = _refuse_direct_send
-    setup_trading_approvals = execute_transaction = _refuse_direct_send
-    split_position = merge_positions = merge_multiple_positions = _refuse_direct_send
-    redeem_positions = execute_collateral_return_plan = _refuse_direct_send
-    place_limit_order = place_market_order = accept_combo_quote = _refuse_direct_send
-    authorize_session_key = revoke_session_key = _refuse_direct_send
+for _sender in _BLOCKED:
+    setattr(ConnectClient, _sender, _refuse_direct_send)
 
 
 def make_clob_client(cs: ConnectSigner, funder: str) -> ConnectClient:
-    """Build an SDK client signing POLY_1271 orders funded by ``funder`` (the DW).
-
-    The agent EOA signs as the DW's owner, the signature the DW validates;
-    it is set here rather than left to the SDK, which treats a DW it cannot
-    derive from the EOA as a session key's. API creds are tied to the signer
-    EOA (not the funder, matching the production trader); they are derived
-    once via an L1 signature and cached in the workspace state (revocable
-    API creds, not key material).
-    """
+    """Build an SDK client signing POLY_1271 orders funded by ``funder`` (the DW)."""
     signer = RemoteSigner(cs)
     config = get_environment_config(PRODUCTION)
     state = load_state(cs)
@@ -106,8 +102,7 @@ def make_clob_client(cs: ConnectSigner, funder: str) -> ConnectClient:
             passphrase=cached["api_passphrase"],
         )
     else:
-        # the SDK's create-or-derive (derives once creating answers 400);
-        # nonce 0 as before
+        # the SDK's create-or-derive (derives once creating answers 400); nonce 0
         auth = sign_api_key_auth(
             signer, chain_id=config.chain_id, timestamp=int(time.time()), nonce=0
         )

@@ -122,8 +122,7 @@ def dw_or_exit(cs: pm.ConnectSigner) -> str:
 def _approve(cs: pm.ConnectSigner, proxy: RelayerProxyClient, dw: str) -> dict:
     """Grant the DW whatever of the canonical approval set it lacks.
 
-    Up to 4 pUSD allowances, 3 CTF operator grants and 1 PositionManager
-    operator grant (see pm_common), relayed as one owner-signed batch.
+    See pm_common for the set; it is relayed as one owner-signed batch.
     `approvals_done` is persisted only once the relayer tx is confirmed mined
     AND its on-chain receipt shows success — a submitted-but-unmined or
     reverted batch must not look done.

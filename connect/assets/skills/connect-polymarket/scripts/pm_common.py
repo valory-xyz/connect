@@ -691,18 +691,9 @@ def contract_owner(w3: Web3, address: str) -> str | None:
 
 # --- canonical approval set ------------------------------------------------------------
 
-# The trading rights the DepositWallet needs, one pair per venue: a pUSD
-# allowance, and an operator grant on the ERC-1155 the venue settles (the CTF
-# for CTF Exchange, NegRisk CTF Exchange and the NegRisk Adapter, the
-# PositionManager for ExchangeV3). The adapter is no exchange, but
-# Polymarket's CLOB checks the DW's pUSD and outcome-token approvals to it on
-# every neg-risk order and rejects the order without them. Polymarket's
-# relayer refuses a pUSD approval to ExchangeV3 for anything but MaxUint256,
-# the amount every allowance here is granted. The two *collateral adapters*
-# are deliberately NOT here: redemption runs from the service safe, never the
-# DW (see redeem.py, which grants those to the safe itself), so granting the
-# DW operator rights over contracts it never calls would be needless
-# authority.
+# Polymarket's relayer refuses a pUSD approval to ExchangeV3 unless it is MaxUint256.
+# The collateral adapters are left out: redemption runs from the service safe, not
+# the DW (see redeem.py, which grants those to the safe itself).
 APPROVAL_SPENDERS_PUSD = (
     CTF_EXCHANGE,
     NEG_RISK_CTF_EXCHANGE,

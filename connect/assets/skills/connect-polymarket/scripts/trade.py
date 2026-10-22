@@ -57,8 +57,6 @@ from polymarket.errors import (
 )
 from remote_signer import clear_cached_creds, make_clob_client
 
-# The SDK's errors for a request the CLOB refused, that got no answer, or
-# whose reply it cannot read.
 _API_ERRORS = (
     RequestRejectedError,
     RateLimitError,
@@ -76,11 +74,6 @@ _UNCERTAIN = (
     "placed ({}); check positions (positions.py positions --wallet dw) before "
     "retrying"
 )
-
-
-def _order_type(name: str) -> str:
-    """Map a CLI order-type string to the SDK's (a plain upper-case str)."""
-    return name.upper()
 
 
 def _auth_failed(e: Exception) -> bool:
@@ -130,7 +123,7 @@ def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
         except _API_ERRORS as e2:
             pm.print_json({"error": str(e2)})
             raise SystemExit(1) from e2
-    if hasattr(result, "model_dump"):  # an SDK response model
+    if hasattr(result, "model_dump"):
         result = result.model_dump()
     pm.print_json(result)
 
@@ -203,7 +196,7 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
     `pm.quote_buy` prices it (the CLOB fee is price-dependent; a flat reserve
     both over- and under-shoots).
     """
-    ot = _order_type(order_type)
+    ot = order_type.upper()
     pm.require_supported_market(token_id)
 
     def op(client, dw):
@@ -255,7 +248,7 @@ def cmd_quote(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) 
     the question a quote is usually asked, and refusing on a zero balance
     the way `buy` does would withhold the answer exactly when it is needed.
     """
-    ot = _order_type(order_type)
+    ot = order_type.upper()
 
     pm.require_supported_market(token_id)
 
@@ -276,7 +269,7 @@ def cmd_sell(
     duplicate — re-signing is one remote ECDSA, cheap. The shares must be in
     the DW when the order matches (sell before sweeping them to the safe).
     """
-    ot = _order_type(order_type)
+    ot = order_type.upper()
     pm.require_supported_market(token_id)
 
     def op(client, dw):
@@ -308,7 +301,7 @@ def cmd_limit(  # pylint: disable=too-many-arguments
     simply skips.
     """
     order_side = side.upper()
-    ot = _order_type(order_type)
+    ot = order_type.upper()
     expiration = None  # the SDK signs GTD when an expiration is set, else GTC
     if ot == "GTD":
         if not expires_in:
