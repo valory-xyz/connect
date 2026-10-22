@@ -960,6 +960,22 @@ class TestGuard:
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, topup)
 
+    def test_rearming_keeps_the_other_allowances(self, store: SettingsStore) -> None:
+        """Re-arming one chain's top-up leaves other chains and the deposit alone."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_agent_topup_once(chain="testchain", amount_cap=100)
+        guard.allow_agent_topup_once(chain="nosafe", amount_cap=100)
+        guard.allow_safe_deposit_once(
+            chain="testchain", tracker=OTHER, amount_cap=100, is_token=False
+        )
+        guard.allow_agent_topup_once(chain="nosafe", amount_cap=100)
+        guard.check_transaction(
+            "testchain", SAFE, 0, exec_transaction_calldata(AGENT, value=100)
+        )
+        guard.check_transaction(
+            "testchain", SAFE, 0, exec_transaction_calldata(OTHER, value=100)
+        )
+
     def test_agent_topup_allowance_expires(
         self,
         store: SettingsStore,
@@ -978,7 +994,10 @@ class TestGuard:
             guard.check_transaction(
                 "testchain", SAFE, 0, exec_transaction_calldata(AGENT, value=1)
             )
-        assert "agent top-up allowance on testchain expired unconsumed" in caplog.text
+        assert (
+            f"safe payment allowance to {AGENT.lower()} on testchain expired unconsumed"
+            in caplog.text
+        )
 
     def test_unrestricted_ignores_the_agent_topup_allowance(
         self, store: SettingsStore
