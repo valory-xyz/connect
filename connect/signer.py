@@ -240,9 +240,7 @@ class Signer:
             cached = self._requests.cached(request_id, stamp)
             if cached is not None:
                 return cached
-        self._check_transaction(
-            chain=chain, to=to, value=value, data=data, audit=audit
-        )
+        self._check_transaction(chain=chain, to=to, value=value, data=data, audit=audit)
 
         def broadcast() -> str:
             return self._send(
