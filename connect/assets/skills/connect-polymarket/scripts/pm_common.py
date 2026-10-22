@@ -152,8 +152,8 @@ CONTRACTS: tuple[Contract, ...] = (
         name="NegRiskAdapter",
         address=NEG_RISK_ADAPTER,
         role=(
-            "Wraps neg-risk positions (CLOB v1, deprecated); "
-            "no longer granted a DW approval"
+            "Wraps neg-risk positions; the CLOB checks the DW's pUSD and "
+            "outcome-token approvals to it on neg-risk orders"
         ),
     ),
     Contract(
@@ -691,17 +691,25 @@ def contract_owner(w3: Web3, address: str) -> str | None:
 
 # --- canonical approval set ------------------------------------------------------------
 
-# The trading rights the DepositWallet needs, one pair per exchange venue: a
-# pUSD allowance, and an operator grant on the ERC-1155 the venue settles
-# (the CTF for CTF Exchange and NegRisk CTF Exchange, the PositionManager for
-# ExchangeV3). Polymarket's relayer refuses a pUSD approval to ExchangeV3
-# for anything but MaxUint256, the amount every allowance here is granted.
-# The two *collateral adapters* are deliberately NOT here: redemption runs
-# from the service safe, never the DW (see redeem.py, which grants those to
-# the safe itself), so granting the DW operator rights over contracts it
-# never calls would be needless authority.
-APPROVAL_SPENDERS_PUSD = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, EXCHANGE_V3)
-APPROVAL_OPERATORS_CTF = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE)
+# The trading rights the DepositWallet needs, one pair per venue: a pUSD
+# allowance, and an operator grant on the ERC-1155 the venue settles (the CTF
+# for CTF Exchange, NegRisk CTF Exchange and the NegRisk Adapter, the
+# PositionManager for ExchangeV3). The adapter is no exchange, but
+# Polymarket's CLOB checks the DW's pUSD and outcome-token approvals to it on
+# every neg-risk order and rejects the order without them. Polymarket's
+# relayer refuses a pUSD approval to ExchangeV3 for anything but MaxUint256,
+# the amount every allowance here is granted. The two *collateral adapters*
+# are deliberately NOT here: redemption runs from the service safe, never the
+# DW (see redeem.py, which grants those to the safe itself), so granting the
+# DW operator rights over contracts it never calls would be needless
+# authority.
+APPROVAL_SPENDERS_PUSD = (
+    CTF_EXCHANGE,
+    NEG_RISK_CTF_EXCHANGE,
+    NEG_RISK_ADAPTER,
+    EXCHANGE_V3,
+)
+APPROVAL_OPERATORS_CTF = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, NEG_RISK_ADAPTER)
 APPROVAL_OPERATORS_POSITION_MANAGER = (EXCHANGE_V3,)
 
 
