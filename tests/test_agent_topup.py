@@ -135,20 +135,36 @@ class TestAgentTopup:
     @pytest.mark.parametrize(
         "requirements",
         [
-            # no native safe entry
-            {"agent": {NATIVE_ASSET: AGENT_NATIVE}, "safe": {TOKEN: SAFE_NATIVE}},
-            {"agent": {NATIVE_ASSET: AGENT_NATIVE}},
-            # no native agent entry: tokens never move
             {"agent": {TOKEN: AGENT_NATIVE}, "safe": {NATIVE_ASSET: SAFE_NATIVE}},
+            {"safe": {NATIVE_ASSET: SAFE_NATIVE}},
         ],
     )
-    def test_no_rule_without_both_native_entries(
+    def test_no_rule_without_a_native_agent_entry(
         self, app_config: AppConfig, test_signer: Signer, requirements: dict
     ) -> None:
-        """Without a native entry for both roles, the chain is not planned."""
+        """Without a native agent entry, the chain is not planned: tokens never move."""
         signer = _signer_on(test_signer, BalancesW3({test_signer.address: 0, SAFE: 0}))
         app_config.fund_requirements = {"testchain": requirements}
         assert not wallet.agent_topup(app_config, signer)
+
+    @pytest.mark.parametrize(
+        "requirements",
+        [
+            {"agent": {NATIVE_ASSET: AGENT_NATIVE}, "safe": {TOKEN: SAFE_NATIVE}},
+            {"agent": {NATIVE_ASSET: AGENT_NATIVE}},
+        ],
+    )
+    def test_rule_needs_no_native_safe_entry(
+        self, app_config: AppConfig, test_signer: Signer, requirements: dict
+    ) -> None:
+        """The move is the agent's need alone; the safe's own entry plays no part."""
+        signer = _signer_on(
+            test_signer, BalancesW3({test_signer.address: 99, SAFE: 1000})
+        )
+        app_config.fund_requirements = {"testchain": requirements}
+        assert wallet.agent_topup(app_config, signer) == {
+            "testchain": AgentTopUp(need=401, move=401)
+        }
 
     def test_unreadable_balance_leaves_the_chain_out(
         self,

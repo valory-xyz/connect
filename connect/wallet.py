@@ -74,18 +74,6 @@ class AgentTopUp:
     move: int  # as much of `need` as the safe holds
 
 
-def _agent_native_requirement(
-    requirements: dict[str, dict[str, FundRequirement]],
-) -> FundRequirement | None:
-    """Return the agent's native requirement; None unless the safe has one too."""
-    found: dict[str, FundRequirement] = {}
-    for role, assets in requirements.items():
-        for asset, requirement in assets.items():
-            if asset.lower() == NATIVE_ASSET:
-                found[role] = requirement
-    return found.get("agent") if "safe" in found else None
-
-
 def deficit(requirement: FundRequirement, balance: int) -> int:
     """Return what funds-manager asks for: up to `topup` once under `threshold`."""
     if balance >= requirement["threshold"]:
@@ -109,7 +97,7 @@ def agent_topup(config: AppConfig, signer: Signer) -> dict[str, AgentTopUp]:
     plans: dict[str, AgentTopUp] = {}
     for chain, requirements in config.fund_requirements.items():
         chain_config = config.chains.get(chain)
-        agent = _agent_native_requirement(requirements)
+        agent = requirements.get("agent", {}).get(NATIVE_ASSET)
         if chain_config is None or not chain_config.safe_address or agent is None:
             continue
         try:

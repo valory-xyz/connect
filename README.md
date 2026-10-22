@@ -263,7 +263,7 @@ semantics are designed.
 as decimal strings or integers.
 
 At start and then every `AGENT_TOPUP_INTERVAL_SECONDS`, on every chain with a
-safe and a native requirement for both roles, the server checks the agent
+safe and a native requirement for the agent, the server checks the agent
 EOA's native balance. Below its `threshold`, the EOA needs `topup - balance`,
 and the safe sends it that much native token, or all it holds when that is
 less, in one plain `execTransaction` CALL (no calldata, no MultiSend). Tokens
