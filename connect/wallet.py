@@ -99,9 +99,8 @@ def plan_agent_topup(
 
 
 def agent_topup(config: AppConfig, signer: Signer) -> dict[str, AgentTopUp]:
-    """Read native balances and plan the top-up on every chain it applies to.
+    """Plan the top-up on every chain it applies to (README, "Agent top-up").
 
-    That is every chain with a safe and a native requirement for both roles.
     A chain whose balances cannot be read is logged and left out.
     """
     plans: dict[str, AgentTopUp] = {}
