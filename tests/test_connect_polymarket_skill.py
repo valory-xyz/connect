@@ -4098,16 +4098,7 @@ def test_sweep_reads_every_page_of_open_orders_raw(clob, pages, refusal) -> None
     assert "x" * 501 not in str(refused.value)
 
 
-@pytest.mark.parametrize(
-    "method",
-    # every SecureClient method that signs or sends a transaction, a
-    # session-key change or an order outside the scripts' own flow
-    """approve_erc20 approve_erc1155_for_all transfer_erc20 setup_trading_approvals
-    execute_transaction split_position merge_positions merge_multiple_positions
-    redeem_positions execute_collateral_return_plan place_limit_order
-    place_market_order accept_combo_quote authorize_session_key
-    revoke_session_key""".split(),
-)
+@pytest.mark.parametrize("method", _script("remote_signer")._BLOCKED)  # noqa: SLF001
 def test_client_refuses_the_sdk_s_direct_sends(clob, method) -> None:
     """The SDK client's own senders are closed: nothing is signed or sent.
 
