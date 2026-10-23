@@ -91,8 +91,10 @@ if [ ! -f "$READY" ]; then
   VERSION_QUERY='import sys; print(sys.version_info[0] * 100 + sys.version_info[1])'
   CHOSEN="$("$PYTHON" -c "$VERSION_QUERY" 2>/dev/null || true)"
   # A venv keeps its builder's Python, so rebuild one an older Python made.
-  # Never rebuild down: every skill shares this venv, and a plain python3 run
-  # of one skill would wipe the venv another built with CONNECT_PYTHON.
+  # Never rebuild down a venv with pip: every skill shares it, and a plain
+  # python3 run of one skill would wipe the venv another built with
+  # CONNECT_PYTHON. One without pip holds no install, so any other version
+  # rebuilds it rather than mixing two Pythons in it.
   REBUILD=""
   CHECKED="$PYTHON"
   CHECKED_VERSION="$CHOSEN"
@@ -105,6 +107,9 @@ if [ ! -f "$READY" ]; then
       # pip installs into this venv as it is, so the floor applies to its Python
       CHECKED="$PY"
       CHECKED_VERSION="$BUILT_WITH"
+    elif [[ $BUILT_WITH =~ ^[0-9]+$ && $CHOSEN =~ ^[0-9]+$ &&
+      $BUILT_WITH != "$CHOSEN" ]]; then
+      REBUILD=1
     fi
   fi
   MIN="${CONNECT_MIN_PYTHON:-}"
