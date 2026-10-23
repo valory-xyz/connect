@@ -76,7 +76,7 @@ Run them from anywhere in the workspace (they locate `.mcp.json` upwards).
 | `markets.py list\|market\|group\|book\|price` | Market discovery and prices (public reads); `list --query` searches, `list --ends-within 48h\|7d\|2w` filters by resolution date, `group` lists a neg-risk market's siblings |
 | `trade.py quote\|buy\|sell\|limit\|order\|cancel` | CLOB orders (POLY_1271, DW-funded); `quote` prices a buy without placing it; market orders take `--order-type fok\|fak`, limit orders `gtc\|gtd --expires-in` |
 | `positions.py positions\|trades` | Portfolio reads (indexed, with an on-chain confirmation) |
-| `redeem.py list\|approve\|redeem\|all` | Redeem resolved positions from the safe |
+| `redeem.py list\|approve\|redeem\|all` | Redeem resolved positions from the safe; `redeem` takes v1 positions only, `all` claims v2 ones too |
 | `pm_common.py` | Print every contract and API host this skill uses, named (reference only, no network) |
 | `netcheck.py` | Prove Polymarket is reachable before blaming the venue |
 | `bootstrap_env.sh` | Create/reuse the venv and export the TLS trust store |
@@ -158,7 +158,7 @@ user rather than retrying.
 to minutes. An empty list right after a confirmed fill means "not indexed
 yet", never "no position".
 
-- It re-checks any token you may hold against the CTF contract, in both the
+- It re-checks any token you may hold on-chain, in both the
   safe and the DW, and reports each hit under `onchain_check.held`. Treat
   those as authoritative where they disagree with `positions`.
 - **`location: deposit_wallet` means the position is unswept** — it still

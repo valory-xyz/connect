@@ -86,6 +86,7 @@ NEG_RISK_CTF_COLLATERAL_ADAPTER = to_checksum_address(
     "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
 )
 DW_FACTORY = to_checksum_address("0x00000000000Fb5C9ADea0298D729A0CB3823Cc07")
+ROUTER = to_checksum_address("0x12121212006e4CD160D18e3f00711DA5c3372600")
 
 MAX_UINT256 = 2**256 - 1
 PARENT_COLLECTION_ID = b"\x00" * 32
@@ -185,6 +186,7 @@ CONTRACTS: tuple[Contract, ...] = (
         role="Deploys and dispatches to the per-owner DW; every relayer "
         "mutation targets it, never a DW directly",
     ),
+    Contract(name="Router", address=ROUTER, role="Protocol V2 redeem, by the safe"),
 )
 
 _CONTRACTS_BY_ADDRESS = {c.address.lower(): c.name for c in CONTRACTS}
@@ -601,6 +603,18 @@ def encode_erc1155_safe_transfer(frm: str, to: str, token_id: int, amount: int) 
         "safeTransferFrom(address,address,uint256,uint256,bytes)",
         ["address", "address", "uint256", "uint256", "bytes"],
         [to_checksum_address(frm), to_checksum_address(to), token_id, amount, b""],
+    )
+
+
+def encode_router_redeem(condition_id: str, outcome_index: int, amount: int) -> str:
+    """Router redeem(bytes31,uint256,uint256); a V2 condition id pads it with 0x00."""
+    condition = bytes.fromhex(condition_id.removeprefix("0x"))
+    if len(condition) != 32 or condition[31]:
+        raise SystemExit(f"{condition_id} is not a padded Protocol V2 condition id")
+    return _call(
+        "redeem(bytes31,uint256,uint256)",
+        ["bytes31", "uint256", "uint256"],
+        [condition[:31], outcome_index, amount],
     )
 
 
@@ -1026,6 +1040,11 @@ def v2_module(token_id: t.Any) -> int:
     value = int(token_id) if str(token_id).isdigit() else 0
     module = value >> 248
     return module if module in (1, 2, 3) and not value & _V2_RESERVED_BITS else 0
+
+
+def position_contract(token_id: t.Any) -> str:
+    """Return the ERC-1155 holding an outcome: PositionManager for V2, else the CTF."""
+    return POSITION_MANAGER if v2_module(token_id) else CTF
 
 
 def require_supported_market(token_id: str) -> None:

@@ -31,10 +31,13 @@ One-time prerequisite per safe: `approve` grants the two adapters ERC-1155
 operator rights on the safe's CTF positions. The adapters never pull ERC-20
 from the safe, so no pUSD allowance is needed.
 
+A Protocol V2 position is claimed through the Router instead, which
+`approve` grants operator rights on the safe's PositionManager positions.
+
 Usage:
     python redeem.py list                # redeemable positions in the safe
     python redeem.py approve             # one-time adapter operator rights
-    python redeem.py redeem --condition-id 0x... --outcome-index 0 [--neg-risk]
+    python redeem.py redeem --condition-id 0x... --outcome-index 0 [--neg-risk]  # v1
     python redeem.py all                 # approve + redeem everything listed
 """
 
@@ -56,14 +59,18 @@ def _redeemable(cs: pm.ConnectSigner) -> list:
 
 
 def _ensure_adapter_approvals(cs: pm.ConnectSigner) -> list:
-    """Grant the collateral adapters operator rights on the safe's CTF (idempotent)."""
+    """Grant the adapters and the Router operator rights on the safe (idempotent)."""
     results = []
-    for adapter in (pm.CTF_COLLATERAL_ADAPTER, pm.NEG_RISK_CTF_COLLATERAL_ADAPTER):
-        if pm.is_approved_for_all(cs.w3, pm.CTF, cs.safe_address, adapter):
+    for token, adapter in (
+        (pm.CTF, pm.CTF_COLLATERAL_ADAPTER),
+        (pm.CTF, pm.NEG_RISK_CTF_COLLATERAL_ADAPTER),
+        (pm.POSITION_MANAGER, pm.ROUTER),
+    ):
+        if pm.is_approved_for_all(cs.w3, token, cs.safe_address, adapter):
             results.append({"adapter": adapter, "approved": "already"})
             continue
         tx_hash = cs.safe_transaction(
-            pm.CTF, pm.encode_set_approval_for_all(adapter, True)
+            token, pm.encode_set_approval_for_all(adapter, True)
         )
         receipt = cs.wait_receipt(tx_hash)
         results.append({"adapter": adapter, **receipt})
@@ -90,6 +97,23 @@ def _redeem_one(
     return {
         "condition_id": condition_id,
         "adapter": adapter,
+        **cs.wait_receipt(tx_hash),
+    }
+
+
+def _redeem_v2(
+    cs: pm.ConnectSigner, condition_id: str, outcome_index: int, position_id: int
+) -> dict:
+    """One safe call to the Router's redeem of the safe's whole V2 position."""
+    # the exact on-chain balance: the data API rounds sizes
+    amount = pm.erc1155_balance_of(
+        cs.w3, pm.POSITION_MANAGER, cs.safe_address, position_id
+    )
+    data = pm.encode_router_redeem(condition_id, outcome_index, amount)
+    tx_hash = cs.safe_transaction(pm.ROUTER, data)
+    return {
+        "condition_id": condition_id,
+        "adapter": pm.ROUTER,
         **cs.wait_receipt(tx_hash),
     }
 
@@ -140,7 +164,12 @@ def cmd_all(cs: pm.ConnectSigner) -> None:
         neg_risk = bool(position.get("negativeRisk"))
         if not condition_id:
             continue
-        results.append(_redeem_one(cs, condition_id, outcome_index, neg_risk))
+        if not pm.v2_module(position.get("asset")):
+            results.append(_redeem_one(cs, condition_id, outcome_index, neg_risk))
+        # the data API marks a resolved V2 market's losing side redeemable too
+        elif position.get("currentValue"):
+            position_id = int(position["asset"])
+            results.append(_redeem_v2(cs, condition_id, outcome_index, position_id))
     failed = [r for r in results if r.get("status") != 1]
     pm.print_json({"redeemed": results, "failed": len(failed)})
     if failed:

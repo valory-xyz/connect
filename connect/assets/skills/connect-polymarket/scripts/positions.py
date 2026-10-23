@@ -25,8 +25,8 @@ the safe; use --wallet to look elsewhere.
 
 The data API is an indexer and lags the chain (see INDEXER_LAG_NOTE), so
 every read names its source and any token this skill has reason to think is
-held is confirmed straight from the CTF contract rather than taken on the
-indexer's word.
+held is confirmed straight from the chain (the CTF, or PositionManager for V2)
+rather than taken on the indexer's word.
 
 Usage:
     python positions.py positions [--wallet safe|dw|eoa|0x...] [--redeemable]
@@ -130,7 +130,7 @@ def _check_addresses(cs: pm.ConnectSigner, wallet_address: str) -> list:
 
 
 def _onchain_holdings(cs: pm.ConnectSigner, addresses: list, token_ids: list) -> list:
-    """Read CTF balances straight from the chain, per wallet and token id.
+    """Read outcome balances straight from the chain, per wallet and token id.
 
     Each hit names the wallet holding it, because "you hold 12.5 shares" and
     "they are still in the DepositWallet, unswept" are different facts and the
@@ -139,7 +139,9 @@ def _onchain_holdings(cs: pm.ConnectSigner, addresses: list, token_ids: list) ->
     held = []
     for wallet in addresses:
         for token_id in token_ids:
-            units = pm.erc1155_balance_of(cs.w3, pm.CTF, wallet["address"], token_id)
+            units = pm.erc1155_balance_of(
+                cs.w3, pm.position_contract(token_id), wallet["address"], token_id
+            )
             if units > 0:
                 held.append(
                     {
