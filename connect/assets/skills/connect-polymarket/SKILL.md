@@ -61,8 +61,9 @@ actually did before repeating it:
   transaction does not confirm on-chain, so a failure is visible — inspect
   the reported tx before re-running, or you may double-spend / double-order.
   A `placement uncertain` failure from `trade.py` means the order may be live:
-  do not re-run it until the on-chain check it names shows what happened, and
-  for a limit order tell the user rather than placing it again.
+  do not re-run it until the on-chain check it names, run after a minute or so
+  (a fill reaches the chain after the match), shows what happened, and for a
+  limit order tell the user rather than placing it again.
 
 ## Scripts (`scripts/`)
 

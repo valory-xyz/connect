@@ -78,9 +78,10 @@ _REFUSED_CODES = (
 )
 _UNCERTAIN = (
     "placement uncertain: the CLOB's reply does not show whether the order was "
-    "placed ({}); before retrying, check the chain (positions.py positions "
-    "--wallet dw --token-ids {}): a limit order may instead rest unfilled on "
-    "the book, where no position shows it"
+    "placed ({}); before retrying, check the chain after a minute or so, since "
+    "a fill settles there after the match (positions.py positions --wallet dw "
+    "--token-ids {}): a limit order may instead rest unfilled on the book, "
+    "where no position shows it"
 )
 
 
