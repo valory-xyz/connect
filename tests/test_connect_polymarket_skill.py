@@ -38,12 +38,14 @@ import base64
 import importlib.util
 import json
 import os
+import re
 import subprocess  # nosec B404 - runs the skill's own bootstrap script
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import get_args
 
 import httpx
 import pytest
@@ -56,12 +58,17 @@ from eth_account.signers.local import LocalAccount
 from eth_keys import keys as eth_keys
 from eth_utils import is_address, keccak, to_checksum_address
 
-# Without the SDK this file skips; see tox.ini, testenv:unit-tests.
-pytest.importorskip("polymarket")
+# Without the SDK this file skips, unless CONNECT_REQUIRE_SDK is set: tox's
+# SDK run sets it, so a broken overlay fails there. See testenv:unit-tests.
+if os.environ.get("CONNECT_REQUIRE_SDK"):
+    importlib.import_module("polymarket")
+else:
+    pytest.importorskip("polymarket")
 
 from polymarket import RequestRejectedError, SecureClient, TransportError  # noqa: E402
 from polymarket._internal.actions.orders import cache as sdk_order_cache  # noqa: E402
 from polymarket._internal.actions.orders import orders as sdk_orders  # noqa: E402
+from polymarket._internal.actions.orders import post as sdk_post  # noqa: E402
 from polymarket._internal.actions.orders.market import (  # noqa: E402
     adjust_buy_amount_for_fees,
 )
@@ -70,6 +77,10 @@ from polymarket._internal.actions.orders.market_data import (  # noqa: E402
     PlatformFeeInfo,
 )
 from polymarket._internal.l1_auth import build_api_key_auth_typed_data  # noqa: E402
+from polymarket.models.clob.order_response import (  # noqa: E402
+    OrderResponseErrorCode,
+    RejectedOrder,
+)
 from web3.exceptions import ContractLogicError, TimeExhausted  # noqa: E402
 
 from connect import workspace  # noqa: E402
@@ -2802,6 +2813,7 @@ def _fake_venv(root: Path, complete: bool = True, built_by: str = "python3") -> 
     """
     venv = root / ".venv"
     (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
     python = venv / "bin" / "python"
     python.write_text(
         f'#!/bin/sh\ncase "$*" in *certifi*) echo /fake/cacert.pem ;;\n'
@@ -3172,6 +3184,46 @@ def test_bootstrap_rebuilds_a_venv_another_python3_made(
     notice = f"rebuilding venv at {venv} with Python {on_path}"
     assert (notice in result.stderr) is rebuilt
     assert (venv / SENTINEL).is_file()
+
+
+@requires_posix_shell
+@pytest.mark.parametrize("built_with", ["3.10.12", None], ids=["older", "broken"])
+def test_bootstrap_never_clears_a_directory_that_is_not_a_venv(
+    tmp_path, built_with
+) -> None:
+    """A CONNECT_POLYMARKET_VENV with no pyvenv.cfg is refused, not rebuilt.
+
+    `venv --clear` empties the directory, so a prefix that only looks like a
+    venv the bootstrap would rebuild is named in the refusal and left as it is.
+    """
+    log = tmp_path / "commands.log"
+    old = str(_python3(tmp_path / "old", built_with, log)) if built_with else "false"
+    venv = _fake_venv(tmp_path / "prefix$(touch pwned)", complete=False, built_by=old)
+    (venv / "pyvenv.cfg").unlink()
+    (venv / "notes.txt").write_text("the operator's own file", encoding="utf-8")
+    before = {p: p.read_bytes() for p in venv.rglob("*") if p.is_file()}
+    bin_dir = _python3(tmp_path / "bin", "3.11.9", log).parent
+
+    result = _run_bootstrap(
+        tmp_path,
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CONNECT_POLYMARKET_VENV": str(venv),
+        },
+    )
+
+    assert result.returncode != 0
+    evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test input
+        ["bash", "-c", result.stdout],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert evaled.returncode != 0
+    assert str(venv) in evaled.stderr
+    assert not (tmp_path / "pwned").exists()
+    assert {p: p.read_bytes() for p in venv.rglob("*") if p.is_file()} == before
 
 
 def test_workspace_gitignores_the_skill_venv() -> None:
@@ -4194,8 +4246,23 @@ def test_trade_order_and_cancel_print_the_clob_s_reply(clob, capsys) -> None:
 _UNREADABLE = {k: v for k, v in _PLACED.items() if k != "takingAmount"}
 
 
-_UNCERTAIN = ("uncertain", "check positions")
+# the on-chain check for the order's own token, not the list that lags the chain
+_UNCERTAIN = ("uncertain", f"--token-ids {_V1_TOKEN}")
 _NO_FUNDS = ("not enough balance / allowance",)
+# a refusal code a later SDK may add, which the script cannot know proves no order
+_NEW_CODE = RejectedOrder.model_construct(code="new_code", message="new refusal")
+
+
+def test_the_sdk_s_refusal_codes_are_all_classified() -> None:
+    """Every code the SDK assigns but "unmatched" and "unknown" proves no order.
+
+    An SDK bump that adds a code fails here until the code is classified.
+    """
+    refused = getattr(_script("trade"), "_REFUSED_CODES", ())
+    assert set(get_args(OrderResponseErrorCode)) ^ set(refused) == {
+        "unmatched",
+        "unknown",
+    }
 
 
 @pytest.mark.parametrize(
@@ -4214,9 +4281,11 @@ _NO_FUNDS = ("not enough balance / allowance",)
         (_BUY, httpx.ReadTimeout("read timed out"), _UNCERTAIN, True),
         (_BUY, (500, {"error": "internal"}), _UNCERTAIN, True),
         (_BUY, (408, {"error": "request timeout"}), ("request timeout",), True),
+        (_BUY, _NEW_CODE, _UNCERTAIN, True),
     ],
     ids="unmatched unmatched-limit unmatched-sell unmatched-limit-sell odd-status "
-    "unreadable unreadable-sell refused refused-limit timed-out 500 408".split(),
+    "unreadable unreadable-sell refused refused-limit timed-out 500 408 "
+    "new-code".split(),
 )
 def test_only_a_refusal_code_proves_an_order_was_not_placed(
     clob, monkeypatch, capsys, command, reply, told_of, kept
@@ -4226,16 +4295,20 @@ def test_only_a_refusal_code_proves_an_order_was_not_placed(
     "unmatched", a reply the SDK cannot classify ("unknown") or cannot read,
     no answer at all, or a 5xx may arrive after the CLOB has the order:
     placement is uncertain, and a buy keeps its pending marker. So does a
-    408. Only a refusal code the SDK assigns, or a 401, proves no order,
-    resolving the marker.
+    408, or a refusal code the script does not know. Only a refusal code it
+    knows, or a 401, proves no order, resolving the marker.
     """
     _dw_holds(clob, monkeypatch, 100.0)
+    if reply is _NEW_CODE:
+        monkeypatch.setattr(sdk_post, "normalize_order_response", lambda raw: _NEW_CODE)
+        reply = _REFUSED
     clob.placed = reply
 
     code, told = _run(clob, capsys, command)
 
     assert code not in (None, 0)
     assert all(word in told for word in told_of)
+    assert not re.search(r"positions --wallet dw(?! --token-ids)", told)
     if kept is not None:
         assert pm.dw_pending_buy_tokens(clob.cs) == ([int(_V1_TOKEN)] if kept else [])
 
@@ -4308,7 +4381,27 @@ def test_sweep_reads_open_orders_unless_forced(clob, monkeypatch, force) -> None
     assert len(clob.calls("GET", "/data/orders")) == (0 if force else 1)
 
 
-@pytest.mark.parametrize("method", _script("remote_signer")._BLOCKED)  # noqa: SLF001
+_DIRECT_SENDS = (
+    "approve_erc20",
+    "approve_erc1155_for_all",
+    "transfer_erc20",
+    "setup_trading_approvals",
+    "execute_transaction",
+    "split_position",
+    "merge_positions",
+    "merge_multiple_positions",
+    "redeem_positions",
+    "execute_collateral_return_plan",
+    "place_limit_order",
+    "place_market_order",
+    "post_orders",  # posts signed orders past the buy marker and market check
+    "accept_combo_quote",
+    "authorize_session_key",
+    "revoke_session_key",
+)
+
+
+@pytest.mark.parametrize("method", _DIRECT_SENDS)
 def test_client_refuses_the_sdk_s_direct_sends(clob, method) -> None:
     """The SDK client's own senders are closed: nothing is signed or sent.
 
@@ -4318,7 +4411,7 @@ def test_client_refuses_the_sdk_s_direct_sends(clob, method) -> None:
     assert callable(getattr(SecureClient, method))
     client = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW)
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(Exception, match="outside Connect's relayer proxy"):
         getattr(client, method)()
 
     assert clob.requests == clob.digests == []

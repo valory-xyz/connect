@@ -30,13 +30,19 @@ shared conftest puts connect-pons' scripts first on ``sys.path``, where another
 # mypy: ignore-errors
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("polymarket")
+# Without the SDK this file skips, unless CONNECT_REQUIRE_SDK is set: tox's
+# SDK run sets it, so a broken overlay fails there. See testenv:unit-tests.
+if os.environ.get("CONNECT_REQUIRE_SDK"):
+    importlib.import_module("polymarket")
+else:
+    pytest.importorskip("polymarket")
 
 _SCRIPTS = (
     Path(__file__).resolve().parent.parent
