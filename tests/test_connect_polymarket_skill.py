@@ -2963,10 +2963,11 @@ def test_bootstrap_emits_only_shell_assignments_on_stdout(tmp_path) -> None:
 
 
 # A `python3` stand-in that reports `version`: it answers `--version` and runs
-# `-c` code under that `sys.version_info`, logs `-m venv` runs to `log`, and
-# refuses anything else, so a run that gets past the version check shows.
+# `-c` code under that `sys.version_info`, logs `-m venv` runs to `log`, gives
+# an existing venv without pip one that logs there too, and refuses anything
+# else, so a run that gets past the version check shows.
 _PYTHON3 = """#!{executable}
-import collections, sys
+import collections, os, sys
 VERSION = "{version}"
 if sys.argv[1] == "--version":
     print("Python " + VERSION)
@@ -2977,6 +2978,11 @@ elif sys.argv[1] == "-c":
 elif sys.argv[1:3] == ["-m", "venv"]:
     with open("{log}", "a") as log:
         print(*sys.argv[1:], file=log)
+    pip = os.path.join(sys.argv[-1], "bin", "pip")
+    if os.path.isdir(os.path.dirname(pip)) and not os.path.exists(pip):
+        with open(pip, "w") as script:
+            script.write('#!/bin/sh\\necho pip "$@" >> "{log}"\\n')
+        os.chmod(pip, 0o755)
 else:
     sys.exit("stand-in python3 will not run " + " ".join(sys.argv[1:]))
 """
@@ -2995,16 +3001,18 @@ def _python3(directory: Path, version: str, log: Path) -> Path:
 
 @requires_posix_shell
 @pytest.mark.parametrize(
-    ("on_path", "chosen"),
+    ("on_path", "chosen", "has_pip"),
     [
-        ("3.10.12", None),
-        ("3.11.0", None),
-        ("3.10.12", "3.10.12"),
-        ("3.10.12", "3.11.0"),
+        ("3.10.12", None, True),
+        ("3.11.0", None, True),
+        ("3.10.12", "3.10.12", True),
+        ("3.10.12", "3.11.0", True),
+        ("3.9.6", "3.10.12", True),
+        ("3.11.0", "3.10.12", False),
     ],
 )
 def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
-    tmp_path, on_path, chosen
+    tmp_path, on_path, chosen, has_pip
 ) -> None:
     """polymarket-client needs Python 3.11, and a venv made for the old SDK is rebuilt.
 
@@ -3017,6 +3025,8 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
     (venv / OLD_SENTINEL).touch()
     pip_log = tmp_path / "pip.log"
     (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho "$@" >> "{pip_log}"\n')
+    if not has_pip:  # pip installed nothing, so the floor is the interpreter's
+        (venv / "bin" / "pip").unlink()
     bin_dir = _python3(tmp_path / "bin", on_path, pip_log).parent
     env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
     chosen_log = tmp_path / "chosen.log"
@@ -3028,6 +3038,7 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
     if (chosen or on_path) == "3.10.12":
         assert result.returncode != 0
         assert not pip_log.exists()
+        assert not chosen_log.exists()  # a refusal leaves the venv alone
         assert "export PY=" not in result.stdout
         evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test input
             ["bash", "-c", result.stdout], capture_output=True, text=True, check=False
@@ -3075,23 +3086,25 @@ def test_bootstrap_creates_a_missing_venv_with_connect_python(tmp_path) -> None:
 
 @requires_posix_shell
 @pytest.mark.parametrize(
-    ("built_with", "on_path", "rebuilt"),
+    ("built_with", "on_path", "has_pip", "rebuilt"),
     [
-        ("3.10.12", "3.11.9", True),
-        ("3.11.2", "3.11.9", False),
-        ("3.12.0", "3.11.9", False),
-        ("3.11.2", "3.10.12", False),
+        ("3.10.12", "3.11.9", True, True),
+        ("3.11.2", "3.11.9", True, False),
+        ("3.12.0", "3.11.9", True, False),
+        ("3.11.2", "3.10.12", True, False),
+        ("3.12.0", "3.11.9", False, True),
     ],
 )
 def test_bootstrap_rebuilds_a_venv_another_python3_made(
-    tmp_path, built_with, on_path, rebuilt
+    tmp_path, built_with, on_path, has_pip, rebuilt
 ) -> None:
     """A venv an older python3 built is rebuilt before the install, not reused.
 
     A user who upgrades python3 to install the SDK must not stay stuck on the
     old venv, whose pip finds no polymarket-client for its Python. One built by
     the same or a newer minor version is installed into as it is, and the
-    3.11 floor is then that venv's Python, not an older python3's.
+    3.11 floor is then that venv's Python, not an older python3's. One without
+    pip holds no install, so any other version rebuilds it.
     """
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
     log = tmp_path / "commands.log"
@@ -3099,6 +3112,8 @@ def test_bootstrap_rebuilds_a_venv_another_python3_made(
     venv = _fake_venv(tmp_path, complete=False, built_by=str(old))
     (venv / OLD_SENTINEL).touch()
     (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho pip "$@" >> "{log}"\n')
+    if not has_pip:
+        (venv / "bin" / "pip").unlink()
     bin_dir = _python3(tmp_path / "bin", on_path, log).parent
 
     result = _run_bootstrap(
