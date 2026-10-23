@@ -1,0 +1,17 @@
+# Gitleaks configuration: the default rules, plus an allowlist of known test
+# fixtures. Keep every entry an exact value with the reason it is not a secret.
+#
+# The workflow checks out with fetch-depth: 0, so `gitleaks git` scans the
+# history of every branch, not only the one under test. A fixture committed on
+# any branch therefore fails the scan on every PR until it is listed here;
+# rewriting the fixture on its own branch does not remove it from history.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Base64 test fixtures for the connect-polymarket CLOB credentials (tests/test_connect_polymarket_skill.py): 'derived-secret' and 'cached-secret'"
+regexes = [
+  '''^ZGVyaXZlZC1zZWNyZXQ=$''',
+  '''^Y2FjaGVkLXNlY3JldA==$''',
+]

@@ -42,6 +42,7 @@ Run standalone (mimicking the Pearl runner) — see README "Development" for the
 - flake8 includes docstring rules (D) and pytest style (PT); every module/function needs a docstring.
 - Copyright headers (Valory AG, Apache 2.0) on every source file — `tox -e fix-copyright` adds them.
 - `packages/valory/connections/`, `packages/valory/protocols/`, `packages/open_aea/` are vendored third-party code, excluded from all linters — don't edit or reformat them.
+- gitleaks scans the history of every branch, not just the PR's (`fetch-depth: 0`), so a fixture that looks like a secret on any branch fails every PR. Allowlist the exact value in `.gitleaks.toml`, not the file or rule.
 
 ## Architecture
 
