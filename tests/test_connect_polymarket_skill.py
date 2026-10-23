@@ -3075,7 +3075,8 @@ def test_bootstrap_creates_a_missing_venv_with_connect_python(tmp_path) -> None:
 
 @requires_posix_shell
 @pytest.mark.parametrize(
-    ("built_with", "rebuilt"), [("3.10.12", True), ("3.11.2", False)]
+    ("built_with", "rebuilt"),
+    [("3.10.12", True), ("3.11.2", False), ("3.12.0", False)],
 )
 def test_bootstrap_rebuilds_a_venv_another_python3_made(
     tmp_path, built_with, rebuilt
@@ -3084,7 +3085,7 @@ def test_bootstrap_rebuilds_a_venv_another_python3_made(
 
     A user who upgrades python3 to install the SDK must not stay stuck on the
     old venv, whose pip finds no polymarket-client for its Python. One built by
-    the same minor version is installed into as it is.
+    the same or a newer minor version is installed into as it is.
     """
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
     log = tmp_path / "commands.log"
