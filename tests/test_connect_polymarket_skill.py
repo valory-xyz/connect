@@ -4425,8 +4425,8 @@ _APPROVE_ALL = "setApprovalForAll(address,bool)"
 _APPROVAL = "0xa22cb465"  # its selector
 _ADAPTER_REDEEM = "redeemPositions(address,bytes32,bytes32,uint256[])"
 # V1 ids whose top byte reads as a V2 module (here 2; 1 for `_V1_HELD` below):
-# their set reserved bits mark them V1.
-_V1_NO = str(int("02" + "9f" * 31, 16))
+# reserved bit 40, their only one set, marks them V1.
+_V1_NO = str((2 << 248) | (1 << 40) | 9)
 
 
 def _calldata(signature: str, *args) -> str:
@@ -4435,11 +4435,10 @@ def _calldata(signature: str, *args) -> str:
     return "0x" + (keccak(text=signature)[:4] + abi_encode(types, list(args))).hex()
 
 
-def _v2_market(question: str, slug: str, condition_id: str, **fields) -> dict:
-    """Build a Gamma V2 row: position id = condition id + outcome index."""
+def _market(slug: str, condition_id: str, **fields) -> dict:
+    """Build an open Gamma V2 row: position id = condition id + outcome index."""
     base = int(condition_id, 16)
     return {
-        "question": question,
         "slug": slug,
         "conditionId": condition_id,
         "version": "v2",
@@ -4452,47 +4451,39 @@ def _v2_market(question: str, slug: str, condition_id: str, **fields) -> dict:
 
 
 # Recorded V2 markets, trimmed; a condition id's first byte names its module.
-_V2_BINARY = _v2_market(
-    "V2 binary",
+_V2_BINARY = _market(
     "polyv2bkbsl-cay-bur-2026-10-23",
     "0x01e64a3b41c057c976f9b5de07e357c99e000000000000000000000000000000",
     negRisk=None,
     volumeNum=500,
 )
-_V2_NEG_RISK = _v2_market(
-    "V2 neg-risk",
-    "polyv2-central-park-high-59f-or-below-2026-10-22",
-    "0x02ee1f9ac20b0329a15c5b142e036fb317000500000000000000000000000000",
-    negRisk=True,
+_UNTRADEABLE = (
+    _market(
+        "polyv2-central-park-high-59f-or-below-2026-10-22",
+        "0x02ee1f9ac20b0329a15c5b142e036fb317000500000000000000000000000000",
+        negRisk=True,
+    ),
+    _market("v2-combinatorial", "0x03" + "5e" * 16 + "00" * 15),
 )
-_V2_COMBINATORIAL = _v2_market(
-    "V2 combinatorial", "v2-combinatorial", "0x03" + "5e" * 16 + "00" * 15
+# a V1 market can list position ids too; it still trades by its CLOB token ids
+_V1_MARKET = _market(
+    "v1-binary",
+    "0x" + "c1" * 32,
+    version="v1",
+    clobTokenIds=json.dumps([_V1_TOKEN, _V1_NO]),
+    volumeNum=1000,
 )
-_V1_MARKET = {
-    "question": "V1 binary",
-    "slug": "v1-binary",
-    "conditionId": "0x" + "c1" * 32,
-    "version": "v1",
-    "clobTokenIds": json.dumps([_V1_TOKEN, _V1_NO]),
-    # a V1 market can list PositionManager ids too; it still trades by clobTokenIds
-    "positionIds": [str(int("01" + "9a" * 30 + "00", 16) + i) for i in (0, 1)],
-    "outcomes": '["Yes", "No"]',
-    "active": True,
-    "closed": False,
-    "volumeNum": 1000,
-}
 _TRADING_IDS = {
-    "V1 binary": [_V1_TOKEN, _V1_NO],
-    "V2 binary": _V2_BINARY["positionIds"],
+    "v1-binary": [_V1_TOKEN, _V1_NO],
+    _V2_BINARY["slug"]: _V2_BINARY["positionIds"],
 }
 
 
 def _gamma(monkeypatch, *rows, slug_index: str = "") -> list:
     """Serve Gamma over `rows` as it filters them: v1 only unless asked for v2.
 
-    public-search returns every version. With `slug_index` ("markets" or
-    "events"), a slug resolves only through that index. Returns the versions
-    each other read asked for.
+    public-search returns every version; with `slug_index`, a slug resolves
+    only through that index. Returns the versions each other read asked for.
     """
     versions: list = []
 
@@ -4500,9 +4491,10 @@ def _gamma(monkeypatch, *rows, slug_index: str = "") -> list:
         return {str(value)} if isinstance(value, (str, int)) else set(map(str, value))
 
     def fake_get(url, params=None):
-        params = dict(params or {})
-        if url.endswith("/public-search"):
+        params, index = dict(params or {}), url.removeprefix(f"{pm.GAMMA_API}/")
+        if index == "public-search":
             return {"events": [{"markets": list(rows)}]}
+        assert index in ("markets", "events"), url
         versions.append(asked(params.get("version", "v1")))
         served = [r for r in rows if r["version"] in versions[-1]]
         for key, ids in (
@@ -4516,9 +4508,9 @@ def _gamma(monkeypatch, *rows, slug_index: str = "") -> list:
         ):
             if key in params:
                 served = [r for r in served if ids(r) & asked(params[key])]
-        if "slug" in params and not url.endswith(slug_index):
+        if "slug" in params and slug_index not in ("", index):
             return []
-        if url.endswith("/events"):
+        if index == "events":
             return [{"slug": params.get("slug"), "markets": served}] if served else []
         return served
 
@@ -4547,15 +4539,12 @@ def test_v2_position_markets_search(monkeypatch, capsys, read) -> None:
     asking for both versions. Neg-risk, combinatorial and closed V2 markets
     are not offered as tradeable.
     """
+    closed = _market("v2-closed", "0x01" + "c0" * 16 + "00" * 15, closed=True)
     versions = _gamma(
         monkeypatch,
-        _V1_MARKET,
-        _V2_BINARY,
-        _V2_NEG_RISK,
-        _V2_COMBINATORIAL,
-        _v2_market(
-            "V2 closed", "v2-closed", "0x01" + "c0" * 16 + "00" * 15, closed=True
-        ),
+        *_BOTH,
+        *_UNTRADEABLE,
+        closed,
         slug_index={"slug": "markets", "events-fallback": "events"}.get(read, ""),
     )
     priced: list = []
@@ -4569,10 +4558,8 @@ def test_v2_position_markets_search(monkeypatch, capsys, read) -> None:
         out = json.loads(capsys.readouterr().out)
         shown.extend(out["siblings"] if isinstance(out, dict) else out)
 
-    assert sorted(m["question"] for m in shown) == sorted(_TRADING_IDS)
-    for market in shown:
-        assert _TRADING_IDS[market["question"]] in market.values()
-        assert _V1_MARKET["positionIds"] not in market.values()
+    assert sorted(m["slug"] for m in shown) == sorted(_TRADING_IDS)
+    assert {m["slug"]: m["clob_token_ids"] for m in shown} == _TRADING_IDS
     assert sorted(priced) == sorted(sum(_TRADING_IDS.values(), []))
     assert all(asked == {"v1", "v2"} for asked in versions)
 
@@ -4594,10 +4581,8 @@ def test_v2_position_trade_by_position_id(clob, monkeypatch, capsys, command) ->
     market lists, are refused before anything is signed or sent.
     """
     # the CLOB stand-in's own V2 market, its book served for the asset asked
-    v2_binary = _v2_market("V2 binary", "v2-binary", f"0x{int(_V2_TOKEN):064x}")
-    versions = _gamma(
-        monkeypatch, _V1_MARKET, v2_binary, _V2_NEG_RISK, _V2_COMBINATORIAL
-    )
+    v2_binary = _market("v2-binary", f"0x{int(_V2_TOKEN):064x}")
+    versions = _gamma(monkeypatch, _V1_MARKET, v2_binary, *_UNTRADEABLE)
     send = clob.send
 
     def book_of_the_asset_asked(request):
@@ -4607,31 +4592,27 @@ def test_v2_position_trade_by_position_id(clob, monkeypatch, capsys, command) ->
     monkeypatch.setattr(clob, "send", book_of_the_asset_asked)
     _dw_holds(clob, monkeypatch, 100.0)
     name, *args = _ORDERS[command]
-    trade, built = _script("trade"), []
-    make = trade.make_clob_client
-    monkeypatch.setattr(
-        trade, "make_clob_client", lambda *a: built.append(a) or make(*a)
-    )
-    run = getattr(trade, f"cmd_{name}")
+    run = getattr(_script("trade"), f"cmd_{name}")
 
-    for market in (_V2_NEG_RISK, _V2_COMBINATORIAL, _V2_BINARY):
+    for market in (*_UNTRADEABLE, _V2_BINARY):
         with pytest.raises(SystemExit):
             run(clob.cs, market["positionIds"][0], *args)
-    assert built == clob.requests == clob.digests == []
+    assert clob.requests == clob.digests == []
     pm.require_supported_market(_V1_NO)  # V1 by its layout, though its top byte is 2
     assert versions[-1] == {"v1"}
 
     traded = []
     for token in (_V1_TOKEN, _V2_TOKEN):
-        try:
-            run(clob.cs, token, *args)
-        except SystemExit as e:
-            pytest.fail(f"{command} {token} refused: {e}")
+        run(clob.cs, token, *args)
         if name == "quote":
             traded.append(json.loads(capsys.readouterr().out)["token_id"])
     if name != "quote":
         traded = [order["tokenId"] for order in clob.orders]
     assert traded == [_V1_TOKEN, _V2_TOKEN]
+    # only an ASCII decimal id can name a V2 position, and no id raises
+    fullwidth = "".join(chr(0xFF10 + int(d)) for d in _V2_TOKEN)
+    for odd in (fullwidth, "²", "", hex(int(_V2_TOKEN)), None):
+        assert pm.v2_module(odd) == 0, odd
 
 
 def _key(*parts) -> tuple:
@@ -4650,40 +4631,37 @@ def _call(target, data) -> tuple:
 class _SafeChain:
     """The service safe and the ERC-1155 balances and approvals it reads.
 
-    Both are keyed by contract, so a read at the wrong one finds nothing; an
-    approval the safe sends is granted on-chain.
+    Both are keyed by contract, so a read at the wrong one finds nothing. An
+    approval the safe sends is granted, and a Router claim burns its position.
     """
 
     safe_address = SAFE_ADDR
     w3 = object()
 
-    def __init__(self, monkeypatch, balances: dict) -> None:
-        """Hold `balances`, (contract, owner, id) -> units; no approvals yet."""
+    def __init__(self, monkeypatch, balances: dict, approved=()) -> None:
+        """Hold `balances`, (contract, owner, id) -> units, and `approved` pairs."""
         self.balances = {_key(*k): units for k, units in balances.items()}
-        self.approved: set = set()
+        self.approved = {_key(*pair) for pair in approved}
         self.sent: list = []
-        monkeypatch.setattr(
-            pm,
-            "erc1155_balance_of",
-            lambda w3, token, owner, token_id: self.balances.get(
-                _key(token, owner, token_id), 0
-            ),
-        )
-        monkeypatch.setattr(
-            pm,
-            "is_approved_for_all",
-            lambda w3, token, owner, operator: _key(token, operator) in self.approved,
-        )
+        for name, read in (
+            ("erc1155_balance_of", lambda w3, *k: self.balances.get(_key(*k), 0)),
+            ("is_approved_for_all", lambda w3, t, _, op: _key(t, op) in self.approved),
+        ):
+            monkeypatch.setattr(pm, name, read)
 
     def safe_transaction(self, to, data, value=0, request_id=None) -> str:
-        """Record one safe call, granting it if it is an approval."""
-        self.sent.append(_call(to, data))
-        if self.sent[-1][1].startswith(_APPROVAL):
-            operator, granted = abi_decode(
-                ["address", "bool"], bytes.fromhex(self.sent[-1][1][10:])
-            )
+        """Record one safe call and apply it as the chain would."""
+        target, data = _call(to, data)
+        self.sent.append((target, data))
+        args = bytes.fromhex(data[10:])
+        if data.startswith(_APPROVAL):
+            operator, granted = abi_decode(["address", "bool"], args)
             if granted:
-                self.approved.add(_key(to, operator))
+                self.approved.add(_key(target, operator))
+        elif target == _ROUTER:
+            condition, index, _ = abi_decode(["bytes31", "uint256", "uint256"], args)
+            claimed = (int.from_bytes(condition, "big") << 8) + index
+            self.balances.pop(_key(_POSITION_MANAGER, SAFE_ADDR, claimed), None)
         return "0x" + "ab" * 32
 
     def wait_receipt(self, tx_hash, timeout=300) -> dict:
@@ -4691,32 +4669,33 @@ class _SafeChain:
         return {"status": 1, "tx_hash": tx_hash}
 
 
-_V2_HELD, _V1_HELD = int(_V2_BINARY["positionIds"][1]), int("01" + "9f" * 31, 16)
+_V2_HELD, _V1_HELD = int(_V2_BINARY["positionIds"][1]), (1 << 248) | (1 << 40) | 7
 
 
 def _holding(monkeypatch, at: str) -> _SafeChain:
     """Hold 5 V2 shares on PositionManager and 7 V1 on the CTF, both at `at`."""
-    return _SafeChain(
-        monkeypatch,
-        {
-            (_POSITION_MANAGER, at, _V2_HELD): 5_000_000,
-            (_CTF, at, _V1_HELD): 7_000_000,
-        },
-    )
+    held = {
+        (_POSITION_MANAGER, at, _V2_HELD): 5 * 10**6,
+        (_CTF, at, _V1_HELD): 7 * 10**6,
+    }
+    return _SafeChain(monkeypatch, held)
 
 
 def test_v2_position_holdings_from_position_manager(monkeypatch, capsys) -> None:
-    """`positions` confirms a V2 holding on PositionManager, a V1 one on the CTF."""
+    """`positions` confirms every V2 holding on PositionManager, V1 on the CTF."""
+    other = [int(m["positionIds"][0]) for m in _UNTRADEABLE]
     cs = _holding(monkeypatch, SAFE_ADDR)
+    cs.balances.update({_key(_POSITION_MANAGER, SAFE_ADDR, i): 10**6 for i in other})
     monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page([]))
     monkeypatch.setattr(positions, "_resolve_dw", lambda cs: DW_HELD)
 
-    positions.cmd_positions(cs, "safe", False, [_V2_HELD, _V1_HELD])
+    positions.cmd_positions(cs, "safe", False, [_V2_HELD, _V1_HELD, *other])
 
     held = json.loads(capsys.readouterr().out)["onchain_check"]["held"]
-    assert [(h["token_id"], h["location"], h["size"]) for h in held] == [
-        (str(_V2_HELD), "service_safe", 5.0),
-        (str(_V1_HELD), "service_safe", 7.0),
+    assert [(int(h["token_id"]), h["size"]) for h in held] == [
+        (_V2_HELD, 5.0),
+        (_V1_HELD, 7.0),
+        *((i, 1.0) for i in other),
     ]
 
 
@@ -4724,10 +4703,7 @@ def test_v2_position_holdings_from_position_manager(monkeypatch, capsys) -> None
 def test_v2_position_funds_through_position_manager(
     monkeypatch, capsys, command
 ) -> None:
-    """V2 shares move between the DW and the safe on PositionManager.
-
-    V1 shares still move on the CTF, in the same sweep.
-    """
+    """V2 shares move between the DW and the safe on PositionManager, V1 on the CTF."""
     holder, receiver = (DW_ADDR, SAFE_ADDR)[:: 1 if command == "sweep" else -1]
     _sweep_mocks(monkeypatch, pusd=0, ctf_balance=0, recorded=[], indexed=[])
     cs = _holding(monkeypatch, holder)
@@ -4760,37 +4736,17 @@ def test_v2_position_funds_through_position_manager(
     ]
 
 
-# A resolved binary V2 market, as the data API lists the safe's two sides of it.
+# A resolved binary V2 market, as the data API lists the safe's sides of it.
 _V2_RESOLVED = "0x01d4bb20435cb2b6c6431871f0ec197e92000000000000000000000000000000"
+_ADAPTERS = (pm.CTF_COLLATERAL_ADAPTER, pm.NEG_RISK_CTF_COLLATERAL_ADAPTER)
+_ROUTER_APPROVAL = (_POSITION_MANAGER, _calldata(_APPROVE_ALL, _ROUTER, True))
 
 
-def _settled(condition_id: str, token_id, index: int, value: float, size: float):
+def _settled(token_id, value, condition_id, index, neg_risk=False) -> dict:
     """Return a redeemable data-API position row, in the names `_v2_page` maps."""
-    return {
-        "conditionId": condition_id,
-        "asset": str(token_id),
-        "outcomeIndex": index,
-        "currentValue": value,
-        "size": size,
-        "redeemable": True,
-        "negativeRisk": False,
-    }
-
-
-_V2_LOST = _settled(_V2_RESOLVED, int(_V2_RESOLVED, 16) + 1, 1, 0.0, 5.0)
-
-
-def _claim_from(monkeypatch, capsys, rows, balances: dict, runs: int = 1) -> list:
-    """Run `redeem.py all` over `rows`; return the safe's calls, approvals apart."""
-    cs = _SafeChain(monkeypatch, balances)
-    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page(rows))
-    for _ in range(runs):
-        redeem.cmd_all(cs)
-    capsys.readouterr()
-    return [
-        [call for call in cs.sent if call[1].startswith(_APPROVAL) is granted]
-        for granted in (True, False)
-    ]
+    keys = ("asset", "currentValue", "conditionId", "outcomeIndex", "negativeRisk")
+    row = zip(keys, (str(token_id), value, condition_id, index, neg_risk))
+    return dict(row, redeemable=True)
 
 
 def _adapter_claim(outcome_index: int) -> tuple:
@@ -4800,47 +4756,69 @@ def _adapter_claim(outcome_index: int) -> tuple:
     return pm.CTF_COLLATERAL_ADAPTER, data
 
 
-@pytest.mark.parametrize("won", [0, 1])
-def test_v2_position_claim_through_router(monkeypatch, capsys, won) -> None:
+@pytest.mark.parametrize(("command", "won"), [("all", 0), ("all", 1), ("redeem", 1)])
+def test_v2_position_claim_through_router(monkeypatch, capsys, command, won) -> None:
     """A winning V2 position is claimed from the safe through the Router.
 
-    The amount is the safe's exact PositionManager balance of that outcome
-    (the data API rounds it) and the condition id is its high 31 bytes. The
-    Router is approved once; V1 still claims through its collateral adapter.
+    The condition id (high 31 bytes) and outcome index come from the position
+    id, the amount from the safe's exact PositionManager balance; the data API
+    row may disagree and rounds sizes. The Router is approved once, a claimed
+    position is not claimed again, and V1 still claims through its adapter.
     """
     position = int(_V2_RESOLVED, 16) + won
-    v2_won = _settled(_V2_RESOLVED, position, won, 1.8181, 1.8181)
-    v1_won = _settled(_V1_MARKET["conditionId"], _V1_TOKEN, 0, 7.0, 7.0)
-    balance = {(_POSITION_MANAGER, SAFE_ADDR, position): 1_818_182}
+    cs = _SafeChain(monkeypatch, {(_POSITION_MANAGER, SAFE_ADDR, position): 1_818_182})
+    rows = [
+        _settled(position, 1.8181, _V2_BINARY["conditionId"], 1 - won),
+        _settled(_V1_TOKEN, 7.0, _V1_MARKET["conditionId"], 0),
+    ]
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page(rows))
 
-    approvals, claims = _claim_from(
-        monkeypatch, capsys, [v2_won, v1_won], balance, runs=2
-    )
+    if command == "redeem":
+        redeem.cmd_redeem(cs, _V2_RESOLVED, won, False)
+    else:
+        redeem.cmd_all(cs)
+        redeem.cmd_all(cs)
 
-    assert sorted(approvals) == sorted(
-        [
-            (_CTF, _calldata(_APPROVE_ALL, pm.CTF_COLLATERAL_ADAPTER, True)),
-            (_CTF, _calldata(_APPROVE_ALL, pm.NEG_RISK_CTF_COLLATERAL_ADAPTER, True)),
-            (_POSITION_MANAGER, _calldata(_APPROVE_ALL, _ROUTER, True)),
-        ]
-    )
-    router_claim = _calldata(
-        "redeem(bytes31,uint256,uint256)",
-        bytes.fromhex(_V2_RESOLVED[2:])[:31],
-        won,
-        1_818_182,
-    )
-    assert claims == 2 * [(_ROUTER, router_claim), _adapter_claim(0)]
+    capsys.readouterr()
+    approvals = [call for call in cs.sent if call[1].startswith(_APPROVAL)]
+    claims = [call for call in cs.sent if call not in approvals]
+    condition = bytes.fromhex(_V2_RESOLVED[2:])[:31]
+    claim = _calldata("redeem(bytes31,uint256,uint256)", condition, won, 1_818_182)
+    if command == "redeem":
+        assert _ROUTER_APPROVAL in approvals
+        assert claims == [(_ROUTER, claim)]
+    else:
+        granted = [(_CTF, _calldata(_APPROVE_ALL, a, True)) for a in _ADAPTERS]
+        assert sorted(approvals) == sorted([*granted, _ROUTER_APPROVAL])
+        assert claims == [(_ROUTER, claim), _adapter_claim(0), _adapter_claim(0)]
+    with pytest.raises(SystemExit):  # a V2 condition id ends in a zero byte
+        pm.encode_router_redeem(_V2_RESOLVED[:-2] + "01", won, 1)
 
 
 def test_v2_position_losing_row_not_claimed(monkeypatch, capsys) -> None:
-    """`redeem.py all` skips a losing V2 row the data API marks redeemable.
+    """`redeem.py all` claims no losing, neg-risk or combinatorial V2 row.
 
-    A losing V1 row still goes to its adapter, as before.
+    A losing V1 row still goes to its adapter. On a safe that approved both
+    adapters before V2, V1 claims ask for no new approval; `approve` grants
+    the Router, once.
     """
-    v1_lost = _settled(_V1_MARKET["conditionId"], _V1_NO, 1, 0.0, 3.0)
-    balance = {(_POSITION_MANAGER, SAFE_ADDR, int(_V2_LOST["asset"])): 5_000_000}
+    neg_risk, combinatorial = _UNTRADEABLE
+    rows = [
+        _settled(int(_V2_RESOLVED, 16) + 1, 0.0, _V2_RESOLVED, 1),
+        _settled(neg_risk["positionIds"][0], 4.0, neg_risk["conditionId"], 0, True),
+        _settled(combinatorial["positionIds"][0], 4.0, combinatorial["conditionId"], 0),
+        _settled(_V1_NO, 0.0, _V1_MARKET["conditionId"], 1),
+    ]
+    held = {(_POSITION_MANAGER, SAFE_ADDR, r["asset"]): 5 * 10**6 for r in rows[:3]}
+    cs = _SafeChain(monkeypatch, held, approved=[(_CTF, a) for a in _ADAPTERS])
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page(rows))
+    monkeypatch.setattr(pm.ConnectSigner, "from_workspace", lambda: cs)
+    monkeypatch.setattr(sys, "argv", ["redeem.py", "approve"])
 
-    _, claims = _claim_from(monkeypatch, capsys, [_V2_LOST, v1_lost], balance)
+    redeem.cmd_all(cs)
+    redeem.cmd_redeem(cs, _V1_MARKET["conditionId"], 1, False)
+    redeem.main()
+    redeem.main()
 
-    assert claims == [_adapter_claim(1)]
+    capsys.readouterr()
+    assert cs.sent == [_adapter_claim(1), _adapter_claim(1), _ROUTER_APPROVAL]
