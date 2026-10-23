@@ -330,14 +330,16 @@ class TestOpenEndpoints:
         self, client: TestClient, app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Test funds status shape."""
-        app_config.fund_requirements = {"testchain": {"agent": {"0x" + "00" * 20: 100}}}
+        app_config.fund_requirements = {
+            "testchain": {"agent": {"0x" + "00" * 20: {"threshold": 100, "topup": 500}}}
+        }
         monkeypatch.setattr(wallet_module, "asset_balance", lambda *a, **k: (40, 18))
         response = client.get("/funds-status")
         assert response.status_code == 200
         body = response.json()
         (chain_entry,) = body.values()
         (asset_entry,) = list(chain_entry.values())[0].values()
-        assert asset_entry == {"balance": "40", "deficit": "60", "decimals": 18}
+        assert asset_entry == {"balance": "40", "deficit": "460", "decimals": 18}
 
     def test_index_html_has_no_token(self, client: TestClient) -> None:
         """Test index html has no token."""

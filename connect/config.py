@@ -29,6 +29,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 
 from connect.run_goal import check_target
 
@@ -53,6 +54,13 @@ DEFAULT_LOG_LEVEL = "info"
 DEFAULT_MINUTES_PER_RUN = 15
 
 
+class FundRequirement(TypedDict):
+    """One asset's funding rule for a role, in wei / smallest unit."""
+
+    threshold: int
+    topup: int
+
+
 @dataclass
 class ChainConfig:
     """Per-chain settings; the chain's name is the AppConfig.chains key."""
@@ -67,8 +75,8 @@ class AppConfig:
 
     chains: dict[str, ChainConfig]
     store_path: Path
-    # chain -> address -> asset -> threshold (wei / smallest unit)
-    fund_requirements: dict[str, dict[str, dict[str, int]]] = field(
+    # chain -> role -> asset -> requirement
+    fund_requirements: dict[str, dict[str, dict[str, FundRequirement]]] = field(
         default_factory=dict
     )
     log_level: str = DEFAULT_LOG_LEVEL
@@ -103,8 +111,50 @@ def _parse_safes(raw: str) -> dict[str, str]:
 FUND_REQUIREMENT_ROLES = ("agent", "safe")
 
 
-def _parse_fund_requirements(raw: str) -> dict[str, dict[str, dict[str, int]]]:
-    """Parse {chain: {"agent"|"safe": {asset: threshold}}} with int-able values.
+FUND_REQUIREMENT_KEYS = ("threshold", "topup")
+
+
+def _parse_amount(value: object, where: str) -> int:
+    """Parse one wei amount: a whole number >= 0, as an int or a decimal string."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(
+            f"{FUND_REQUIREMENTS_ENV} amount for {where} must be a whole number, "
+            f"got {value!r}"
+        )
+    try:
+        amount = int(value)
+    except ValueError as e:
+        raise ValueError(
+            f"{FUND_REQUIREMENTS_ENV} amount for {where} must be a whole number, "
+            f"got {value!r}"
+        ) from e
+    if amount < 0:
+        raise ValueError(
+            f"{FUND_REQUIREMENTS_ENV} amount for {where} must be >= 0, got {value!r}"
+        )
+    return amount
+
+
+def _parse_fund_requirement(value: object, where: str) -> FundRequirement:
+    """Parse one asset's requirement, an object of exactly threshold and topup."""
+    if not isinstance(value, dict) or set(value) != set(FUND_REQUIREMENT_KEYS):
+        raise ValueError(
+            f"{FUND_REQUIREMENTS_ENV} entry for {where} must be an object of "
+            f"exactly {list(FUND_REQUIREMENT_KEYS)}, got {value!r}"
+        )
+    return FundRequirement(
+        threshold=_parse_amount(value["threshold"], f"{where} threshold"),
+        topup=_parse_amount(value["topup"], f"{where} topup"),
+    )
+
+
+def _parse_fund_requirements(
+    raw: str,
+) -> dict[str, dict[str, dict[str, FundRequirement]]]:
+    """Parse {chain: {"agent"|"safe": {asset: requirement}}}.
+
+    A requirement is {"threshold", "topup"}, the shape funds-manager reads,
+    with amounts as decimal strings or ints.
 
     Keys are roles, not addresses: the service template is static and cannot
     know the per-user agent EOA / safe addresses; funds_status() resolves the
@@ -119,7 +169,7 @@ def _parse_fund_requirements(raw: str) -> dict[str, dict[str, dict[str, int]]]:
         raise ValueError(f"{FUND_REQUIREMENTS_ENV} is not valid JSON: {e}") from e
     if not isinstance(parsed, dict):
         raise ValueError(f"{FUND_REQUIREMENTS_ENV} must be a JSON object")
-    result: dict[str, dict[str, dict[str, int]]] = {}
+    result: dict[str, dict[str, dict[str, FundRequirement]]] = {}
     for chain, roles in parsed.items():
         if not isinstance(roles, dict):
             raise ValueError(
@@ -131,8 +181,17 @@ def _parse_fund_requirements(raw: str) -> dict[str, dict[str, dict[str, int]]]:
                 f"{FUND_REQUIREMENTS_ENV} keys must be roles {FUND_REQUIREMENT_ROLES},"
                 f" got {sorted(unknown)} for chain '{chain}'"
             )
+        for role, assets in roles.items():
+            if not isinstance(assets, dict):
+                raise ValueError(
+                    f"{FUND_REQUIREMENTS_ENV} entry for {role} on chain '{chain}' "
+                    "must be an object of asset -> requirement"
+                )
         result[chain.lower()] = {
-            str(role): {str(asset): int(amount) for asset, amount in assets.items()}
+            str(role): {
+                str(asset): _parse_fund_requirement(value, f"{role} {asset} on {chain}")
+                for asset, value in assets.items()
+            }
             for role, assets in roles.items()
         }
     return result

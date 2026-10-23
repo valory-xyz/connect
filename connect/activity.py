@@ -41,6 +41,9 @@ ACTIVITY_LOG_FILE = "activity_log.jsonl"
 PERFORMANCE_FILE = "agent_performance.json"
 MAX_LOG_BYTES = 5 * 1024 * 1024  # rotate to .1 beyond this
 ACTIVITY_GOAL_KEY = "activity_goal"
+# Connect's own housekeeping: audited, but not the agent's activity on Pearl's
+# performance card (README, "Agent top-up")
+HOUSEKEEPING_KINDS = frozenset({"agent_topup", "agent_topup_failed"})
 
 
 class ActivityLog:
@@ -70,7 +73,8 @@ class ActivityLog:
             self._count += 1
             if kind == "transaction":
                 self._tx_count += 1
-            self._last_activity = kind
+            if kind not in HOUSEKEEPING_KINDS:
+                self._last_activity = kind
             try:
                 self._append(entry)
                 self._write_performance()
