@@ -105,8 +105,10 @@ def test_order_commands_proceed_on_a_v1_market(monkeypatch, trade, command) -> N
         return [{"version": "v1"}]
 
     monkeypatch.setattr(pm, "http_get_json", fake_get)
-    monkeypatch.setattr(trade, "_run_client", lambda *a, **k: runs.append(a))
+    monkeypatch.setattr(trade, "_run_client", lambda *a, **k: runs.append(k))
 
     _COMMANDS[command](trade)
     assert lookups == [{"clob_token_ids": TOKEN_ID}]
     assert len(runs) == 1
+    # only the quote, which places nothing, may retry after an auth failure
+    assert runs[0].get("retry_auth", True) is (command == "quote")

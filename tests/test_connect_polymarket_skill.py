@@ -3139,13 +3139,17 @@ def test_bootstrap_rebuilds_a_venv_another_python3_made(
     the same or a newer minor version is installed into as it is, and the
     3.11 floor is then that venv's Python, not an older python3's. One without
     pip holds no install, so any other version rebuilds it. One whose Python
-    runs nothing (built_with None) is rebuilt, ready or not.
+    runs nothing (built_with None) is rebuilt, ready or not; the ready one
+    is a dangling link, as deleting its base Python leaves it.
     """
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
     log = tmp_path / "commands.log"
     log.touch()
     old = str(_python3(tmp_path / "old", built_with, log)) if built_with else "false"
     venv = _fake_venv(tmp_path, complete=ready, built_by=old)
+    if ready and not built_with:
+        (venv / "bin" / "python").unlink()
+        (venv / "bin" / "python").symlink_to(tmp_path / "gone" / "python3.12")
     (venv / OLD_SENTINEL).touch()
     (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho pip "$@" >> "{log}"\n')
     if not has_pip:
