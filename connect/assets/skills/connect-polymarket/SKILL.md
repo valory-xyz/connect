@@ -46,7 +46,8 @@ USDC.e in safe --wrap--> pUSD in safe --top-up--> DW --buy--> position in DW
    the DW to settle), unless you pass `--force`. Selling happens before
    sweeping (the shares must be in the DW when a sell matches).
 5. `redeem.py all` — after market resolution, the safe redeems its winning
-   positions for pUSD.
+   positions for pUSD. A resolved v2 market's losing side stays listed as
+   redeemable: it pays nothing, and `all` leaves it.
 
 Re-running after a failure is **not** uniformly a no-op — check what a step
 actually did before repeating it:
