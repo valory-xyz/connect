@@ -102,7 +102,8 @@ eval "$(CONNECT_PYTHON="$(uv python find 3.11)" bash scripts/bootstrap_env.sh)"
 
 Later runs reuse that venv with the plain `eval` above. If uv itself is
 missing, its [standalone installer](https://docs.astral.sh/uv/getting-started/installation/)
-also needs no admin rights; installing it is part of the same ask.
+also needs no admin rights but adds `~/.local/bin` to the PATH in the user's
+shell profile, so say so; installing it is part of the same ask.
 
 Don't skip the `eval`: `SSL_CERT_FILE` points at certifi's CA bundle, without
 which a pyenv or source-built Python fails every HTTPS call with

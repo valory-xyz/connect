@@ -90,23 +90,34 @@ if [ ! -f "$READY" ]; then
   # major * 100 + minor, so two versions compare as integers
   VERSION_QUERY='import sys; print(sys.version_info[0] * 100 + sys.version_info[1])'
   CHOSEN="$("$PYTHON" -c "$VERSION_QUERY" 2>/dev/null || true)"
-  MIN="${CONNECT_MIN_PYTHON:-}"
-  if [ -n "$MIN" ] && ! { [[ $CHOSEN =~ ^[0-9]+$ ]] &&
-    ((CHOSEN >= ${MIN%%.*} * 100 + ${MIN#*.})); }; then
-    FOUND="$("$PYTHON" --version 2>/dev/null || true)"
-    echo "echo \"$SKILL: needs Python $MIN+ to build its venv, but $PYTHON is ${FOUND:-missing}\" >&2; false"
-    exit 1 # the ERR trap does not fire on exit, so print the refusal here
-  fi
   # A venv keeps its builder's Python, so rebuild one an older Python made.
   # Never rebuild down: every skill shares this venv, and a plain python3 run
   # of one skill would wipe the venv another built with CONNECT_PYTHON.
+  REBUILD=""
+  CHECKED="$PYTHON"
+  CHECKED_VERSION="$CHOSEN"
   if [ -x "$PY" ]; then
     BUILT_WITH="$("$PY" -c "$VERSION_QUERY" 2>/dev/null || true)"
     if [[ $BUILT_WITH =~ ^[0-9]+$ && $CHOSEN =~ ^[0-9]+$ ]] &&
       ((CHOSEN > BUILT_WITH)); then
-      echo "$SKILL: rebuilding venv at $VENV with $("$PYTHON" --version)" >&2
-      "$PYTHON" -m venv --clear "$VENV" >&2
+      REBUILD=1
+    elif [ -x "$VENV/bin/pip" ]; then
+      # pip installs into this venv as it is, so the floor applies to its Python
+      CHECKED="$PY"
+      CHECKED_VERSION="$BUILT_WITH"
     fi
+  fi
+  MIN="${CONNECT_MIN_PYTHON:-}"
+  if [ -n "$MIN" ] && ! { [[ $CHECKED_VERSION =~ ^[0-9]+$ ]] &&
+    ((CHECKED_VERSION >= ${MIN%%.*} * 100 + ${MIN#*.})); }; then
+    FOUND="$("$CHECKED" --version 2>/dev/null || true)"
+    MSG="$SKILL: needs Python $MIN+ to build its venv, but $CHECKED is ${FOUND:-missing}"
+    printf 'echo %q >&2; false\n' "$MSG"
+    exit 1 # the ERR trap does not fire on exit, so print the refusal here
+  fi
+  if [ -n "$REBUILD" ]; then
+    echo "$SKILL: rebuilding venv at $VENV with $("$PYTHON" --version)" >&2
+    "$PYTHON" -m venv --clear "$VENV" >&2
   fi
 fi
 
