@@ -92,8 +92,9 @@ The skill needs Python 3.11+ to build its venv: on an older Python the
 bootstrap refuses and the `eval` fails. Retrying with the same `python3` will
 not help. Explain to the user that the skill needs Python 3.11+, and offer to
 install it with uv, which needs no admin rights on macOS and Linux: it puts a
-standalone Python in uv's data directory under the user's home and leaves the
-system `python3` unchanged. Only with the user's explicit OK, install it and
+standalone Python in uv's data directory under the user's home, adds a
+`python3.11` command in `~/.local/bin`, and leaves the system `python3`
+unchanged. Only with the user's explicit OK, install it and
 rebuild the venv with it; never install silently:
 
 ```bash
