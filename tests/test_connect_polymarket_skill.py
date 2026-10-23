@@ -2964,7 +2964,7 @@ def test_bootstrap_emits_only_shell_assignments_on_stdout(tmp_path) -> None:
 
 
 # A `python3` stand-in that reports `version`: it answers `--version` and runs
-# `-c` code under that `sys.version_info`, logs `-m venv --clear` to `log`, and
+# `-c` code under that `sys.version_info`, logs `-m venv` runs to `log`, and
 # refuses anything else, so a run that gets past the version check shows.
 _PYTHON3 = """#!{executable}
 import collections, sys
@@ -2975,7 +2975,7 @@ elif sys.argv[1] == "-c":
     version_info = collections.namedtuple("version_info", "major minor micro")
     sys.version_info = version_info(*(int(part) for part in VERSION.split(".")))
     exec(sys.argv[2])
-elif sys.argv[1:4] == ["-m", "venv", "--clear"]:
+elif sys.argv[1:3] == ["-m", "venv"]:
     with open("{log}", "a") as log:
         print(*sys.argv[1:], file=log)
 else:
@@ -2995,27 +2995,38 @@ def _python3(directory: Path, version: str, log: Path) -> Path:
 
 
 @requires_posix_shell
-@pytest.mark.parametrize("version", ["3.10.12", "3.11.0"])
+@pytest.mark.parametrize(
+    ("on_path", "chosen"),
+    [
+        ("3.10.12", None),
+        ("3.11.0", None),
+        ("3.11.0", "3.10.12"),
+        ("3.10.12", "3.11.0"),
+    ],
+)
 def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
-    tmp_path, version
+    tmp_path, on_path, chosen
 ) -> None:
     """polymarket-client needs Python 3.11, and a venv made for the old SDK is rebuilt.
 
-    On 3.10 the bootstrap refuses before pip runs, naming the floor; on 3.11
-    it installs the pinned SDK, never py-clob-client-v2, under the new sentinel.
+    The interpreter is CONNECT_PYTHON when set, else python3. Below 3.11 the
+    bootstrap refuses before pip runs, naming the floor; on 3.11 it installs
+    the pinned SDK, never py-clob-client-v2, under the new sentinel.
     """
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
     venv = _fake_venv(tmp_path, complete=False)
     (venv / OLD_SENTINEL).touch()
     pip_log = tmp_path / "pip.log"
     (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho "$@" >> "{pip_log}"\n')
-    bin_dir = _python3(tmp_path / "bin", version, pip_log).parent
+    bin_dir = _python3(tmp_path / "bin", on_path, pip_log).parent
+    env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    chosen_log = tmp_path / "chosen.log"
+    if chosen:
+        env["CONNECT_PYTHON"] = str(_python3(tmp_path / "chosen", chosen, chosen_log))
 
-    result = _run_bootstrap(
-        tmp_path, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
-    )
+    result = _run_bootstrap(tmp_path, env)
 
-    if version == "3.10.12":
+    if (chosen or on_path) == "3.10.12":
         assert result.returncode != 0
         assert not pip_log.exists()
         assert "export PY=" not in result.stdout
@@ -3023,13 +3034,37 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
             ["bash", "-c", result.stdout], capture_output=True, text=True, check=False
         )
         assert "needs Python 3.11+" in evaled.stderr
-        assert "python3 is Python 3.10.12" in evaled.stderr
+        assert "Python 3.10.12" in evaled.stderr
     else:
         assert result.returncode == 0, result.stderr
         installs = pip_log.read_text(encoding="utf-8").split()
         assert "polymarket-client==0.13.0" in installs
         assert not [name for name in installs if "py-clob-client" in name]
+        assert "venv" not in installs  # python3 neither built nor rebuilt it
         assert (venv / SENTINEL).is_file()
+    if chosen == "3.11.0":
+        # the venv python3 3.10 made is rebuilt by CONNECT_PYTHON, and once it
+        # is ready a plain run reuses it, however old python3 is
+        assert chosen_log.read_text(encoding="utf-8") == f"-m venv --clear {venv}\n"
+        again = _run_bootstrap(tmp_path, {"PATH": env["PATH"]})
+        assert again.returncode == 0, again.stderr
+        assert "reusing venv" in again.stderr
+
+
+@requires_posix_shell
+def test_bootstrap_creates_a_missing_venv_with_connect_python(tmp_path) -> None:
+    """A fresh workspace gets its venv from CONNECT_PYTHON, not the older python3."""
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    log = tmp_path / "chosen.log"
+    chosen = _python3(tmp_path / "chosen", "3.11.0", log)
+    bin_dir = _python3(tmp_path / "bin", "3.10.12", tmp_path / "path.log").parent
+    env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    result = _run_bootstrap(tmp_path, {**env, "CONNECT_PYTHON": str(chosen)})
+
+    assert "creating venv" in result.stderr
+    assert not (tmp_path / "path.log").exists()
+    assert log.read_text(encoding="utf-8") == f"-m venv {tmp_path / '.venv'}\n"
 
 
 @requires_posix_shell
@@ -3081,6 +3116,12 @@ def test_skill_no_longer_teaches_the_inverted_dns_rule() -> None:
     doc = (_SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
     assert "one address for all three means" not in doc
     assert "Identical IP addresses across the three hosts are normal" in doc
+
+
+def test_skill_names_the_interpreter_the_bootstrap_honours() -> None:
+    """The documented fix for an old python3 must set the variable the script reads."""
+    doc = (_SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+    assert "CONNECT_PYTHON=" in doc
 
 
 # --- data API v2: positions and trades ------------------------------------------
