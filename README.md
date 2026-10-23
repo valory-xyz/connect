@@ -201,7 +201,9 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   the one safe→balance-tracker payment a 402 top-up would send, single-use,
   shape-checked (bare native transfer or `deposit(uint256)` with no inner
   value) and capped at the same bound mech-client itself enforces on the
-  shortfall (10× the mech's per-request rate). The MechMarketplace contract per chain
+  shortfall (10× the mech's per-request rate). The
+  [agent top-up](#agent-top-up) arms the same bare native shape for the agent
+  EOA. The MechMarketplace contract per chain
   (imported from the pinned mech-client) is whitelisted by default — the only
   contract the safe calls in the on-chain mech flow — so mech requests work out
   of the box. Balance trackers and payment tokens are deliberately not
@@ -253,6 +255,36 @@ whitelist is not editable through the API yet — a patch replaces it wholesale
 across all chains and only its address *format* can be validated here, so it
 stays frozen at the defaults (a `whitelist` in a patch is a 422) until those
 semantics are designed.
+
+## Agent top-up
+
+`CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS` is
+`{chain: {"agent" | "safe": {asset: {"threshold", "topup"}}}}`, amounts in wei
+as decimal strings or integers.
+
+At start and then every `AGENT_TOPUP_INTERVAL_SECONDS`, on every chain with a
+safe and a native requirement for the agent, the server checks the agent
+EOA's native balance. Below its `threshold`, the EOA needs `topup - balance`,
+and the safe sends it that much native token, or all it holds when that is
+less, in one plain `execTransaction` CALL (no calldata, no MultiSend). Tokens
+never move. An EOA that cannot pay the gas fails the send at estimation, which
+costs nothing. A top-up that is mined successfully is audited as
+`agent_topup`; one that is refused, fails to send, reverts or is not mined in
+time, as `agent_topup_failed`. Those two entries are the top-up's whole audit:
+it is not a `transaction`, `send_failed` or `blocked` entry, it does not count
+towards the `transactions` metric in `agent_performance.json`, and it never
+becomes its `last_activity`. In restricted mode the send passes through a
+one-shot allowance for exactly that transfer, capped at the amount sent.
+
+`GET /funds-status` reports each entry's deficit as funds-manager does:
+`topup - balance` once the balance is below `threshold`, else 0. The
+exception is the native pair on a chain whose last top-up succeeded. There,
+an agent EOA below its `threshold` reports 0, since the next top-up covers
+it, and the safe is judged on what it keeps after sending the EOA's need:
+`remaining = safe balance - need`, and the safe's deficit is
+`topup - remaining` when `remaining` is below its `threshold`, else 0. When
+the safe holds less than the need, `remaining` is negative, so the shortfall
+is added to the safe's `topup`.
 
 ## Threat-model notes
 
@@ -413,7 +445,7 @@ Run standalone (mimicking the Pearl runner):
 export CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS=<rpc-url>
 export CONNECTION_CONFIGS_CONFIG_STORE_PATH=/path/to/persistent_data
 export CONNECTION_CONFIGS_CONFIG_SAFE_CONTRACT_ADDRESSES='{"gnosis":"0x..."}'
-export CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS='{"gnosis":{"agent":{"0x0000000000000000000000000000000000000000":"1000000000000000000"}}}'
+export CONNECTION_CONFIGS_CONFIG_FUND_REQUIREMENTS='{"gnosis":{"agent":{"0x0000000000000000000000000000000000000000":{"threshold":"10000000000000000","topup":"50000000000000000"}},"safe":{"0x0000000000000000000000000000000000000000":{"threshold":"1000000000000000000","topup":"5000000000000000000"}}}}'
 # cwd must contain ethereum_private_key.txt (encrypted web3 keystore JSON)
 uv run python -m connect --password-stdin   # prompts "Enter password:" on a TTY
 # legacy (password lands in /proc/<pid>/cmdline, readable by any local user):

@@ -61,7 +61,11 @@ def funds_status(request: Request) -> dict:
         if now - cache["at"] < FUNDS_STATUS_CACHE_SECONDS:
             return cache["value"]
     try:
-        value = wallet.funds_status(request.app.state.config, request.app.state.signer)
+        value = wallet.funds_status(
+            request.app.state.config,
+            request.app.state.signer,
+            request.app.state.topped_up,
+        )
     except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("funds-status computation failed")
         return {}

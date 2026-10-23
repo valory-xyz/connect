@@ -113,6 +113,7 @@ from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
 OTHER = "0x" + "bb" * 20
+AGENT = "0x" + "Ab" * 20  # the agent EOA; mixed case, as a checksum address is
 # A mech's on-chain record as the marketplace indexer counts it. A fixed
 # creation time keeps everything but the age independent of the clock.
 SAMPLE_CREATED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -739,7 +740,7 @@ def make_guard(
         },
         store_path=Path("/nonexistent"),
     )
-    return Guard(store, config)
+    return Guard(store, config, agent_signer=AGENT)
 
 
 class TestGuard:
@@ -914,6 +915,100 @@ class TestGuard:
                 "testchain", SAFE, 0, exec_transaction_calldata(TRACKER, value=1)
             )
         assert "expired unconsumed" in caplog.text
+
+    def test_agent_topup_allowance(self, store: SettingsStore) -> None:
+        """A pre-authorized safe -> agent EOA transfer passes once, capped.
+
+        Over the cap, with calldata, or to anyone but the agent EOA is
+        refused and consumes nothing, so the compliant top-up still passes.
+        """
+        guard = make_guard(store, MODE_RESTRICTED)
+        topup = exec_transaction_calldata(AGENT.lower(), value=50)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, topup)  # not armed
+        guard.allow_agent_topup_once(chain="TestChain", amount_cap=100)
+        for bad in (
+            exec_transaction_calldata(AGENT, value=101),  # over the cap
+            exec_transaction_calldata(AGENT, value=50, data=b"\x01"),  # calldata
+            exec_transaction_calldata(OTHER, value=50),  # not the agent EOA
+        ):
+            with pytest.raises(GuardError, match="do not allow the safe to call"):
+                guard.check_transaction("testchain", SAFE, 0, bad)
+        guard.check_transaction("testchain", SAFE, 0, topup, consume=False)
+        guard.check_transaction("testchain", SAFE, 0, topup)  # consumes
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, topup)
+
+    def test_agent_topup_allowance_binds_chain(self, store: SettingsStore) -> None:
+        """An allowance armed for another chain matches nothing here."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_agent_topup_once(chain="nosafe", amount_cap=100)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction(
+                "testchain", SAFE, 0, exec_transaction_calldata(AGENT, value=1)
+            )
+
+    def test_rearming_replaces_the_agent_topup_allowance(
+        self, store: SettingsStore
+    ) -> None:
+        """Re-arming one chain refreshes its single grant rather than stacking."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        for _ in range(3):
+            guard.allow_agent_topup_once(chain="testchain", amount_cap=100)
+        topup = exec_transaction_calldata(AGENT, value=100)
+        guard.check_transaction("testchain", SAFE, 0, topup)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, topup)
+
+    def test_rearming_keeps_the_other_allowances(self, store: SettingsStore) -> None:
+        """Re-arming one chain's top-up leaves other chains and the deposit alone."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_agent_topup_once(chain="testchain", amount_cap=100)
+        guard.allow_agent_topup_once(chain="nosafe", amount_cap=100)
+        guard.allow_safe_deposit_once(
+            chain="testchain", tracker=OTHER, amount_cap=100, is_token=False
+        )
+        guard.allow_agent_topup_once(chain="nosafe", amount_cap=100)
+        guard.check_transaction(
+            "testchain", SAFE, 0, exec_transaction_calldata(AGENT, value=100)
+        )
+        guard.check_transaction(
+            "testchain", SAFE, 0, exec_transaction_calldata(OTHER, value=100)
+        )
+
+    def test_agent_topup_allowance_expires(
+        self,
+        store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An agent top-up allowance left behind by a failed send dies loudly."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_agent_topup_once(chain="testchain", amount_cap=100)
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            "connect.guard.time.monotonic",
+            lambda: real_monotonic() + ALLOWANCE_TTL + 1,
+        )
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction(
+                "testchain", SAFE, 0, exec_transaction_calldata(AGENT, value=1)
+            )
+        assert (
+            f"safe payment allowance to {AGENT.lower()} on testchain expired unconsumed"
+            in caplog.text
+        )
+
+    def test_unrestricted_ignores_the_agent_topup_allowance(
+        self, store: SettingsStore
+    ) -> None:
+        """Unrestricted mode passes the top-up without spending an armed grant."""
+        guard = make_guard(store, MODE_UNRESTRICTED)
+        guard.allow_agent_topup_once(chain="testchain", amount_cap=100)
+        topup = exec_transaction_calldata(AGENT, value=100)
+        guard.check_transaction("testchain", SAFE, 0, topup)
+        store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
+        guard.check_transaction("testchain", SAFE, 0, topup)
 
     def test_restricted_requires_safe_target(self, store: SettingsStore) -> None:
         """Everything must go to (or through) the service safe."""
@@ -1209,7 +1304,7 @@ class TestSignerGuardIntegration:
             account=account,
             config=app_config,
             activity=activity,
-            guard=Guard(settings_store, app_config),
+            guard=Guard(settings_store, app_config, agent_signer=account.address),
         )
         signer._chains._states["testchain"] = (  # pylint: disable=protected-access
             _ChainState(w3=t.cast(Web3, fake_w3), lock=threading.Lock(), chain_id=31337)
@@ -1500,7 +1595,7 @@ class TestSignerGuardIntegration:
             account=account,
             config=config,
             activity=activity,
-            guard=Guard(settings_store, config),
+            guard=Guard(settings_store, config, agent_signer=account.address),
         )
         with pytest.raises(SignerError, match="no service safe is configured"):
             signer.send_via_safe("safeless", WHITELISTED, value=1)
@@ -2942,7 +3037,7 @@ class TestMech:
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
         )
-        guard = Guard(settings_store, app_config)
+        guard = Guard(settings_store, app_config, agent_signer=account.address)
         signer = Signer(
             account=account, config=app_config, activity=activity, guard=guard
         )
