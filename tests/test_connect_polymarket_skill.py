@@ -2884,7 +2884,6 @@ def test_bootstrap_retries_a_venv_whose_install_died_partway(tmp_path) -> None:
 
 
 @requires_posix_shell
-@requires_posix_shell
 def test_a_venv_without_pip_is_rebuilt_not_reused(tmp_path) -> None:
     """An interpreter alone does not prove a venv works.
 
@@ -3033,6 +3032,7 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
         evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test input
             ["bash", "-c", result.stdout], capture_output=True, text=True, check=False
         )
+        assert evaled.returncode != 0
         assert "needs Python 3.11+" in evaled.stderr
         assert "Python 3.10.12" in evaled.stderr
     else:
@@ -3044,11 +3044,17 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
         assert (venv / SENTINEL).is_file()
     if chosen == "3.11.0":
         # the venv python3 3.10 made is rebuilt by CONNECT_PYTHON, and once it
-        # is ready a plain run reuses it, however old python3 is
+        # is ready a plain run from the skill's directory reuses it as it is,
+        # however old python3 is
         assert chosen_log.read_text(encoding="utf-8") == f"-m venv --clear {venv}\n"
-        again = _run_bootstrap(tmp_path, {"PATH": env["PATH"]})
+        (venv / "bin" / "python").unlink()
+        (venv / "bin" / "python").symlink_to(env["CONNECT_PYTHON"])
+        nested = tmp_path / ".claude" / "skills" / "connect-polymarket"
+        nested.mkdir(parents=True)
+        again = _run_bootstrap(nested, {"PATH": env["PATH"]})
         assert again.returncode == 0, again.stderr
         assert "reusing venv" in again.stderr
+        assert "venv" not in pip_log.read_text(encoding="utf-8").split()
 
 
 @requires_posix_shell
@@ -3121,7 +3127,8 @@ def test_skill_no_longer_teaches_the_inverted_dns_rule() -> None:
 def test_skill_names_the_interpreter_the_bootstrap_honours() -> None:
     """The documented fix for an old python3 must set the variable the script reads."""
     doc = (_SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
-    assert "CONNECT_PYTHON=" in doc
+    assert "uv python install 3.11" in doc
+    assert 'CONNECT_PYTHON="$(uv python find 3.11)"' in doc
 
 
 # --- data API v2: positions and trades ------------------------------------------
