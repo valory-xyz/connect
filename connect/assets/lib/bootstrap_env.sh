@@ -95,10 +95,10 @@ if [ ! -f "$READY" ] || [ -n "$BROKEN" ]; then
   # major * 100 + minor, so two versions compare as integers
   VERSION_QUERY='import sys; print(sys.version_info[0] * 100 + sys.version_info[1])'
   CHOSEN="$("$PYTHON" -c "$VERSION_QUERY" 2>/dev/null || true)"
-  # rebuild only upward: the venv is shared, and a pip-less one holds no install
   REBUILD="$BROKEN"
   CHECKED="$PYTHON"
   CHECKED_VERSION="$CHOSEN"
+  # rebuild only upward: the venv is shared, and a pip-less one holds no install
   if [ -z "$BROKEN" ] && [ -x "$PY" ]; then
     BUILT_WITH="$("$PY" -c "$VERSION_QUERY" 2>/dev/null || true)"
     if [[ $BUILT_WITH =~ ^[0-9]+$ && $CHOSEN =~ ^[0-9]+$ ]] &&

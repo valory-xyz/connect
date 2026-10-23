@@ -88,7 +88,7 @@ eval "$(bash scripts/bootstrap_env.sh)"   # sets $PY, SSL_CERT_FILE, REQUESTS_CA
 "$PY" scripts/markets.py list             # run every script with "$PY"
 ```
 
-The skill needs Python 3.11+. When there is no ready venv and the bootstrap
+The skill needs Python 3.11+. When there is no usable venv and the bootstrap
 refuses an older Python, retrying with the same `python3` won't help: tell the
 user, and only with their explicit OK install one (`uv python install 3.11`
 needs no admin rights), then build the venv with it, which later runs reuse:
