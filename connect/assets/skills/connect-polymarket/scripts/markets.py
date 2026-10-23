@@ -127,7 +127,7 @@ def _attach_live_prices(slims: list, live: bool = True) -> list:
 
 
 def _tradeable(market: dict) -> bool:
-    """Whether this skill can still trade a market: open, v1 or binary v2."""
+    """Whether this skill can still trade a market."""
     if market.get("closed") or market.get("active") is False:
         return False
     if market.get("version") == "v2":

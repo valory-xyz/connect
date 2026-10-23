@@ -1037,7 +1037,8 @@ def fetch_all_positions(
 
 def v2_module(token_id: t.Any) -> int:
     """Return a V2 position id's module (1 binary, 2 neg-risk, 3 combo), or 0 for V1."""
-    value = int(token_id) if str(token_id).isdigit() else 0
+    text = str(token_id)
+    value = int(text) if text.isascii() and text.isdigit() else 0
     module = value >> 248
     return module if module in (1, 2, 3) and not value & _V2_RESERVED_BITS else 0
 

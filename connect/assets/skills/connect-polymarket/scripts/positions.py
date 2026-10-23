@@ -25,8 +25,8 @@ the safe; use --wallet to look elsewhere.
 
 The data API is an indexer and lags the chain (see INDEXER_LAG_NOTE), so
 every read names its source and any token this skill has reason to think is
-held is confirmed straight from the chain (the CTF, or PositionManager for V2)
-rather than taken on the indexer's word.
+held is confirmed straight from the chain rather than taken on the
+indexer's word.
 
 Usage:
     python positions.py positions [--wallet safe|dw|eoa|0x...] [--redeemable]
