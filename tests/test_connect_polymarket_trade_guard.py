@@ -19,10 +19,10 @@
 
 """Tests that connect-polymarket's trade.py places orders only on v1 markets.
 
-trade.py imports ``py_clob_client_v2``, which is not a repo dependency, so the
-SDK and the remote signer are replaced by stand-ins for the import. The
-module is loaded under its own name: the shared conftest puts connect-pons'
-scripts first on ``sys.path``, where another ``trade`` lives.
+trade.py imports the Polymarket SDK, so these run where tox -e unit-tests
+layers it on, and skip elsewhere. The module is loaded under its own name: the
+shared conftest puts connect-pons' scripts first on ``sys.path``, where another
+``trade`` lives.
 """
 
 # The skill's scripts are imported through sys.path, which mypy cannot follow
@@ -36,7 +36,6 @@ from pathlib import Path
 
 import pytest
 
-# trade.py imports the SDK, which only tox -e unit-tests installs (`uv run --with`).
 pytest.importorskip("polymarket")
 
 _SCRIPTS = (
@@ -54,58 +53,9 @@ import pm_common as pm  # noqa: E402
 TOKEN_ID = "12345"  # nosec B105
 
 
-class _OrderType:
-    """Stand-in for the SDK's order-type constants."""
-
-    FOK = "FOK"
-    FAK = "FAK"
-    GTC = "GTC"
-    GTD = "GTD"
-
-
-class _Side:
-    """Stand-in for the SDK's order sides."""
-
-    BUY = "BUY"
-    SELL = "SELL"
-
-
-class _PolyApiException(Exception):
-    """Stand-in for the SDK's API error."""
-
-
-def _module(name: str, **attrs) -> types.ModuleType:
-    """Build a stand-in module carrying `attrs`."""
-    module = types.ModuleType(name)
-    module.__dict__.update(attrs)
-    return module
-
-
-_STAND_INS = {
-    "py_clob_client_v2": {
-        "MarketOrderArgs": dict,
-        "OrderArgs": dict,
-        "OrderType": _OrderType,
-    },
-    "py_clob_client_v2.clob_types": {"OrderPayload": dict},
-    "py_clob_client_v2.exceptions": {"PolyApiException": _PolyApiException},
-    "py_clob_client_v2.order_builder": {},
-    "py_clob_client_v2.order_builder.constants": {"BUY": "BUY", "SELL": "SELL"},
-    "py_clob_client_v2.order_utils": {},
-    "py_clob_client_v2.order_utils.model": {},
-    "py_clob_client_v2.order_utils.model.order_data_v2": {"Side": _Side},
-    "remote_signer": {
-        "clear_cached_creds": lambda cs: None,
-        "make_clob_client": lambda cs, dw: None,
-    },
-}
-
-
 @pytest.fixture
-def trade(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
-    """connect-polymarket's trade.py, imported against the stand-ins."""
-    for name, attrs in _STAND_INS.items():
-        monkeypatch.setitem(sys.modules, name, _module(name, **attrs))
+def trade() -> types.ModuleType:
+    """connect-polymarket's trade.py, on the real SDK."""
     spec = importlib.util.spec_from_file_location(
         "connect_polymarket_trade", _SCRIPTS / "trade.py"
     )
