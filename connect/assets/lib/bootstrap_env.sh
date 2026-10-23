@@ -86,7 +86,13 @@ PY="$VENV/bin/python"
 READY="$VENV/$SENTINEL"
 
 PYTHON="${CONNECT_PYTHON:-python3}"
-if [ ! -f "$READY" ]; then
+# a bin/python that cannot run (its base Python is gone) makes the venv broken,
+# ready or not, so it is rebuilt
+BROKEN=""
+if { [ -L "$PY" ] || [ -x "$PY" ]; } && ! "$PY" -c pass 2>/dev/null; then
+  BROKEN=1
+fi
+if [ ! -f "$READY" ] || [ -n "$BROKEN" ]; then
   # major * 100 + minor, so two versions compare as integers
   VERSION_QUERY='import sys; print(sys.version_info[0] * 100 + sys.version_info[1])'
   CHOSEN="$("$PYTHON" -c "$VERSION_QUERY" 2>/dev/null || true)"
@@ -95,10 +101,10 @@ if [ ! -f "$READY" ]; then
   # python3 run of one skill would wipe the venv another built with
   # CONNECT_PYTHON. One without pip holds no install, so any other version
   # rebuilds it rather than mixing two Pythons in it.
-  REBUILD=""
+  REBUILD="$BROKEN"
   CHECKED="$PYTHON"
   CHECKED_VERSION="$CHOSEN"
-  if [ -x "$PY" ]; then
+  if [ -z "$BROKEN" ] && [ -x "$PY" ]; then
     BUILT_WITH="$("$PY" -c "$VERSION_QUERY" 2>/dev/null || true)"
     if [[ $BUILT_WITH =~ ^[0-9]+$ && $CHOSEN =~ ^[0-9]+$ ]] &&
       ((CHOSEN > BUILT_WITH)); then
@@ -116,7 +122,7 @@ if [ ! -f "$READY" ]; then
   if [ -n "$MIN" ] && ! { [[ $CHECKED_VERSION =~ ^[0-9]+$ ]] &&
     ((CHECKED_VERSION >= ${MIN%%.*} * 100 + ${MIN#*.})); }; then
     FOUND="$("$CHECKED" --version 2>/dev/null || true)"
-    MSG="$SKILL: needs Python $MIN+ to build its venv, but $CHECKED is ${FOUND:-missing}"
+    MSG="$SKILL: needs Python $MIN+ to build its venv, but $CHECKED is ${FOUND:-not a runnable Python}"
     printf 'echo %q >&2; false\n' "$MSG"
     exit 1 # the ERR trap does not fire on exit, so print the refusal here
   fi
