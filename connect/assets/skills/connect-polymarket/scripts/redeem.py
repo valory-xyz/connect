@@ -36,7 +36,7 @@ A binary Protocol V2 position is claimed through the Router instead, which
 
 Usage:
     python redeem.py list                # redeemable positions in the safe
-    python redeem.py approve             # one-time adapter operator rights
+    python redeem.py approve             # one-time adapter and Router operator rights
     python redeem.py redeem --condition-id 0x... --outcome-index 0 [--neg-risk]
     python redeem.py all                 # approve + redeem everything listed
 """
@@ -114,11 +114,10 @@ def _redeem_v2(cs: pm.ConnectSigner, position_id: int) -> dict | None:
     )
     if not amount:
         return None
-    condition_id = f"0x{position_id >> 8:062x}00"
-    data = pm.encode_router_redeem(condition_id, position_id & 0xFF, amount)
+    data = pm.encode_router_redeem(position_id, amount)
     tx_hash = cs.safe_transaction(pm.ROUTER, data)
     return {
-        "condition_id": condition_id,
+        "condition_id": f"0x{position_id >> 8:062x}00",
         "adapter": pm.ROUTER,
         **cs.wait_receipt(tx_hash),
     }
@@ -146,7 +145,10 @@ def cmd_redeem(
 ) -> None:
     """Redeem one resolved position from the safe."""
     position_id = int(condition_id, 16) + outcome_index
-    if pm.v2_module(position_id) == 1:
+    module = pm.v2_module(position_id)
+    if module > 1:
+        raise SystemExit("this skill claims no neg-risk or combinatorial V2 position")
+    if module == 1:
         _ensure_router_approval(cs)
         result = _redeem_v2(cs, position_id)
         if result is None:

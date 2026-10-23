@@ -606,15 +606,12 @@ def encode_erc1155_safe_transfer(frm: str, to: str, token_id: int, amount: int) 
     )
 
 
-def encode_router_redeem(condition_id: str, outcome_index: int, amount: int) -> str:
-    """Router redeem(bytes31,uint256,uint256); a V2 condition id pads it with 0x00."""
-    condition = bytes.fromhex(condition_id.removeprefix("0x"))
-    if len(condition) != 32 or condition[31]:
-        raise SystemExit(f"{condition_id} is not a padded Protocol V2 condition id")
+def encode_router_redeem(position_id: int, amount: int) -> str:
+    """Router redeem(bytes31,uint256,uint256) of `amount` of a V2 position id."""
     return _call(
         "redeem(bytes31,uint256,uint256)",
         ["bytes31", "uint256", "uint256"],
-        [condition[:31], outcome_index, amount],
+        [(position_id >> 8).to_bytes(31, "big"), position_id & 0xFF, amount],
     )
 
 
@@ -1056,9 +1053,11 @@ def require_supported_market(token_id: str) -> None:
     token no open market lists is refused as well.
     """
     module = v2_module(token_id)
-    params: dict = {"clob_token_ids": str(token_id)}
-    if module:
-        params["version"] = GAMMA_VERSIONS
+    params = (
+        {"position_ids": str(token_id), "version": GAMMA_VERSIONS}
+        if module
+        else {"clob_token_ids": str(token_id)}
+    )
     markets = http_get_json(f"{GAMMA_API}/markets", params=params)
     listed = markets if isinstance(markets, list) else []
     versions = {market.get("version") for market in listed if isinstance(market, dict)}

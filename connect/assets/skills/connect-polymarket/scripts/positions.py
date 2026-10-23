@@ -148,7 +148,7 @@ def _onchain_holdings(cs: pm.ConnectSigner, addresses: list, token_ids: list) ->
                         "token_id": str(token_id),
                         "address": wallet["address"],
                         "location": wallet["location"],
-                        # CTF outcome tokens carry the collateral's decimals
+                        # outcome tokens carry the collateral's decimals
                         "size": units / 10**pm.PUSD_DECIMALS,
                         "size_base_units": units,
                     }
@@ -349,7 +349,7 @@ def main() -> None:
     positions.add_argument(
         "--no-onchain",
         action="store_true",
-        help="trust the indexer alone (skips the CTF balance check)",
+        help="trust the indexer alone (skips the on-chain balance check)",
     )
     trades = sub.add_parser("trades")
     trades.add_argument("--wallet", default="safe")
