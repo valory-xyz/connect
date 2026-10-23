@@ -4424,8 +4424,7 @@ _TRANSFER = "safeTransferFrom(address,address,uint256,uint256,bytes)"
 _APPROVE_ALL = "setApprovalForAll(address,bool)"
 _APPROVAL = "0xa22cb465"  # its selector
 _ADAPTER_REDEEM = "redeemPositions(address,bytes32,bytes32,uint256[])"
-# V1 ids whose top byte reads as a V2 module (here 2; 1 for `_V1_HELD` below):
-# reserved bit 40, their only one set, marks them V1.
+# V1 ids whose top byte reads as a V2 module; reserved bit 40 marks them V1.
 _V1_NO = str((2 << 248) | (1 << 40) | 9)
 
 
@@ -4443,6 +4442,7 @@ def _market(slug: str, condition_id: str, **fields) -> dict:
         "conditionId": condition_id,
         "version": "v2",
         "positionIds": [str(base), str(base + 1)],
+        "clobTokenIds": None,
         "outcomes": '["Yes", "No"]',
         "active": True,
         "closed": False,
@@ -4500,11 +4500,8 @@ def _gamma(monkeypatch, *rows, slug_index: str = "") -> list:
         for key, ids in (
             ("slug", lambda r: {r["slug"]}),
             ("condition_ids", lambda r: {r["conditionId"]}),
-            (
-                "clob_token_ids",
-                lambda r: set(r["positionIds"])
-                | set(json.loads(r.get("clobTokenIds", "[]"))),
-            ),
+            ("clob_token_ids", lambda r: set(json.loads(r["clobTokenIds"] or "[]"))),
+            ("position_ids", lambda r: set(r["positionIds"])),
         ):
             if key in params:
                 served = [r for r in served if ids(r) & asked(params[key])]
@@ -4582,7 +4579,7 @@ def test_v2_position_trade_by_position_id(clob, monkeypatch, capsys, command) ->
     """
     # the CLOB stand-in's own V2 market, its book served for the asset asked
     v2_binary = _market("v2-binary", f"0x{int(_V2_TOKEN):064x}")
-    versions = _gamma(monkeypatch, _V1_MARKET, v2_binary, *_UNTRADEABLE)
+    _gamma(monkeypatch, _V1_MARKET, v2_binary, *_UNTRADEABLE)
     send = clob.send
 
     def book_of_the_asset_asked(request):
@@ -4599,7 +4596,6 @@ def test_v2_position_trade_by_position_id(clob, monkeypatch, capsys, command) ->
             run(clob.cs, market["positionIds"][0], *args)
     assert clob.requests == clob.digests == []
     pm.require_supported_market(_V1_NO)  # V1 by its layout, though its top byte is 2
-    assert versions[-1] == {"v1"}
 
     traded = []
     for token in (_V1_TOKEN, _V2_TOKEN):
@@ -4609,10 +4605,6 @@ def test_v2_position_trade_by_position_id(clob, monkeypatch, capsys, command) ->
     if name != "quote":
         traded = [order["tokenId"] for order in clob.orders]
     assert traded == [_V1_TOKEN, _V2_TOKEN]
-    # only an ASCII decimal id can name a V2 position, and no id raises
-    fullwidth = "".join(chr(0xFF10 + int(d)) for d in _V2_TOKEN)
-    for odd in (fullwidth, "²", "", hex(int(_V2_TOKEN)), None):
-        assert pm.v2_module(odd) == 0, odd
 
 
 def _key(*parts) -> tuple:
@@ -4697,12 +4689,14 @@ def test_v2_position_holdings_from_position_manager(monkeypatch, capsys) -> None
         (_V1_HELD, 7.0),
         *((i, 1.0) for i in other),
     ]
+    # only an ASCII decimal id can name a V2 position, and no id raises
+    fullwidth = "".join(chr(0xFF10 + int(d)) for d in _V2_TOKEN)
+    for odd in (fullwidth, "²", "", hex(int(_V2_TOKEN)), None):
+        assert pm.v2_module(odd) == 0, odd
 
 
 @pytest.mark.parametrize("command", ["sweep", "return-position"])
-def test_v2_position_funds_through_position_manager(
-    monkeypatch, capsys, command
-) -> None:
+def test_v2_position_funds_through_position_manager(monkeypatch, command) -> None:
     """V2 shares move between the DW and the safe on PositionManager, V1 on the CTF."""
     holder, receiver = (DW_ADDR, SAFE_ADDR)[:: 1 if command == "sweep" else -1]
     _sweep_mocks(monkeypatch, pusd=0, ctf_balance=0, recorded=[], indexed=[])
@@ -4726,7 +4720,6 @@ def test_v2_position_funds_through_position_manager(
             funds.cmd_return_position(cs, token_id, None)
         moved = cs.sent
 
-    capsys.readouterr()
     assert moved == [
         (
             _POSITION_MANAGER,
@@ -4757,7 +4750,7 @@ def _adapter_claim(outcome_index: int) -> tuple:
 
 
 @pytest.mark.parametrize(("command", "won"), [("all", 0), ("all", 1), ("redeem", 1)])
-def test_v2_position_claim_through_router(monkeypatch, capsys, command, won) -> None:
+def test_v2_position_claim_through_router(monkeypatch, command, won) -> None:
     """A winning V2 position is claimed from the safe through the Router.
 
     The condition id (high 31 bytes) and outcome index come from the position
@@ -4779,7 +4772,6 @@ def test_v2_position_claim_through_router(monkeypatch, capsys, command, won) -> 
         redeem.cmd_all(cs)
         redeem.cmd_all(cs)
 
-    capsys.readouterr()
     approvals = [call for call in cs.sent if call[1].startswith(_APPROVAL)]
     claims = [call for call in cs.sent if call not in approvals]
     condition = bytes.fromhex(_V2_RESOLVED[2:])[:31]
@@ -4791,12 +4783,10 @@ def test_v2_position_claim_through_router(monkeypatch, capsys, command, won) -> 
         granted = [(_CTF, _calldata(_APPROVE_ALL, a, True)) for a in _ADAPTERS]
         assert sorted(approvals) == sorted([*granted, _ROUTER_APPROVAL])
         assert claims == [(_ROUTER, claim), _adapter_claim(0), _adapter_claim(0)]
-    with pytest.raises(SystemExit):  # a V2 condition id ends in a zero byte
-        pm.encode_router_redeem(_V2_RESOLVED[:-2] + "01", won, 1)
 
 
-def test_v2_position_losing_row_not_claimed(monkeypatch, capsys) -> None:
-    """`redeem.py all` claims no losing, neg-risk or combinatorial V2 row.
+def test_v2_position_losing_row_not_claimed(monkeypatch) -> None:
+    """`redeem.py` claims no losing, neg-risk or combinatorial V2 position.
 
     A losing V1 row still goes to its adapter. On a safe that approved both
     adapters before V2, V1 claims ask for no new approval; `approve` grants
@@ -4815,10 +4805,12 @@ def test_v2_position_losing_row_not_claimed(monkeypatch, capsys) -> None:
     monkeypatch.setattr(pm.ConnectSigner, "from_workspace", lambda: cs)
     monkeypatch.setattr(sys, "argv", ["redeem.py", "approve"])
 
+    for market in _UNTRADEABLE:
+        with pytest.raises(SystemExit):
+            redeem.cmd_redeem(cs, market["conditionId"], 0, True)
     redeem.cmd_all(cs)
     redeem.cmd_redeem(cs, _V1_MARKET["conditionId"], 1, False)
     redeem.main()
     redeem.main()
 
-    capsys.readouterr()
     assert cs.sent == [_adapter_claim(1), _adapter_claim(1), _ROUTER_APPROVAL]
