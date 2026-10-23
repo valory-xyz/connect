@@ -75,6 +75,7 @@ _BLOCKED = (
     "execute_collateral_return_plan",
     "place_limit_order",
     "place_market_order",
+    "post_orders",
     "accept_combo_quote",
     "authorize_session_key",
     "revoke_session_key",

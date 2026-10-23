@@ -122,6 +122,12 @@ if [ ! -f "$READY" ] || [ -n "$BROKEN" ]; then
     exit 1
   fi
   if [ -n "$REBUILD" ]; then
+    # `--clear` empties the directory, so only a venv is cleared
+    if [ ! -f "$VENV/pyvenv.cfg" ]; then
+      MSG="$SKILL: $VENV needs a rebuild but has no pyvenv.cfg, so it is not cleared; remove it or set $VENV_OVERRIDE to another path"
+      printf 'echo %q >&2; false\n' "$MSG"
+      exit 1
+    fi
     echo "$SKILL: rebuilding venv at $VENV with $("$PYTHON" --version)" >&2
     "$PYTHON" -m venv --clear "$VENV" >&2
   fi

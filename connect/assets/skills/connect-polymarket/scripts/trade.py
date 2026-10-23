@@ -64,15 +64,23 @@ _API_ERRORS = (
     UnexpectedResponseError,
 )
 
-# Order-reply codes that leave placement uncertain. The SDK reads a CLOB
-# reply of status "unmatched", or one it cannot classify ("unknown"), as a
-# rejection and drops its order id and the reply's success flag; any other
-# refusal code it assigns proves the order was not placed.
-_UNCERTAIN_CODES = ("unmatched", "unknown")
+# Order-reply codes that prove the order was not placed. Any other refusal
+# ("unmatched", "unknown", or a code a later SDK adds) leaves placement uncertain.
+_REFUSED_CODES = (
+    "market_not_ready",
+    "not_enough_balance",
+    "invalid_nonce",
+    "invalid_expiration",
+    "post_only_would_cross",
+    "post_only_mode",
+    "fok_not_filled",
+    "fak_not_filled",
+)
 _UNCERTAIN = (
     "placement uncertain: the CLOB's reply does not show whether the order was "
-    "placed ({}); check positions (positions.py positions --wallet dw) before "
-    "retrying"
+    "placed ({}); before retrying, check the chain (positions.py positions "
+    "--wallet dw --token-ids {}): a limit order may instead rest unfilled on "
+    "the book, where no position shows it"
 )
 
 
@@ -128,21 +136,22 @@ def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
     pm.print_json(result)
 
 
-def _post(client, order):
+def _post(client, order, token_id: str):
     """Post a signed order; refuse when its reply leaves placement uncertain.
 
-    Uncertain: an `_UNCERTAIN_CODES` code, no reply, an unreadable one, or a 5xx.
+    Uncertain: a refusal code not in `_REFUSED_CODES`, no reply, an unreadable
+    one, or a 5xx.
     """
     try:
         response = client.post_order(order)
     except (TransportError, UnexpectedResponseError) as e:
-        raise SystemExit(_UNCERTAIN.format(e)) from e
+        raise SystemExit(_UNCERTAIN.format(e, token_id)) from e
     except RequestRejectedError as e:
         if e.status >= 500:
-            raise SystemExit(_UNCERTAIN.format(e)) from e
+            raise SystemExit(_UNCERTAIN.format(e, token_id)) from e
         raise
-    if not response.ok and response.code in _UNCERTAIN_CODES:
-        raise SystemExit(_UNCERTAIN.format(response.message))
+    if not response.ok and response.code not in _REFUSED_CODES:
+        raise SystemExit(_UNCERTAIN.format(response.message, token_id))
     return response
 
 
@@ -169,7 +178,7 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
     # the submission rather than proceed without the recovery hint.
     pm.record_dw_buy_intent(cs, token_id_int)
     try:
-        response = _post(client, order)
+        response = _post(client, order, token_id)
     except _API_ERRORS as e:
         if _definitive_auth_rejection(e):
             pm.reject_dw_buy_intent(cs, token_id_int)
@@ -276,7 +285,7 @@ def cmd_sell(
         order = client.create_market_order(
             token_id=token_id, side="SELL", shares=shares, order_type=ot
         )
-        return _post(client, order)
+        return _post(client, order, token_id)
 
     _run_client(cs, op, retry_auth=False)
 
@@ -319,7 +328,7 @@ def cmd_limit(  # pylint: disable=too-many-arguments
         )
         if order_side == pm.BUY_SIDE:
             return _post_buy_with_recovery_hint(client, cs, token_id, order)
-        return _post(client, order)
+        return _post(client, order, token_id)
 
     _run_client(cs, op, retry_auth=False)
 
