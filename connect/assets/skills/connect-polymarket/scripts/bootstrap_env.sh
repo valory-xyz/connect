@@ -25,13 +25,9 @@ if [ ! -f "$SHARED" ]; then
   echo "echo \"connect-polymarket: shared bootstrap missing at $SHARED\" >&2; false"
   exit 1
 fi
-# polymarket-client 0.13.0 requires Python 3.11+. The shared bootstrap builds
-# the venv with this python3, and on an older one pip only answers "No
-# matching distribution found", which reads like a network problem.
-if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
-  FOUND="$(python3 --version 2>/dev/null || true)"
-  echo "echo \"connect-polymarket: needs Python 3.11+ to build its venv, but python3 is ${FOUND:-missing}\" >&2; false"
-  exit 1
-fi
-exec bash "$SHARED" connect-polymarket CONNECT_POLYMARKET_VENV .bootstrap-complete-polymarket-client-0.13.0 \
+# polymarket-client 0.13.0 requires Python 3.11+, and on an older one pip only
+# answers "No matching distribution found", which reads like a network problem.
+# The shared bootstrap checks this floor only when it must build or install
+# into the venv, so a ready venv is reused whatever python3 is.
+CONNECT_MIN_PYTHON=3.11 exec bash "$SHARED" connect-polymarket CONNECT_POLYMARKET_VENV .bootstrap-complete-polymarket-client-0.13.0 \
   "polymarket-client==0.13.0" "web3>=7.15,<8" requests certifi

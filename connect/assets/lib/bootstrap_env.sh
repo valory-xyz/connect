@@ -22,6 +22,10 @@
 #
 #   bash bootstrap_env.sh <skill> <venv-override-var> <sentinel> <package>...
 #
+# CONNECT_PYTHON names the interpreter that builds the venv (default python3).
+# A wrapper that needs a minimum Python sets CONNECT_MIN_PYTHON (e.g. 3.11);
+# it is checked only when the venv must be built or installed into.
+#
 # Everything human-readable goes to stderr; stdout carries only shell
 # assignments, so the eval above is safe and the script can still be run on
 # its own to see what it would do.
@@ -81,15 +85,28 @@ PY="$VENV/bin/python"
 # idempotent) instead of being reused forever with missing imports.
 READY="$VENV/$SENTINEL"
 
-# a venv keeps its builder's Python; rebuild one a different python3 made
-VERSION_QUERY='import sys; print("Python %d.%d" % sys.version_info[:2])'
-if [ ! -f "$READY" ] && [ -x "$PY" ]; then
-  BUILT_WITH="$("$PY" -c "$VERSION_QUERY" 2>/dev/null || true)"
-  ON_PATH="$(python3 -c "$VERSION_QUERY" 2>/dev/null || true)"
-  if [[ $BUILT_WITH == "Python "* && $ON_PATH == "Python "* &&
-    $BUILT_WITH != "$ON_PATH" ]]; then
-    echo "$SKILL: rebuilding venv at $VENV with $(python3 --version)" >&2
-    python3 -m venv --clear "$VENV" >&2
+PYTHON="${CONNECT_PYTHON:-python3}"
+if [ ! -f "$READY" ]; then
+  # major * 100 + minor, so two versions compare as integers
+  VERSION_QUERY='import sys; print(sys.version_info[0] * 100 + sys.version_info[1])'
+  CHOSEN="$("$PYTHON" -c "$VERSION_QUERY" 2>/dev/null || true)"
+  MIN="${CONNECT_MIN_PYTHON:-}"
+  if [ -n "$MIN" ] && ! { [[ $CHOSEN =~ ^[0-9]+$ ]] &&
+    ((CHOSEN >= ${MIN%%.*} * 100 + ${MIN#*.})); }; then
+    FOUND="$("$PYTHON" --version 2>/dev/null || true)"
+    echo "echo \"$SKILL: needs Python $MIN+ to build its venv, but $PYTHON is ${FOUND:-missing}\" >&2; false"
+    exit 1 # the ERR trap does not fire on exit, so print the refusal here
+  fi
+  # A venv keeps its builder's Python, so rebuild one an older Python made.
+  # Never rebuild down: every skill shares this venv, and a plain python3 run
+  # of one skill would wipe the venv another built with CONNECT_PYTHON.
+  if [ -x "$PY" ]; then
+    BUILT_WITH="$("$PY" -c "$VERSION_QUERY" 2>/dev/null || true)"
+    if [[ $BUILT_WITH =~ ^[0-9]+$ && $CHOSEN =~ ^[0-9]+$ ]] &&
+      ((CHOSEN > BUILT_WITH)); then
+      echo "$SKILL: rebuilding venv at $VENV with $("$PYTHON" --version)" >&2
+      "$PYTHON" -m venv --clear "$VENV" >&2
+    fi
   fi
 fi
 
@@ -101,7 +118,7 @@ fi
 # first attempt printed. Re-running the create is what keeps that message.
 if [ ! -x "$PY" ] || [ ! -x "$VENV/bin/pip" ]; then
   echo "$SKILL: creating venv at $VENV" >&2
-  python3 -m venv "$VENV" >&2
+  "$PYTHON" -m venv "$VENV" >&2
 fi
 if [ ! -f "$READY" ]; then
   echo "$SKILL: installing dependencies into $VENV" >&2

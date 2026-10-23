@@ -88,9 +88,21 @@ eval "$(bash scripts/bootstrap_env.sh)"   # sets $PY, SSL_CERT_FILE, REQUESTS_CA
 "$PY" scripts/markets.py list             # run every script with "$PY"
 ```
 
-The skill needs Python 3.11+ (the `python3` the venv is built with): on an
-older one the bootstrap refuses and the `eval` fails. Retrying will not help,
-so tell the user a newer `python3` is needed.
+The skill needs Python 3.11+ to build its venv: on an older `python3` the
+bootstrap refuses and the `eval` fails. Retrying with the same `python3` will
+not help. Explain to the user that the skill needs Python 3.11+, and offer to
+install it with uv, which needs no admin rights on macOS and Linux. Only with
+the user's explicit OK, install it and rebuild the venv with it; never install
+silently:
+
+```bash
+uv python install 3.11
+eval "$(CONNECT_PYTHON="$(uv python find 3.11)" bash scripts/bootstrap_env.sh)"
+```
+
+Later runs reuse that venv with the plain `eval` above. If uv itself is
+missing, its [standalone installer](https://docs.astral.sh/uv/getting-started/installation/)
+also needs no admin rights; installing it is part of the same ask.
 
 Don't skip the `eval`: `SSL_CERT_FILE` points at certifi's CA bundle, without
 which a pyenv or source-built Python fails every HTTPS call with
