@@ -3030,8 +3030,9 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
     bin_dir = _python3(tmp_path / "bin", on_path, pip_log).parent
     env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
     chosen_log = tmp_path / "chosen.log"
-    if chosen:
-        env["CONNECT_PYTHON"] = str(_python3(tmp_path / "chosen", chosen, chosen_log))
+    if chosen:  # a path the refusal names must not run in the caller's eval
+        chosen_dir = tmp_path / "chosen$(touch pwned)"
+        env["CONNECT_PYTHON"] = str(_python3(chosen_dir, chosen, chosen_log))
 
     result = _run_bootstrap(tmp_path, env)
 
@@ -3041,9 +3042,14 @@ def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
         assert not chosen_log.exists()  # a refusal leaves the venv alone
         assert "export PY=" not in result.stdout
         evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test input
-            ["bash", "-c", result.stdout], capture_output=True, text=True, check=False
+            ["bash", "-c", result.stdout],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            check=False,
         )
         assert evaled.returncode != 0
+        assert not (tmp_path / "pwned").exists()
         assert "needs Python 3.11+" in evaled.stderr
         assert "Python 3.10.12" in evaled.stderr
     else:
