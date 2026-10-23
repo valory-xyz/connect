@@ -244,8 +244,12 @@ TRADE_FIELDS_V2_TO_V1 = {
     "outcome_index": "outcomeIndex",
     "transaction_hash": "transactionHash",
 }
-# Gamma market `version` this skill can trade; other versions settle elsewhere.
+# Gamma market `version` traded by CLOB token id; v2 ones trade by position id.
 SUPPORTED_MARKET_VERSION = "v1"
+# Gamma serves only v1 rows unless asked; repeating `version` asks for both.
+GAMMA_VERSIONS = ["v1", "v2"]
+# Bits 40-103 of a Protocol V2 position id are reserved and always zero.
+_V2_RESERVED_BITS = ((1 << 64) - 1) << 40
 DEFAULT_RELAYER_PROXY_URL = "https://mpp.valory.xyz"
 
 HTTP_TIMEOUT = 30
@@ -1015,6 +1019,13 @@ def fetch_all_positions(
     if not redeemable:
         return positions
     return [p for p in positions if p.get("redeemable")]
+
+
+def v2_module(token_id: t.Any) -> int:
+    """Return a V2 position id's module (1 binary, 2 neg-risk, 3 combo), or 0 for V1."""
+    value = int(token_id) if str(token_id).isdigit() else 0
+    module = value >> 248
+    return module if module in (1, 2, 3) and not value & _V2_RESERVED_BITS else 0
 
 
 def require_supported_market(token_id: str) -> None:

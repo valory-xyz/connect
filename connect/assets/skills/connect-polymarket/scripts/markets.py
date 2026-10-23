@@ -60,6 +60,12 @@ def _json_field(market: dict, key: str):
     return value
 
 
+def _trading_ids(market: dict):
+    """Return the ids a market trades by: V2 position ids, else CLOB token ids."""
+    v2 = market.get("version") == "v2"
+    return _json_field(market, "positionIds" if v2 else "clobTokenIds")
+
+
 def _slim(market: dict) -> dict:
     """Return the fields a trading decision actually needs."""
     return {
@@ -69,7 +75,7 @@ def _slim(market: dict) -> dict:
         "group_item_title": market.get("groupItemTitle"),
         "outcomes": _json_field(market, "outcomes"),
         "outcome_prices_indicative": _json_field(market, "outcomePrices"),
-        "clob_token_ids": _json_field(market, "clobTokenIds"),
+        "clob_token_ids": _trading_ids(market),
         "neg_risk": market.get("negRisk"),
         "volume": market.get("volumeNum") or market.get("volume"),
         "liquidity": market.get("liquidityNum") or market.get("liquidity"),
@@ -121,12 +127,13 @@ def _attach_live_prices(slims: list, live: bool = True) -> list:
 
 
 def _tradeable(market: dict) -> bool:
-    """Whether this skill can still trade a market."""
-    return (
-        not market.get("closed")
-        and market.get("active") is not False
-        and market.get("version") == pm.SUPPORTED_MARKET_VERSION
-    )
+    """Whether this skill can still trade a market: open, v1 or binary v2."""
+    if market.get("closed") or market.get("active") is False:
+        return False
+    if market.get("version") == "v2":
+        ids = _trading_ids(market)
+        return bool(ids) and all(pm.v2_module(i) == 1 for i in ids)
+    return market.get("version") == pm.SUPPORTED_MARKET_VERSION
 
 
 def _volume(market: dict) -> float:
@@ -249,6 +256,7 @@ def cmd_list(  # pylint: disable=too-many-arguments
             # over-fetch: the version and window filters run client-side, so a
             # page of exactly `limit` could come back short
             "limit": max(limit * 10, 100),
+            "version": pm.GAMMA_VERSIONS,
         }
         if tag:
             params["tag_slug"] = tag
@@ -261,6 +269,11 @@ def cmd_list(  # pylint: disable=too-many-arguments
     pm.print_json(_attach_live_prices([_slim(m) for m in markets[:limit]], live))
 
 
+def _both(**params) -> dict:
+    """Gamma query `params`, asking for v1 and v2 rows alike."""
+    return {**params, "version": pm.GAMMA_VERSIONS}
+
+
 def _lookup_markets(slug: str | None, condition_id: str | None) -> list:
     """Find a market by slug or condition id, raw as Gamma returns it.
 
@@ -270,13 +283,13 @@ def _lookup_markets(slug: str | None, condition_id: str | None) -> list:
     slugs match the oldest edition.
     """
     if slug:
-        markets = pm.http_get_json(f"{pm.GAMMA_API}/markets", params={"slug": slug})
+        markets = pm.http_get_json(f"{pm.GAMMA_API}/markets", params=_both(slug=slug))
         if not markets:
-            events = pm.http_get_json(f"{pm.GAMMA_API}/events", params={"slug": slug})
+            events = pm.http_get_json(f"{pm.GAMMA_API}/events", params=_both(slug=slug))
             markets = [m for e in events or [] for m in e.get("markets") or []]
     elif condition_id:
         markets = pm.http_get_json(
-            f"{pm.GAMMA_API}/markets", params={"condition_ids": condition_id}
+            f"{pm.GAMMA_API}/markets", params=_both(condition_ids=condition_id)
         )
     else:
         raise SystemExit("pass --slug or --condition-id")
@@ -301,7 +314,7 @@ def _event_slug_of(market: dict) -> str | None:
 
 def _fetch_event(event_slug: str) -> dict | None:
     """One event — the container a market group lives in — or None."""
-    events = pm.http_get_json(f"{pm.GAMMA_API}/events", params={"slug": event_slug})
+    events = pm.http_get_json(f"{pm.GAMMA_API}/events", params=_both(slug=event_slug))
     return events[0] if events else None
 
 
