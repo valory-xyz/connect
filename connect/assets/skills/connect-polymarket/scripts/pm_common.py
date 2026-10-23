@@ -1029,23 +1029,24 @@ def v2_module(token_id: t.Any) -> int:
 
 
 def require_supported_market(token_id: str) -> None:
-    """Refuse an outcome token unless an open market of the supported version lists it.
+    """Refuse an outcome token unless an open market this skill trades lists it.
 
-    Only Gamma ``version`` SUPPORTED_MARKET_VERSION markets settle on the
-    contracts this skill signs for. Other versions identify outcomes by a
-    different id, and Gamma omits closed markets by default, so a token no
-    open market lists is refused as well.
+    Only v1 and binary v2 markets (Gamma ``version``) settle on the contracts
+    this skill signs for, and Gamma omits closed markets by default, so a
+    token no open market lists is refused as well.
     """
-    markets = http_get_json(
-        f"{GAMMA_API}/markets", params={"clob_token_ids": str(token_id)}
-    )
+    module = v2_module(token_id)
+    params: dict = {"clob_token_ids": str(token_id)}
+    if module:
+        params["version"] = GAMMA_VERSIONS
+    markets = http_get_json(f"{GAMMA_API}/markets", params=params)
     listed = markets if isinstance(markets, list) else []
     versions = {market.get("version") for market in listed if isinstance(market, dict)}
-    if versions != {SUPPORTED_MARKET_VERSION}:
+    if module > 1 or versions != {"v2" if module else "v1"}:
         raise SystemExit(
-            f"no open {SUPPORTED_MARKET_VERSION} market lists token {token_id}; "
-            f"this skill trades only {SUPPORTED_MARKET_VERSION} markets (Gamma "
-            "`version`), and a closed market cannot be traded"
+            f"no open {'binary v2' if module else 'v1'} market lists token "
+            f"{token_id}; this skill trades only v1 and binary v2 markets "
+            "(Gamma `version`), and a closed market cannot be traded"
         )
 
 
