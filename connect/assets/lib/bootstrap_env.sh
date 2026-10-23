@@ -86,8 +86,7 @@ PY="$VENV/bin/python"
 READY="$VENV/$SENTINEL"
 
 PYTHON="${CONNECT_PYTHON:-python3}"
-# a bin/python that cannot run (its base Python is gone) makes the venv broken,
-# ready or not, so it is rebuilt
+# a bin/python that cannot run (its base Python is gone) is rebuilt, ready or not
 BROKEN=""
 if { [ -L "$PY" ] || [ -x "$PY" ]; } && ! "$PY" -c pass 2>/dev/null; then
   BROKEN=1
@@ -96,11 +95,7 @@ if [ ! -f "$READY" ] || [ -n "$BROKEN" ]; then
   # major * 100 + minor, so two versions compare as integers
   VERSION_QUERY='import sys; print(sys.version_info[0] * 100 + sys.version_info[1])'
   CHOSEN="$("$PYTHON" -c "$VERSION_QUERY" 2>/dev/null || true)"
-  # A venv keeps its builder's Python, so rebuild one an older Python made.
-  # Never rebuild down a venv with pip: every skill shares it, and a plain
-  # python3 run of one skill would wipe the venv another built with
-  # CONNECT_PYTHON. One without pip holds no install, so any other version
-  # rebuilds it rather than mixing two Pythons in it.
+  # rebuild only upward: the venv is shared, and a pip-less one holds no install
   REBUILD="$BROKEN"
   CHECKED="$PYTHON"
   CHECKED_VERSION="$CHOSEN"
@@ -124,7 +119,7 @@ if [ ! -f "$READY" ] || [ -n "$BROKEN" ]; then
     FOUND="$("$CHECKED" --version 2>/dev/null || true)"
     MSG="$SKILL: needs Python $MIN+ to build its venv, but $CHECKED is ${FOUND:-not a runnable Python}"
     printf 'echo %q >&2; false\n' "$MSG"
-    exit 1 # the ERR trap does not fire on exit, so print the refusal here
+    exit 1
   fi
   if [ -n "$REBUILD" ]; then
     echo "$SKILL: rebuilding venv at $VENV with $("$PYTHON" --version)" >&2
