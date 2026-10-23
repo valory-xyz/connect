@@ -2999,7 +2999,7 @@ def _python3(directory: Path, version: str, log: Path) -> Path:
     [
         ("3.10.12", None),
         ("3.11.0", None),
-        ("3.11.0", "3.10.12"),
+        ("3.10.12", "3.10.12"),
         ("3.10.12", "3.11.0"),
     ],
 )
@@ -3075,17 +3075,23 @@ def test_bootstrap_creates_a_missing_venv_with_connect_python(tmp_path) -> None:
 
 @requires_posix_shell
 @pytest.mark.parametrize(
-    ("built_with", "rebuilt"),
-    [("3.10.12", True), ("3.11.2", False), ("3.12.0", False)],
+    ("built_with", "on_path", "rebuilt"),
+    [
+        ("3.10.12", "3.11.9", True),
+        ("3.11.2", "3.11.9", False),
+        ("3.12.0", "3.11.9", False),
+        ("3.11.2", "3.10.12", False),
+    ],
 )
 def test_bootstrap_rebuilds_a_venv_another_python3_made(
-    tmp_path, built_with, rebuilt
+    tmp_path, built_with, on_path, rebuilt
 ) -> None:
     """A venv an older python3 built is rebuilt before the install, not reused.
 
     A user who upgrades python3 to install the SDK must not stay stuck on the
     old venv, whose pip finds no polymarket-client for its Python. One built by
-    the same or a newer minor version is installed into as it is.
+    the same or a newer minor version is installed into as it is, and the
+    3.11 floor is then that venv's Python, not an older python3's.
     """
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
     log = tmp_path / "commands.log"
@@ -3093,7 +3099,7 @@ def test_bootstrap_rebuilds_a_venv_another_python3_made(
     venv = _fake_venv(tmp_path, complete=False, built_by=str(old))
     (venv / OLD_SENTINEL).touch()
     (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho pip "$@" >> "{log}"\n')
-    bin_dir = _python3(tmp_path / "bin", "3.11.9", log).parent
+    bin_dir = _python3(tmp_path / "bin", on_path, log).parent
 
     result = _run_bootstrap(
         tmp_path, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
@@ -3108,7 +3114,7 @@ def test_bootstrap_rebuilds_a_venv_another_python3_made(
     rebuilds = [f"-m venv --clear {venv}"] if rebuilt else []
     assert [commands[i] for i in venv_runs] == rebuilds
     assert all(i < install for i in venv_runs)
-    notice = f"rebuilding venv at {venv} with Python 3.11.9"
+    notice = f"rebuilding venv at {venv} with Python {on_path}"
     assert (notice in result.stderr) is rebuilt
     assert (venv / SENTINEL).is_file()
 
