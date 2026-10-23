@@ -3999,11 +3999,11 @@ def test_trade_buy_spends_what_the_sdk_sizes_for_the_balance(
         order = clob.orders[-1]
         assert (int(order["makerAmount"]), int(order["takerAmount"])) == amounts
     assert pm.dw_open_tokens(clob.cs) == [int(_V1_TOKEN)]
-    assert pm.dw_pending_buy_tokens(clob.cs) == []
     signed = len(clob.digests)
     trade.cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
     quote = json.loads(capsys.readouterr().out)
     assert len(clob.digests) == signed  # a quote asks Connect for no signature
+    assert pm.dw_pending_buy_tokens(clob.cs) == []  # buys confirmed, quote left none
     assert 8.88 <= quote["spendable_now_usd"] < 8.89  # the buy's spend, to the cent
     assert 1.25 - 1e-6 <= quote["shortfall_usd"] <= 1.26
     for balance in (1.0, 0.004):  # under the minimum once the fee is held back
@@ -4029,30 +4029,43 @@ def test_trade_buy_spends_what_the_sdk_sizes_for_the_balance(
 
 
 @pytest.mark.parametrize(
-    "command", [_BUY, _LIMIT_BUY, _SELL], ids=["buy", "limit-buy", "sell"]
+    ("command", "status", "error"),
+    [
+        (_BUY, 401, "expired"),
+        (_LIMIT_BUY, 401, "expired"),
+        (_SELL, 401, "expired"),
+        (_BUY, 403, "Unauthorized"),
+    ],
+    ids=["buy", "limit-buy", "sell", "auth-message"],
 )
 def test_trade_auth_rejected_order_is_never_posted_twice(
-    clob, monkeypatch, capsys, command
+    clob, monkeypatch, capsys, command, status, error
 ) -> None:
-    """An order refused with 401 is not retried, and its creds and marker go.
+    """An order refused for its creds is not retried, and its creds go.
 
-    A 401 is an auth failure whatever its message says.
+    A 401 is an auth failure whatever its message says, and proves no order,
+    so a buy's marker goes too. An auth-looking refusal that is not a 401
+    keeps the marker and the rest of the state, and says to reconcile.
     """
     _dw_holds(clob, monkeypatch, 100.0)
-    clob.refused_key, clob.refusal = "cached-key", (401, {"error": "expired"})
+    clob.refused_key, clob.refusal = "cached-key", (status, {"error": error})
+    clob.issued = _issued("fresh-key")  # a retry could post again
     name, *args = command
 
     with pytest.raises(SystemExit, match="^1$"):
         getattr(_script("trade"), f"cmd_{name}")(clob.cs, _V1_TOKEN, *args)
 
+    ambiguous = status != 401
+    warning = "submission outcome may be ambiguous; reconcile before retrying"
     assert json.loads(capsys.readouterr().out) == {
-        "error": "expired",
+        "error": error,
         "retry": "not attempted automatically: operation is not replay-safe",
+        **({"warning": warning} if ambiguous else {}),
     }
     assert len(clob.calls("POST", "/order")) == 1
-    state = pm.load_state(clob.cs)
-    assert "clob_creds" not in state
-    assert pm._dw_pending_buy_counts(state) == {}  # noqa: SLF001
+    assert "clob_creds" not in pm.load_state(clob.cs)
+    pending = [int(_V1_TOKEN)] if ambiguous else []
+    assert pm.dw_pending_buy_tokens(clob.cs) == pending
 
 
 def test_trade_buy_warns_when_its_placed_marker_cannot_be_confirmed(
@@ -4164,11 +4177,9 @@ _NO_FUNDS = ("not enough balance / allowance",)
         (_BUY, httpx.ReadTimeout("read timed out"), _UNCERTAIN, True),
         (_BUY, (500, {"error": "internal"}), _UNCERTAIN, True),
         (_BUY, (408, {"error": "request timeout"}), ("request timeout",), True),
-        (_BUY, (403, {"error": "Unauthorized"}), ("reconcile before retrying",), True),
     ],
     ids="unmatched unmatched-limit unmatched-sell unmatched-limit-sell odd-status "
-    "unreadable unreadable-sell refused refused-limit timed-out 500 408 "
-    "auth-message".split(),
+    "unreadable unreadable-sell refused refused-limit timed-out 500 408".split(),
 )
 def test_only_a_refusal_code_proves_an_order_was_not_placed(
     clob, monkeypatch, capsys, command, reply, told_of, kept
@@ -4178,8 +4189,8 @@ def test_only_a_refusal_code_proves_an_order_was_not_placed(
     "unmatched", a reply the SDK cannot classify ("unknown") or cannot read,
     no answer at all, or a 5xx may arrive after the CLOB has the order:
     placement is uncertain, and a buy keeps its pending marker. So does a
-    408, or an auth-looking refusal that is not a 401. Only a refusal code the
-    SDK assigns, or a 401, proves no order, resolving the marker.
+    408. Only a refusal code the SDK assigns, or a 401, proves no order,
+    resolving the marker.
     """
     _dw_holds(clob, monkeypatch, 100.0)
     clob.placed = reply
