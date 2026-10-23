@@ -606,15 +606,6 @@ def encode_erc1155_safe_transfer(frm: str, to: str, token_id: int, amount: int) 
     )
 
 
-def encode_router_redeem(position_id: int, amount: int) -> str:
-    """Router redeem(bytes31,uint256,uint256) of `amount` of a V2 position id."""
-    return _call(
-        "redeem(bytes31,uint256,uint256)",
-        ["bytes31", "uint256", "uint256"],
-        [(position_id >> 8).to_bytes(31, "big"), position_id & 0xFF, amount],
-    )
-
-
 def encode_onramp_wrap(asset: str, to: str, amount: int) -> str:
     """CollateralOnramp.wrap(address,address,uint256) — USDC.e only; mints pUSD to `to`."""
     return _call(

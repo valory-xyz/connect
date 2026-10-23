@@ -44,6 +44,7 @@ Usage:
 import argparse
 
 import pm_common as pm
+from polymarket.calls import router_redeem_call
 
 POSITIONS_PAGE_LIMIT = 500
 
@@ -114,10 +115,16 @@ def _redeem_v2(cs: pm.ConnectSigner, position_id: int) -> dict | None:
     )
     if not amount:
         return None
-    data = pm.encode_router_redeem(position_id, amount)
-    tx_hash = cs.safe_transaction(pm.ROUTER, data)
+    condition_id = f"0x{position_id >> 8:062x}00"
+    call = router_redeem_call(
+        router=pm.ROUTER,
+        condition_id=condition_id,
+        outcome_index=position_id & 0xFF,
+        amount=amount,
+    )
+    tx_hash = cs.safe_transaction(call.to, call.data)
     return {
-        "condition_id": f"0x{position_id >> 8:062x}00",
+        "condition_id": condition_id,
         "adapter": pm.ROUTER,
         **cs.wait_receipt(tx_hash),
     }
