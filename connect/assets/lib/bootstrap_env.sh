@@ -22,6 +22,10 @@
 #
 #   bash bootstrap_env.sh <skill> <venv-override-var> <sentinel> <package>...
 #
+# CONNECT_PYTHON names the interpreter that builds the venv (default python3).
+# A wrapper that needs a minimum Python sets CONNECT_MIN_PYTHON (e.g. 3.11);
+# it is checked only when the venv must be built or installed into.
+#
 # Everything human-readable goes to stderr; stdout carries only shell
 # assignments, so the eval above is safe and the script can still be run on
 # its own to see what it would do.
@@ -81,6 +85,54 @@ PY="$VENV/bin/python"
 # idempotent) instead of being reused forever with missing imports.
 READY="$VENV/$SENTINEL"
 
+PYTHON="${CONNECT_PYTHON:-python3}"
+# a bin/python that cannot run (its base Python is gone) is rebuilt, ready or not
+BROKEN=""
+if { [ -L "$PY" ] || [ -x "$PY" ]; } && ! "$PY" -c pass 2>/dev/null; then
+  BROKEN=1
+fi
+if [ ! -f "$READY" ] || [ -n "$BROKEN" ]; then
+  # major * 100 + minor, so two versions compare as integers
+  VERSION_QUERY='import sys; print(sys.version_info[0] * 100 + sys.version_info[1])'
+  CHOSEN="$("$PYTHON" -c "$VERSION_QUERY" 2>/dev/null || true)"
+  REBUILD="$BROKEN"
+  CHECKED="$PYTHON"
+  CHECKED_VERSION="$CHOSEN"
+  # rebuild only upward: the venv is shared, and a pip-less one holds no install
+  if [ -z "$BROKEN" ] && [ -x "$PY" ]; then
+    BUILT_WITH="$("$PY" -c "$VERSION_QUERY" 2>/dev/null || true)"
+    if [[ $BUILT_WITH =~ ^[0-9]+$ && $CHOSEN =~ ^[0-9]+$ ]] &&
+      ((CHOSEN > BUILT_WITH)); then
+      REBUILD=1
+    elif [ -x "$VENV/bin/pip" ]; then
+      # pip installs into this venv as it is, so the floor applies to its Python
+      CHECKED="$PY"
+      CHECKED_VERSION="$BUILT_WITH"
+    elif [[ $BUILT_WITH =~ ^[0-9]+$ && $CHOSEN =~ ^[0-9]+$ &&
+      $BUILT_WITH != "$CHOSEN" ]]; then
+      REBUILD=1
+    fi
+  fi
+  MIN="${CONNECT_MIN_PYTHON:-}"
+  if [ -n "$MIN" ] && ! { [[ $CHECKED_VERSION =~ ^[0-9]+$ ]] &&
+    ((CHECKED_VERSION >= ${MIN%%.*} * 100 + ${MIN#*.})); }; then
+    FOUND="$("$CHECKED" --version 2>/dev/null || true)"
+    MSG="$SKILL: needs Python $MIN+ to build its venv, but $CHECKED is ${FOUND:-not a runnable Python}"
+    printf 'echo %q >&2; false\n' "$MSG"
+    exit 1
+  fi
+  if [ -n "$REBUILD" ]; then
+    # `--clear` empties the directory, so only a venv is cleared
+    if [ ! -f "$VENV/pyvenv.cfg" ]; then
+      MSG="$SKILL: $VENV needs a rebuild but has no pyvenv.cfg, so it is not cleared; remove it or set $VENV_OVERRIDE to another path"
+      printf 'echo %q >&2; false\n' "$MSG"
+      exit 1
+    fi
+    echo "$SKILL: rebuilding venv at $VENV with $("$PYTHON" --version)" >&2
+    "$PYTHON" -m venv --clear "$VENV" >&2
+  fi
+fi
+
 # Gate on pip, not just the interpreter. A `python3 -m venv` that dies at the
 # ensurepip step (Debian/Ubuntu ship it as a separate python3-venv package)
 # still leaves an executable bin/python behind, so checking the interpreter
@@ -89,7 +141,7 @@ READY="$VENV/$SENTINEL"
 # first attempt printed. Re-running the create is what keeps that message.
 if [ ! -x "$PY" ] || [ ! -x "$VENV/bin/pip" ]; then
   echo "$SKILL: creating venv at $VENV" >&2
-  python3 -m venv "$VENV" >&2
+  "$PYTHON" -m venv "$VENV" >&2
 fi
 if [ ! -f "$READY" ]; then
   echo "$SKILL: installing dependencies into $VENV" >&2

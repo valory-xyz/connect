@@ -19,7 +19,7 @@
 
 """Place, inspect and cancel CLOB orders (POLY_1271, funded by the DW).
 
-Prerequisites: `deposit_wallet.py ensure` once, then `funds.py top-up` with
+Prerequisites: `deposit_wallet.py ensure` first, then `funds.py top-up` with
 the pUSD the buy will spend. After trading, ALWAYS `funds.py sweep` — the
 funds-flow contract keeps persistent assets in the recoverable service safe.
 
@@ -44,32 +44,57 @@ shares ("--shares").
 import argparse
 import sys
 import time
+from decimal import Decimal
 
 import pm_common as pm
 from deposit_wallet import dw_or_exit
-from py_clob_client_v2 import MarketOrderArgs, OrderArgs, OrderType
-from py_clob_client_v2.clob_types import OrderPayload
-from py_clob_client_v2.exceptions import PolyApiException
-from py_clob_client_v2.order_builder.constants import BUY, SELL
-from py_clob_client_v2.order_utils.model.order_data_v2 import Side
+from polymarket._internal.actions.orders.market import adjust_buy_amount_for_fees
+from polymarket.errors import (
+    RateLimitError,
+    RequestRejectedError,
+    TransportError,
+    UnexpectedResponseError,
+)
 from remote_signer import clear_cached_creds, make_clob_client
 
+_API_ERRORS = (
+    RequestRejectedError,
+    RateLimitError,
+    TransportError,
+    UnexpectedResponseError,
+)
 
-def _order_type(name: str):
-    """Map a CLI order-type string to the SDK constant (plain str, not Enum)."""
-    return getattr(OrderType, name.upper())
+# Order-reply codes that prove the order was not placed. Any other refusal
+# ("unmatched", "unknown", or a code a later SDK adds) leaves placement uncertain.
+_REFUSED_CODES = (
+    "market_not_ready",
+    "not_enough_balance",
+    "invalid_nonce",
+    "invalid_expiration",
+    "post_only_would_cross",
+    "post_only_mode",
+    "fok_not_filled",
+    "fak_not_filled",
+)
+_UNCERTAIN = (
+    "placement uncertain: the CLOB's reply does not show whether the order was "
+    "placed ({}); before retrying, check the chain after a minute or so, since "
+    "a fill settles there after the match (positions.py positions --wallet dw "
+    "--token-ids {}): a limit order may instead rest unfilled on the book, "
+    "where no position shows it"
+)
 
 
-def _auth_failed(e: PolyApiException) -> bool:
+def _auth_failed(e: Exception) -> bool:
     """Whether a CLOB rejection looks like stale/invalid API credentials."""
-    code = getattr(e, "status_code", None)
-    msg = str(getattr(e, "error_msg", "") or e).lower()
+    code = getattr(e, "status", None)
+    msg = str(e).lower()
     return code == 401 or "unauthorized" in msg or "apikey" in msg or "api key" in msg
 
 
-def _definitive_auth_rejection(e: PolyApiException) -> bool:
+def _definitive_auth_rejection(e: Exception) -> bool:
     """Whether the response proves authentication failed before submission."""
-    return getattr(e, "status_code", None) == 401
+    return getattr(e, "status", None) == 401
 
 
 def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
@@ -85,14 +110,14 @@ def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
     client = make_clob_client(cs, dw)
     try:
         result = op(client, dw)
-    except PolyApiException as e:
+    except _API_ERRORS as e:
         if not _auth_failed(e):
-            pm.print_json({"error": str(getattr(e, "error_msg", "") or e)})
+            pm.print_json({"error": str(e)})
             raise SystemExit(1) from e
         clear_cached_creds(cs)
         if not retry_auth:
             error = {
-                "error": str(getattr(e, "error_msg", "") or e),
+                "error": str(e),
                 "retry": "not attempted automatically: operation is not replay-safe",
             }
             if not _definitive_auth_rejection(e):
@@ -104,39 +129,64 @@ def _run_client(cs: pm.ConnectSigner, op, retry_auth: bool = True) -> None:
         client = make_clob_client(cs, dw)  # re-derives creds
         try:
             result = op(client, dw)
-        except PolyApiException as e2:
-            pm.print_json({"error": str(getattr(e2, "error_msg", "") or e2)})
+        except _API_ERRORS as e2:
+            pm.print_json({"error": str(e2)})
             raise SystemExit(1) from e2
+    if hasattr(result, "model_dump"):
+        result = result.model_dump()
     pm.print_json(result)
 
 
-def _post_buy_with_recovery_hint(client, cs, token_id: str, order, order_type):
-    """Post a buy while preserving enough state to recover an unknown outcome.
+def _post(client, order, token_id: str):
+    """Post a signed order; refuse when its reply leaves placement uncertain.
 
-    Persist the token before submission: the CLOB may accept and fill the order
-    even if its response is lost. A later sweep can then check the DW's
-    on-chain balance directly instead of depending on the lagging data API.
-
-    A structured ``success: false`` response or status-code 401 authentication
-    rejection proves that no order was submitted. Other HTTP exceptions remain
-    ambiguous: a timeout, rate limit, intermediary response, or message-only
-    auth error may arrive after the request reached the CLOB. A harmless
-    zero-balance hint is safer than an undiscoverable filled position.
+    Uncertain: a refusal code not in `_REFUSED_CODES`, no reply, an unreadable
+    one, or a 5xx.
     """
+    try:
+        response = client.post_order(order)
+    except (TransportError, UnexpectedResponseError) as e:
+        raise SystemExit(_UNCERTAIN.format(e, token_id)) from e
+    except RequestRejectedError as e:
+        if e.status >= 500:
+            raise SystemExit(_UNCERTAIN.format(e, token_id)) from e
+        raise
+    if not response.ok and response.code not in _REFUSED_CODES:
+        raise SystemExit(_UNCERTAIN.format(response.message, token_id))
+    return response
+
+
+def _quote(client, token_id: str, usd: float, balance: float, order_type: str):
+    """`pm.quote_buy` on the SDK's price estimate and fee-aware buy sizing."""
+    price = client.estimate_market_price(
+        token_id=token_id, side=pm.BUY_SIDE, amount=usd, order_type=order_type
+    )
+    # pylint: disable-next=protected-access
+    market = client._ctx.order_metadata.resolve_market(client._ctx, token_id=token_id)
+
+    def spend(funds: Decimal) -> Decimal:
+        return adjust_buy_amount_for_fees(
+            amount=Decimal(str(usd)), price=price, max_spend=funds, fee=market.fee_info
+        )
+
+    return pm.quote_buy(token_id, usd, balance, order_type, float(price), spend)
+
+
+def _post_buy_with_recovery_hint(client, cs, token_id: str, order):
+    """Post a buy; only a refusal code or a 401 drops its pending marker."""
     token_id_int = int(token_id)
     # This happens before funds may move, so a state-write failure must abort
     # the submission rather than proceed without the recovery hint.
     pm.record_dw_buy_intent(cs, token_id_int)
     try:
-        response = client.post_order(order, order_type)
-    except PolyApiException as e:
+        response = _post(client, order, token_id)
+    except _API_ERRORS as e:
         if _definitive_auth_rejection(e):
             pm.reject_dw_buy_intent(cs, token_id_int)
         raise
-    if isinstance(response, dict) and response.get("success") is False:
+    if not response.ok:
         pm.reject_dw_buy_intent(cs, token_id_int)
-        detail = response.get("errorMsg") or "CLOB rejected the buy"
-        raise SystemExit(str(detail))
+        raise SystemExit(response.message)
     try:
         pm.confirm_dw_buy_intent(cs, token_id_int)
     except Exception as e:  # noqa: BLE001 - post succeeded; retain pending marker
@@ -151,11 +201,12 @@ def _post_buy_with_recovery_hint(client, cs, token_id: str, order, order_type):
 def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) -> None:
     """Market buy: spend `usd` pUSD on an outcome token (default FOK).
 
-    The DW's live pUSD balance is passed as user_usdc_balance so the SDK
-    sizes the order to amount - exact fee (the CLOB fee is price-dependent;
-    a flat reserve both over- and under-shoots).
+    The DW's live pUSD balance is the SDK's spend cap, so it sizes the order
+    to what the balance covers once the exact fee is held back, the way
+    `pm.quote_buy` prices it (the CLOB fee is price-dependent; a flat reserve
+    both over- and under-shoots).
     """
-    ot = _order_type(order_type)
+    ot = order_type.upper()
     pm.require_supported_market(token_id)
 
     def op(client, dw):
@@ -167,7 +218,7 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
         # Preflight with the SDK's own sizing (see pm.MIN_MARKETABLE_USD) so
         # the error names the exact top-up, not just the CLOB's bare refusal.
         try:
-            quote = pm.quote_buy(client, token_id, usd, balance, ot)
+            quote = _quote(client, token_id, usd, balance, ot)
             if quote["blocked"]:
                 raise SystemExit(
                     f"a ${usd:.2f} buy against a {balance:.6f} pUSD balance "
@@ -181,16 +232,21 @@ def cmd_buy(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) ->
         # let the CLOB itself validate the order.
         except Exception:  # noqa: BLE001 # nosec B110
             pass
-        order = client.create_market_order(
-            MarketOrderArgs(
-                token_id=token_id,
-                amount=usd,
-                side=BUY,
-                order_type=ot,
-                user_usdc_balance=balance,
+        # dust: the SDK would size the order to nothing
+        if balance < pm.MIN_MARKETABLE_USD:
+            raise SystemExit(
+                f"a ${usd:.2f} buy against a {balance:.6f} pUSD balance would be "
+                f"rejected: under the CLOB's ${pm.MIN_MARKETABLE_USD:.0f} "
+                "marketable minimum — run `funds.py top-up` first"
             )
+        order = client.create_market_order(
+            token_id=token_id,
+            side=pm.BUY_SIDE,
+            amount=usd,
+            max_spend=balance,
+            order_type=ot,
         )
-        return _post_buy_with_recovery_hint(client, cs, token_id, order, ot)
+        return _post_buy_with_recovery_hint(client, cs, token_id, order)
 
     _run_client(cs, op, retry_auth=False)
 
@@ -202,13 +258,13 @@ def cmd_quote(cs: pm.ConnectSigner, token_id: str, usd: float, order_type: str) 
     the question a quote is usually asked, and refusing on a zero balance
     the way `buy` does would withhold the answer exactly when it is needed.
     """
-    ot = _order_type(order_type)
+    ot = order_type.upper()
 
     pm.require_supported_market(token_id)
 
     def op(client, dw):
         balance = pm.units_to_usd(pm.erc20_balance_of(cs.w3, pm.PUSD, dw))
-        return pm.quote_buy(client, token_id, usd, balance, ot)
+        return _quote(client, token_id, usd, balance, ot)
 
     _run_client(cs, op)
 
@@ -223,19 +279,14 @@ def cmd_sell(
     duplicate — re-signing is one remote ECDSA, cheap. The shares must be in
     the DW when the order matches (sell before sweeping them to the safe).
     """
-    ot = _order_type(order_type)
+    ot = order_type.upper()
     pm.require_supported_market(token_id)
 
     def op(client, dw):
         order = client.create_market_order(
-            MarketOrderArgs(
-                token_id=token_id,
-                amount=shares,
-                side=Side.SELL,
-                order_type=ot,
-            )
+            token_id=token_id, side="SELL", shares=shares, order_type=ot
         )
-        return client.post_order(order, ot)
+        return _post(client, order, token_id)
 
     _run_client(cs, op, retry_auth=False)
 
@@ -259,42 +310,38 @@ def cmd_limit(  # pylint: disable=too-many-arguments
     an order that never fills leaves a harmless zero-balance hint that sweep
     simply skips.
     """
-    order_side = BUY if side == "buy" else SELL
-    ot = _order_type(order_type)
-    expiration = 0
-    if ot == OrderType.GTD:
+    order_side = side.upper()
+    ot = order_type.upper()
+    expiration = None  # the SDK signs GTD when an expiration is set, else GTC
+    if ot == "GTD":
         if not expires_in:
             raise SystemExit("--expires-in <seconds> is required for gtd orders")
         expiration = int(time.time()) + expires_in
     pm.require_supported_market(token_id)
 
     def op(client, dw):
-        order = client.create_order(
-            OrderArgs(
-                token_id=token_id,
-                price=price,
-                size=size,
-                side=order_side,
-                expiration=expiration,
-            )
+        order = client.create_limit_order(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=order_side,
+            expiration=expiration,
         )
-        if order_side == BUY:
-            return _post_buy_with_recovery_hint(client, cs, token_id, order, ot)
-        return client.post_order(order, ot)
+        if order_side == pm.BUY_SIDE:
+            return _post_buy_with_recovery_hint(client, cs, token_id, order)
+        return _post(client, order, token_id)
 
     _run_client(cs, op, retry_auth=False)
 
 
 def cmd_order(cs: pm.ConnectSigner, order_id: str) -> None:
     """Status of an order by id."""
-    _run_client(cs, lambda client, dw: client.get_order(order_id))
+    _run_client(cs, lambda client, dw: client.get_order(order_id=order_id))
 
 
 def cmd_cancel(cs: pm.ConnectSigner, order_id: str) -> None:
     """Cancel a resting order by id."""
-    _run_client(
-        cs, lambda client, dw: client.cancel_order(OrderPayload(orderID=order_id))
-    )
+    _run_client(cs, lambda client, dw: client.cancel_order(order_id=order_id))
 
 
 def main() -> None:

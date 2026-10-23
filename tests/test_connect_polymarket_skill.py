@@ -23,28 +23,67 @@ These lock the bytes/behaviour a silent bug would corrupt: calldata encoders,
 the EIP-712 DepositWallet batch digest, the dollar↔units conversion, the
 approval-set decision, ``contract_owner``'s RPC-vs-revert distinction, the
 relayer tx record selection, and ``_resolve_dw``'s safety branches. No
-network, no funds, no ``py_clob_client_v2`` dependency (order/SDK paths are
-covered by the live e2e, not here).
+network and no funds. The order-signing tests run the pinned unified SDK
+(``polymarket-client``, layered on by tox -e unit-tests; without it this file
+skips) against a stand-in for the Connect signer, so the signatures they check
+are the SDK's own.
 """
 
 # The skill modules are imported at runtime via a sys.path insert (they ship
-# as bundled assets, not an installed package) and pull in py_clob_client_v2,
-# which has no type stubs — mypy can follow none of this, so skip the file.
+# as bundled assets, not an installed package) and pull in the CLOB SDK —
+# mypy can follow none of this, so skip the file.
 # mypy: ignore-errors
 
+import base64
+import importlib.util
 import json
 import os
+import re
 import subprocess  # nosec B404 - runs the skill's own bootstrap script
 import sys
+import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from typing import get_args
 
+import httpx
 import pytest
+import requests
 from eth_abi import decode as abi_decode
-from eth_utils import is_address, to_checksum_address
-from web3.exceptions import ContractLogicError, TimeExhausted
+from eth_abi import encode as abi_encode
+from eth_account import Account
+from eth_account.messages import _hash_eip191_message, encode_defunct, encode_typed_data
+from eth_account.signers.local import LocalAccount
+from eth_keys import keys as eth_keys
+from eth_utils import is_address, keccak, to_checksum_address
 
-from connect import workspace
+# Without the SDK this file skips, unless CONNECT_REQUIRE_SDK is set: tox's
+# SDK run sets it, so a broken overlay fails there. See testenv:unit-tests.
+if os.environ.get("CONNECT_REQUIRE_SDK"):
+    importlib.import_module("polymarket")
+else:
+    pytest.importorskip("polymarket")
+
+from polymarket import RequestRejectedError, SecureClient, TransportError  # noqa: E402
+from polymarket._internal.actions.orders import cache as sdk_order_cache  # noqa: E402
+from polymarket._internal.actions.orders import orders as sdk_orders  # noqa: E402
+from polymarket._internal.actions.orders import post as sdk_post  # noqa: E402
+from polymarket._internal.actions.orders.market import (  # noqa: E402
+    adjust_buy_amount_for_fees,
+)
+from polymarket._internal.actions.orders.market_data import (  # noqa: E402
+    MarketInfo,
+    PlatformFeeInfo,
+)
+from polymarket._internal.l1_auth import build_api_key_auth_typed_data  # noqa: E402
+from polymarket.models.clob.order_response import (  # noqa: E402
+    OrderResponseErrorCode,
+    RejectedOrder,
+)
+from web3.exceptions import ContractLogicError, TimeExhausted  # noqa: E402
+
+from connect import workspace  # noqa: E402
 
 # The skill ships as bundled assets, not an installed package; put its scripts
 # dir on the path so we can import the modules under test. pm_common locates
@@ -94,6 +133,17 @@ ADDR_A = to_checksum_address("0x" + "11" * 20)
 ADDR_B = to_checksum_address("0x" + "22" * 20)
 DW_ADDR = to_checksum_address("0x" + "d0" * 20)
 SAFE_ADDR = to_checksum_address("0x" + "5a" * 20)
+
+# Polygon mainnet addresses, written out rather than read from the skill so a
+# wrong constant there fails these tests instead of cancelling out.
+_PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+_CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+_CTF_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
+_NEG_RISK_CTF_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
+_NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+_EXCHANGE_V3 = "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa"
+_POSITION_MANAGER = "0x006F54F7f9A22e0000CC2AB60031000000ae9fEF"
+_MAX_UINT256 = 2**256 - 1
 
 
 # The data API's v2 name for each v1 field the fixtures are written in. Kept
@@ -233,17 +283,19 @@ def test_record_dw_token_best_effort_swallows_failure(
 def test_missing_approval_calls_when_nothing_is_granted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """All-missing yields 3 pUSD approvals + 3 CTF operator grants, no more."""
+    """All-missing yields 4 pUSD approvals and 4 operator grants (3 CTF, 1 V2)."""
     monkeypatch.setattr(pm, "erc20_allowance", lambda *a: 0)
     monkeypatch.setattr(pm, "is_approved_for_all", lambda *a: False)
     calls = pm.missing_approval_calls(None, ADDR_A)
-    assert len(calls) == 6
+    assert len(calls) == 8
     pusd_calls = [c for c in calls if c["target"] == pm.PUSD]
     ctf_calls = [c for c in calls if c["target"] == pm.CTF]
-    assert len(pusd_calls) == len(pm.APPROVAL_SPENDERS_PUSD) == 3
-    assert len(ctf_calls) == len(pm.APPROVAL_OPERATORS_CTF) == 3
+    position_calls = [c for c in calls if c["target"] == _POSITION_MANAGER]
+    assert len(pusd_calls) == 4
+    assert len(ctf_calls) == 3
+    assert len(position_calls) == 1
     assert all(c["data"].startswith("0x095ea7b3") for c in pusd_calls)
-    assert all(c["data"].startswith("0xa22cb465") for c in ctf_calls)
+    assert all(c["data"].startswith("0xa22cb465") for c in ctf_calls + position_calls)
 
 
 def test_missing_approval_calls_skips_already_granted(
@@ -267,7 +319,7 @@ def test_missing_approval_calls_partial(monkeypatch: pytest.MonkeyPatch) -> None
     )
     monkeypatch.setattr(pm, "is_approved_for_all", lambda *a: True)
     calls = pm.missing_approval_calls(None, ADDR_A)
-    assert len(calls) == 2  # the two pUSD spenders that are NOT yet approved
+    assert len(calls) == 3  # the three pUSD spenders that are NOT yet approved
     assert all(c["target"] == pm.PUSD for c in calls)
 
 
@@ -683,7 +735,7 @@ def test_dw_position_token_ids_fails_at_the_page_cap(monkeypatch) -> None:
 
 def _sweep_mocks(monkeypatch, *, pusd, ctf_balance, recorded, indexed, pending=()):
     # Bypass the open-orders guard here (it needs the CLOB SDK); it has its
-    # own tests in test_connect_polymarket_sdk.py.
+    # own tests against the CLOB stand-in below.
     monkeypatch.setattr(funds, "_abort_if_open_orders", lambda cs, dw: None)
     monkeypatch.setattr(funds, "dw_or_exit", lambda cs: DW_ADDR)
     monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, tok, dw: pusd)
@@ -1577,12 +1629,22 @@ def test_constants_report_publishes_the_addresses_and_hosts() -> None:
         c.address for c in pm.CONTRACTS
     ]
     assert pm.CLOB_HOST in report["api_hosts"].values()
-    # the approval set, named — the DW's three venues, not the two adapters
-    assert set(report["dw_trading_approvals"]["pusd_allowances"].values()) == {
-        "CTFExchange",
-        "NegRiskCTFExchange",
-        "NegRiskAdapter",
-    }
+    # the approval set, named: the DW's three venues and the NegRiskAdapter
+    # neg-risk orders need, not the two collateral adapters
+    venues = {"CTFExchange", "NegRiskCTFExchange", "NegRiskAdapter", "ExchangeV3"}
+    approvals = report["dw_trading_approvals"]
+    assert set(approvals["pusd_allowances"].values()) == venues
+    named = {name for section in approvals.values() for name in section.values()}
+    assert named == venues
+
+
+def test_constants_report_describes_the_protocol_v2_contracts() -> None:
+    """The rows Protocol V2 adds, and the NegRiskAdapter still listed as granted."""
+    rows = {c["name"]: c for c in pm.constants_report()["contracts"]}
+    assert rows["ExchangeV3"]["address"] == _EXCHANGE_V3
+    assert rows["PositionManager"]["address"] == _POSITION_MANAGER
+    assert rows["NegRiskAdapter"]["address"] == _NEG_RISK_ADAPTER
+    assert "no longer granted" not in rows["NegRiskAdapter"]["role"]
 
 
 def test_status_prints_the_labels_beside_the_approvals(monkeypatch, capsys) -> None:
@@ -2405,45 +2467,48 @@ def test_main_wires_group_and_no_live(monkeypatch, capsys) -> None:
 # --- quote: the buy math, before the buy (OPE-1862 #4) --------------------------
 
 
-class _QuoteClient:
-    """The two SDK sizing calls quote_buy leans on, with a flat 3% taker fee."""
+def _dw_holds(clob, monkeypatch, balance: float) -> None:
+    """Make the DepositWallet hold `balance` pUSD."""
+    clob.cs._w3 = object()  # noqa: SLF001 - the balance read is stubbed
+    units = round(balance * 1_000_000)
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: units)
 
-    def __init__(self, price=0.5, fee_rate=0.03) -> None:
-        self.price = price
-        self.fee_rate = fee_rate
 
-    def calculate_market_price(self, token_id, side, amount, order_type):
-        return self.price
+def _quote(usd: float, balance: float, price: float = 0.5) -> dict:
+    """`pm.quote_buy` at `price`, sized by the SDK at 0.50 with a 3% taker fee."""
+    fee = PlatformFeeInfo(rate=Decimal("0.015"), exponent=Decimal(0))
 
-    def _adjust_buy_amount_for_balance(self, token_id, amount, price, balance, _):
-        # mirrors py_clob_client_v2 fees.py: the fee is charged on
-        # min(amount, balance) and SUBTRACTED from the balance
-        fee = self.fee_rate * min(amount, balance)
-        return min(amount, max(balance - fee, 0.0))
+    def spend(funds: Decimal) -> Decimal:
+        return adjust_buy_amount_for_fees(
+            amount=Decimal(str(usd)), price=Decimal("0.5"), max_spend=funds, fee=fee
+        )
+
+    return pm.quote_buy("7", usd, balance, "FOK", price, spend)
 
 
 def test_quote_surfaces_price_fee_shares_and_topup() -> None:
     """The numbers existed only inside the buy preflight's error message."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 100.0, "FOK")
+    quote = _quote(10.0, 100.0)
 
     assert quote["fill_price"] == 0.5
     assert quote["estimated_shares"] == 20.0
     assert quote["estimated_fee_usd"] == pytest.approx(0.30, abs=1e-6)
     assert quote["required_dw_balance_usd"] == pytest.approx(10.30, abs=1e-6)
     assert quote["shortfall_usd"] == 0.0
+    assert quote["spendable_now_usd"] == 10.0
     assert quote["blocked"] is False
 
 
 def test_quote_names_the_exact_topup_when_the_balance_is_short() -> None:
     """shortfall_usd goes straight to `funds.py top-up --amount`."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 4.0, "FOK")
+    quote = _quote(10.0, 4.0)
     assert quote["dw_balance_usd"] == 4.0
     assert quote["shortfall_usd"] == pytest.approx(6.30, abs=1e-6)
 
 
 def test_quote_flags_the_dollar_minimum_that_breaks_small_bets() -> None:
     """A $1 bet on a $1 balance is fee-shrunk under the CLOB's minimum."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 1.0, 1.0, "FOK")
+    quote = _quote(1.0, 1.0)
     assert quote["spendable_now_usd"] < 1.0
     assert quote["blocked"] is True
     assert quote["shortfall_usd"] > 0
@@ -2456,7 +2521,7 @@ def test_a_bet_under_the_minimum_is_blocked_even_with_a_fat_balance() -> None:
     affordable == usd, so the old `affordable < usd` guard was false and the
     quote published a verdict the CLOB would reject.
     """
-    quote = pm.quote_buy(_QuoteClient(), "7", 0.50, 100.0, "FOK")
+    quote = _quote(0.50, 100.0)
 
     assert quote["shortfall_usd"] == 0.0  # money is not the problem
     assert quote["blocked"] is True
@@ -2466,7 +2531,7 @@ def test_a_bet_under_the_minimum_is_blocked_even_with_a_fat_balance() -> None:
 
 def test_a_fee_shrunk_bet_is_told_to_add_funds_not_to_raise_the_bet() -> None:
     """The two block causes need opposite fixes, so they must read differently."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 1.0, 1.0, "FOK")
+    quote = _quote(1.0, 1.0)
 
     assert quote["blocked"] is True
     assert "can be funded once the taker fee is held back" in quote["blocked_reason"]
@@ -2475,21 +2540,27 @@ def test_a_fee_shrunk_bet_is_told_to_add_funds_not_to_raise_the_bet() -> None:
 
 def test_a_healthy_quote_has_no_blocked_reason() -> None:
     """`blocked_reason` is None exactly when the order would go through."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 100.0, "FOK")
+    quote = _quote(10.0, 100.0)
     assert quote["blocked"] is False
     assert quote["blocked_reason"] is None
 
 
 def test_quote_works_against_an_empty_deposit_wallet() -> None:
-    """How much do I need? is the question an empty DW most needs answered."""
-    quote = pm.quote_buy(_QuoteClient(), "7", 10.0, 0.0, "FOK")
+    """How much do I need? is the question an empty DW most needs answered.
+
+    A balance of less than a cent is as good as empty.
+    """
+    quote = _quote(10.0, 0.0)
     assert quote["spendable_now_usd"] == 0.0
     assert quote["shortfall_usd"] == quote["required_dw_balance_usd"]
+    dust = _quote(10.0, 0.004)
+    assert dust["blocked"] is True
+    assert dust["shortfall_usd"] == pytest.approx(quote["shortfall_usd"] - 0.004)
 
 
 def test_quote_does_not_divide_by_a_zero_price() -> None:
     """An empty book must not turn a quote into a ZeroDivisionError."""
-    quote = pm.quote_buy(_QuoteClient(price=0), "7", 10.0, 50.0, "FOK")
+    quote = _quote(10.0, 50.0, price=0)
     assert quote["estimated_shares"] is None
 
 
@@ -2690,6 +2761,10 @@ def test_skill_ships_the_scripts_its_docs_reference() -> None:
 
 
 BOOTSTRAP = _SCRIPTS / "bootstrap_env.sh"
+# The ready sentinel names the SDK pin, so a venv built for an older pin is not
+# mistaken for a ready one. OLD_SENTINEL is what py-clob-client-v2 venvs carry.
+SENTINEL = ".bootstrap-complete-polymarket-client-0.13.0"
+OLD_SENTINEL = ".bootstrap-complete"
 
 
 def _posix_shell_available() -> bool:
@@ -2728,20 +2803,27 @@ def _fake_pip(venv: Path, exit_code: int = 0) -> Path:
     return pip
 
 
-def _fake_venv(root: Path, complete: bool = True) -> Path:
+def _fake_venv(root: Path, complete: bool = True, built_by: str = "python3") -> Path:
     """Build a venv stub whose python answers the certifi query.
 
     `complete=False` reproduces a venv whose pip install died partway: the
-    interpreter exists, the sentinel does not.
+    interpreter exists, the sentinel does not. Anything else is run by
+    `built_by`, by default the `python3` on PATH, so the venv's version is that
+    interpreter's.
     """
     venv = root / ".venv"
     (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
     python = venv / "bin" / "python"
-    python.write_text("#!/bin/sh\necho /fake/cacert.pem\n", encoding="utf-8")
+    python.write_text(
+        f'#!/bin/sh\ncase "$*" in *certifi*) echo /fake/cacert.pem ;;\n'
+        f'*) exec "{built_by}" "$@" ;; esac\n',
+        encoding="utf-8",
+    )
     python.chmod(0o755)
     _fake_pip(venv)  # creation is gated on pip, so the stub needs one
     if complete:
-        (venv / ".bootstrap-complete").touch()
+        (venv / SENTINEL).touch()
     return venv
 
 
@@ -2810,10 +2892,9 @@ def test_bootstrap_retries_a_venv_whose_install_died_partway(tmp_path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "installing dependencies" in result.stderr
-    assert (venv / ".bootstrap-complete").is_file()
+    assert (venv / SENTINEL).is_file()
 
 
-@requires_posix_shell
 @requires_posix_shell
 def test_a_venv_without_pip_is_rebuilt_not_reused(tmp_path) -> None:
     """An interpreter alone does not prove a venv works.
@@ -2847,7 +2928,7 @@ def test_bootstrap_failure_makes_the_callers_eval_fail(tmp_path) -> None:
     assert result.returncode != 0
     assert "false" in result.stdout  # eval'ing this fails the caller too
     assert "export PY=" not in result.stdout
-    assert not (venv / ".bootstrap-complete").exists()
+    assert not (venv / SENTINEL).exists()
 
     # prove the emitted snippet really does fail the caller's eval
     evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test-controlled input
@@ -2870,12 +2951,14 @@ def test_bootstrap_override_wins_over_the_workspace(tmp_path) -> None:
     python = elsewhere / "bin" / "python"
     python.write_text("#!/bin/sh\necho /other/cacert.pem\n", encoding="utf-8")
     python.chmod(0o755)
-    (elsewhere / ".bootstrap-complete").touch()
+    _fake_pip(elsewhere)  # without pip the bootstrap rebuilds the venv
+    (elsewhere / SENTINEL).touch()
 
     result = _run_bootstrap(tmp_path, {"CONNECT_POLYMARKET_VENV": str(elsewhere)})
 
     assert result.returncode == 0, result.stderr
     assert f"export PY={python}" in result.stdout
+    assert "reusing venv" in result.stderr
 
 
 @requires_posix_shell
@@ -2891,6 +2974,258 @@ def test_bootstrap_emits_only_shell_assignments_on_stdout(tmp_path) -> None:
     )
 
 
+# A `python3` stand-in that reports `version`: it answers `--version` and runs
+# `-c` code under that `sys.version_info`, logs `-m venv` runs to `log`, gives
+# an existing venv without pip one that logs there too, and on `--clear` drops
+# its sentinels and makes itself its python. It refuses anything else, so a
+# run that gets past the version check shows.
+_PYTHON3 = """#!{executable}
+import collections, os, sys
+VERSION = "{version}"
+if sys.argv[1] == "--version":
+    print("Python " + VERSION)
+elif sys.argv[1] == "-c":
+    version_info = collections.namedtuple("version_info", "major minor micro")
+    sys.version_info = version_info(*(int(part) for part in VERSION.split(".")))
+    exec(sys.argv[2])
+elif sys.argv[1:3] == ["-m", "venv"]:
+    with open("{log}", "a") as log:
+        print(*sys.argv[1:], file=log)
+    venv = sys.argv[-1]
+    if "--clear" in sys.argv:
+        for name in os.listdir(venv):
+            if name.startswith(".bootstrap-complete"):
+                os.remove(os.path.join(venv, name))
+        os.remove(os.path.join(venv, "bin", "python"))
+        os.symlink(__file__, os.path.join(venv, "bin", "python"))
+    pip = os.path.join(venv, "bin", "pip")
+    if os.path.isdir(os.path.dirname(pip)) and not os.path.exists(pip):
+        with open(pip, "w") as script:
+            script.write('#!/bin/sh\\necho pip "$@" >> "{log}"\\n')
+        os.chmod(pip, 0o755)
+else:
+    sys.exit("stand-in python3 will not run " + " ".join(sys.argv[1:]))
+"""
+
+
+def _python3(directory: Path, version: str, log: Path) -> Path:
+    """Write the `python3` stand-in reporting `version` into `directory`."""
+    directory.mkdir(exist_ok=True)
+    python3 = directory / "python3"
+    python3.write_text(
+        _PYTHON3.format(executable=sys.executable, version=version, log=log)
+    )
+    python3.chmod(0o755)
+    return python3
+
+
+@requires_posix_shell
+@pytest.mark.parametrize(
+    ("on_path", "chosen", "venv_state"),
+    [
+        ("3.10.12", None, "pip"),
+        ("3.11.0", None, "pip"),
+        ("3.10.12", "3.10.12", "pip"),
+        ("3.10.12", "3.11.0", "pip"),
+        ("3.9.6", "3.10.12", "pip"),
+        ("3.11.0", "3.10.12", "no pip"),
+        ("3.10.12", None, "broken"),
+    ],
+)
+def test_bootstrap_needs_python_3_11_and_rebuilds_old_sdk_venvs(
+    tmp_path, on_path, chosen, venv_state
+) -> None:
+    """polymarket-client needs Python 3.11, and a venv made for the old SDK is rebuilt.
+
+    The interpreter is CONNECT_PYTHON when set, else python3. Below 3.11 the
+    bootstrap refuses before pip runs, naming the floor; on 3.11 it installs
+    the pinned SDK, never py-clob-client-v2, under the new sentinel.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    venv = _fake_venv(tmp_path, complete=False)
+    (venv / OLD_SENTINEL).touch()
+    pip_log = tmp_path / "pip.log"
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho "$@" >> "{pip_log}"\n')
+    if venv_state == "no pip":  # pip installed nothing: the interpreter's floor
+        (venv / "bin" / "pip").unlink()
+    if venv_state == "broken":  # its base Python is gone, so it runs nothing
+        (venv / "bin" / "python").write_text("#!/bin/sh\nexit 1\n")
+    bin_dir = _python3(tmp_path / "bin", on_path, pip_log).parent
+    env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    chosen_log = tmp_path / "chosen.log"
+    if chosen:  # a path the refusal names must not run in the caller's eval
+        chosen_dir = tmp_path / "chosen$(touch pwned)"
+        env["CONNECT_PYTHON"] = str(_python3(chosen_dir, chosen, chosen_log))
+
+    result = _run_bootstrap(tmp_path, env)
+
+    if (chosen or on_path) == "3.10.12":
+        assert result.returncode != 0
+        assert not pip_log.exists()
+        assert not chosen_log.exists()  # a refusal leaves the venv alone
+        assert "export PY=" not in result.stdout
+        evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test input
+            ["bash", "-c", result.stdout],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert evaled.returncode != 0
+        assert not (tmp_path / "pwned").exists()
+        assert "needs Python 3.11+" in evaled.stderr
+        assert "Python 3.10.12" in evaled.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        installs = pip_log.read_text(encoding="utf-8").split()
+        assert "polymarket-client==0.13.0" in installs
+        assert not [name for name in installs if "py-clob-client" in name]
+        assert "venv" not in installs  # python3 neither built nor rebuilt it
+        assert (venv / SENTINEL).is_file()
+    if chosen == "3.11.0":
+        # the venv python3 3.10 made is rebuilt by CONNECT_PYTHON, and once it
+        # is ready a plain run from the skill's directory reuses it as it is,
+        # however old python3 is
+        assert chosen_log.read_text(encoding="utf-8") == f"-m venv --clear {venv}\n"
+        nested = tmp_path / ".claude" / "skills" / "connect-polymarket"
+        nested.mkdir(parents=True)
+        again = _run_bootstrap(nested, {"PATH": env["PATH"]})
+        assert again.returncode == 0, again.stderr
+        assert "reusing venv" in again.stderr
+        assert "venv" not in pip_log.read_text(encoding="utf-8").split()
+
+
+@requires_posix_shell
+@pytest.mark.parametrize("runnable", [True, False])
+def test_bootstrap_creates_a_missing_venv_with_connect_python(
+    tmp_path, runnable
+) -> None:
+    """A fresh workspace gets its venv from CONNECT_PYTHON, not the older python3.
+
+    A CONNECT_PYTHON that is there but runs no Python is refused as such.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    log = tmp_path / "chosen.log"
+    chosen = _python3(tmp_path / "chosen", "3.11.0", log)
+    if not runnable:
+        chosen.write_text("#!/bin/sh\nexit 1\n")
+    bin_dir = _python3(tmp_path / "bin", "3.10.12", tmp_path / "path.log").parent
+    env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    result = _run_bootstrap(tmp_path, {**env, "CONNECT_PYTHON": str(chosen)})
+
+    assert not (tmp_path / "path.log").exists()
+    if runnable:
+        assert "creating venv" in result.stderr
+        assert log.read_text(encoding="utf-8") == f"-m venv {tmp_path / '.venv'}\n"
+    else:
+        evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test input
+            ["bash", "-c", result.stdout], capture_output=True, text=True, check=False
+        )
+        assert evaled.returncode != 0
+        assert "not a runnable Python" in evaled.stderr
+        assert not (tmp_path / ".venv").exists()
+
+
+@requires_posix_shell
+@pytest.mark.parametrize(
+    ("built_with", "on_path", "has_pip", "ready", "rebuilt"),
+    [
+        ("3.10.12", "3.11.9", True, False, True),
+        ("3.11.2", "3.11.9", True, False, False),
+        ("3.12.0", "3.11.9", True, False, False),
+        ("3.11.2", "3.10.12", True, False, False),
+        ("3.12.0", "3.11.9", False, False, True),
+        (None, "3.11.9", True, False, True),
+        (None, "3.11.9", False, False, True),
+        (None, "3.11.9", True, True, True),
+    ],
+)
+def test_bootstrap_rebuilds_a_venv_another_python3_made(
+    tmp_path, built_with, on_path, has_pip, ready, rebuilt
+) -> None:
+    """A venv an older python3 built is rebuilt before the install, not reused.
+
+    A user who upgrades python3 to install the SDK must not stay stuck on the
+    old venv, whose pip finds no polymarket-client for its Python. One built by
+    the same or a newer minor version is installed into as it is, and the
+    3.11 floor is then that venv's Python, not an older python3's. One without
+    pip holds no install, so any other version rebuilds it. One whose Python
+    runs nothing (built_with None) is rebuilt, ready or not; the ready one
+    is a dangling link, as deleting its base Python leaves it.
+    """
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
+    log = tmp_path / "commands.log"
+    log.touch()
+    old = str(_python3(tmp_path / "old", built_with, log)) if built_with else "false"
+    venv = _fake_venv(tmp_path, complete=ready, built_by=old)
+    if ready and not built_with:
+        (venv / "bin" / "python").unlink()
+        (venv / "bin" / "python").symlink_to(tmp_path / "gone" / "python3.12")
+    (venv / OLD_SENTINEL).touch()
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho pip "$@" >> "{log}"\n')
+    if not has_pip:
+        (venv / "bin" / "pip").unlink()
+    bin_dir = _python3(tmp_path / "bin", on_path, log).parent
+
+    result = _run_bootstrap(
+        tmp_path, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    )
+
+    assert result.returncode == 0, result.stderr
+    commands = log.read_text(encoding="utf-8").splitlines()
+    venv_runs = [i for i, c in enumerate(commands) if c.startswith("-m venv")]
+    rebuilds = [f"-m venv --clear {venv}"] if rebuilt else []
+    assert [commands[i] for i in venv_runs] == rebuilds
+    install = next(
+        i for i, c in enumerate(commands) if "polymarket-client==0.13.0" in c
+    )
+    assert all(i < install for i in venv_runs)
+    notice = f"rebuilding venv at {venv} with Python {on_path}"
+    assert (notice in result.stderr) is rebuilt
+    assert (venv / SENTINEL).is_file()
+
+
+@requires_posix_shell
+@pytest.mark.parametrize("built_with", ["3.10.12", None], ids=["older", "broken"])
+def test_bootstrap_never_clears_a_directory_that_is_not_a_venv(
+    tmp_path, built_with
+) -> None:
+    """A CONNECT_POLYMARKET_VENV with no pyvenv.cfg is refused, not rebuilt.
+
+    `venv --clear` empties the directory, so a prefix that only looks like a
+    venv the bootstrap would rebuild is named in the refusal and left as it is.
+    """
+    log = tmp_path / "commands.log"
+    old = str(_python3(tmp_path / "old", built_with, log)) if built_with else "false"
+    venv = _fake_venv(tmp_path / "prefix$(touch pwned)", complete=False, built_by=old)
+    (venv / "pyvenv.cfg").unlink()
+    (venv / "notes.txt").write_text("the operator's own file", encoding="utf-8")
+    before = {p: p.read_bytes() for p in venv.rglob("*") if p.is_file()}
+    bin_dir = _python3(tmp_path / "bin", "3.11.9", log).parent
+
+    result = _run_bootstrap(
+        tmp_path,
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CONNECT_POLYMARKET_VENV": str(venv),
+        },
+    )
+
+    assert result.returncode != 0
+    evaled = subprocess.run(  # nosec B603 B607 - fixed argv, test input
+        ["bash", "-c", result.stdout],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert evaled.returncode != 0
+    assert str(venv) in evaled.stderr
+    assert not (tmp_path / "pwned").exists()
+    assert {p: p.read_bytes() for p in venv.rglob("*") if p.is_file()} == before
+
+
 def test_workspace_gitignores_the_skill_venv() -> None:
     """A `git init` in the workspace must not be able to stage the venv."""
     assert ".venv/" in workspace.GITIGNORE_ENTRIES
@@ -2901,6 +3236,16 @@ def test_skill_no_longer_teaches_the_inverted_dns_rule() -> None:
     doc = (_SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
     assert "one address for all three means" not in doc
     assert "Identical IP addresses across the three hosts are normal" in doc
+
+
+def test_skill_names_the_interpreter_the_bootstrap_honours() -> None:
+    """The documented fix for an old python3 must set the variable the script reads."""
+    doc = (_SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+    assert [
+        line
+        for line in doc.splitlines()
+        if "CONNECT_PYTHON=" in line and "bootstrap_env.sh" in line
+    ]
 
 
 # --- data API v2: positions and trades ------------------------------------------
@@ -3192,3 +3537,881 @@ def test_require_supported_market_refuses_anything_else(monkeypatch, listed) -> 
 
     with pytest.raises(SystemExit, match="no open v1 market lists token 1948"):
         pm.require_supported_market("1948")
+
+
+# --- Protocol V2 trading approvals on the DepositWallet ---------------------------
+
+# (token, spender or operator) of each approval the DW needs: the pre-V2 set,
+# which includes the NegRiskAdapter neg-risk orders need, and the V2 pair.
+_V1_APPROVALS = (
+    (_PUSD, _CTF_EXCHANGE),
+    (_PUSD, _NEG_RISK_CTF_EXCHANGE),
+    (_PUSD, _NEG_RISK_ADAPTER),
+    (_CTF, _CTF_EXCHANGE),
+    (_CTF, _NEG_RISK_CTF_EXCHANGE),
+    (_CTF, _NEG_RISK_ADAPTER),
+)
+_V2_APPROVALS = ((_PUSD, _EXCHANGE_V3), (_POSITION_MANAGER, _EXCHANGE_V3))
+
+
+def _approval_calls(approvals) -> list:
+    """Return the exact calls granting `approvals`, spelled out byte by byte.
+
+    pUSD gets approve(spender, MaxUint256), an ERC-1155 setApprovalForAll
+    (operator, true), so a wrong selector, party, amount or flag fails here.
+    """
+    calls = []
+    for token, party in approvals:
+        word = "0" * 24 + party.removeprefix("0x").lower()
+        if token == _PUSD:
+            calls.append({"target": token, "data": "0x095ea7b3" + word + "f" * 64})
+        else:
+            calls.append(
+                {"target": token, "data": "0xa22cb465" + word + "0" * 63 + "1"}
+            )
+    return sorted(calls, key=str)
+
+
+def _approvals_on_chain(monkeypatch, granted: set) -> None:
+    """Answer the DW's approval reads from `granted`, a set of (token, party)."""
+
+    def allowance(w3, token, owner, spender):
+        return _MAX_UINT256 if (token, spender) in granted else 0
+
+    monkeypatch.setattr(pm, "erc20_allowance", allowance)
+    monkeypatch.setattr(
+        pm, "is_approved_for_all", lambda w3, t, o, op: (t, op) in granted
+    )
+
+
+def test_dw_setup_includes_v2_approvals(monkeypatch) -> None:
+    """A fresh DW gets the V1 set, NegRiskAdapter included, and both V2 approvals.
+
+    The pUSD approval to ExchangeV3 is MaxUint256: Polymarket's relayer
+    refuses the whole batch for anything less.
+    """
+    _approvals_on_chain(monkeypatch, set())
+    calls = pm.missing_approval_calls(None, DW_ADDR)
+    assert sorted(calls, key=str) == _approval_calls(_V1_APPROVALS + _V2_APPROVALS)
+
+
+def test_existing_wallet_gets_v2_approvals_once(monkeypatch) -> None:
+    """A DW holding the pre-V2 set gets exactly the two V2 approvals, then none."""
+    granted = set(_V1_APPROVALS)
+    _approvals_on_chain(monkeypatch, granted)
+    calls = pm.missing_approval_calls(None, DW_ADDR)
+    assert sorted(calls, key=str) == _approval_calls(_V2_APPROVALS)
+    granted.update(_V2_APPROVALS)  # the batch is mined
+    assert pm.missing_approval_calls(None, DW_ADDR) == []
+
+
+# --- relayer proxy errors keep the relayer's own words ----------------------------
+
+# What Polymarket's relayer answered, through the proxy, to a bounded pUSD
+# approval of ExchangeV3.
+_RELAYER_REFUSAL = (
+    '{"error":"call blocked: call[0] blocked: approve to exchange '
+    '0xe3333700cA9d93003F00f0F71f8515005F6c00Aa must be MaxUint256"}'
+)
+
+
+class _RelayerCS:
+    agent_eoa = _StubCS.agent_eoa
+
+    @staticmethod
+    def personal_sign(message: str) -> str:
+        return "0x" + "11" * 65
+
+
+def test_relayer_error_body_surfaced(monkeypatch) -> None:
+    """A relayer proxy error names the call, the HTTP error, then the body.
+
+    Only the body's first 500 characters, as a gateway can answer with a
+    whole page; nothing after the error when no answer came at all.
+    """
+    answers = [(400, _RELAYER_REFUSAL), (502, "<html>" + "-" * 600), None]
+
+    def answer(method, url, **kwargs):
+        reply = answers.pop(0)
+        if reply is None:
+            raise requests.ConnectionError("proxy unreachable")
+        response = requests.Response()
+        response.status_code, response.url, response.reason = reply[0], url, "Nope"
+        response._content = reply[1].encode()  # noqa: SLF001
+        return response
+
+    monkeypatch.setattr(requests, "request", answer)
+    proxy = relayer_proxy.RelayerProxyClient(_RelayerCS(), "http://proxy.test")
+    call = "Relayer proxy GET deployed failed:"
+    url = "http://proxy.test/polymarket/relayer/deployed"
+    for shown in (
+        f"{call} 400 Client Error: Nope for url: {url}: {_RELAYER_REFUSAL}",
+        f"{call} 502 Server Error: Nope for url: {url}: <html>" + "-" * 494,
+        f"{call} proxy unreachable",
+    ):
+        with pytest.raises(relayer_proxy.RelayerProxyError) as failed:
+            proxy.deployed(DW_ADDR)
+        assert str(failed.value) == shown
+
+
+# --- the CLOB client on the unified SDK --------------------------------------------
+
+# A throwaway, publicly known test key, held only by the Connect stand-in, the
+# way the Connect server is the only holder of the agent's key. Built before
+# any test forbids creating keys.
+_CONNECT_KEY = eth_keys.PrivateKey(
+    bytes.fromhex("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+)
+_AGENT_EOA = "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+# The DepositWallet Polymarket's factory derives for _AGENT_EOA, its owner.
+_AGENT_DW = "0xd2C50736787e5eeefA6c2E81496AE56d51D6b7B1"
+_V1_TOKEN = (  # nosec B105 - an outcome token id, not a password
+    "71321045679252212594626385532706912750332728571942532289631379312455583992563"
+)
+# A Protocol V2 position id: module 1, the reserved bits clear, outcome 0.
+_V2_TOKEN = str(int("01" + "ab" * 18 + "00" * 13, 16))
+
+# Captured from the code this replaces (py_clob_client_v2 1.0.2): the digest
+# Connect signed, and its signature, for a GTC BUY of 10 _V1_TOKEN at 0.50,
+# salt 123456789, timestamp 1_800_000_000_000 ms.
+_V1_GOLDEN_DIGEST = "0x5253886c32ea78ebf65a8a427ba9e2b9933c5e947f15b7e5be7bff836a099fa2"
+_V1_GOLDEN_SIGNATURE = (
+    "0xf30cb504a98efc00e00d1d6adf9907082af48a5c291e253d5ab9bec39515464d5e8feef8568e"
+    "84b9df2e200be08116dc62d235ee22d574d2db0e78eab023c8531b3264e159346253e26a64e00b"
+    "69032db0e7d32f94628de3e6eecb50304d7af3d2f2e81f819fc723d708509aa07d9b8300a86396"
+    "585213189e722a5e0da4d252394f726465722875696e743235362073616c742c61646472657373"
+    "206d616b65722c61646472657373207369676e65722c75696e7432353620746f6b656e49642c75"
+    "696e74323536206d616b6572416d6f756e742c75696e743235362074616b6572416d6f756e742c"
+    "75696e743820736964652c75696e7438207369676e6174757265547970652c75696e7432353620"
+    "74696d657374616d702c62797465733332206d657461646174612c62797465733332206275696c"
+    "6465722900ba"
+)
+_ORDER_TYPE = (
+    b"Order(uint256 salt,address maker,address signer,uint256 tokenId,"
+    b"uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,"
+    b"uint256 timestamp,bytes32 metadata,bytes32 builder)"
+)
+_ORDER_ID = "0x" + "0e" * 32
+_OPEN_ORDER = {  # one row of the CLOB's /data/orders, and its /data/order reply
+    "id": _ORDER_ID,
+    "market": "0x" + "cd" * 32,
+    "asset_id": _V1_TOKEN,
+    "owner": "cached-key",
+    "maker_address": _AGENT_DW,
+    "side": "BUY",
+    "price": "0.5",
+    "original_size": "10",
+    "size_matched": "0",
+    "outcome": "Yes",
+    "order_type": "GTC",
+    "status": "LIVE",
+    "associate_trades": [],
+    "created_at": 1_800_000_000,
+}
+_PLACED = {  # the CLOB's reply to a placed order
+    "success": True,
+    "errorMsg": "",
+    "orderID": _ORDER_ID,
+    "status": "live",
+    "makingAmount": "",
+    "takingAmount": "",
+}
+# Marketable but delayed: the order may still be placed, though the SDK reads
+# the reply as a rejection with code "unmatched" and drops its order id.
+_UNMATCHED = dict(_PLACED, status="unmatched")
+_REFUSED = dict(
+    _PLACED, success=False, errorMsg="not enough balance / allowance", orderID=""
+)
+# One level each side: asks at 0.50, bids at 0.40.
+_BOOK = {
+    "market": "0x" + "cd" * 32,
+    "asset_id": _V1_TOKEN,
+    "timestamp": "1800000000000",
+    "hash": "0x" + "00" * 20,
+    "bids": [{"price": "0.4", "size": "1000"}],
+    "asks": [{"price": "0.5", "size": "1000"}],
+    "min_order_size": "1",
+    "tick_size": "0.01",
+    "neg_risk": False,
+}
+
+
+def _connect_sign(digest: bytes) -> str:
+    """Sign a raw digest the way connect/signer.py does: unprefixed, v in {27, 28}."""
+    sig = _CONNECT_KEY.sign_msg_hash(digest)
+    return "0x" + sig.to_bytes()[:64].hex() + f"{sig.v + 27:02x}"
+
+
+def _creds(key: str) -> dict:
+    """Return API creds in the workspace's format, the secret base64 like a real one."""
+    secret = base64.b64encode(key.encode()).decode()
+    return {"api_key": key, "api_secret": secret, "api_passphrase": key + "-pass"}
+
+
+def _issued(key: str) -> dict:
+    """Return the same creds as the CLOB issues them."""
+    return dict(zip(("apiKey", "secret", "passphrase"), _creds(key).values()))
+
+
+class _Clob:
+    """The SDK's HTTP endpoints and the Connect server, in process.
+
+    Records every request and digest; each attribute set in __init__ is an answer.
+    """
+
+    def __init__(self, cs) -> None:
+        """Bind the workspace; nothing issued, posted or refused yet."""
+        self.cs, self.requests, self.digests = cs, [], []
+        self.create, self.issued = 200, None
+        self.orders, self.book, self.fee = [], _BOOK, (Decimal(0), Decimal(1))
+        self.placed, self.order = _PLACED, _OPEN_ORDER
+        self.pages, self.refused_key, self.refusal = {}, None, None
+
+    def sign(self, path: str, payload: dict) -> dict:
+        """Answer the Connect signer's ``POST /sign-message``: a digest, nothing else."""
+        assert path == "/sign-message"
+        assert set(payload) == {"digest"}
+        digest = bytes.fromhex(str(payload["digest"]).removeprefix("0x"))
+        self.digests.append("0x" + digest.hex())
+        return {"signature": _connect_sign(digest)}
+
+    def send(self, request: httpx.Request) -> httpx.Response:
+        """Answer one SDK request."""
+        self.requests.append(request)
+        method, path = request.method, request.url.path
+
+        def reply(body, status=200):
+            return httpx.Response(status, json=body, request=request)
+
+        if path == "/auth/api-key" and isinstance(self.create, Exception):
+            raise self.create
+        if path in ("/auth/api-key", "/auth/derive-api-key"):
+            created = path.endswith("derive-api-key") or self.create == 200
+            return reply(self.issued) if created else reply({}, self.create)
+        if self.refused_key and request.headers.get("POLY_API_KEY") == self.refused_key:
+            return reply(*self.refusal[::-1])
+        if (method, path) == ("POST", "/order"):
+            self.orders.append(json.loads(request.content)["order"])
+            if isinstance(self.placed, Exception):
+                raise self.placed
+            if isinstance(self.placed, tuple):  # (status, body)
+                return reply(*self.placed[::-1])
+            return reply(self.placed)
+        if (method, path) == ("DELETE", "/order"):
+            assert json.loads(request.content) == {"orderID": _ORDER_ID}
+            return reply({"canceled": [_ORDER_ID], "not_canceled": {}})
+        if path == f"/data/order/{_ORDER_ID}":
+            return reply(self.order)
+        if path == "/book":
+            return reply(self.book)
+        return reply(self.pages[request.url.params.get("next_cursor", "MA==")])
+
+    def calls(self, method: str, path: str) -> list:
+        """Return the requests sent to one endpoint."""
+        return [r for r in self.requests if (r.method, r.url.path) == (method, path)]
+
+
+@pytest.fixture
+def clob(tmp_path, monkeypatch) -> _Clob:
+    """Return a workspace with cached creds and a DW, the SDK's network faked.
+
+    Order salts and timestamps are fixed; any eth_account or eth_keys entry
+    point that holds or uses a key fails the test.
+    """
+
+    def key_used(*args, **kwargs):
+        raise AssertionError("key material was used in the skill's process")
+
+    for name in (
+        "create",
+        "from_key",
+        "_sign_hash",
+        "sign_message",
+        "unsafe_sign_hash",
+    ):
+        monkeypatch.setattr(Account, name, key_used)
+    for cls in (LocalAccount, eth_keys.PrivateKey):
+        monkeypatch.setattr(cls, "__init__", key_used)
+
+    cs = pm.ConnectSigner("http://127.0.0.1:8716", "test-bearer", tmp_path)
+    cs._info = {"agent_eoa": _AGENT_EOA}  # noqa: SLF001 - /wallet, pre-answered
+    pm.save_state(cs, {"clob_creds": _creds("cached-key")})
+    http = _Clob(cs)
+    monkeypatch.setattr(cs, "_post", http.sign)
+    monkeypatch.setattr(httpx.Client, "send", lambda self, r, **kw: http.send(r))
+    monkeypatch.setattr(deposit_wallet, "_resolve_dw", lambda cs: _AGENT_DW)
+    monkeypatch.setattr(
+        pm, "http_get_json", lambda url, params=None: [{"version": "v1"}]
+    )
+    monkeypatch.setattr(sdk_orders, "_generate_salt", lambda: 123456789)
+    monkeypatch.setattr(sdk_orders, "_current_timestamp_ms", lambda: 1_800_000_000_000)
+    monkeypatch.setattr(
+        sdk_order_cache, "resolve_condition_by_token_sync", lambda ctx, token_id: "0x"
+    )
+    monkeypatch.setattr(
+        sdk_order_cache,
+        "fetch_market_info_sync",
+        lambda ctx, condition_id: MarketInfo(
+            fee_info=PlatformFeeInfo(rate=http.fee[0], exponent=http.fee[1]),
+            neg_risk=False,
+            tick_size=Decimal("0.01"),
+            token_ids=frozenset({_V1_TOKEN, _V2_TOKEN}),
+        ),
+    )
+    return http
+
+
+def _script(name: str):
+    """Import a skill script under its own name (connect-pons has a trade.py too)."""
+    path = _SCRIPTS / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"connect_polymarket_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _domain_separator(version: str, exchange: str) -> bytes:
+    """EIP-712 domain separator of a Polymarket exchange on Polygon."""
+    domain_type = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+    return keccak(
+        abi_encode(
+            ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+            [
+                keccak(text=domain_type),
+                keccak(text="Polymarket CTF Exchange"),
+                keccak(text=version),
+                137,
+                exchange,
+            ],
+        )
+    )
+
+
+def test_remote_signer_signs_v1_and_v2_orders(clob) -> None:
+    """Both order kinds sign through RemoteSigner, each on its own exchange.
+
+    The V1 order is byte-identical to the old code's. Both carry the DW's
+    POLY_1271 wrapping: the owner's signature over the order in the DW's
+    TypedDataSign, the exchange's domain (V1: "2" on CTF Exchange; V2: "3" on
+    ExchangeV3), the contents hash, and the Order type string and its length.
+    """
+    client = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW)
+    v1 = client.create_limit_order(
+        token_id=_V1_TOKEN, price="0.5", size="10", side="BUY"
+    )
+    v2 = client.create_limit_order(
+        token_id=_V2_TOKEN, price="0.5", size="10", side="BUY"
+    )
+
+    assert (clob.digests[0], v1.signature) == (_V1_GOLDEN_DIGEST, _V1_GOLDEN_SIGNATURE)
+    typed_data_sign = (
+        b"TypedDataSign(Order contents,string name,string version,uint256 chainId,"
+        b"address verifyingContract,bytes32 salt)" + _ORDER_TYPE
+    )
+    for order, digest, domain in (
+        (v1, clob.digests[0], _domain_separator("2", _CTF_EXCHANGE)),
+        (v2, clob.digests[1], _domain_separator("3", _EXCHANGE_V3)),
+    ):
+        signature = bytes.fromhex(order.signature.removeprefix("0x"))
+        contents = signature[97:129]
+        assert signature[65:97] == domain
+        assert signature[129:] == _ORDER_TYPE + len(_ORDER_TYPE).to_bytes(2, "big")
+        struct = abi_encode(
+            ["bytes32"] * 4 + ["uint256", "address", "bytes32"],
+            [
+                keccak(typed_data_sign),
+                contents,
+                keccak(text="DepositWallet"),
+                keccak(text="1"),
+                137,
+                _AGENT_DW,
+                bytes(32),
+            ],
+        )
+        assert digest == "0x" + keccak(b"\x19\x01" + domain + keccak(struct)).hex()
+        assert signature[:65].hex() == _connect_sign(bytes.fromhex(digest[2:]))[2:]
+        assert (order.maker, order.signer, order.signature_type) == (
+            _AGENT_DW,
+            _AGENT_DW,
+            3,
+        )
+
+
+def test_no_private_key_in_process(clob) -> None:
+    """The SDK holds a RemoteSigner, and every signature it gets is Connect's.
+
+    With every key entry point failing the test (the `clob` fixture), its
+    `address` is the agent EOA, and typed data and an EIP-191 message both
+    reach Connect as a digest alone.
+    """
+    remote_signer = _script("remote_signer")
+    held = remote_signer.make_clob_client(clob.cs, _AGENT_DW)._ctx.signer
+    assert isinstance(held, remote_signer.RemoteSigner)
+    assert held.address == _AGENT_EOA
+
+    typed = build_api_key_auth_typed_data(
+        address=_AGENT_EOA, chain_id=137, timestamp=1_800_000_000, nonce=0
+    )
+    typed_digest = _hash_eip191_message(encode_typed_data(full_message=typed))
+    message_digest = keccak(b"\x19Ethereum Signed Message:\n5hello")
+    for signed, digest in (
+        (held.sign_typed_data(typed), typed_digest),
+        (held.sign_message(encode_defunct(text="hello")), message_digest),
+    ):
+        assert "0x" + signed.signature.hex() == _connect_sign(digest)
+    assert clob.digests == ["0x" + typed_digest.hex(), "0x" + message_digest.hex()]
+
+
+def test_cached_api_credentials_reused(clob) -> None:
+    """Workspace creds are reused as they are, with no request and no signature."""
+    stored = pm.state_path(clob.cs).read_bytes()
+    creds = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW).credentials
+    assert (creds.key, creds.secret, creds.passphrase) == tuple(
+        _creds("cached-key").values()
+    )
+    assert clob.requests == clob.digests == []
+    assert pm.state_path(clob.cs).read_bytes() == stored
+
+
+@pytest.mark.parametrize(
+    "create",
+    [200, 400, 500, httpx.ConnectError("connection reset by peer")],
+    ids=["200", "400", "500", "no-answer"],
+)
+def test_first_credentials_derive_only_after_a_400_on_create(clob, create) -> None:
+    """A workspace without creds creates them once, deriving only after a 400.
+
+    The L1 auth is Connect's signature with nonce 0. Created or derived creds
+    are kept beside the rest of the workspace state and reused next time; a
+    500, or no answer at all, is an error that derives and keeps nothing.
+    """
+    clob.issued, clob.create = _issued("fresh-key"), create
+    wallet = {"deposit_wallet": {"address": _AGENT_DW}}
+    pm.save_state(clob.cs, wallet)
+    make_clob_client = _script("remote_signer").make_clob_client
+    issued = create in (200, 400)
+
+    if issued:
+        for _ in range(2):
+            assert make_clob_client(clob.cs, _AGENT_DW).credentials.key == "fresh-key"
+    else:
+        with pytest.raises((RequestRejectedError, TransportError)):
+            make_clob_client(clob.cs, _AGENT_DW)
+
+    paths = ["/auth/api-key", "/auth/derive-api-key"][: 1 + (create == 400)]
+    assert [r.url.path for r in clob.requests] == paths
+    created = clob.requests[0]
+    clob_auth = build_api_key_auth_typed_data(
+        address=_AGENT_EOA,
+        chain_id=137,
+        timestamp=int(created.headers["POLY_TIMESTAMP"]),
+        nonce=0,
+    )
+    digest = _hash_eip191_message(encode_typed_data(full_message=clob_auth))
+    assert (created.headers["POLY_NONCE"], clob.digests[0]) == (
+        "0",
+        "0x" + digest.hex(),
+    )
+    assert created.headers["POLY_SIGNATURE"] == _connect_sign(digest)
+    kept = {"clob_creds": _creds("fresh-key")} if issued else {}
+    assert pm.load_state(clob.cs) == {**wallet, **kept}
+
+
+# --- trade.py and funds.py on the unified SDK ---------------------------------------
+
+_BUY, _LIMIT_BUY = ("buy", 10.0, "fok"), ("limit", "buy", 0.5, 10.0, "gtc", None)
+_SELL, _LIMIT_SELL = ("sell", 12.5, "fak"), ("limit", "sell", 0.5, 10.0, "gtc", None)
+
+
+def _run(clob, capsys, command) -> tuple:
+    """Run one trade.py command; return its exit code and all it told the agent."""
+    name, *args = command
+    try:
+        getattr(_script("trade"), f"cmd_{name}")(clob.cs, _V1_TOKEN, *args)
+        code = None
+    except SystemExit as e:
+        code = e.code
+    out = capsys.readouterr()
+    return code, (out.out + out.err + str(code)).lower()
+
+
+@pytest.mark.parametrize(
+    ("command", "order_type", "amounts"),
+    [
+        (("limit", "sell", 0.42, 7.0, "gtd", 3600), "GTD", (7_000_000, 2_940_000)),
+        (_SELL, "FAK", (12_500_000, 5_000_000)),
+    ],
+    ids=["limit-gtd", "market"],
+)
+def test_trade_sell_posts_one_order_and_prints_the_clob_s_reply(
+    clob, capsys, command, order_type, amounts
+) -> None:
+    """A sell posts one signed order, prints its id and leaves no buy's marker."""
+    start = int(time.time())
+    code, told = _run(clob, capsys, command)
+
+    (order,) = clob.orders
+    assert (order["maker"], order["tokenId"], order["side"]) == (
+        _AGENT_DW,
+        _V1_TOKEN,
+        "SELL",
+    )
+    assert (int(order["makerAmount"]), int(order["takerAmount"])) == amounts
+    assert json.loads(clob.requests[-1].content)["orderType"] == order_type
+    if order_type == "GTD":
+        assert start + 3600 <= int(order["expiration"]) <= time.time() + 3600
+    assert code is None
+    assert _ORDER_ID.lower() in told
+    assert "dw_open_tokens" not in pm.load_state(clob.cs)
+
+
+def test_trade_buy_spends_what_the_sdk_sizes_for_the_balance(
+    clob, monkeypatch, capsys
+) -> None:
+    """`trade.py buy` spends at most the DW's pUSD, sized by the SDK's own rules.
+
+    A placed buy confirms its marker and keeps its holdings hint. `trade.py
+    quote` reports the same spend without asking Connect to sign, even for an
+    empty DW; dust is refused before anything is posted, naming the quote's
+    top-up; and topping up by the quote's shortfall buys all of --usd, even at
+    the buy's cent rounding.
+    """
+    trade = _script("trade")
+    clob.fee = (Decimal("0.25"), Decimal(1))
+    for balance, amounts in (
+        (100.0, (10_000_000, 20_000_000)),
+        (10.5, (9_330_000, 18_660_000)),  # covers --usd, not its fee
+        (10.0, (8_880_000, 17_760_000)),
+    ):
+        _dw_holds(clob, monkeypatch, balance)
+        assert _run(clob, capsys, _BUY)[0] is None
+        order = clob.orders[-1]
+        assert (int(order["makerAmount"]), int(order["takerAmount"])) == amounts
+    assert pm.dw_open_tokens(clob.cs) == [int(_V1_TOKEN)]
+    signed = len(clob.digests)
+    trade.cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
+    quote = json.loads(capsys.readouterr().out)
+    assert len(clob.digests) == signed  # a quote asks Connect for no signature
+    assert pm.dw_pending_buy_tokens(clob.cs) == []  # buys confirmed, quote left none
+    assert 8.88 <= quote["spendable_now_usd"] < 8.89  # the buy's spend, to the cent
+    assert 1.25 - 1e-6 <= quote["shortfall_usd"] <= 1.26
+    for balance in (1.0, 0.004):  # under the minimum once the fee is held back
+        _dw_holds(clob, monkeypatch, balance)
+        trade.cmd_quote(clob.cs, _V1_TOKEN, 1.0, "fok")
+        topup = json.loads(capsys.readouterr().out)["shortfall_usd"]
+        with pytest.raises(SystemExit, match=f"{topup:.4f}.*`trade.py quote`"):
+            trade.cmd_buy(clob.cs, _V1_TOKEN, 1.0, "fok")
+    assert len(clob.orders) == 3
+    _dw_holds(clob, monkeypatch, 0.0)
+    trade.cmd_quote(clob.cs, _V1_TOKEN, 10.0, "fok")
+    empty = json.loads(capsys.readouterr().out)
+    assert empty["shortfall_usd"] == empty["required_dw_balance_usd"] > 10.0
+
+    clob.fee = (Decimal("0.3489"), Decimal(2))
+    clob.book = dict(_BOOK, asks=[{"price": "0.3", "size": "1000"}])
+    _dw_holds(clob, monkeypatch, 6.727721)
+    trade.cmd_quote(clob.cs, _V1_TOKEN, 36.46, "fok")
+    shortfall = json.loads(capsys.readouterr().out)["shortfall_usd"]
+    _dw_holds(clob, monkeypatch, 6.727721 + shortfall)
+    trade.cmd_buy(clob.cs, _V1_TOKEN, 36.46, "fok")
+    assert int(clob.orders[-1]["makerAmount"]) == 36_460_000
+
+
+@pytest.mark.parametrize(
+    ("command", "status", "error"),
+    [
+        (_BUY, 401, "expired"),
+        (_LIMIT_BUY, 401, "expired"),
+        (_SELL, 401, "expired"),
+        (_BUY, 403, "Unauthorized"),
+    ],
+    ids=["buy", "limit-buy", "sell", "auth-message"],
+)
+def test_trade_auth_rejected_order_is_never_posted_twice(
+    clob, monkeypatch, capsys, command, status, error
+) -> None:
+    """An order refused for its creds is not retried, and its creds go.
+
+    A 401 is an auth failure whatever its message says, and proves no order,
+    so a buy's marker goes too. An auth-looking refusal that is not a 401
+    keeps the marker and the rest of the state, and says to reconcile.
+    """
+    _dw_holds(clob, monkeypatch, 100.0)
+    clob.refused_key, clob.refusal = "cached-key", (status, {"error": error})
+    clob.issued = _issued("fresh-key")  # a retry could post again
+    name, *args = command
+
+    with pytest.raises(SystemExit, match="^1$"):
+        getattr(_script("trade"), f"cmd_{name}")(clob.cs, _V1_TOKEN, *args)
+
+    ambiguous = status != 401
+    warning = "submission outcome may be ambiguous; reconcile before retrying"
+    assert json.loads(capsys.readouterr().out) == {
+        "error": error,
+        "retry": "not attempted automatically: operation is not replay-safe",
+        **({"warning": warning} if ambiguous else {}),
+    }
+    assert len(clob.calls("POST", "/order")) == 1
+    assert "clob_creds" not in pm.load_state(clob.cs)
+    pending = [int(_V1_TOKEN)] if ambiguous else []
+    assert pm.dw_pending_buy_tokens(clob.cs) == pending
+
+
+def test_trade_buy_warns_when_its_placed_marker_cannot_be_confirmed(
+    clob, monkeypatch, capsys
+) -> None:
+    """A placed buy is reported placed even if confirming its marker fails."""
+    _dw_holds(clob, monkeypatch, 100.0)
+
+    def disk_full(cs, token_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pm, "confirm_dw_buy_intent", disk_full)
+
+    code, told = _run(clob, capsys, _BUY)
+
+    assert code is None
+    assert _ORDER_ID.lower() in told
+    assert "the action itself succeeded" in told
+    assert pm.dw_pending_buy_tokens(clob.cs) == [int(_V1_TOKEN)]
+
+
+def test_trade_main_wires_the_quote_subcommand(clob, monkeypatch, capsys) -> None:
+    """The CLI is the only way a quote runs in production, so parse it for real."""
+    _dw_holds(clob, monkeypatch, 100.0)
+    monkeypatch.setattr(pm.ConnectSigner, "from_workspace", lambda: clob.cs)
+    argv = ["trade.py", "quote", "--token-id", _V1_TOKEN, "--usd", "10"]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    _script("trade").main()
+
+    quote = json.loads(capsys.readouterr().out)
+    assert (quote["token_id"], quote["requested_usd"]) == (_V1_TOKEN, 10.0)
+    assert quote["order_type"] == "FOK"
+
+
+def test_trade_prints_the_clob_s_refusal_as_its_error(clob, capsys) -> None:
+    """A refusal not about credentials prints ``{"error": ...}`` and exits 1."""
+    clob.refused_key, clob.refusal = "cached-key", (400, {"error": "refused"})
+
+    with pytest.raises(SystemExit, match="^1$"):
+        _script("trade").cmd_order(clob.cs, _ORDER_ID)
+
+    assert json.loads(capsys.readouterr().out) == {"error": "refused"}
+
+
+def test_trade_order_and_cancel_print_the_clob_s_reply(clob, capsys) -> None:
+    """`trade.py order` prints the order's id and status; `cancel` the CLOB's reply.
+
+    A cancel or an order read, both replay-safe, refused with a bare 401 is
+    retried once on re-derived creds, which are kept; a second refusal is
+    printed. An order reply the SDK's model refuses (the null
+    ``associate_trades`` the CLOB sends) prints an error and exits 1, quoting
+    at most 500 characters.
+    """
+    trade = _script("trade")
+    trade.cmd_order(clob.cs, _ORDER_ID)
+    printed = capsys.readouterr().out
+    assert _ORDER_ID in printed
+    assert "LIVE" in printed
+    clob.refused_key, clob.refusal = "cached-key", (401, {"error": "unauthorized"})
+    clob.issued = _issued("fresh-key")
+    trade.cmd_cancel(clob.cs, _ORDER_ID)
+    assert json.loads(capsys.readouterr().out) == {
+        "canceled": [_ORDER_ID],
+        "not_canceled": {},
+    }
+    cancels = clob.calls("DELETE", "/order")
+    assert [r.headers["POLY_API_KEY"] for r in cancels] == ["cached-key", "fresh-key"]
+    assert pm.load_state(clob.cs)["clob_creds"] == _creds("fresh-key")
+    clob.refused_key, clob.issued = "fresh-key", _issued("third-key")
+    trade.cmd_order(clob.cs, _ORDER_ID)
+    assert "LIVE" in capsys.readouterr().out
+    assert pm.load_state(clob.cs)["clob_creds"] == _creds("third-key")
+
+    clob.order = dict(_OPEN_ORDER, associate_trades=None, outcome="x" * 600)
+    with pytest.raises(SystemExit, match="^1$"):
+        trade.cmd_order(clob.cs, _ORDER_ID)
+    printed = capsys.readouterr().out
+    assert "error" in json.loads(printed)
+    assert "x" * 501 not in printed
+
+    clob.refused_key = "third-key"  # the re-derived key is refused too
+    with pytest.raises(SystemExit, match="^1$"):
+        trade.cmd_cancel(clob.cs, _ORDER_ID)
+    assert json.loads(capsys.readouterr().out) == {"error": "unauthorized"}
+    assert len(clob.calls("DELETE", "/order")) == 4
+
+
+_UNREADABLE = {k: v for k, v in _PLACED.items() if k != "takingAmount"}
+
+
+# the on-chain check for the order's own token, not the list that lags the chain
+_UNCERTAIN = ("uncertain", f"--token-ids {_V1_TOKEN}")
+_NO_FUNDS = ("not enough balance / allowance",)
+# a refusal code a later SDK may add, which the script cannot know proves no order
+_NEW_CODE = RejectedOrder.model_construct(code="new_code", message="new refusal")
+
+
+def test_the_sdk_s_refusal_codes_are_all_classified() -> None:
+    """Every code the SDK assigns but "unmatched" and "unknown" proves no order.
+
+    An SDK bump that adds a code fails here until the code is classified.
+    """
+    refused = getattr(_script("trade"), "_REFUSED_CODES", ())
+    assert set(get_args(OrderResponseErrorCode)) ^ set(refused) == {
+        "unmatched",
+        "unknown",
+    }
+
+
+@pytest.mark.parametrize(
+    ("command", "reply", "told_of", "kept"),
+    [
+        (_BUY, _UNMATCHED, _UNCERTAIN, True),
+        (_LIMIT_BUY, _UNMATCHED, _UNCERTAIN, True),
+        (_SELL, _UNMATCHED, _UNCERTAIN, None),
+        (_LIMIT_SELL, _UNMATCHED, _UNCERTAIN, None),
+        # success: true with a status the SDK does not know: code "unknown"
+        (_BUY, dict(_PLACED, status="pending"), _UNCERTAIN, True),
+        (_BUY, _UNREADABLE, _UNCERTAIN, True),
+        (_SELL, _UNREADABLE, _UNCERTAIN, None),
+        (_BUY, _REFUSED, _NO_FUNDS, False),
+        (_LIMIT_BUY, _REFUSED, _NO_FUNDS, False),
+        (_BUY, httpx.ReadTimeout("read timed out"), _UNCERTAIN, True),
+        (_BUY, (500, {"error": "internal"}), _UNCERTAIN, True),
+        (_BUY, (408, {"error": "request timeout"}), ("request timeout",), True),
+        (_BUY, _NEW_CODE, _UNCERTAIN, True),
+    ],
+    ids="unmatched unmatched-limit unmatched-sell unmatched-limit-sell odd-status "
+    "unreadable unreadable-sell refused refused-limit timed-out 500 408 "
+    "new-code".split(),
+)
+def test_only_a_refusal_code_proves_an_order_was_not_placed(
+    clob, monkeypatch, capsys, command, reply, told_of, kept
+) -> None:
+    """Every outcome short of a placed order exits non-zero with its reason.
+
+    "unmatched", a reply the SDK cannot classify ("unknown") or cannot read,
+    no answer at all, or a 5xx may arrive after the CLOB has the order:
+    placement is uncertain, and a buy keeps its pending marker. So does a
+    408, or a refusal code the script does not know. Only a refusal code it
+    knows, or a 401, proves no order, resolving the marker.
+    """
+    _dw_holds(clob, monkeypatch, 100.0)
+    if reply is _NEW_CODE:
+        monkeypatch.setattr(sdk_post, "normalize_order_response", lambda raw: _NEW_CODE)
+        reply = _REFUSED
+    clob.placed = reply
+
+    code, told = _run(clob, capsys, command)
+
+    assert code not in (None, 0)
+    assert all(word in told for word in told_of)
+    assert not re.search(r"positions --wallet dw(?! --token-ids)", told)
+    if kept is not None:
+        assert pm.dw_pending_buy_tokens(clob.cs) == ([int(_V1_TOKEN)] if kept else [])
+
+
+_IDS = ["0x" + f"{n:02x}" * 32 for n in range(1, 7)]
+_UNVERIFIED = "could not verify open CLOB orders before sweeping ("
+
+
+def _page(data, next_cursor="LTE=") -> dict:
+    """Return one page of the CLOB's open orders."""
+    return {"data": data, "next_cursor": next_cursor}
+
+
+@pytest.mark.parametrize(
+    ("pages", "refusal"),
+    [
+        # six orders on later pages: counted, the first five named
+        (
+            {
+                "MA==": _page([], "Mg=="),
+                "Mg==": _page([dict(_OPEN_ORDER, id=i) for i in _IDS[:2]], "NA=="),
+                "NA==": _page([dict(_OPEN_ORDER, id=i) for i in _IDS[2:]]),
+            },
+            f"6 open CLOB order(s) rest against the DW ({', '.join(_IDS[:5])}) ",
+        ),
+        # rows the SDK cannot read: one that is not an order, ids that are not
+        # strings, the null trades the CLOB sends, a page that is not a list;
+        # whatever the refusal quotes of them stops at 500 characters
+        ({"MA==": _page([_OPEN_ORDER, "x" * 600])}, _UNVERIFIED),
+        (
+            {"MA==": _page([dict(_OPEN_ORDER, id=123), dict(_OPEN_ORDER, id=None)])},
+            _UNVERIFIED,
+        ),
+        ({"MA==": _page([dict(_OPEN_ORDER, associate_trades=None)])}, _UNVERIFIED),
+        ({"MA==": _page("x" * 600)}, _UNVERIFIED),
+    ],
+    ids=["six", "non-object-row", "non-string-ids", "null-trades", "oversized-page"],
+)
+def test_sweep_reads_every_page_of_open_orders_raw(clob, pages, refusal) -> None:
+    """The open-orders check behind `funds.py sweep` reads every page.
+
+    Orders on any page block the sweep. A reply the SDK cannot read refuses
+    it too, rather than reading as no orders, and echoes no more than 500
+    characters of what the CLOB sent.
+    """
+    clob.pages = pages
+
+    with pytest.raises(SystemExit) as refused:
+        funds._abort_if_open_orders(clob.cs, _AGENT_DW)
+
+    assert str(refused.value).startswith(refusal)
+    assert "x" * 501 not in str(refused.value)
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_sweep_reads_open_orders_unless_forced(clob, monkeypatch, force) -> None:
+    """`funds.py sweep` goes ahead once the CLOB lists no open order.
+
+    --force skips that read.
+    """
+    check = funds._abort_if_open_orders
+    _sweep_mocks(monkeypatch, pusd=0, ctf_balance=0, recorded=[], indexed=[])
+    monkeypatch.setattr(funds, "_abort_if_open_orders", check)
+    monkeypatch.setattr(pm.ConnectSigner, "safe_address", SAFE_ADDR)
+    clob.cs._w3 = object()  # noqa: SLF001 - the balance reads are stubbed
+    clob.pages = {"MA==": _page([])}
+
+    funds.cmd_sweep(clob.cs, None, force=force)
+
+    assert len(clob.calls("GET", "/data/orders")) == (0 if force else 1)
+
+
+_DIRECT_SENDS = (
+    "approve_erc20",
+    "approve_erc1155_for_all",
+    "transfer_erc20",
+    "setup_trading_approvals",
+    "execute_transaction",
+    "split_position",
+    "merge_positions",
+    "merge_multiple_positions",
+    "redeem_positions",
+    "execute_collateral_return_plan",
+    "place_limit_order",
+    "place_market_order",
+    "post_orders",  # posts signed orders past the buy marker and market check
+    "accept_combo_quote",
+    "authorize_session_key",
+    "revoke_session_key",
+)
+
+
+@pytest.mark.parametrize("method", _DIRECT_SENDS)
+def test_client_refuses_the_sdk_s_direct_sends(clob, method) -> None:
+    """The SDK client's own senders are closed: nothing is signed or sent.
+
+    Each would sign through Connect and go straight to Polymarket, past the
+    scripts' order flow or the relayer proxy.
+    """
+    assert callable(getattr(SecureClient, method))
+    client = _script("remote_signer").make_clob_client(clob.cs, _AGENT_DW)
+
+    with pytest.raises(Exception, match="outside Connect's relayer proxy"):
+        getattr(client, method)()
+
+    assert clob.requests == clob.digests == []
