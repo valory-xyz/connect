@@ -4450,7 +4450,7 @@ def _market(slug: str, condition_id: str, **fields) -> dict:
     }
 
 
-# Recorded V2 markets, trimmed; a condition id's first byte names its module.
+# Recorded V2 markets plus a synthetic combinatorial; an id's first byte is its module.
 _V2_BINARY = _market(
     "polyv2bkbsl-cay-bur-2026-10-23",
     "0x01e64a3b41c057c976f9b5de07e357c99e000000000000000000000000000000",
@@ -4533,8 +4533,8 @@ def test_v2_position_markets_search(monkeypatch, capsys, read) -> None:
 
     Each market offers the ids it trades by, chosen by its version: a V2
     market's position ids, a V1 market's CLOB token ids, in one Gamma read
-    asking for both versions. Neg-risk, combinatorial and closed V2 markets
-    are not offered as tradeable.
+    asking for both versions. Listings leave out neg-risk, combinatorial and
+    closed V2 markets.
     """
     closed = _market("v2-closed", "0x01" + "c0" * 16 + "00" * 15, closed=True)
     versions = _gamma(
@@ -4786,11 +4786,11 @@ def test_v2_position_claim_through_router(monkeypatch, command, won) -> None:
 
 
 def test_v2_position_losing_row_not_claimed(monkeypatch) -> None:
-    """`redeem.py` claims no losing, neg-risk or combinatorial V2 position.
+    """`redeem.py` claims no losing, unheld, neg-risk or combinatorial V2 position.
 
-    A losing V1 row still goes to its adapter. On a safe that approved both
-    adapters before V2, V1 claims ask for no new approval; `approve` grants
-    the Router, once.
+    Refusing one sends nothing, not even the Router approval. A losing V1 row
+    still goes to its adapter. On a safe that approved both adapters before
+    V2, V1 claims ask for no new approval; `approve` grants the Router, once.
     """
     neg_risk, combinatorial = _UNTRADEABLE
     rows = [
@@ -4805,7 +4805,7 @@ def test_v2_position_losing_row_not_claimed(monkeypatch) -> None:
     monkeypatch.setattr(pm.ConnectSigner, "from_workspace", lambda: cs)
     monkeypatch.setattr(sys, "argv", ["redeem.py", "approve"])
 
-    for market in _UNTRADEABLE:
+    for market in (*_UNTRADEABLE, {"conditionId": _V2_RESOLVED}):
         with pytest.raises(SystemExit):
             redeem.cmd_redeem(cs, market["conditionId"], 0, True)
     redeem.cmd_all(cs)
