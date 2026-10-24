@@ -4756,14 +4756,14 @@ def test_v2_position_claim_through_router(monkeypatch, command, won) -> None:
     The condition id (high 31 bytes) and outcome index come from the position
     id, the amount from the safe's exact PositionManager balance; the data API
     row may disagree and rounds sizes. The Router is approved once, a claimed
-    position is not claimed again, and V1 still claims through its adapter.
+    position is not claimed again, and V1 claims through an adapter approved for it.
     """
     position = int(_V2_RESOLVED, 16) + won
     cs = _SafeChain(monkeypatch, {(_POSITION_MANAGER, SAFE_ADDR, position): 1_818_182})
     rows = [
         _settled(position, 1.8181, _V2_BINARY["conditionId"], 1 - won),
         _settled(_V1_TOKEN, 7.0, _V1_MARKET["conditionId"], 0),
-    ]
+    ][: 1 + won]
     monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page(rows))
 
     if command == "redeem":
@@ -4781,8 +4781,8 @@ def test_v2_position_claim_through_router(monkeypatch, command, won) -> None:
         assert claims == [(_ROUTER, claim)]
     else:
         granted = [(_CTF, _calldata(_APPROVE_ALL, a, True)) for a in _ADAPTERS]
-        assert sorted(approvals) == sorted([*granted, _ROUTER_APPROVAL])
-        assert claims == [(_ROUTER, claim), _adapter_claim(0), _adapter_claim(0)]
+        assert sorted(approvals) == sorted([*granted[: 2 * won], _ROUTER_APPROVAL])
+        assert claims == [(_ROUTER, claim), *[_adapter_claim(0)] * 2 * won]
 
 
 def test_v2_position_losing_row_not_claimed(monkeypatch) -> None:

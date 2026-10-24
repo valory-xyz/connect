@@ -184,7 +184,10 @@ def cmd_all(cs: pm.ConnectSigner) -> None:
         for p in positions
         if pm.v2_module(p.get("asset")) == 1 and p.get("currentValue")
     ]
-    _ensure_adapter_approvals(cs)
+    if any(
+        p.get("conditionId") and not pm.v2_module(p.get("asset")) for p in positions
+    ):
+        _ensure_adapter_approvals(cs)
     results = []
     for position in positions:
         condition_id = position.get("conditionId")
