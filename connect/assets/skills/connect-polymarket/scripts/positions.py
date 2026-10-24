@@ -139,9 +139,8 @@ def _onchain_holdings(cs: pm.ConnectSigner, addresses: list, token_ids: list) ->
     held = []
     for wallet in addresses:
         for token_id in token_ids:
-            units = pm.erc1155_balance_of(
-                cs.w3, pm.position_contract(token_id), wallet["address"], token_id
-            )
+            token = pm.position_contract(token_id)
+            units = pm.erc1155_balance_of(cs.w3, token, wallet["address"], token_id)
             if units > 0:
                 held.append(
                     {

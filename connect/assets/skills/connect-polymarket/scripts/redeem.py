@@ -184,10 +184,6 @@ def cmd_all(cs: pm.ConnectSigner) -> None:
         for p in positions
         if pm.v2_module(p.get("asset")) == 1 and p.get("currentValue")
     ]
-    if any(
-        p.get("conditionId") and not pm.v2_module(p.get("asset")) for p in positions
-    ):
-        _ensure_adapter_approvals(cs)
     results = []
     for position in positions:
         condition_id = position.get("conditionId")
@@ -197,6 +193,7 @@ def cmd_all(cs: pm.ConnectSigner) -> None:
             result = _redeem_v2(cs, int(position["asset"]))
             results.extend([result] if result else [])
         elif condition_id and not pm.v2_module(position.get("asset")):
+            _ensure_adapter_approvals(cs)
             results.append(_redeem_one(cs, condition_id, outcome_index, neg_risk))
     failed = [r for r in results if r.get("status") != 1]
     pm.print_json({"redeemed": results, "failed": len(failed)})
