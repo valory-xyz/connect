@@ -109,9 +109,9 @@ class Contract(t.NamedTuple):
 # collateral — and a wrong label reads exactly like a right one.
 #
 # Every address and role below, except the NegRiskAdapter role and the
-# ExchangeV3 and PositionManager rows, was checked against Polymarket's
+# ExchangeV3, PositionManager, and Router rows, was checked against Polymarket's
 # published deployments on 2026-08-06 (docs.polymarket.com/resources/contracts).
-# The ExchangeV3 and PositionManager addresses match the pinned SDK's
+# The ExchangeV3, PositionManager, and Router addresses match the pinned SDK's
 # environment config (polymarket-client 0.13.0).
 # Rows are written with keywords: all three fields are strings, so a positional
 # row would let a name and a role swap as silently as the mistake this table
