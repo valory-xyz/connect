@@ -122,6 +122,7 @@ def _redeem_v2(cs: pm.ConnectSigner, position_id: int) -> dict | None:
         outcome_index=position_id & 0xFF,
         amount=amount,
     )
+    _ensure_router_approval(cs)
     tx_hash = cs.safe_transaction(call.to, call.data)
     return {
         "condition_id": condition_id,
@@ -156,7 +157,6 @@ def cmd_redeem(
     if module > 1:
         raise SystemExit("this skill claims no neg-risk or combinatorial V2 position")
     if module == 1:
-        _ensure_router_approval(cs)
         result = _redeem_v2(cs, position_id)
         if result is None:
             raise SystemExit(f"the safe holds no position {position_id}")
@@ -185,8 +185,6 @@ def cmd_all(cs: pm.ConnectSigner) -> None:
         if pm.v2_module(p.get("asset")) == 1 and p.get("currentValue")
     ]
     _ensure_adapter_approvals(cs)
-    if binary_v2:
-        _ensure_router_approval(cs)
     results = []
     for position in positions:
         condition_id = position.get("conditionId")
