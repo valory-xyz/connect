@@ -25,7 +25,7 @@ the safe; use --wallet to look elsewhere.
 
 The data API is an indexer and lags the chain (see INDEXER_LAG_NOTE), so
 every read names its source and any token this skill has reason to think is
-held is confirmed straight from the CTF contract rather than taken on the
+held is confirmed straight from the chain rather than taken on the
 indexer's word.
 
 Usage:
@@ -130,7 +130,7 @@ def _check_addresses(cs: pm.ConnectSigner, wallet_address: str) -> list:
 
 
 def _onchain_holdings(cs: pm.ConnectSigner, addresses: list, token_ids: list) -> list:
-    """Read CTF balances straight from the chain, per wallet and token id.
+    """Read outcome balances straight from the chain, per wallet and token id.
 
     Each hit names the wallet holding it, because "you hold 12.5 shares" and
     "they are still in the DepositWallet, unswept" are different facts and the
@@ -139,14 +139,15 @@ def _onchain_holdings(cs: pm.ConnectSigner, addresses: list, token_ids: list) ->
     held = []
     for wallet in addresses:
         for token_id in token_ids:
-            units = pm.erc1155_balance_of(cs.w3, pm.CTF, wallet["address"], token_id)
+            token = pm.position_contract(token_id)
+            units = pm.erc1155_balance_of(cs.w3, token, wallet["address"], token_id)
             if units > 0:
                 held.append(
                     {
                         "token_id": str(token_id),
                         "address": wallet["address"],
                         "location": wallet["location"],
-                        # CTF outcome tokens carry the collateral's decimals
+                        # outcome tokens carry the collateral's decimals
                         "size": units / 10**pm.PUSD_DECIMALS,
                         "size_base_units": units,
                     }
@@ -347,7 +348,7 @@ def main() -> None:
     positions.add_argument(
         "--no-onchain",
         action="store_true",
-        help="trust the indexer alone (skips the CTF balance check)",
+        help="trust the indexer alone (skips the on-chain balance check)",
     )
     trades = sub.add_parser("trades")
     trades.add_argument("--wallet", default="safe")
