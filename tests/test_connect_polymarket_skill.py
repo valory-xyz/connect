@@ -4828,3 +4828,74 @@ def test_v2_position_losing_row_not_claimed(monkeypatch, capsys) -> None:
         }
         for r, reason in zip(rows, reasons)
     ]
+
+
+def test_v2_position_claim_by_position_id(monkeypatch, capsys) -> None:
+    """A V2 row whose condition id is its legacy V1 one is claimed by position id."""
+    position = int(_V2_RESOLVED, 16) + 1
+    rows = [
+        _settled(position, 2.0, _V1_MARKET["conditionId"], 1),
+        _settled(_V1_TOKEN, 7.0, _V1_MARKET["conditionId"], 0),
+    ]
+    held = {(_POSITION_MANAGER, SAFE_ADDR, position): 2_000_000}
+    cs = _SafeChain(monkeypatch, held)
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page(rows))
+    monkeypatch.setattr(pm.ConnectSigner, "from_workspace", lambda: cs)
+
+    def claim_by_id(position_id: str) -> None:
+        monkeypatch.setattr(
+            sys, "argv", ["redeem.py", "redeem", "--position-id", position_id]
+        )
+        redeem.main()
+
+    redeem.cmd_list(cs)
+    v2_row, v1_row = json.loads(capsys.readouterr().out)
+    assert "position_id" not in v1_row
+    with pytest.raises(SystemExit, match="not a binary V2"):
+        claim_by_id(str(_V1_HELD))
+    claim_by_id(v2_row["position_id"])
+    with pytest.raises(SystemExit, match="holds no position"):
+        claim_by_id(str(position))
+
+    condition = bytes.fromhex(_V2_RESOLVED[2:])[:31]
+    claim = _calldata("redeem(bytes31,uint256,uint256)", condition, 1, 2_000_000)
+    assert cs.sent == [_ROUTER_APPROVAL, (_ROUTER, claim)]
+
+
+@pytest.mark.parametrize(
+    ("condition_id", "outcome_index"),
+    [(_V2_RESOLVED[:-2] + "01", 0), (_V2_RESOLVED, 2)],
+)
+def test_v2_position_claim_refuses_a_condition_id_off_the_layout(
+    monkeypatch, condition_id, outcome_index
+) -> None:
+    """A V2 condition id not ending in 00, or an index past 1, claims nothing."""
+    held = {(_POSITION_MANAGER, SAFE_ADDR, int(condition_id, 16)): 10**6}
+    cs = _SafeChain(monkeypatch, held)
+    with pytest.raises(SystemExit, match="--position-id"):
+        redeem.cmd_redeem(cs, condition_id, outcome_index, False)
+    assert cs.sent == []
+
+
+def test_redeem_requires_its_v1_arguments_before_the_workspace(monkeypatch, capsys):
+    """Without --position-id, `redeem` still requires both V1 arguments."""
+    monkeypatch.setattr(pm.ConnectSigner, "from_workspace", lambda: pytest.fail())
+    monkeypatch.setattr(sys, "argv", ["redeem.py", "redeem", "--outcome-index", "0"])
+    with pytest.raises(SystemExit) as exited:
+        redeem.main()
+    assert exited.value.code == 2
+    assert capsys.readouterr().err.endswith(
+        "error: the following arguments are required: --condition-id\n"
+    )
+
+
+def test_v2_position_unheld_row_reported_skipped(monkeypatch, capsys) -> None:
+    """`all` reports a valued V2 row the safe no longer holds as `not_held`."""
+    rows = [_settled(int(_V2_RESOLVED, 16), 3.0, _V2_RESOLVED, 0)]
+    cs = _SafeChain(monkeypatch, {})
+    monkeypatch.setattr(pm, "http_get_json", lambda url, params=None: _v2_page(rows))
+    redeem.cmd_all(cs)
+    assert json.loads(capsys.readouterr().out)["skipped"] == [
+        {"condition_id": _V2_RESOLVED, "outcome_index": 0, "reason": "not_held"}
+    ]
+    assert cs.sent == []

@@ -38,7 +38,8 @@ Usage:
     python redeem.py list                # redeemable positions in the safe
     python redeem.py approve             # one-time adapter and Router operator rights
     python redeem.py redeem --condition-id 0x... --outcome-index 0 [--neg-risk]
-    python redeem.py all                 # approve + redeem everything listed
+    python redeem.py redeem --position-id <id>   # a V2 row's position_id from list
+    python redeem.py all                 # redeem everything listed, report the skips
 """
 
 import argparse
@@ -142,6 +143,11 @@ def cmd_list(cs: pm.ConnectSigner) -> None:
                 "outcome_index": p.get("outcomeIndex"),
                 "size": p.get("size"),
                 "neg_risk": p.get("negativeRisk"),
+                **(
+                    {"position_id": p.get("asset")}
+                    if pm.v2_module(p.get("asset"))
+                    else {}
+                ),
             }
             for p in _redeemable(cs)
         ]
@@ -157,13 +163,25 @@ def cmd_redeem(
     if module > 1:
         raise SystemExit("this skill claims no neg-risk or combinatorial V2 position")
     if module == 1:
-        result = _redeem_v2(cs, position_id)
-        if result is None:
-            raise SystemExit(f"the safe holds no position {position_id}")
-    else:
-        _ensure_adapter_approvals(cs)
-        result = _redeem_one(cs, condition_id, outcome_index, neg_risk)
+        # only a condition id ending in 00 plus index 0 or 1 adds up to a position id
+        if int(condition_id, 16) & 0xFF or outcome_index not in (0, 1):
+            raise SystemExit("claim this V2 position with its --position-id")
+        cmd_redeem_position(cs, position_id)
+        return
+    _ensure_adapter_approvals(cs)
+    result = _redeem_one(cs, condition_id, outcome_index, neg_risk)
     pm.check_mined(result, f"redemption of {condition_id}")
+    pm.print_json(result)
+
+
+def cmd_redeem_position(cs: pm.ConnectSigner, position_id: int) -> None:
+    """Redeem the safe's whole binary V2 position `position_id`."""
+    if pm.v2_module(position_id) != 1:
+        raise SystemExit(f"{position_id} is not a binary V2 position id")
+    result = _redeem_v2(cs, position_id)
+    if result is None:
+        raise SystemExit(f"the safe holds no position {position_id}")
+    pm.check_mined(result, f"redemption of {result['condition_id']}")
     pm.print_json(result)
 
 
@@ -184,12 +202,20 @@ def cmd_all(cs: pm.ConnectSigner) -> None:
         outcome_index = int(position.get("outcomeIndex") or 0)
         neg_risk = bool(position.get("negativeRisk"))
         module = pm.v2_module(position.get("asset"))
+        reason = None
         if module == 1 and position.get("currentValue"):
             result = _redeem_v2(cs, int(position["asset"]))
-            results.extend([result] if result else [])
+            if result:
+                results.append(result)
+            else:
+                reason = "not_held"
         elif module:
             # the data API marks a resolved V2 market's losing side redeemable too
             reason = "no_value" if module == 1 else "unsupported_v2"
+        elif condition_id:
+            _ensure_adapter_approvals(cs)
+            results.append(_redeem_one(cs, condition_id, outcome_index, neg_risk))
+        if reason:
             skipped.append(
                 {
                     "condition_id": condition_id,
@@ -197,9 +223,6 @@ def cmd_all(cs: pm.ConnectSigner) -> None:
                     "reason": reason,
                 }
             )
-        elif condition_id:
-            _ensure_adapter_approvals(cs)
-            results.append(_redeem_one(cs, condition_id, outcome_index, neg_risk))
     failed = [r for r in results if r.get("status") != 1]
     summary: dict = {"redeemed": results, "failed": len(failed)}
     if skipped:
@@ -220,15 +243,29 @@ def main() -> None:
     sub.add_parser("approve")
     sub.add_parser("all")
     redeem = sub.add_parser("redeem")
-    redeem.add_argument("--condition-id", required=True)
-    redeem.add_argument("--outcome-index", type=int, required=True)
+    redeem.add_argument("--condition-id")
+    redeem.add_argument("--outcome-index", type=int)
     redeem.add_argument("--neg-risk", action="store_true")
+    redeem.add_argument("--position-id", type=int)
     args = parser.parse_args()
+    if args.command == "redeem" and args.position_id is None:
+        missing = [
+            flag
+            for flag, value in (
+                ("--condition-id", args.condition_id),
+                ("--outcome-index", args.outcome_index),
+            )
+            if value is None
+        ]
+        if missing:
+            redeem.error(f"the following arguments are required: {', '.join(missing)}")
     cs = pm.ConnectSigner.from_workspace()
     if args.command == "list":
         cmd_list(cs)
     elif args.command == "approve":
         pm.print_json(_ensure_adapter_approvals(cs) + _ensure_router_approval(cs))
+    elif args.command == "redeem" and args.position_id is not None:
+        cmd_redeem_position(cs, args.position_id)
     elif args.command == "redeem":
         cmd_redeem(cs, args.condition_id, args.outcome_index, args.neg_risk)
     elif args.command == "all":
