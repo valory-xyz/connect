@@ -936,7 +936,10 @@ def test_redeem_all_success(monkeypatch, capsys) -> None:
     monkeypatch.setattr(redeem, "_ensure_adapter_approvals", lambda cs: [])
     monkeypatch.setattr(redeem, "_redeem_one", lambda cs, cid, idx, nr: {"status": 1})
     redeem.cmd_all(object())
-    assert json.loads(capsys.readouterr().out)["failed"] == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "redeemed": [{"status": 1}],
+        "failed": 0,
+    }
 
 
 def test_redeemable_fetches_every_page(monkeypatch) -> None:
@@ -4785,7 +4788,7 @@ def test_v2_position_claim_through_router(monkeypatch, command, won) -> None:
         assert claims == [(_ROUTER, claim), *[_adapter_claim(0)] * 2 * won]
 
 
-def test_v2_position_losing_row_not_claimed(monkeypatch) -> None:
+def test_v2_position_losing_row_not_claimed(monkeypatch, capsys) -> None:
     """`redeem.py` claims no losing, unheld, neg-risk or combinatorial V2 position.
 
     Refusing one sends nothing, not even the Router approval. A losing V1 row
@@ -4808,9 +4811,20 @@ def test_v2_position_losing_row_not_claimed(monkeypatch) -> None:
     for market in (*_UNTRADEABLE, {"conditionId": _V2_RESOLVED}):
         with pytest.raises(SystemExit):
             redeem.cmd_redeem(cs, market["conditionId"], 0, True)
+    capsys.readouterr()
     redeem.cmd_all(cs)
+    skipped = json.loads(capsys.readouterr().out)["skipped"]
     redeem.cmd_redeem(cs, _V1_MARKET["conditionId"], 1, False)
     redeem.main()
     redeem.main()
 
     assert cs.sent == [_adapter_claim(1), _adapter_claim(1), _ROUTER_APPROVAL]
+    reasons = ["no_value", "unsupported_v2", "unsupported_v2"]
+    assert skipped == [
+        {
+            "condition_id": r["conditionId"],
+            "outcome_index": r["outcomeIndex"],
+            "reason": reason,
+        }
+        for r, reason in zip(rows, reasons)
+    ]

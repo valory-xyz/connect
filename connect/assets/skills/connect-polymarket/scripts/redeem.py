@@ -178,25 +178,33 @@ def cmd_all(cs: pm.ConnectSigner) -> None:
     if not positions:
         pm.print_json({"redeemed": [], "note": "nothing redeemable"})
         return
-    # the data API marks a resolved V2 market's losing side redeemable too
-    binary_v2 = [
-        p
-        for p in positions
-        if pm.v2_module(p.get("asset")) == 1 and p.get("currentValue")
-    ]
-    results = []
+    results, skipped = [], []
     for position in positions:
         condition_id = position.get("conditionId")
         outcome_index = int(position.get("outcomeIndex") or 0)
         neg_risk = bool(position.get("negativeRisk"))
-        if position in binary_v2:
+        module = pm.v2_module(position.get("asset"))
+        if module == 1 and position.get("currentValue"):
             result = _redeem_v2(cs, int(position["asset"]))
             results.extend([result] if result else [])
-        elif condition_id and not pm.v2_module(position.get("asset")):
+        elif module:
+            # the data API marks a resolved V2 market's losing side redeemable too
+            reason = "no_value" if module == 1 else "unsupported_v2"
+            skipped.append(
+                {
+                    "condition_id": condition_id,
+                    "outcome_index": outcome_index,
+                    "reason": reason,
+                }
+            )
+        elif condition_id:
             _ensure_adapter_approvals(cs)
             results.append(_redeem_one(cs, condition_id, outcome_index, neg_risk))
     failed = [r for r in results if r.get("status") != 1]
-    pm.print_json({"redeemed": results, "failed": len(failed)})
+    summary: dict = {"redeemed": results, "failed": len(failed)}
+    if skipped:
+        summary["skipped"] = skipped
+    pm.print_json(summary)
     if failed:
         raise SystemExit(
             f"{len(failed)}/{len(results)} redemption(s) did not confirm on-chain; "
