@@ -4899,3 +4899,26 @@ def test_v2_position_unheld_row_reported_skipped(monkeypatch, capsys) -> None:
         {"condition_id": _V2_RESOLVED, "outcome_index": 0, "reason": "not_held"}
     ]
     assert cs.sent == []
+
+
+@pytest.mark.parametrize(
+    ("condition_id", "outcome_index"),
+    [(_V1_MARKET["conditionId"], 1), (_V2_RESOLVED, 0)],
+)
+def test_redeem_claims_by_condition_id_through_main(
+    monkeypatch, condition_id, outcome_index
+) -> None:
+    """`redeem --condition-id` claims V1 on its adapter and V2 on the Router."""
+    position = int(_V2_RESOLVED, 16)
+    held = {(_POSITION_MANAGER, SAFE_ADDR, position): 10**6}
+    cs = _SafeChain(monkeypatch, held, approved=[(_CTF, a) for a in _ADAPTERS])
+    monkeypatch.setattr(pm.ConnectSigner, "from_workspace", lambda: cs)
+    argv = ["--condition-id", condition_id, "--outcome-index", str(outcome_index)]
+    monkeypatch.setattr(sys, "argv", ["redeem.py", "redeem", *argv])
+
+    redeem.main()
+
+    condition = bytes.fromhex(_V2_RESOLVED[2:])[:31]
+    claim = _calldata("redeem(bytes31,uint256,uint256)", condition, 0, 10**6)
+    v2 = [_ROUTER_APPROVAL, (_ROUTER, claim)]
+    assert cs.sent == (v2 if condition_id == _V2_RESOLVED else [_adapter_claim(1)])
