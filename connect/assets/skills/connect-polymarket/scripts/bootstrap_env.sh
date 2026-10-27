@@ -25,5 +25,6 @@ if [ ! -f "$SHARED" ]; then
   echo "echo \"connect-polymarket: shared bootstrap missing at $SHARED\" >&2; false"
   exit 1
 fi
-exec bash "$SHARED" connect-polymarket CONNECT_POLYMARKET_VENV .bootstrap-complete \
-  "py-clob-client-v2==1.0.2" "web3>=7.15,<8" requests certifi
+# pip answers "No matching distribution" below 3.11, which reads like a network problem
+CONNECT_MIN_PYTHON=3.11 exec bash "$SHARED" connect-polymarket CONNECT_POLYMARKET_VENV .bootstrap-complete-polymarket-client-0.13.0 \
+  "polymarket-client==0.13.0" "web3>=7.15,<8" requests certifi
