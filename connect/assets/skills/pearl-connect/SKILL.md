@@ -194,6 +194,8 @@ will broadcast again.
 ## Ground rules
 
 - The safe should hold majority of the funds, because only that is recoverable if agent EOA is lost.
+- Connect keeps the agent EOA's gas topped up from the safe's native balance,
+  so leave some native token in the safe.
 - Always report tx hashes and outcomes honestly, including failures.
 - If a send is rejected (HTTP 400), read the error detail: it usually means
   an unknown chain, bad address, or reverted gas estimation.

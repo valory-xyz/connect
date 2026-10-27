@@ -1485,9 +1485,11 @@ class TestWalletExtras:
     ) -> None:
         """The "safe" role resolves to the chain's configured safe address."""
         app_config.fund_requirements = {
-            "testchain": {"safe": {"0x" + "00" * 20: 99999}}
+            "testchain": {
+                "safe": {"0x" + "00" * 20: {"threshold": 99999, "topup": 99999}}
+            }
         }
-        report = wallet.funds_status(app_config, test_signer)
+        report = wallet.funds_status(app_config, test_signer, set())
         safe = app_config.chains["testchain"].safe_address
         assert list(report["testchain"]) == [safe]
 
@@ -1497,13 +1499,14 @@ class TestWalletExtras:
         """Unknown chains and unresolvable roles are skipped."""
         app_config.chains["testchain"].safe_address = None
         app_config.fund_requirements = {
-            "notachain": {"agent": {"0x" + "00" * 20: 1}},
+            "notachain": {"agent": {"0x" + "00" * 20: {"threshold": 1, "topup": 1}}},
             "testchain": {
-                "safe": {"0x" + "00" * 20: 1},  # unresolvable: no safe configured
-                "agent": {"0x" + "00" * 20: 99999},
+                # unresolvable: no safe configured
+                "safe": {"0x" + "00" * 20: {"threshold": 1, "topup": 1}},
+                "agent": {"0x" + "00" * 20: {"threshold": 99999, "topup": 99999}},
             },
         }
-        report = wallet.funds_status(app_config, test_signer)
+        report = wallet.funds_status(app_config, test_signer, set())
         assert list(report) == ["testchain"]
         entry = report["testchain"][test_signer.address]["0x" + "00" * 20]
         assert entry == {
@@ -1616,7 +1619,7 @@ class TestPearlRoutesExtras:
     ) -> None:
         """RPC failure yields {} instead of an error."""
         monkeypatch.setattr(
-            wallet, "funds_status", lambda c, s: (_ for _ in ()).throw(RuntimeError())
+            wallet, "funds_status", lambda *_: (_ for _ in ()).throw(RuntimeError())
         )
         app = make_app(test_signer, app_config, activity)
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
