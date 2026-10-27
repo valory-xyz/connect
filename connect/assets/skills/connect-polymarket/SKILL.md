@@ -46,7 +46,10 @@ USDC.e in safe --wrap--> pUSD in safe --top-up--> DW --buy--> position in DW
    the DW to settle), unless you pass `--force`. Selling happens before
    sweeping (the shares must be in the DW when a sell matches).
 5. `redeem.py all` — after market resolution, the safe redeems its winning
-   positions for pUSD.
+   positions for pUSD. A resolved v2 market's losing side stays listed as
+   redeemable: it pays nothing, and `all` lists it under `skipped`. To claim
+   one v2 position, pass the `position_id` from `redeem.py list` to
+   `redeem --position-id`.
 
 Re-running after a failure is **not** uniformly a no-op — check what a step
 actually did before repeating it:
@@ -144,13 +147,13 @@ Before any buy, `trade.py quote --token-id <id> --usd <n>` returns the fill
 price, the taker fee, the estimated shares and `shortfall_usd` — the exact
 amount to pass to `funds.py top-up`.
 
-### Only v1 markets are tradeable
+### Only v1 and binary v2 markets are tradeable
 
-Polymarket also lists markets on a newer protocol version, which settle on
-contracts this skill does not sign for. Gamma names a market's version in
-`version`; only `v1` markets are traded here. `markets.py list` leaves the
-others out, and `trade.py quote/buy/sell/limit` refuses a token that no open
-v1 market lists. Relay that refusal to the user rather than retrying.
+Gamma names a market's protocol version in `version`. Neg-risk and
+combinatorial `v2` markets settle on contracts this skill does not sign for.
+`markets.py list` leaves them out, and `trade.py quote/buy/sell/limit` refuses
+a token that no open v1 or binary v2 market lists. Relay that refusal to the
+user rather than retrying.
 
 ### Portfolio reads lag the chain
 
@@ -158,7 +161,7 @@ v1 market lists. Relay that refusal to the user rather than retrying.
 to minutes. An empty list right after a confirmed fill means "not indexed
 yet", never "no position".
 
-- It re-checks any token you may hold against the CTF contract, in both the
+- It re-checks any token you may hold on-chain, in both the
   safe and the DW, and reports each hit under `onchain_check.held`. Treat
   those as authoritative where they disagree with `positions`.
 - **`location: deposit_wallet` means the position is unswept** — it still

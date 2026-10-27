@@ -258,14 +258,15 @@ def cmd_sweep(cs: pm.ConnectSigner, token_ids: list, force: bool = False) -> Non
     visible_pending_ids = set()
     checked_pending_ids = pending_buy_ids & set(candidate_ids)
     for token_id in candidate_ids:
-        balance = pm.erc1155_balance_of(cs.w3, pm.CTF, dw, token_id)
+        token = pm.position_contract(token_id)
+        balance = pm.erc1155_balance_of(cs.w3, token, dw, token_id)
         if balance > 0:
             swept_tokens[str(token_id)] = balance
             if token_id in pending_buy_ids:
                 visible_pending_ids.add(token_id)
             calls.append(
                 {
-                    "target": pm.CTF,
+                    "target": token,
                     "data": pm.encode_erc1155_safe_transfer(
                         dw, safe, token_id, balance
                     ),
@@ -360,7 +361,8 @@ def cmd_return_position(
     """
     dw = dw_or_exit(cs)
     safe = cs.safe_address
-    balance = pm.erc1155_balance_of(cs.w3, pm.CTF, safe, token_id)
+    token = pm.position_contract(token_id)
+    balance = pm.erc1155_balance_of(cs.w3, token, safe, token_id)
     units = pm.usd_to_units(shares) if shares is not None else balance
     if balance <= 0:
         raise SystemExit(f"the safe holds no position {token_id}")
@@ -370,7 +372,7 @@ def cmd_return_position(
             f"({pm.units_to_usd(balance)})"
         )
     tx_hash = cs.safe_transaction(
-        pm.CTF, pm.encode_erc1155_safe_transfer(safe, dw, token_id, units)
+        token, pm.encode_erc1155_safe_transfer(safe, dw, token_id, units)
     )
     receipt = cs.wait_receipt(tx_hash)
     pm.check_mined(receipt, f"return of position {token_id} to the DW")

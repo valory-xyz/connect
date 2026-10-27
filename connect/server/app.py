@@ -204,7 +204,12 @@ def create_app(  # pylint: disable=too-many-arguments
     app.state.mech = mech
     app.state.auth_limiter = limiter
     app.state.workspace = workspace
-    app.state.funds_cache = {"at": 0.0, "value": {}, "lock": threading.Lock()}
+    # stale from the start: the monotonic clock can begin near 0 after a boot
+    app.state.funds_cache = {
+        "at": float("-inf"),
+        "value": {},
+        "lock": threading.Lock(),
+    }
     # chains whose last agent top-up succeeded, for /funds-status
     app.state.topped_up = set()
 

@@ -86,6 +86,7 @@ NEG_RISK_CTF_COLLATERAL_ADAPTER = to_checksum_address(
     "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
 )
 DW_FACTORY = to_checksum_address("0x00000000000Fb5C9ADea0298D729A0CB3823Cc07")
+ROUTER = to_checksum_address("0x12121212006e4CD160D18e3f00711DA5c3372600")
 
 MAX_UINT256 = 2**256 - 1
 PARENT_COLLECTION_ID = b"\x00" * 32
@@ -108,9 +109,9 @@ class Contract(t.NamedTuple):
 # collateral — and a wrong label reads exactly like a right one.
 #
 # Every address and role below, except the NegRiskAdapter role and the
-# ExchangeV3 and PositionManager rows, was checked against Polymarket's
+# ExchangeV3, PositionManager, and Router rows, was checked against Polymarket's
 # published deployments on 2026-08-06 (docs.polymarket.com/resources/contracts).
-# The ExchangeV3 and PositionManager addresses match the pinned SDK's
+# The ExchangeV3, PositionManager, and Router addresses match the pinned SDK's
 # environment config (polymarket-client 0.13.0).
 # Rows are written with keywords: all three fields are strings, so a positional
 # row would let a name and a role swap as silently as the mistake this table
@@ -185,6 +186,7 @@ CONTRACTS: tuple[Contract, ...] = (
         role="Deploys and dispatches to the per-owner DW; every relayer "
         "mutation targets it, never a DW directly",
     ),
+    Contract(name="Router", address=ROUTER, role="Protocol V2 redeem, by the safe"),
 )
 
 _CONTRACTS_BY_ADDRESS = {c.address.lower(): c.name for c in CONTRACTS}
@@ -244,8 +246,12 @@ TRADE_FIELDS_V2_TO_V1 = {
     "outcome_index": "outcomeIndex",
     "transaction_hash": "transactionHash",
 }
-# Gamma market `version` this skill can trade; other versions settle elsewhere.
+# Gamma market `version` traded by CLOB token id; v2 ones trade by position id.
 SUPPORTED_MARKET_VERSION = "v1"
+# Gamma serves only v1 rows unless asked; repeating `version` asks for both.
+GAMMA_VERSIONS = ["v1", "v2"]
+# Bits 40-103 of a Protocol V2 position id are reserved and always zero.
+_V2_RESERVED_BITS = ((1 << 64) - 1) << 40
 DEFAULT_RELAYER_PROXY_URL = "https://mpp.valory.xyz"
 
 HTTP_TIMEOUT = 30
@@ -1017,24 +1023,40 @@ def fetch_all_positions(
     return [p for p in positions if p.get("redeemable")]
 
 
-def require_supported_market(token_id: str) -> None:
-    """Refuse an outcome token unless an open market of the supported version lists it.
+def v2_module(token_id: t.Any) -> int:
+    """Return a V2 position id's module (1 binary, 2 neg-risk, 3 combo), or 0 for V1."""
+    text = str(token_id)
+    value = int(text) if text.isascii() and text.isdigit() else 0
+    module = value >> 248
+    return module if module in (1, 2, 3) and not value & _V2_RESERVED_BITS else 0
 
-    Only Gamma ``version`` SUPPORTED_MARKET_VERSION markets settle on the
-    contracts this skill signs for. Other versions identify outcomes by a
-    different id, and Gamma omits closed markets by default, so a token no
-    open market lists is refused as well.
+
+def position_contract(token_id: t.Any) -> str:
+    """Return the ERC-1155 holding an outcome: PositionManager for V2, else the CTF."""
+    return POSITION_MANAGER if v2_module(token_id) else CTF
+
+
+def require_supported_market(token_id: str) -> None:
+    """Refuse an outcome token unless an open market this skill trades lists it.
+
+    Only v1 and binary v2 markets (Gamma ``version``) settle on the contracts
+    this skill signs for, and Gamma omits closed markets by default, so a
+    token no open market lists is refused as well.
     """
-    markets = http_get_json(
-        f"{GAMMA_API}/markets", params={"clob_token_ids": str(token_id)}
+    module = v2_module(token_id)
+    params = (
+        {"position_ids": str(token_id), "version": GAMMA_VERSIONS}
+        if module
+        else {"clob_token_ids": str(token_id)}
     )
+    markets = http_get_json(f"{GAMMA_API}/markets", params=params)
     listed = markets if isinstance(markets, list) else []
     versions = {market.get("version") for market in listed if isinstance(market, dict)}
-    if versions != {SUPPORTED_MARKET_VERSION}:
+    if module > 1 or versions != {"v2" if module else "v1"}:
         raise SystemExit(
-            f"no open {SUPPORTED_MARKET_VERSION} market lists token {token_id}; "
-            f"this skill trades only {SUPPORTED_MARKET_VERSION} markets (Gamma "
-            "`version`), and a closed market cannot be traded"
+            f"no open {'binary v2' if module else 'v1'} market lists token "
+            f"{token_id}; this skill trades only v1 and binary v2 markets "
+            "(Gamma `version`), and a closed market cannot be traded"
         )
 
 
