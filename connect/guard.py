@@ -50,9 +50,11 @@ safe's ERC-1271 SafeMessage hash, and registers exactly that digest
 For transactions, the same flow may pre-authorize the one deposit its 402
 top-up would send — the safe paying the mech balance tracker
 (allow_safe_deposit_once), shape-checked (a bare native transfer, or
-deposit(uint256) with no inner value) and bounded by an amount cap. Every
-allowance is single-use and short-lived. A live allowance is a bounded grant,
-not a promise about the caller: any matching request may consume it — for the
+deposit(uint256) with no inner value) and bounded by an amount cap. The
+agent top-up arms the same native shape for the agent EOA
+(allow_agent_topup_once; README, "Agent top-up"). Every allowance is
+single-use and short-lived. A live allowance is a bounded grant, not a
+promise about the caller: any matching request may consume it — for the
 deposit that means the agent could send the tracker payment itself, moving at
 most the cap into a balance the mech flow spends — which is accepted and
 audited, not prevented. A dry run (consume=False) makes that window and its
@@ -105,7 +107,9 @@ ALLOWANCE_TTL = 90.0
 
 @dataclass(frozen=True)
 class _DepositAllowance:
-    """One pre-authorized safe -> balance-tracker payment, capped and typed.
+    """One pre-authorized safe payment, capped and typed.
+
+    `tracker` is a mech balance tracker, or the agent EOA for its top-up.
 
     `is_token` picks the shape: a `deposit(uint256 amount)` call with no
     inner value (amount capped), or a bare native transfer (inner value
@@ -159,10 +163,13 @@ class _SafeExec:
 class Guard:
     """Mode/whitelist enforcement backed by the tamper-evident settings store."""
 
-    def __init__(self, store: SettingsStore, config: AppConfig) -> None:
-        """Initialize."""
+    def __init__(
+        self, store: SettingsStore, config: AppConfig, *, agent_signer: str
+    ) -> None:
+        """Initialize; `agent_signer` is the address of the key that signs."""
         self._store = store
         self._config = config
+        self._agent_signer = agent_signer.lower()
         self._allowance_lock = threading.Lock()
         # digest -> monotonic expiry; entries are consumed by check_sign_digest
         self._allowed_digests: dict[bytes, float] = {}
@@ -214,6 +221,19 @@ class Guard:
                 )
             )
 
+    def allow_agent_topup_once(self, *, chain: str, amount_cap: int) -> None:
+        """Permit one restricted-mode native transfer from the safe to the agent EOA.
+
+        The recipient is always the signer's own address, so the allowance
+        only moves funds between the two accounts this key already controls.
+        """
+        self.allow_safe_deposit_once(
+            chain=chain,
+            tracker=self._agent_signer,
+            amount_cap=amount_cap,
+            is_token=False,
+        )
+
     def _purge_expired(self) -> None:
         """Drop expired allowances — loudly; the caller holds the allowance lock.
 
@@ -229,7 +249,7 @@ class Guard:
         for allowance in self._deposit_allowances:
             if allowance.expires <= now:
                 logger.warning(
-                    "deposit allowance for tracker %s on %s expired unconsumed",
+                    "safe payment allowance to %s on %s expired unconsumed",
                     allowance.tracker,
                     allowance.chain,
                 )

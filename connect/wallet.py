@@ -17,12 +17,22 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Balance queries shared by /funds-status, /wallet and the MCP wallet_info tool."""
+"""Balance queries shared by /funds-status, /wallet and the MCP wallet_info tool.
+
+Also the agent top-up rule (README, "Agent top-up").
+"""
+
+import logging
+import typing as t
+from collections.abc import Collection
+from dataclasses import dataclass
 
 from web3 import Web3
 
-from connect.config import AppConfig, NATIVE_ASSET
+from connect.config import AppConfig, FundRequirement, NATIVE_ASSET
 from connect.signer import Signer
+
+logger = logging.getLogger("agent")
 
 ERC20_ABI = [
     {
@@ -56,13 +66,78 @@ def asset_balance(w3: Web3, asset: str, address: str, chain: str) -> tuple[int, 
     return token.functions.balanceOf(address).call(), _decimals_cache[key]
 
 
-def funds_status(config: AppConfig, signer: Signer) -> dict:
-    """SDK-shape funding report: {chain: {address: {asset: {balance, deficit, decimals}}}}."""
+@dataclass(frozen=True)
+class AgentTopUp:
+    """One chain's top-up: what the agent EOA is short, and what the safe sends."""
+
+    need: int  # wei up to the agent's topup; 0 unless it is under its threshold
+    move: int  # as much of `need` as the safe holds
+
+
+def deficit(requirement: FundRequirement, balance: int) -> int:
+    """Return what funds-manager asks for: up to `topup` once under `threshold`."""
+    if balance >= requirement["threshold"]:
+        return 0
+    return max(0, requirement["topup"] - balance)
+
+
+def plan_agent_topup(
+    agent: FundRequirement, agent_balance: int, safe_balance: int
+) -> AgentTopUp:
+    """Apply the top-up rule to one chain's native balances."""
+    need = deficit(agent, agent_balance)
+    return AgentTopUp(need=need, move=min(need, safe_balance))
+
+
+def agent_topup(config: AppConfig, signer: Signer) -> dict[str, AgentTopUp]:
+    """Plan the top-up on every chain it applies to (README, "Agent top-up").
+
+    A chain whose balances cannot be read is logged and left out.
+    """
+    plans: dict[str, AgentTopUp] = {}
+    for chain, requirements in config.fund_requirements.items():
+        chain_config = config.chains.get(chain)
+        agent = requirements.get("agent", {}).get(NATIVE_ASSET)
+        if chain_config is None or not chain_config.safe_address or agent is None:
+            continue
+        try:
+            w3 = signer.w3(chain)
+            agent_balance = w3.eth.get_balance(Web3.to_checksum_address(signer.address))
+            safe_balance = w3.eth.get_balance(
+                Web3.to_checksum_address(chain_config.safe_address)
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "agent top-up: could not read native balances on %s",
+                chain,
+                exc_info=True,
+            )
+            continue
+        plans[chain] = plan_agent_topup(agent, agent_balance, safe_balance)
+    return plans
+
+
+class _NativeEntry(t.NamedTuple):
+    """One role's native line in a chain's report."""
+
+    address: str
+    asset: str
+    balance: int
+    requirement: FundRequirement
+
+
+def funds_status(config: AppConfig, signer: Signer, topped_up: Collection[str]) -> dict:
+    """SDK-shape funding report: {chain: {address: {asset: {balance, deficit, decimals}}}}.
+
+    Every deficit is `deficit()`, except the native ones on a chain in
+    `topped_up` (its last agent top-up succeeded): README, "Agent top-up".
+    """
     report: dict = {}
     for chain, requirements in config.fund_requirements.items():
         if chain not in config.chains:
             continue
         w3 = signer.w3(chain)
+        native: dict[str, _NativeEntry] = {}
         for role, assets in requirements.items():
             if role == "agent":
                 address: str | None = signer.address
@@ -70,14 +145,33 @@ def funds_status(config: AppConfig, signer: Signer) -> dict:
                 address = config.chains[chain].safe_address
             if not address:  # no safe configured on this chain
                 continue
-            for asset, threshold in assets.items():
+            for asset, requirement in assets.items():
                 balance, decimals = asset_balance(w3, asset, address, chain)
                 report.setdefault(chain, {}).setdefault(address, {})[asset] = {
                     "balance": str(balance),
-                    "deficit": str(max(0, threshold - balance)),
+                    "deficit": str(deficit(requirement, balance)),
                     "decimals": decimals,
                 }
+                if asset.lower() == NATIVE_ASSET:
+                    native[role] = _NativeEntry(address, asset, balance, requirement)
+        if chain in topped_up and "agent" in native and "safe" in native:
+            _report_after_topup(report[chain], native["agent"], native["safe"])
     return report
+
+
+def _report_after_topup(
+    chain_report: dict, agent: _NativeEntry, safe: _NativeEntry
+) -> None:
+    """Report the native deficits as they stand after the top-up; in place."""
+    plan = plan_agent_topup(agent.requirement, agent.balance, safe.balance)
+    if plan.need == 0:
+        return
+    chain_report[agent.address][agent.asset]["deficit"] = "0"
+    # negative when the safe is short, so the shortfall joins its deficit
+    remaining = safe.balance - plan.need
+    chain_report[safe.address][safe.asset]["deficit"] = str(
+        deficit(safe.requirement, remaining)
+    )
 
 
 def _not_actionable_because(safe: str | None, balances: dict) -> str | None:

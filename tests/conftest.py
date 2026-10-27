@@ -468,9 +468,11 @@ def settings_store(
 
 
 @pytest.fixture
-def guard(settings_store: SettingsStore, app_config: AppConfig) -> Guard:
+def guard(
+    settings_store: SettingsStore, app_config: AppConfig, account: LocalAccount
+) -> Guard:
     """Guard over the unrestricted test settings store."""
-    return Guard(settings_store, app_config)
+    return Guard(settings_store, app_config, agent_signer=account.address)
 
 
 @pytest.fixture
