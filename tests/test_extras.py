@@ -1609,6 +1609,21 @@ class TestPearlRoutesExtras:
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/funds-status").json() == {"cached": True}
 
+    def test_funds_status_cold_cache_computes_right_after_boot(  # pylint: disable=too-many-arguments
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+        make_app: t.Callable,
+    ) -> None:
+        """The first request computes even when the monotonic clock is near 0."""
+        monkeypatch.setattr(wallet, "funds_status", lambda *_: {"computed": True})
+        app = make_app(test_signer, app_config, activity)
+        monkeypatch.setattr(time_module, "monotonic", lambda: 0.0)
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            assert client.get("/funds-status").json() == {"computed": True}
+
     def test_funds_status_failure_returns_empty(  # pylint: disable=too-many-arguments
         self,
         test_signer: Signer,
