@@ -12,7 +12,7 @@ dependencies = [
     "eth-account==0.13.7",
     "mcp==1.28.1",
     "mech-client==0.24.0",
-    "open-aea-ledger-ethereum==2.2.9",
+    "open-aea-ledger-ethereum==2.2.10",
     "tomli-w==1.2.0",
 ]
 
