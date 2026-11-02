@@ -291,7 +291,7 @@ def test_polymarket_token_constants_are_the_tokens_they_claim(
     w3 = Web3(Web3.HTTPProvider(polygon_rpc_url, request_kwargs={"timeout": 45}))
 
     sys.path.insert(0, str(_POLYMARKET_SCRIPTS))
-    # tox.ini excludes connect-polymarket from mypy (it needs py_clob_client_v2
+    # tox.ini excludes connect-polymarket from mypy (it needs polymarket-client
     # and a runtime sys.path insert), so this import is unresolvable by design
     import pm_common  # type: ignore[import-not-found] # pylint: disable=import-outside-toplevel
 

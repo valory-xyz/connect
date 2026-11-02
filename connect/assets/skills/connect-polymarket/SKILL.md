@@ -46,7 +46,10 @@ USDC.e in safe --wrap--> pUSD in safe --top-up--> DW --buy--> position in DW
    the DW to settle), unless you pass `--force`. Selling happens before
    sweeping (the shares must be in the DW when a sell matches).
 5. `redeem.py all` — after market resolution, the safe redeems its winning
-   positions for pUSD.
+   positions for pUSD. A resolved v2 market's losing side stays listed as
+   redeemable: it pays nothing, and `all` lists it under `skipped`. To claim
+   one v2 position, pass the `position_id` from `redeem.py list` to
+   `redeem --position-id`.
 
 Re-running after a failure is **not** uniformly a no-op — check what a step
 actually did before repeating it:
@@ -60,6 +63,10 @@ actually did before repeating it:
   run. Every fund-moving command fails loudly (non-zero exit) if its
   transaction does not confirm on-chain, so a failure is visible — inspect
   the reported tx before re-running, or you may double-spend / double-order.
+  A `placement uncertain` failure from `trade.py` means the order may be live:
+  do not re-run it until the on-chain check it names, run after a minute or so
+  (a fill reaches the chain after the match), shows what happened, and for a
+  limit order tell the user rather than placing it again.
 
 ## Scripts (`scripts/`)
 
@@ -67,7 +74,7 @@ Run them from anywhere in the workspace (they locate `.mcp.json` upwards).
 
 | Script | What it does |
 |---|---|
-| `deposit_wallet.py status\|ensure` | Deploy the DW via the relayer proxy and grant its trading approvals (idempotent one-time setup) |
+| `deposit_wallet.py status\|ensure` | Deploy the DW via the relayer proxy and grant its trading approvals (idempotent: run it before trading, it adds any approval the DW lacks) |
 | `funds.py balances\|wrap\|top-up\|sweep\|return-position` | Treasury flows between safe and DW; `return-position` stages an already-swept position back in the DW for selling |
 | `markets.py list\|market\|group\|book\|price` | Market discovery and prices (public reads); `list --query` searches, `list --ends-within 48h\|7d\|2w` filters by resolution date, `group` lists a neg-risk market's siblings |
 | `trade.py quote\|buy\|sell\|limit\|order\|cancel` | CLOB orders (POLY_1271, DW-funded); `quote` prices a buy without placing it; market orders take `--order-type fok\|fak`, limit orders `gtc\|gtd --expires-in` |
@@ -88,6 +95,12 @@ eval "$(bash scripts/bootstrap_env.sh)"   # sets $PY, SSL_CERT_FILE, REQUESTS_CA
 "$PY" scripts/markets.py list             # run every script with "$PY"
 ```
 
+The skill needs Python 3.11+. When there is no usable venv and the bootstrap
+refuses an older Python, retrying with the same `python3` won't help: tell the
+user, and only with their explicit OK install one (`uv python install 3.11`
+needs no admin rights), then build the venv with it, which later runs reuse:
+`eval "$(CONNECT_PYTHON="$(uv python find 3.11)" bash scripts/bootstrap_env.sh)"`.
+
 Don't skip the `eval`: `SSL_CERT_FILE` points at certifi's CA bundle, without
 which a pyenv or source-built Python fails every HTTPS call with
 `CERTIFICATE_VERIFY_FAILED` — an error that reads like a venue outage but is
@@ -102,7 +115,7 @@ A typical first session, with `$PY` exported as above:
 
 ```bash
 "$PY" scripts/netcheck.py                  # optional: prove the network works
-"$PY" scripts/deposit_wallet.py ensure     # once: DW + approvals
+"$PY" scripts/deposit_wallet.py ensure     # before trading: DW + approvals
 "$PY" scripts/funds.py wrap                # USDC.e → pUSD in the safe
 "$PY" scripts/markets.py list --query "bitcoin"
 "$PY" scripts/trade.py quote --token-id <id> --usd 10   # fee, shares, top-up
@@ -134,13 +147,13 @@ Before any buy, `trade.py quote --token-id <id> --usd <n>` returns the fill
 price, the taker fee, the estimated shares and `shortfall_usd` — the exact
 amount to pass to `funds.py top-up`.
 
-### Only v1 markets are tradeable
+### Only v1 and binary v2 markets are tradeable
 
-Polymarket also lists markets on a newer protocol version, which settle on
-contracts this skill does not sign for. Gamma names a market's version in
-`version`; only `v1` markets are traded here. `markets.py list` leaves the
-others out, and `trade.py quote/buy/sell/limit` refuses a token that no open
-v1 market lists. Relay that refusal to the user rather than retrying.
+Gamma names a market's protocol version in `version`. Neg-risk and
+combinatorial `v2` markets settle on contracts this skill does not sign for.
+`markets.py list` leaves them out, and `trade.py quote/buy/sell/limit` refuses
+a token that no open v1 or binary v2 market lists. Relay that refusal to the
+user rather than retrying.
 
 ### Portfolio reads lag the chain
 
@@ -148,7 +161,7 @@ v1 market lists. Relay that refusal to the user rather than retrying.
 to minutes. An empty list right after a confirmed fill means "not indexed
 yet", never "no position".
 
-- It re-checks any token you may hold against the CTF contract, in both the
+- It re-checks any token you may hold on-chain, in both the
   safe and the DW, and reports each hit under `onchain_check.held`. Treat
   those as authoritative where they disagree with `positions`.
 - **`location: deposit_wallet` means the position is unswept** — it still
