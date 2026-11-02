@@ -32,6 +32,7 @@ import json
 import os
 import sys
 import typing as t
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
 import requests
@@ -76,6 +77,8 @@ NEG_RISK_CTF_EXCHANGE = to_checksum_address(
     "0xe2222d279d744050d28e00520010520000310F59"
 )
 NEG_RISK_ADAPTER = to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+EXCHANGE_V3 = to_checksum_address("0xe3333700cA9d93003F00f0F71f8515005F6c00Aa")
+POSITION_MANAGER = to_checksum_address("0x006F54F7f9A22e0000CC2AB60031000000ae9fEF")
 CTF_COLLATERAL_ADAPTER = to_checksum_address(
     "0xAdA100Db00Ca00073811820692005400218FcE1f"
 )
@@ -83,6 +86,7 @@ NEG_RISK_CTF_COLLATERAL_ADAPTER = to_checksum_address(
     "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
 )
 DW_FACTORY = to_checksum_address("0x00000000000Fb5C9ADea0298D729A0CB3823Cc07")
+ROUTER = to_checksum_address("0x12121212006e4CD160D18e3f00711DA5c3372600")
 
 MAX_UINT256 = 2**256 - 1
 PARENT_COLLECTION_ID = b"\x00" * 32
@@ -104,8 +108,11 @@ class Contract(t.NamedTuple):
 # to swap by accident — the CTF holds the outcome shares, the onramp mints the
 # collateral — and a wrong label reads exactly like a right one.
 #
-# Every address and role below was checked against Polymarket's published
-# deployments on 2026-08-06 (docs.polymarket.com/resources/contracts).
+# Every address and role below, except the NegRiskAdapter role and the
+# ExchangeV3, PositionManager, and Router rows, was checked against Polymarket's
+# published deployments on 2026-08-06 (docs.polymarket.com/resources/contracts).
+# The ExchangeV3, PositionManager, and Router addresses match the pinned SDK's
+# environment config (polymarket-client 0.13.0).
 # Rows are written with keywords: all three fields are strings, so a positional
 # row would let a name and a role swap as silently as the mistake this table
 # exists to prevent.
@@ -148,7 +155,20 @@ CONTRACTS: tuple[Contract, ...] = (
     Contract(
         name="NegRiskAdapter",
         address=NEG_RISK_ADAPTER,
-        role="Wraps neg-risk positions; third holder of the DW's trading approvals",
+        role=(
+            "Wraps neg-risk positions; the CLOB checks the DW's pUSD and "
+            "outcome-token approvals to it on neg-risk orders"
+        ),
+    ),
+    Contract(
+        name="ExchangeV3",
+        address=EXCHANGE_V3,
+        role="CLOB settlement for Protocol V2 markets",
+    ),
+    Contract(
+        name="PositionManager",
+        address=POSITION_MANAGER,
+        role="The ERC-1155 holding every Protocol V2 position",
     ),
     Contract(
         name="CtfCollateralAdapter",
@@ -166,6 +186,7 @@ CONTRACTS: tuple[Contract, ...] = (
         role="Deploys and dispatches to the per-owner DW; every relayer "
         "mutation targets it, never a DW directly",
     ),
+    Contract(name="Router", address=ROUTER, role="Protocol V2 redeem, by the safe"),
 )
 
 _CONTRACTS_BY_ADDRESS = {c.address.lower(): c.name for c in CONTRACTS}
@@ -225,8 +246,12 @@ TRADE_FIELDS_V2_TO_V1 = {
     "outcome_index": "outcomeIndex",
     "transaction_hash": "transactionHash",
 }
-# Gamma market `version` this skill can trade; other versions settle elsewhere.
+# Gamma market `version` traded by CLOB token id; v2 ones trade by position id.
 SUPPORTED_MARKET_VERSION = "v1"
+# Gamma serves only v1 rows unless asked; repeating `version` asks for both.
+GAMMA_VERSIONS = ["v1", "v2"]
+# Bits 40-103 of a Protocol V2 position id are reserved and always zero.
+_V2_RESERVED_BITS = ((1 << 64) - 1) << 40
 DEFAULT_RELAYER_PROXY_URL = "https://mpp.valory.xyz"
 
 HTTP_TIMEOUT = 30
@@ -675,18 +700,17 @@ def contract_owner(w3: Web3, address: str) -> str | None:
 
 # --- canonical approval set ------------------------------------------------------------
 
-# The trading rights the DepositWallet needs: 3 pUSD allowances and 3 CTF
-# operator grants, one pair per exchange venue (CTF Exchange, NegRisk CTF
-# Exchange, NegRisk Adapter). The two *collateral adapters* are deliberately
-# NOT here: redemption runs from the service safe, never the DW (see
-# redeem.py, which grants those to the safe itself), so granting the DW
-# operator rights over contracts it never calls would be needless authority.
-APPROVAL_SPENDERS_PUSD = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, NEG_RISK_ADAPTER)
-APPROVAL_OPERATORS_CTF = (
+# Polymarket's relayer refuses a pUSD approval to ExchangeV3 unless it is MaxUint256.
+# The collateral adapters are left out: redemption runs from the service safe, not
+# the DW (see redeem.py, which grants those to the safe itself).
+APPROVAL_SPENDERS_PUSD = (
     CTF_EXCHANGE,
     NEG_RISK_CTF_EXCHANGE,
     NEG_RISK_ADAPTER,
+    EXCHANGE_V3,
 )
+APPROVAL_OPERATORS_CTF = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, NEG_RISK_ADAPTER)
+APPROVAL_OPERATORS_POSITION_MANAGER = (EXCHANGE_V3,)
 
 
 def approval_contracts() -> dict:
@@ -698,6 +722,7 @@ def approval_contracts() -> dict:
     return {
         "pusd_allowances": labelled(APPROVAL_SPENDERS_PUSD),
         "ctf_operators": labelled(APPROVAL_OPERATORS_CTF),
+        "position_manager_operators": labelled(APPROVAL_OPERATORS_POSITION_MANAGER),
     }
 
 
@@ -711,6 +736,10 @@ def approvals_status(w3: Web3, owner: str) -> dict:
         "ctf_operators": {
             operator: is_approved_for_all(w3, CTF, owner, operator)
             for operator in APPROVAL_OPERATORS_CTF
+        },
+        "position_manager_operators": {
+            operator: is_approved_for_all(w3, POSITION_MANAGER, owner, operator)
+            for operator in APPROVAL_OPERATORS_POSITION_MANAGER
         },
     }
 
@@ -729,6 +758,10 @@ def missing_approval_calls(w3: Web3, owner: str) -> list:
             calls.append(
                 {"target": CTF, "data": encode_set_approval_for_all(operator, True)}
             )
+    for operator, ok in status["position_manager_operators"].items():
+        if not ok:
+            data = encode_set_approval_for_all(operator, True)
+            calls.append({"target": POSITION_MANAGER, "data": data})
     return calls
 
 
@@ -810,6 +843,7 @@ def clob_live_prices(token_ids: t.Iterable) -> dict:
 # reserve is out of the spend — which is why a bet equal to the whole DW
 # balance bounces.
 MIN_MARKETABLE_USD = 1.0
+_CENT = Decimal("0.01")
 
 BUY_SIDE = "BUY"
 
@@ -835,26 +869,35 @@ def _blocked_reason(usd: float, spendable: float, shortfall: float) -> str | Non
     )
 
 
-def quote_buy(  # pylint: disable=protected-access
-    client: t.Any, token_id: str, usd: float, balance: float, order_type: t.Any
+def quote_buy(  # pylint: disable=too-many-arguments
+    token_id: str,
+    usd: float,
+    balance: float,
+    order_type: t.Any,
+    price: float,
+    spend: t.Callable[[Decimal], Decimal],
 ) -> dict:
     """Price a buy against the live book: fill price, fee, shares, top-up.
 
-    Every number comes from the CLOB SDK's own sizing rather than a
-    reimplementation, so a quote and the buy that follows it cannot disagree.
-    The per-market taker fee is measured, not derived: it is whatever the SDK
-    declines to spend when the balance is exactly the order amount.
+    Every number comes from the CLOB SDK's own sizing, the one `trade.py buy`
+    sizes its order with, so a quote and the buy that follows it cannot
+    disagree: `price` is the fill price `usd` reaches on the book, and
+    `spend(balance)` what the SDK spends of `usd` from that balance once the
+    market's taker fee is held back. The fee is measured, not derived.
 
-    `client` is duck-typed on purpose — this lives here, away from trade.py's
+    Both are passed in on purpose — this lives here, away from trade.py's
     SDK imports, so the arithmetic can be tested without installing the SDK.
     """
-    price = client.calculate_market_price(token_id, BUY_SIDE, usd, order_type)
-    # The fee at full size is what a balance of exactly `usd` cannot cover.
-    fee = usd - client._adjust_buy_amount_for_balance(token_id, usd, price, usd, None)
-    affordable = client._adjust_buy_amount_for_balance(
-        token_id, usd, price, balance, None
-    )
-    required = usd + fee
+    exact = Decimal(str(usd))
+    affordable = float(spend(Decimal(str(balance))))
+    # Short of all of `usd`, the SDK's spend scales with the balance: `usd`
+    # scaled by what a balance of exactly `usd` spends is the balance that
+    # spends all of it, to within a cent, and the SDK confirms the cent.
+    need = (exact * exact / spend(exact)).quantize(_CENT, ROUND_DOWN)
+    while spend(need) < exact:
+        need += _CENT
+    required = float(need)
+    fee = required - usd
     # What the order is actually worth: the spend, or what the balance leaves
     # of it after the fee. Comparing only the fee-shrunk figure to the minimum
     # passes a bet that was under it to begin with — a $0.50 quote against a
@@ -980,24 +1023,40 @@ def fetch_all_positions(
     return [p for p in positions if p.get("redeemable")]
 
 
-def require_supported_market(token_id: str) -> None:
-    """Refuse an outcome token unless an open market of the supported version lists it.
+def v2_module(token_id: t.Any) -> int:
+    """Return a V2 position id's module (1 binary, 2 neg-risk, 3 combo), or 0 for V1."""
+    text = str(token_id)
+    value = int(text) if text.isascii() and text.isdigit() else 0
+    module = value >> 248
+    return module if module in (1, 2, 3) and not value & _V2_RESERVED_BITS else 0
 
-    Only Gamma ``version`` SUPPORTED_MARKET_VERSION markets settle on the
-    contracts this skill signs for. Other versions identify outcomes by a
-    different id, and Gamma omits closed markets by default, so a token no
-    open market lists is refused as well.
+
+def position_contract(token_id: t.Any) -> str:
+    """Return the ERC-1155 holding an outcome: PositionManager for V2, else the CTF."""
+    return POSITION_MANAGER if v2_module(token_id) else CTF
+
+
+def require_supported_market(token_id: str) -> None:
+    """Refuse an outcome token unless an open market this skill trades lists it.
+
+    Only v1 and binary v2 markets (Gamma ``version``) settle on the contracts
+    this skill signs for, and Gamma omits closed markets by default, so a
+    token no open market lists is refused as well.
     """
-    markets = http_get_json(
-        f"{GAMMA_API}/markets", params={"clob_token_ids": str(token_id)}
+    module = v2_module(token_id)
+    params = (
+        {"position_ids": str(token_id), "version": GAMMA_VERSIONS}
+        if module
+        else {"clob_token_ids": str(token_id)}
     )
+    markets = http_get_json(f"{GAMMA_API}/markets", params=params)
     listed = markets if isinstance(markets, list) else []
     versions = {market.get("version") for market in listed if isinstance(market, dict)}
-    if versions != {SUPPORTED_MARKET_VERSION}:
+    if module > 1 or versions != {"v2" if module else "v1"}:
         raise SystemExit(
-            f"no open {SUPPORTED_MARKET_VERSION} market lists token {token_id}; "
-            f"this skill trades only {SUPPORTED_MARKET_VERSION} markets (Gamma "
-            "`version`), and a closed market cannot be traded"
+            f"no open {'binary v2' if module else 'v1'} market lists token "
+            f"{token_id}; this skill trades only v1 and binary v2 markets "
+            "(Gamma `version`), and a closed market cannot be traded"
         )
 
 
