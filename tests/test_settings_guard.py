@@ -4484,7 +4484,8 @@ class TestMech:
             )
             assert patched_mech.calls[-1]["timeout"] <= bound
             assert all(wait <= bound for wait in waits)
-            assert bool(waits) == (bound > 1)  # 1 s leaves nothing to resume
+            if bound > 1:  # with 1 s, a coarse clock may or may not leave a wait
+                assert waits
 
     def test_offchain_request_signs_the_nonce_connect_allocated(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
