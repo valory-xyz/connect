@@ -267,6 +267,17 @@ def test_re_approving_permit2_draws_on_the_session_each_time() -> None:
     assert refused.value.rule == "token-cap-per-session"
 
 
+def test_a_universal_router_approval_on_its_chain_draws_nothing() -> None:
+    """The router pulls only from its caller: its grant funds only the safe's swaps."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
+    approval = {"token": USDC, "spender": ROBINHOOD_ROUTER, "amount": 100}
+    arguments = {"chain": "robinhood", "intent": {"approvals": [approval]}}
+    store.authorize(capped, "safe_transaction", arguments)
+    store.authorize(capped, "safe_transaction", arguments)
+    store.authorize(capped, "safe_transaction", {"intent": {"spend": {USDC: 100}}})
+
+
 @pytest.mark.parametrize("chain", ["gnosis", "not-a-chain", None])
 def test_a_universal_router_draws_off_the_chain_it_is_deployed_on(
     chain: str | None,
