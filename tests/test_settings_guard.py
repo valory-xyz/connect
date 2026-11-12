@@ -63,6 +63,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import ALLOWANCE_TTL, Guard, GuardError
 from connect.idempotency import RequestLedger
+from connect.intent import Capped
 from connect.mech import (
     DEFAULT_DELIVERY_TIMEOUT,
     DEFAULT_MECH_CHAIN,
@@ -4683,6 +4684,80 @@ class TestMech:
         )
         assert queue.slots[patched_mech.contract.nonce].delivered_at is not None
         assert nonces.gap_retries == app_config.mech_gap_retries
+        # pylint: disable-next=protected-access
+        assert nonces._settle_timeout == app_config.mech_settle_timeout
+
+    @pytest.mark.parametrize(
+        ("request_ids", "deliveries", "delivered"),
+        [
+            (["ab"], {}, False),  # still pending: its clock waits for the timeout
+            (["0xAB"], {"ab": {"a": 1}}, True),  # one id, spelled two ways
+        ],
+    )
+    def test_only_a_delivered_request_starts_its_settle_clock(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        request_ids: list,
+        deliveries: dict,
+        delivered: bool,
+    ) -> None:
+        """The allocator hears of a delivery only for the nonce that got one."""
+
+        async def nothing(*_args: t.Any) -> dict:
+            return {}
+
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(nothing))
+        nonce = patched_mech.contract.nonce
+        patched_mech.result = {
+            **patched_mech.result,
+            "request_ids": request_ids,
+            "nonces": [nonce],
+            "deliveries": {
+                key: DeliveryResult(request_id=key, data=data, url=None)
+                for key, data in deliveries.items()
+            },
+        }
+        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        assert (queue.slots[nonce].delivered_at is not None) is delivered
+
+    def test_a_plain_prompt_gets_no_chat_report(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Only a messages-list prompt is read as chat, whatever the delivery says."""
+        patched_mech.result["deliveries"] = {
+            "ab": DeliveryResult(request_id="ab", data={"content": "Hi"}, url=None)
+        }
+        report = mech_service.request(
+            "plain question", "tool", chain="testchain", priority_mech=OTHER
+        )
+        assert "completion" not in report
+
+    def test_a_chat_delivery_that_cannot_be_read_keeps_the_paid_payload(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Paid and delivered: a chat parse failure is reported, never raised."""
+
+        def broken(_data: t.Any) -> dict:
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(mech_module, "chat_report", broken)
+        report = mech_service.request(
+            json.dumps([{"role": "user", "content": "hi"}]),
+            "chat",
+            chain="testchain",
+            priority_mech=OTHER,
+        )
+        assert report["delivery_results"] == {"ab": {"answer": "42"}}
+        assert "maximum recursion" in report["chat_error"]
 
     def test_a_failed_resumed_watch_keeps_the_paid_payload(
         self,
@@ -4731,6 +4806,7 @@ class TestMech:
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
+        store_path: Path,
     ) -> None:
         """An RPC error before mech-client's pre-sign hook: n was never sent."""
         patched_mech.raises = ConnectionError("the RPC is down")
@@ -4738,6 +4814,7 @@ class TestMech:
             mech_service.request(
                 "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r2"
             )
+        assert "mech_request_not_sent" in audit_kinds(store_path)
         patched_mech.raises = None
         mech_service.request(
             "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r2"
@@ -5476,7 +5553,12 @@ def _build_tools(  # pylint: disable=too-many-arguments
     test must monkeypatch the flag *before* build_mcp runs, which fixture
     ordering cannot express.
     """
-    from connect.server.mcp_tools import build_mcp
+    from connect.server.auth import (  # pylint: disable=import-outside-toplevel
+        GrantStore,
+    )
+    from connect.server.mcp_tools import (  # pylint: disable=import-outside-toplevel
+        build_mcp,
+    )
 
     mcp = build_mcp(
         test_signer,
@@ -5485,6 +5567,7 @@ def _build_tools(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech_service,
         settings_store=settings_store,
+        grants=GrantStore("workspace-token"),
     )
     manager = mcp._tool_manager  # pylint: disable=protected-access
     return {tool.name: tool.fn for tool in manager.list_tools()}
@@ -5571,7 +5654,8 @@ class TestMcpGuardrailTools:
             "value": 5,
             "data": "0xab",
             "via_safe": False,
-            "intent": None,
+            # called in-process, with no token: held as capped (fail closed)
+            "intent": Capped(None),
         }
 
     async def test_preflight_tool_carries_the_refusal(

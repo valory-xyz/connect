@@ -159,6 +159,14 @@ def test_an_unanswered_reservation_is_held_as_unknown(
         assert slot.nonce == 6
 
 
+def test_a_checksummed_mech_is_the_same_mech(allocator: NonceAllocator) -> None:
+    """The mech's address in any case is one mech: its own slot never blocks it."""
+    with take(allocator, 5, MECH_A.lower()) as slot:
+        slot.answered("accepted", mech=MECH_A.lower(), salt="")
+    with take(allocator, 5, MECH_A.upper().replace("0X", "0x"), timeout=0) as slot:
+        assert slot.nonce == 6
+
+
 def test_taken_resolves_our_unknown_or_stalls(allocator: NonceAllocator) -> None:
     """Taken on our own unknown slot means accepted; otherwise the queue stalls."""
     with take(allocator, 5) as slot:
@@ -170,6 +178,7 @@ def test_taken_resolves_our_unknown_or_stalls(allocator: NonceAllocator) -> None
     with take(allocator, 5) as slot:
         assert slot.nonce == 5  # stalled: only the probe at mapNonces
         slot.answered("taken", mech=MECH_A, salt="")  # our own unknown 5
+    assert held(allocator, 5)["state"] == "accepted"  # type: ignore[index]
     with take(allocator, 5) as slot:
         assert slot.nonce == 5
         slot.answered("accepted", mech=MECH_A, salt="")
@@ -269,6 +278,8 @@ def test_outcomes_follow_the_mechs_answers() -> None:
     )
     assert mech_nonces.outcome_of(reject(401, "bad signature")) == "not_accepted"
     assert mech_nonces.outcome_of(reject(402)) == "not_accepted"
+    assert mech_nonces.outcome_of(reject(400)) == "not_accepted"  # the bound
+    assert mech_nonces.outcome_of(reject(399)) == "unknown"
     assert mech_nonces.outcome_of(reject(500)) == "unknown"
 
 

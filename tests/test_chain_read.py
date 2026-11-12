@@ -44,8 +44,10 @@ class _Eth:
         self.slots: dict[str, int] = {}
         self.raise_for: set[str] = set()
         self.down: set[str] = set()
+        self.blocks: list[t.Any] = []
 
     def call(self, tx: dict, block_identifier: t.Any = "latest") -> bytes:
+        self.blocks.append(block_identifier)
         to = tx["to"].lower()
         if to in self.raise_for:
             raise ContractLogicError("execution reverted")
@@ -55,6 +57,8 @@ class _Eth:
         for (address, prefix), answer in self.answers.items():
             if address == to and data.startswith(prefix):
                 return answer
+        if data.startswith(chain_read.selector_of("supportsInterface(bytes4)")):
+            return b"\0" * 32  # ABI-encoded false, as a real ERC-165 answers
         return b""
 
     def get_storage_at(self, address: str, slot: int) -> bytes:
@@ -125,6 +129,23 @@ def test_chain_call_takes_a_block_tag_or_number() -> None:
     w3 = _w3()
     for block in ("finalized", "123", "0x7b"):
         assert "result" in chain_read.chain_call(t.cast(Web3, w3), TOKEN, "0x", block)
+    assert w3.eth.blocks == ["finalized", 123, 123]
+
+
+def test_an_erc721_is_not_read_as_an_erc1155() -> None:
+    """An encoded false from supportsInterface is a no, not an answer."""
+    abi = chain_read.get_abi(t.cast(Web3, _w3()), NFT)
+    assert "ownerOf" in _names(abi["abi"])
+    assert "safeBatchTransferFrom" not in _names(abi["abi"])
+
+
+def test_an_implementation_address_with_leading_zeros_is_followed() -> None:
+    """The EIP-1967 slot is a number: a leading zero byte must be padded back."""
+    w3 = _w3()
+    low = "0x00" + "72" * 19
+    w3.eth.slots[PROXY] = int(low, 16)
+    proxy = chain_read.get_abi(t.cast(Web3, w3), PROXY)
+    assert proxy["implementation"] == Web3.to_checksum_address(low)
 
 
 def test_get_abi_by_interface_and_known_address() -> None:
@@ -179,3 +200,70 @@ def test_decode_calldata() -> None:
     )
     assert nested["args"] == [["0xabcd"]]
     assert chain_read._jsonable(True) is True  # pylint: disable=protected-access
+
+
+def _addresses_in(relative: str, names: list[str]) -> dict[str, str]:
+    """Read named address constants out of a bundled skill's source, lower-case."""
+    import re  # pylint: disable=import-outside-toplevel
+    from pathlib import Path  # pylint: disable=import-outside-toplevel
+
+    source = (Path(chain_read.__file__).parent / "assets" / relative).read_text()
+    found = {}
+    for name in names:
+        match = re.search(
+            rf'{name}\s*=\s*(?:to_checksum_address\()?\s*"(0x[0-9a-fA-F]{{40}})"',
+            source,
+        )
+        assert match, name
+        found[name] = match.group(1).lower()
+    return found
+
+
+@pytest.mark.parametrize(
+    ("relative", "names"),
+    [
+        (
+            "skills/connect-polymarket/scripts/pm_common.py",
+            [
+                "PUSD",
+                "USDC_E",
+                "USDC",
+                "COLLATERAL_ONRAMP",
+                "CTF",
+                "CTF_COLLATERAL_ADAPTER",
+                "NEG_RISK_CTF_COLLATERAL_ADAPTER",
+            ],
+        ),
+        (
+            "skills/connect-pons/scripts/pons.py",
+            ["WETH", "USDG", "MEME_HOOK", "FEE_ESCROW"],
+        ),
+    ],
+)
+def test_the_skills_contracts_are_shipped(relative: str, names: list[str]) -> None:
+    """get_abi knows every contract the bundled skills call, at their address."""
+    for name, address in _addresses_in(relative, names).items():
+        assert address in chain_read.KNOWN_CONTRACTS, name
+
+
+def test_every_universal_router_is_shipped() -> None:
+    """Each chain's router in the lib's Uniswap deployments has its execute ABI."""
+    import re  # pylint: disable=import-outside-toplevel
+    from pathlib import Path  # pylint: disable=import-outside-toplevel
+
+    source = (Path(chain_read.__file__).parent / "assets/lib/uniswap.py").read_text()
+    routers = re.findall(r'"universal_router": "(0x[0-9a-fA-F]{40})"', source)
+    assert routers
+    for router in routers:
+        name, signatures = chain_read.KNOWN_CONTRACTS[router.lower()]
+        assert name == "Uniswap Universal Router"
+        assert "execute(bytes,bytes[],uint256)" in signatures
+
+
+def test_a_skill_contract_is_verified_with_its_calls() -> None:
+    """The CTF comes back verified, with the calls the Polymarket skill makes."""
+    ctf = chain_read.get_abi(
+        t.cast(Web3, _w3()), "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    )
+    assert ctf["verified"] is True
+    assert {"redeemPositions", "setApprovalForAll"} <= _names(ctf["abi"])

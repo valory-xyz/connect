@@ -34,14 +34,13 @@ from mcp.types import ToolAnnotations
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from connect import chain_read
-from connect import intent as intent_module
 from connect import settings as settings_config
 from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
-from connect.server.auth import VALUE_CAPPED
+from connect.server.auth import AUTH_TOKEN, GrantStore
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer
@@ -61,6 +60,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     guard: Guard,
     mech: MechService,
     settings_store: SettingsStore,
+    grants: GrantStore,
 ) -> FastMCP:
     """Build mcp."""
     # Read once per build: tool registration happens here while wallet_info's
@@ -130,7 +130,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             address=target,
             value=value,
             data=data,
-            intent=_for_token(ctx, intent),
+            intent=_for_token(grants, ctx, intent),
             request_id=request_id,
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
@@ -162,7 +162,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             address=to,
             value=value,
             data=data,
-            intent=_for_token(ctx, intent),
+            intent=_for_token(grants, ctx, intent),
             request_id=request_id,
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
@@ -195,7 +195,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             value=value,
             data=data,
             via_safe=via_safe,
-            intent=_for_token(ctx, intent),
+            intent=_for_token(grants, ctx, intent),
         )
         if reason is None:
             return {"allowed": True}
@@ -233,7 +233,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             value=value,
             data=data,
             via_safe=via_safe,
-            intent=_for_token(ctx, intent),
+            intent=_for_token(grants, ctx, intent),
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -410,20 +410,18 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     return mcp
 
 
-def _for_token(ctx: Context | None, intent: dict | None) -> t.Any:
+def _for_token(grants: GrantStore, ctx: Context | None, intent: dict | None) -> t.Any:
     """Return the intent the gate holds this call to, for the calling token.
 
-    The MCP mount marks a value-capped token's request; its intent is then
-    `intent.Capped`, so the gate refuses any position the call moves out.
+    The MCP mount stamps the token on the request; `GrantStore.intent_for`
+    decides, and treats a call that reached a tool without one as capped.
     """
     try:
         request = ctx.request_context.request if ctx is not None else None
     except ValueError:  # no request: called in-process, not through the mount
         request = None
-    state = getattr(request, "state", None)
-    if getattr(state, VALUE_CAPPED, False):
-        return intent_module.Capped(intent)
-    return intent
+    token = getattr(getattr(request, "state", None), AUTH_TOKEN, None)
+    return grants.intent_for(token, intent)
 
 
 async def _dispatch(  # pylint: disable=too-many-arguments

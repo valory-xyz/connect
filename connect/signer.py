@@ -30,6 +30,7 @@ import logging
 import threading
 import typing as t
 from dataclasses import dataclass
+from functools import partial
 
 from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider, parse_rpc_urls
 from eth_abi.exceptions import EncodingError
@@ -70,6 +71,18 @@ class _ServerBuilt:
 
 
 SERVER_BUILT = _ServerBuilt()
+
+
+class _GateRefused(Exception):
+    """A call the intent gate refuses before simulating it: `problem` says why."""
+
+    def __init__(self, rule: intent_module.Rule, detail: str) -> None:
+        """Initialize."""
+        super().__init__(rule, detail)
+        self.problem = intent_module.Problem(rule=rule, detail=detail)
+
+
+GateFactory = t.Callable[[], "_GateCall"]
 
 
 @dataclass(frozen=True)
@@ -265,7 +278,6 @@ class Signer:
         is what the transaction may do; a value-moving one without it is
         refused (`SERVER_BUILT` is for the server's own transactions).
         """
-        gate = None if intent is SERVER_BUILT else self._eoa_gate(to, value, data)
         return self._send_guarded(
             chain,
             to,
@@ -274,11 +286,15 @@ class Signer:
             request_id=request_id,
             gas=gas,
             audit=audit,
-            gate=gate,
+            gate=(
+                None
+                if intent is SERVER_BUILT
+                else lambda: self._eoa_gate(chain, to, value, data)
+            ),
             intent=intent,
         )
 
-    def _send_guarded(  # pylint: disable=too-many-arguments
+    def _send_guarded(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         chain: str,
         to: str,
@@ -288,10 +304,14 @@ class Signer:
         request_id: str | None,
         gas: int | None,
         audit: bool,
-        gate: _GateCall | None,
+        gate: GateFactory | None,
         intent: t.Any,
     ) -> str:
-        """Replay, guard, intent gate, then broadcast: the one path to signing."""
+        """Replay, guard, intent gate, then broadcast: the one path to signing.
+
+        `gate` builds the call the intent gate simulates, after the guard has
+        answered, so a gate refusal and a guard refusal are audited alike.
+        """
         stamp = _call_stamp(chain, to, value, data)
         if request_id is not None:
             # a completed send stays answerable even if the guardrail has
@@ -304,14 +324,20 @@ class Signer:
         if gate is not None:
             # after the guard, so the cheap static rules answer first and the
             # simulation only ever runs on a call the guard already permits
-            problems = self._gate_problems(chain, gate, intent)
+            gated_to, gated_value = to, value
+            try:
+                call = gate()
+                gated_to, gated_value = call.to, call.value
+                problems = self._gate_problems(chain, call, intent)
+            except _GateRefused as e:
+                problems = [e.problem]
             if problems:
                 if audit:
                     self._activity.record(
                         "refusal",
                         chain=chain,
-                        to=gate.to,
-                        value=str(gate.value),
+                        to=gated_to,
+                        value=str(gated_value),
                         rule=problems[0]["rule"],
                         rules=[p["rule"] for p in problems],
                         reason=intent_module.refusal_message(problems),
@@ -399,31 +425,63 @@ class Signer:
             gate=(
                 None
                 if intent is SERVER_BUILT
-                else _GateCall(sender=safe, to=target, value=value, data=data)
+                else lambda: _GateCall(sender=safe, to=target, value=value, data=data)
             ),
             intent=intent,
         )
 
-    def _eoa_gate(self, to: str, value: int, data: str) -> _GateCall:
-        """Return the call to gate for an EOA send: the safe's, if it is execTransaction.
+    def _eoa_gate(self, chain: str, to: str, value: int, data: str) -> _GateCall:
+        """Return the call to gate for an EOA send: the safe's, for its execTransaction.
 
-        :raises SignerError: an execTransaction that also carries EOA value,
-            or one that pays a gas refund, which the gate cannot see.
+        An EOA transaction to the configured safe carrying execTransaction
+        moves the safe's assets, so the gate simulates the call inside it, as
+        the safe; to anything else, the EOA's own call is what runs.
+
+        :raises _GateRefused: what the gate cannot hold to an intent — the
+            safe's approveHash (it pre-approves a transaction by hash, which
+            anyone may then execute), and an execTransaction that also carries
+            EOA value, pays a gas refund or is not a CALL.
         """
-        inner = safe_module.inner_call(data)
-        if inner is None:
-            return _GateCall(sender=self.address, to=to, value=value, data=data)
+        calldata = (data or "0x").removeprefix("0x").lower()
+        if calldata.startswith(safe_module.APPROVE_HASH_SELECTOR):
+            raise _GateRefused(
+                "approve-hash",
+                "approveHash pre-approves a safe transaction by its hash, which "
+                "the intent gate cannot see; act as the safe with "
+                "safe_transaction instead",
+            )
+        safe = self._config.chain(chain).safe_address
+        own = _GateCall(sender=self.address, to=to, value=value, data=data)
+        if (
+            safe is None
+            or to.lower() != safe.lower()
+            or not safe_module.is_exec_transaction(data)
+        ):
+            return own
+        try:
+            exec_call = safe_module.SafeExec.decode(data)
+        except ValueError as e:
+            raise _GateRefused("bad-exec-transaction", str(e)) from e
         if value:
-            raise SignerError(
+            raise _GateRefused(
+                "bad-exec-transaction",
                 "an execTransaction to a safe may not also carry value from the "
-                "EOA; send the value as part of the safe's own call"
+                "EOA; send the value as part of the safe's own call",
             )
-        if inner.pays_refund:
-            raise SignerError(
+        if exec_call.operation != safe_module.OPERATION_CALL:
+            raise _GateRefused(
+                "bad-exec-transaction",
+                "an execTransaction may only CALL (operation 0), never DELEGATECALL",
+            )
+        if exec_call.pays_refund:
+            raise _GateRefused(
+                "bad-exec-transaction",
                 "an execTransaction may not pay a gas refund: gasPrice, gasToken "
-                "and refundReceiver must be zero (safe_transaction sets them so)"
+                "and refundReceiver must be zero (safe_transaction sets them so)",
             )
-        return _GateCall(sender=to, to=inner.to, value=inner.value, data=inner.data)
+        return _GateCall(
+            sender=safe, to=exec_call.to, value=exec_call.value, data=exec_call.data
+        )
 
     def _simulate(self, chain: str, call: _GateCall) -> intent_module.AssetDiff:
         """Simulate one call at head over the chain's RPC.
@@ -508,15 +566,14 @@ class Signer:
         intent: t.Any = None,
     ) -> dict:
         """Simulate a call at head and report its asset diff and intent verdict."""
-        call = (
-            _GateCall(
-                sender=self._sender(chain, True), to=target, value=value, data=data
-            )
-            if via_safe
-            else self._eoa_gate(target, value, data)
-        )
-        if not via_safe:
-            self._sender(chain, False)  # an unknown chain is refused here too
+        sender = self._sender(chain, via_safe)  # no safe / unknown chain refused
+        if via_safe:
+            call = _GateCall(sender=sender, to=target, value=value, data=data)
+        else:
+            try:
+                call = self._eoa_gate(chain, target, value, data)
+            except _GateRefused as e:
+                return {"fits_intent": False, "problems": [e.problem]}
         diff, parsed, problems = self._evaluate(chain, call, intent)
         if diff is None:
             return {"fits_intent": False, "problems": problems}
@@ -578,15 +635,12 @@ class Signer:
         else:
             try:
                 self._sender(chain, via_safe)  # no safe / unknown chain refused
-                gate = (
-                    _GateCall(
-                        sender=t.cast(str, self._config.chain(chain).safe_address),
-                        to=target,
-                        value=value,
-                        data=data,
-                    )
+                safe = t.cast(str, self._config.chain(chain).safe_address)
+                # built after the guard has answered, as the send builds it
+                gate: GateFactory = (
+                    partial(_GateCall, sender=safe, to=target, value=value, data=data)
                     if via_safe
-                    else self._eoa_gate(target, value, data)
+                    else partial(self._eoa_gate, chain, target, value, data)
                 )
                 if via_safe:
                     target, data = self._compose_safe_call(chain, target, value, data)
@@ -597,7 +651,10 @@ class Signer:
                     _decode_calldata(data)
                 reason = self._refused_by_guard(chain, target, value, data)
                 if reason is None:
-                    problems = self._gate_problems(chain, gate, intent)
+                    try:
+                        problems = self._gate_problems(chain, gate(), intent)
+                    except _GateRefused as e:
+                        problems = [e.problem]
                     if problems:
                         reason = intent_module.refusal_message(problems)
             except SignerError as e:

@@ -77,6 +77,8 @@ Rule = t.Literal[
     "undeclared-approval",
     "simulation-unavailable",
     "token-cap-positions",
+    "approve-hash",
+    "bad-exec-transaction",
 ]
 RULES: tuple[str, ...] = t.get_args(Rule)
 
@@ -211,6 +213,15 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
         gas_used = int(str(call.get("gasUsed", "0x0")), 16)
     except (TypeError, ValueError, AttributeError) as e:
         raise SimulationUnavailable(f"unreadable eth_simulateV1 answer: {e}") from e
+    if ok and value > 0:
+        sent = sum(a for src, _, a in _native_moves(logs) if src == sender.lower())
+        if sent < value:
+            # an RPC that ignores traceTransfers logs no native move at all,
+            # and a value send would then look like it moves nothing
+            raise SimulationUnavailable(
+                "the RPC did not trace the call's native transfer "
+                "(traceTransfers), so its native moves cannot be checked"
+            )
     called = [to.lower()]
     for log in logs:
         address = str(log.get("address", "")).lower()
@@ -230,11 +241,42 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
             if delta
         },
         recipients=diff["recipients"],
-        approvals=diff["approvals"],
+        approvals=[
+            entry
+            for entry in diff["approvals"]
+            if not _lowers_an_allowance(rpc, sender.lower(), entry)
+        ],
         positions=diff["positions"],
         called=called,
         gas_used=gas_used,
     )
+
+
+ALLOWANCE_SELECTOR = "0xdd62ed3e"  # allowance(address,address)
+
+
+def _lowers_an_allowance(rpc: Rpc, holder: str, entry: dict[str, t.Any]) -> bool:
+    """Whether an ERC-20 Approval only lowers what the spender already had.
+
+    OpenZeppelin 4.x tokens emit Approval from transferFrom as they spend an
+    allowance down: no new grant, so it is not one the intent must declare.
+    The allowance is read at head, before the call; a read that fails keeps
+    the approval, so a doubt is checked rather than waved through.
+    """
+    if "id" in entry or entry["amount"] in ("0", "all"):
+        return False  # a revoke is skipped anyway; NFTs have no allowance
+    data = (
+        ALLOWANCE_SELECTOR
+        + holder.removeprefix("0x").rjust(64, "0")
+        + str(entry["spender"]).removeprefix("0x").rjust(64, "0")
+    )
+    try:
+        before = int(
+            str(rpc("eth_call", [{"to": entry["token"], "data": data}, "latest"])), 16
+        )
+    except (SimulationUnavailable, ValueError):
+        return False
+    return int(entry["amount"]) <= before
 
 
 SYMBOL_SELECTOR = "0x95d89b41"  # symbol()
@@ -485,13 +527,20 @@ def _address(value: t.Any) -> str:
     return text
 
 
-def _amount(value: t.Any) -> int:
-    if isinstance(value, bool):
+def parse_amount(value: t.Any) -> int:
+    """Parse an amount in base units: an int or an int string, >= 0.
+
+    A float is refused, not truncated: 0.9 must not become a minimum of 0, and
+    a large one has already lost its precision. So is a bool.
+
+    :raises TypeError: not a whole number. :raises ValueError: negative.
+    """
+    if isinstance(value, (bool, float)):
         raise TypeError("an amount must be a whole number of base units")
-    amount = int(value, 0) if isinstance(value, str) else int(value)
-    if amount < 0:
+    parsed = int(value, 0) if isinstance(value, str) else int(value)
+    if parsed < 0:
         raise ValueError("an amount must be >= 0")
-    return amount
+    return parsed
 
 
 def balance_key(key: t.Any) -> TokenKey:
@@ -509,11 +558,11 @@ def _amounts(raw: t.Any, where: str) -> dict[TokenKey, int]:
     if not isinstance(raw, dict):
         raise TypeError(f"intent '{where}' must be an object of token -> amount")
     amounts: dict[TokenKey, int] = {}
-    for token, amount in raw.items():
+    for token, value in raw.items():
         key = balance_key(token)
         if key in amounts:
             raise ValueError(f"intent '{where}' names {key} twice")
-        amounts[key] = _amount(amount)
+        amounts[key] = parse_amount(value)
     return amounts
 
 
@@ -523,7 +572,7 @@ def _approval(raw: t.Any) -> IntentApproval:
     return IntentApproval(
         token=_token(raw["token"]),
         spender=_address(raw["spender"]),
-        amount=_amount(raw["amount"]),
+        amount=parse_amount(raw["amount"]),
     )
 
 

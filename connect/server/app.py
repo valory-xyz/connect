@@ -174,6 +174,9 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     workspace: Workspace,
 ) -> FastAPI:
     """Create app."""
+    # the run's token is the workspace's scoped token (read + mech + tx);
+    # narrower ones are minted from it through POST /tokens
+    grants = GrantStore(token)
     mcp = build_mcp(
         signer,
         config,
@@ -181,6 +184,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
         guard=guard,
         mech=mech,
         settings_store=settings_store,
+        grants=grants,
     )
 
     @asynccontextmanager
@@ -206,9 +210,6 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     # attacker's Host header — refuse anything that isn't a loopback name
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
     limiter = AuthFailureLimiter()
-    # the run's token is the workspace's scoped token (read + mech + tx);
-    # narrower ones are minted from it through POST /tokens
-    grants = GrantStore(token)
     app.state.grants = grants
     app.state.signer = signer
     app.state.config = config

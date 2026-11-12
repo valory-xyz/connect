@@ -36,6 +36,7 @@ loud and slow, not silent.
 
 import hmac
 import json
+import math
 import secrets
 import threading
 import time
@@ -109,8 +110,8 @@ class TokenGrant(StrictBody):
 
 WORKSPACE_GRANT = TokenGrant(scopes=list(SCOPES))
 
-# the request-state key the MCP mount sets: whether the token is value-capped
-VALUE_CAPPED = "value_capped"
+# the request-state key the MCP mount sets: the bearer token that authorized it
+AUTH_TOKEN = "auth_token"  # nosec B105 - a state key, not a credential
 
 
 class GrantRefused(Exception):
@@ -185,14 +186,12 @@ def _declared(
         raise GrantRefused("bad-intent", problems[0]["detail"])
     declared = dict((parsed or {}).get("spend", {}))
     value = arguments.get("value") or 0
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        value = int(value)  # a JSON 5.0, which the tool's int field takes too
     try:
-        if isinstance(value, bool):
-            raise TypeError("a boolean")
-        value = int(value, 0) if isinstance(value, str) else int(value)
+        value = intent_module.parse_amount(value)  # the gate's own amount rule
     except (TypeError, ValueError) as e:
-        raise GrantRefused("bad-value", f"value is not a whole number: {e}") from e
-    if value < 0:
-        raise GrantRefused("bad-value", "value must be a non-negative amount")
+        raise GrantRefused("bad-value", f"value: {e} (got {value!r})") from e
     declared[intent_module.NATIVE] = max(declared.get(intent_module.NATIVE, 0), value)
     return declared, list((parsed or {}).get("approvals", []))
 
@@ -282,9 +281,18 @@ class GrantStore:
         if scope == "tx" and action != "sign_message":
             self._check_value(token, grant, arguments)
 
-    def value_capped(self, token: str) -> bool:
-        """Whether a value cap binds `token` (a child of a capped one is capped)."""
-        return self.grant(token).value_capped()
+    def intent_for(self, token: str | None, intent: t.Any) -> t.Any:
+        """Return the intent the gate holds a call to, for the calling token.
+
+        A value-capped token's intent is `intent.Capped`, so the gate refuses
+        any position the call moves out. The one rule for both surfaces, and
+        it fails closed: a call with no known token is treated as capped.
+        """
+        with self._lock:
+            grant = self._grants.get(token) if token else None
+        if grant is None or grant.value_capped():
+            return intent_module.Capped(intent)
+        return intent
 
     @staticmethod
     def _check_mech_payment(
@@ -301,7 +309,7 @@ class GrantStore:
                 f"max_payment no higher than that (got {asked})",
             )
 
-    def _check_value(
+    def _check_value(  # pylint: disable=too-many-locals
         self, token: str, grant: TokenGrant, arguments: t.Mapping[str, t.Any]
     ) -> None:
         declared, approvals = _declared(arguments)  # refuses malformed first
@@ -315,6 +323,12 @@ class GrantStore:
                         f"this token spends at most {per_tx.get(asset, 0)} of "
                         f"{asset} per transaction (the call declares {amount})",
                     )
+        # an approval is spend its spender may take later, outside any send this
+        # token makes: it draws on the session budget like the spend itself
+        drawn = dict(declared)
+        for approval in approvals:
+            key = intent_module.balance_key(approval["token"])
+            drawn[key] = drawn.get(key, 0) + approval["amount"]
         with self._lock:
             # this token and every ancestor it was minted from: minting more
             # children must not multiply a parent's session budget
@@ -328,7 +342,7 @@ class GrantStore:
             ]
             for holder, per_session in capped:
                 spent = self._spent.get(holder, {})
-                for asset, amount in declared.items():
+                for asset, amount in drawn.items():
                     cap = t.cast(dict, per_session).get(asset, 0)
                     if spent.get(asset, 0) + amount > cap:
                         raise GrantRefused(
@@ -336,11 +350,11 @@ class GrantStore:
                             f"this token spends at most {cap} of {asset} in all "
                             f"(with every token minted from it); "
                             f"{spent.get(asset, 0)} is spent and this declares "
-                            f"{amount}",
+                            f"{amount} (spend and approvals)",
                         )
             for holder, _ in capped:
                 spent = self._spent.setdefault(holder, {})
-                for asset, amount in declared.items():
+                for asset, amount in drawn.items():
                     spent[asset] = spent.get(asset, 0) + amount
 
     @staticmethod
@@ -523,7 +537,7 @@ class AuthMiddleware:
             await _send_json(send, 200, refusal)
             return
         # read back by the send tools through the MCP request context
-        scope.setdefault("state", {})[VALUE_CAPPED] = self._grants.value_capped(token)
+        scope.setdefault("state", {})[AUTH_TOKEN] = token
         await self._app(scope, _replay(body, receive), send)
 
     def _refusal(self, token: str, body: bytes) -> dict | None:

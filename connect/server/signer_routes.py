@@ -29,7 +29,6 @@ import typing as t
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import Field, field_validator
 
-from connect import intent as intent_module
 from connect import settings as settings_config
 from connect import wallet
 from connect.server.auth import GrantRefused, TokenGrant, authorize_route
@@ -93,9 +92,9 @@ def _dispatch(
     meaning the two endpoints deliberately keep distinct. A value-capped
     token's intent is `intent.Capped`: no position may leave under it.
     """
-    intent: t.Any = body.intent
-    if request.app.state.grants.value_capped(request.state.auth_token):
-        intent = intent_module.Capped(intent)
+    intent = request.app.state.grants.intent_for(
+        getattr(request.state, "auth_token", None), body.intent
+    )
     try:
         tx_hash = method(
             body.chain,

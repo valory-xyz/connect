@@ -30,6 +30,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
+from connect.server.auth import GrantStore
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import SERVER_BUILT, Signer, SignerError
@@ -74,6 +75,7 @@ def tools(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech_service,
         settings_store=settings_store,
+        grants=GrantStore("workspace-token"),
     )
     manager = mcp._tool_manager  # pylint: disable=protected-access
     return {tool.name: tool.fn for tool in manager.list_tools()}
@@ -251,7 +253,10 @@ class TestSignerGate:
             test_signer.send(
                 "testchain", SAFE, value=1, data=calldata, intent=pay(EOA, 7)
             )
-        assert safe_module.inner_call("0x6a761202" + "zz") is None
+        with pytest.raises(ValueError, match="could not decode"):
+            safe_module.SafeExec.decode("0x6a761202" + "zz")
+        with pytest.raises(ValueError, match="not execTransaction"):
+            safe_module.SafeExec.decode("0x12345678")
 
     @pytest.mark.parametrize("field", [6, 7, 8])
     def test_an_eoa_exec_transaction_may_not_pay_a_gas_refund(
@@ -277,6 +282,91 @@ class TestSignerGate:
             test_signer.send("testchain", SAFE, data=calldata, intent={})
         assert fake_w3.provider.simulated == []
         assert fake_w3.eth.sent == []
+
+    def test_an_approve_hash_is_refused_and_audited(
+        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
+    ) -> None:
+        """A pre-approved safe tx hash could later be executed by anyone, unseen."""
+        calldata = "0xd4d9bdcd" + "ab" * 32
+        with pytest.raises(SignerError, match="'approve-hash'"):
+            test_signer.send("testchain", SAFE, data=calldata)
+        assert fake_w3.provider.simulated == []
+        assert fake_w3.eth.sent == []
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry["rule"] == "approve-hash"
+        reason, problems = test_signer.check(
+            "testchain", SAFE, data=calldata, via_safe=False
+        )
+        assert "'approve-hash'" in str(reason)
+        assert problems[0]["rule"] == "approve-hash"
+
+    def test_exec_transaction_bytes_to_another_contract_run_as_the_eoa(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Only the configured safe unwraps them: elsewhere the EOA's call runs."""
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        calldata = safe_module.exec_transaction(
+            target=EOA, value=7, data="0x", owner=test_signer.address
+        )
+        test_signer.send("testchain", TOKEN, data=calldata)
+        assert fake_w3.provider.simulated[-1]["from"] == test_signer.address
+        assert fake_w3.provider.simulated[-1]["to"] == TOKEN
+
+    def test_the_dry_runs_answer_as_the_send_does(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """check() and simulate() unwrap, and refuse, an EOA execTransaction too."""
+        from eth_abi import encode  # pylint: disable=import-outside-toplevel
+
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        moving = safe_module.exec_transaction(
+            target=EOA, value=7, data="0x", owner=test_signer.address
+        )
+        reason, problems = test_signer.check(
+            "testchain", SAFE, data=moving, via_safe=False
+        )
+        assert "'missing-intent'" in str(reason)
+        assert fake_w3.provider.simulated[-1]["from"] == SAFE
+        args: list = [EOA, 0, b"", 1, 0, 0, 0, safe_module.ZERO_ADDRESS]
+        args += [safe_module.ZERO_ADDRESS, b""]
+        delegate = "0x" + safe_module.EXEC_TRANSACTION_SELECTOR
+        delegate += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()
+        result = test_signer.simulate("testchain", SAFE, data=delegate, via_safe=False)
+        assert result["fits_intent"] is False
+        assert result["problems"][0]["rule"] == "bad-exec-transaction"
+        assert "DELEGATECALL" in result["problems"][0]["detail"]
+        args[3], args[6] = 0, 1
+        refund = "0x" + safe_module.EXEC_TRANSACTION_SELECTOR
+        refund += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()
+        reason, _ = test_signer.check(
+            "testchain", SAFE, data=refund, via_safe=False, intent={}
+        )
+        assert "may not pay a gas refund" in str(reason)
+        bad = test_signer.simulate(
+            "testchain", SAFE, data="0x6a761202zz", via_safe=False
+        )
+        assert bad["problems"][0]["rule"] == "bad-exec-transaction"
+
+    def test_a_replay_answers_before_the_gate(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """A completed send replays its hash even when the RPC cannot simulate now."""
+        first = test_signer.send_via_safe(
+            "testchain", EOA, value=1, intent=pay(EOA, 1), request_id="r1"
+        )
+        simulated = len(fake_w3.provider.simulated)
+        fake_w3.provider.unavailable = True
+        again = test_signer.send_via_safe(
+            "testchain", EOA, value=1, intent=pay(EOA, 1), request_id="r1"
+        )
+        assert again == first
+        assert len(fake_w3.provider.simulated) == simulated
 
     def test_the_guard_answers_before_anything_is_simulated(
         self, test_signer: Signer, fake_w3: FakeW3, guard: Guard

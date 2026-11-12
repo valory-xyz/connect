@@ -30,6 +30,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
+from connect.server.auth import GrantStore
 from connect.server.mcp_tools import build_mcp
 from connect.server.strict import unknown_parameters_message
 from connect.settings import SettingsStore
@@ -58,6 +59,7 @@ def mcp(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech_service,
         settings_store=settings_store,
+        grants=GrantStore("workspace-token"),
     )
 
 

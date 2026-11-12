@@ -96,3 +96,12 @@ def test_a_malformed_choice_from_an_untrusted_delivery_is_no_crash() -> None:
     """A delivery is the mech's to shape: a string message or choice reports nothing."""
     assert chat_report({"choices": [{"message": "hi"}]}) is None
     assert chat_report({"choices": ["hi"]}) is None
+
+
+def test_a_deeply_nested_delivery_or_prompt_is_no_crash() -> None:
+    """json.loads overflows on deep nesting: read as text, never raised."""
+    deep = "[" * 100_000 + "]" * 100_000
+    assert is_chat_prompt(deep) is False
+    report = chat_report({"result": deep})
+    assert report is not None
+    assert report["completion"] == deep  # undecodable text is the completion

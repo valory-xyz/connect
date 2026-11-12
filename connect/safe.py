@@ -32,7 +32,7 @@ no safe nonce appears anywhere here. Nothing is signed over it, so nobody has
 to predict it; the Safe reads and increments its own.
 """
 
-import typing as t
+from dataclasses import dataclass
 
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
@@ -57,6 +57,9 @@ OPERATION_CALL = 0
 ZERO_ADDRESS = "0x" + "00" * 20
 
 APPROVE_SELECTOR = "095ea7b3"  # approve(address,uint256)
+# Safe.approveHash(bytes32): an owner pre-approves a safe transaction by hash,
+# which anyone may then execute with no further signature
+APPROVE_HASH_SELECTOR = "d4d9bdcd"
 DEPOSIT_SELECTOR = "b6b55f25"  # deposit(uint256) — mech BalanceTracker top-up
 
 # EIP-712 typehashes of the Safe v1.3.0+ SafeMessage wrapping (unchanged in
@@ -182,37 +185,56 @@ def decode_deposit(data: str) -> int | None:
     return int(amount)
 
 
-class InnerCall(t.NamedTuple):
-    """The call an execTransaction makes, and whether it pays a gas refund."""
+@dataclass(frozen=True)
+class SafeExec:
+    """An execTransaction, decoded: the call the safe makes and its refund fields.
+
+    The one decoder of these bytes: the guard judges them and the intent gate
+    simulates the call inside, so the two cannot read them differently.
+    """
 
     to: str
     value: int
     data: str
-    pays_refund: bool
+    operation: int
+    gas_price: int
+    gas_token: str
+    refund_receiver: str
+
+    @classmethod
+    def decode(cls, data: str) -> "SafeExec":
+        """Decode execTransaction calldata; ValueError when it will not read."""
+        calldata = (data or "0x").removeprefix("0x").lower()
+        if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
+            raise ValueError("not execTransaction calldata")
+        try:
+            decoded = tuple(
+                abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
+            )
+        except Exception as e:
+            raise ValueError(f"could not decode execTransaction calldata: {e}") from e
+        return cls(
+            to=str(decoded[0]),
+            value=int(decoded[1]),
+            data="0x" + bytes(decoded[2]).hex(),
+            operation=int(decoded[3]),
+            gas_price=int(decoded[6]),
+            gas_token=str(decoded[7]),
+            refund_receiver=str(decoded[8]),
+        )
+
+    @property
+    def pays_refund(self) -> bool:
+        """Whether the safe would also pay a gas refund, outside the call itself."""
+        return (
+            self.gas_price != 0
+            or self.gas_token.lower() != ZERO_ADDRESS
+            or self.refund_receiver.lower() != ZERO_ADDRESS
+        )
 
 
-def inner_call(data: str) -> InnerCall | None:
-    """Return the call an execTransaction makes, or None if not one.
-
-    The intent gate simulates this call as the safe whatever path sends it:
-    an EOA transaction to the safe carrying execTransaction moves the safe's
-    assets, not the EOA's. `pays_refund` is set when any gas-refund field is:
-    the safe would then also pay gasPrice per gas in gasToken to
-    refundReceiver, which the inner call's simulation does not show.
-    """
-    calldata = (data or "0x").removeprefix("0x").lower()
-    if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
-        return None
-    try:
-        decoded = tuple(abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:])))
-    except Exception:  # pylint: disable=broad-exception-caught
-        return None  # the guard refuses calldata it cannot decode first
-    target, value, inner, _, _, _, gas_price, gas_token, refund_receiver, _ = decoded
-    return InnerCall(
-        to=str(target),
-        value=int(value),
-        data="0x" + bytes(inner).hex(),
-        pays_refund=bool(gas_price)
-        or str(gas_token).lower() != ZERO_ADDRESS
-        or str(refund_receiver).lower() != ZERO_ADDRESS,
+def is_exec_transaction(data: str) -> bool:
+    """Whether calldata calls execTransaction."""
+    return (
+        (data or "0x").removeprefix("0x").lower().startswith(EXEC_TRANSACTION_SELECTOR)
     )

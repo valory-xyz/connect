@@ -37,7 +37,7 @@ def is_chat_prompt(prompt: str) -> bool:
     """Whether the prompt is a JSON list of {role, content} messages."""
     try:
         messages = json.loads(prompt)
-    except ValueError:
+    except (ValueError, RecursionError):  # deep nesting overflows the decoder
         return False
     return (
         isinstance(messages, list)
@@ -51,7 +51,7 @@ def _parse(value: t.Any) -> t.Any:
     if isinstance(value, str):
         try:
             return json.loads(value)
-        except ValueError:
+        except (ValueError, RecursionError):  # an untrusted delivery: any depth
             return value
     return value
 

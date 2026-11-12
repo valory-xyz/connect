@@ -204,6 +204,67 @@ def test_a_capped_token_approves_no_more_than_its_caps(
     store.authorize(WORKSPACE, "safe_transaction", arguments)  # uncapped
 
 
+def test_approvals_draw_on_the_session_budget() -> None:
+    """Two approvals each under the cap may not add up past it."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
+    other = "0x" + "5f" * 20
+    store.authorize(
+        capped,
+        "safe_transaction",
+        {
+            "intent": {
+                "approvals": [{"token": USDC, "spender": RECIPIENT, "amount": 60}]
+            }
+        },
+    )
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(
+            capped,
+            "safe_transaction",
+            {
+                "intent": {
+                    "approvals": [{"token": USDC, "spender": other, "amount": 60}]
+                }
+            },
+        )
+    assert refused.value.rule == "token-cap-per-session"
+
+
+@pytest.mark.parametrize("cap", ["max_value_per_tx", "max_value_per_session"])
+def test_an_asset_a_cap_does_not_name_may_not_be_spent(cap: str) -> None:
+    """A token capped on native only spends no USDC at all."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(**{cap: {"native": 10}}))
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(capped, "safe_transaction", {"intent": {"spend": {USDC: 1}}})
+    assert refused.value.rule == cap.replace("max_value_", "token-cap-").replace(
+        "_", "-"
+    )
+
+
+def test_an_integral_float_value_is_taken_and_a_fraction_refused() -> None:
+    """5.0 is what the tool's int field takes too; 0.5 and inf are not amounts."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(max_value_per_tx={"native": 5}))
+    store.authorize(capped, "safe_transaction", {"value": 5.0})
+    for value in (0.5, float("inf")):
+        with pytest.raises(GrantRefused) as refused:
+            store.authorize(capped, "safe_transaction", {"value": value})
+        assert refused.value.rule == "bad-value"
+
+
+def test_a_call_with_no_known_token_is_held_as_capped() -> None:
+    """The one capped rule fails closed: no token, or an unknown one, is capped."""
+    store = GrantStore(WORKSPACE)
+    raw = {"spend": {"native": 1}}
+    for token in (None, "not-a-token"):
+        assert store.intent_for(token, raw) == intent_module.Capped(raw)
+    assert store.intent_for(WORKSPACE, raw) is raw
+    capped = store.mint(WORKSPACE, grant(max_value_per_tx={"native": 5}))
+    assert store.intent_for(capped, raw) == intent_module.Capped(raw)
+
+
 def test_cap_keys_are_normalised_when_minted() -> None:
     """A checksummed address, NATIVE or the CELO face caps what the gate books."""
     store = GrantStore(WORKSPACE)
@@ -505,14 +566,14 @@ SAFE = "0x" + "22" * 20
 POSITIONS = "0x" + "4d" * 20
 
 
-def _position_out_log() -> dict:
-    """Return an ERC-1155 TransferSingle moving one position out of the safe."""
+def _position_out_log(holder: str = SAFE) -> dict:
+    """Return an ERC-1155 TransferSingle moving one position out of `holder`."""
     return {
         "address": POSITIONS,
         "topics": [
             intent_module.TRANSFER_SINGLE,
-            "0x" + SAFE[2:].rjust(64, "0"),
-            "0x" + SAFE[2:].rjust(64, "0"),
+            "0x" + holder[2:].lower().rjust(64, "0"),
+            "0x" + holder[2:].lower().rjust(64, "0"),
             "0x" + RECIPIENT[2:].rjust(64, "0"),
         ],
         "data": "0x" + hex(7)[2:].rjust(64, "0") + hex(3)[2:].rjust(64, "0"),
@@ -550,20 +611,24 @@ def test_http_capped_token_may_not_move_a_position(
     assert rules == ["token-cap-positions"]
 
 
+@pytest.mark.parametrize(
+    ("tool", "to_key"), [("safe_transaction", "target"), ("send_transaction", "to")]
+)
 def test_mcp_capped_token_may_not_move_a_position(
-    client: TestClient, fake_w3: FakeW3
+    client: TestClient, fake_w3: FakeW3, test_signer: Signer, tool: str, to_key: str
 ) -> None:
-    """Through the real MCP mount: the tool sees which token called it."""
-    fake_w3.provider.logs = [_position_out_log()]
+    """Through the real MCP mount, on both send tools: the tool sees the token."""
+    holder = SAFE if tool == "safe_transaction" else test_signer.address
+    fake_w3.provider.logs = [_position_out_log(holder)]
     call = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "safe_transaction",
+            "name": tool,
             "arguments": {
                 "chain": "testchain",
-                "target": POSITIONS,
+                to_key: POSITIONS,
                 "intent": {"recipients": [RECIPIENT]},
             },
         },
@@ -576,6 +641,49 @@ def test_mcp_capped_token_may_not_move_a_position(
     allowed = client.post("/mcp/", json=call, headers={**headers, **_bearer(WORKSPACE)})
     assert "token-cap-positions" not in allowed.text
     assert len(fake_w3.eth.sent) == 1
+
+
+def test_http_sign_and_send_holds_a_capped_token_to_its_positions(
+    client: TestClient, fake_w3: FakeW3, test_signer: Signer
+) -> None:
+    """The EOA route wraps a capped token's intent as the safe route does."""
+    fake_w3.provider.logs = [_position_out_log(test_signer.address)]
+    body = {
+        "chain": "testchain",
+        "to": POSITIONS,
+        "intent": {"recipients": [RECIPIENT]},
+    }
+    refused = client.post(
+        "/sign-and-send", json=body, headers=_bearer(_mint_capped(client))
+    )
+    assert refused.status_code == 400
+    assert "token-cap-positions" in refused.json()["detail"]
+    assert not fake_w3.eth.sent
+
+
+def test_mcp_value_that_is_not_finite_is_a_bad_value_refusal(
+    client: TestClient, store_path: t.Any
+) -> None:
+    """JSON 1e999 decodes to inf: a named refusal, audited, never an HTTP 500."""
+    body = (
+        '{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": '
+        '{"name": "safe_transaction", "arguments": {"chain": "testchain", '
+        '"target": "0x' + "aa" * 20 + '", "value": 1e999}}}'
+    )
+    capped = _mint_capped(client)
+    answer = client.post(
+        "/mcp/",
+        content=body,
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            **_bearer(capped),
+        },
+    )
+    assert answer.status_code == 200
+    assert "rule 'bad-value'" in answer.text
+    rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert rules == ["bad-value"]
 
 
 def test_http_mint_refuses_an_unknown_field_by_name(

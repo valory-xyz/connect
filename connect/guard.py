@@ -72,14 +72,11 @@ import threading
 import time
 from dataclasses import dataclass
 
-from eth_abi import decode as abi_decode
-
 from connect.config import AppConfig
 from connect.safe import (
     EXEC_TRANSACTION_SELECTOR,
-    EXEC_TRANSACTION_TYPES,
     OPERATION_CALL,
-    ZERO_ADDRESS,
+    SafeExec,
     decode_approve,
     decode_deposit,
 )
@@ -121,43 +118,6 @@ class _DepositAllowance:
     is_token: bool
     amount_cap: int
     expires: float
-
-
-@dataclass(frozen=True)
-class _SafeExec:
-    """The execTransaction fields this gate has an opinion about."""
-
-    to: str
-    value: int
-    data: str
-    operation: int
-    gas_price: int
-    gas_token: str
-    refund_receiver: str
-
-    @classmethod
-    def decode(cls, calldata: str) -> "_SafeExec":
-        """Read an execTransaction, or :raises GuardError: if it will not read.
-
-        Calldata we cannot parse is calldata we cannot judge, so it is refused
-        rather than waved through — mech-client's transactions arrive here too,
-        and the agent can still hand-roll its own.
-        """
-        try:
-            decoded = tuple(
-                abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
-            )
-        except Exception as e:
-            raise GuardError(f"could not decode execTransaction calldata: {e}") from e
-        return cls(
-            to=str(decoded[0]),
-            value=int(decoded[1]),
-            data="0x" + decoded[2].hex(),
-            operation=decoded[3],
-            gas_price=decoded[6],
-            gas_token=str(decoded[7]),
-            refund_receiver=str(decoded[8]),
-        )
 
 
 class Guard:
@@ -295,7 +255,12 @@ class Guard:
             # and whether or not a safe is configured here: the floor protects
             # any safe the agent reaches, and "protected only if configured"
             # would be a hole an unconfigured chain walks straight through.
-            exec_call = _SafeExec.decode(calldata)
+            try:
+                exec_call = SafeExec.decode(calldata)
+            except ValueError as e:
+                # calldata we cannot parse is calldata we cannot judge, so it
+                # is refused rather than waved through
+                raise GuardError(str(e)) from e
             self._check_floor(to, exec_call)
         if self._store.load().protected.mode == MODE_RESTRICTED:
             self._check_restricted(
@@ -308,7 +273,7 @@ class Guard:
                 consume=consume,
             )
 
-    def _check_floor(self, target: str, exec_call: "_SafeExec") -> None:
+    def _check_floor(self, target: str, exec_call: "SafeExec") -> None:
         """Enforce the two rules no mode lifts; see the module docstring for why.
 
         `target` is the contract the execTransaction is sent to — the safe
@@ -334,7 +299,7 @@ class Guard:
         to: str,
         value: int,
         calldata: str,
-        exec_call: "_SafeExec | None",
+        exec_call: "SafeExec | None",
         consume: bool,
     ) -> None:
         """Restricted mode: the safe CALLs a whitelisted address, or nothing."""
@@ -361,11 +326,7 @@ class Guard:
         # A non-zero gasPrice makes the safe pay a refund (in gasToken, to
         # refundReceiver or tx.origin) — funds leaving the safe past the
         # whitelist. The standard flow always zeroes all three fields.
-        if (
-            exec_call.gas_price != 0
-            or exec_call.gas_token.lower() != ZERO_ADDRESS
-            or exec_call.refund_receiver.lower() != ZERO_ADDRESS
-        ):
+        if exec_call.pays_refund:
             raise GuardError(
                 "the guardrail requires execTransaction refund fields to be "
                 "zero (gasPrice=0, gasToken=0x0, refundReceiver=0x0) — a gas "
@@ -395,7 +356,7 @@ class Guard:
             )
 
     def _consume_deposit_allowance(
-        self, chain: str, exec_call: "_SafeExec", *, consume: bool
+        self, chain: str, exec_call: "SafeExec", *, consume: bool
     ) -> bool:
         """Consume a deposit allowance this safe call matches, if any.
 

@@ -54,7 +54,12 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
-from connect.mech_allowances import MechAllowances, OffchainDigests, read_map_nonces
+from connect.mech_allowances import (
+    MechAllowances,
+    OffchainDigests,
+    marketplace_contract,
+    read_map_nonces,
+)
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
 from connect.mech_chat import chat_report, is_chat_prompt
 from connect.mech_nonces import (
@@ -670,6 +675,15 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 reason=str(e),
             )
             raise MechNotSent(f"rule '{e.rule}': {e}{note}") from e
+        except MechNotSent as e:  # failed before reaching the mech: nothing paid
+            self._activity.record(
+                "mech_request_not_sent",
+                chain=plan.chain,
+                tool=plan.tool,
+                request_id=request_id,
+                error=str(e),
+            )
+            raise
         except (MechError, SignerError):
             raise
         except Exception as e:
@@ -718,11 +732,15 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 t.cast(str, self._config.chain(plan.chain).safe_address),
                 [nonce for key, nonce in by_key if key in got],
             )
-        if is_chat_prompt(prompt):
-            for data in (payload.get("delivery_results") or {}).values():
-                chat = chat_report(data)
-                if chat is not None:
-                    payload.update(chat)
+        try:  # paid and delivered by now: a delivery it cannot read loses nothing
+            if is_chat_prompt(prompt):
+                for data in (payload.get("delivery_results") or {}).values():
+                    chat = chat_report(data)
+                    if chat is not None:
+                        payload.update(chat)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning("could not read a chat completion: %s", e)
+            payload["chat_error"] = str(e)
         return payload
 
     def _resume_watch(self, payload: dict, deadline: float) -> None:
@@ -771,8 +789,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         wait = min(timeout, ACK_WAIT_SECONDS)
         if plan.offchain is None:  # on-chain takes mapNonces itself: none held
             try:
-                # pylint: disable-next=protected-access
-                contract = plan.service._get_marketplace_contract()
+                contract = marketplace_contract(plan.service)
             except Exception as e:
                 raise MechNotSent(f"could not read the marketplace: {e}") from e
             with self._nonces.exclusive(
@@ -916,11 +933,10 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         timeout: float,
     ) -> dict:
         """Run the watcher for the flow this request was sent through."""
-        # pylint: disable=protected-access
         if pending.offchain:
             url = service.tool_manager.get_offchain_url(pending.service_id)
             return await OffchainDeliveryWatcher(url, timeout).watch([key])
-        contract = service._get_marketplace_contract()
+        contract = marketplace_contract(service)
         watcher = OnchainDeliveryWatcher(contract, service.ledger_api, timeout)
         return await watcher.watch([key], from_block=pending.from_block)
 

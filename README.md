@@ -196,10 +196,22 @@ its `Approval` is an approval like any other, and an intent naming the face in
 `spend` or `receive_min` means `"native"` (naming both is `bad-intent`). Under a
 value-capped token the gate also refuses any ERC-721/1155 position leaving the
 sender (`token-cap-positions`; README, "Scoped tokens"). A `send_transaction`
-to the safe whose calldata is `execTransaction` is gated as the safe's inner
-call, and refused before simulating if it also carries value from the EOA or
-pays a gas refund (any of `gasPrice`, `gasToken`, `refundReceiver` set), which
-the inner call's simulation would not show. An RPC that cannot simulate refuses the send
+to the configured safe whose calldata is `execTransaction` is gated as the
+safe's inner call (to any other address the EOA's own call is what runs, and
+what is simulated), and refused before simulating as `bad-exec-transaction` if
+it also carries value from the EOA, is not a CALL, or pays a gas refund (any of
+`gasPrice`, `gasToken`, `refundReceiver` set), which the inner call's
+simulation would not show. The safe's `approveHash` is refused outright
+(`approve-hash`): it pre-approves a safe transaction by hash, which anyone may
+then execute, so no intent could hold it. These refusals are audited like the
+rest, after the guard has answered. An amount in an intent is a whole number
+of base units: a float or a bool is `bad-intent`, never truncated. An ERC-20
+`Approval` whose amount is no higher than the spender's allowance before the
+call (read at head; OpenZeppelin 4.x tokens emit one from `transferFrom` as
+they spend an allowance down) is no new grant and needs no declaring; a read
+that fails keeps it. A call that sends native value but whose simulation logs
+no native transfer of it fails closed as `simulation-unavailable`: the RPC
+ignored `traceTransfers`. An RPC that cannot simulate refuses the send
 as `simulation-unavailable`, so Pearl must give Connect, on every chain, an RPC
 that serves `eth_simulateV1` (Celo's `forno.celo.org` does not). The
 transactions the server builds itself — the mech flow (`MechSigner`) and the
@@ -209,6 +221,11 @@ single-use allowances. The diff names each token's `symbol()` for the reader
 (display only: nothing is checked against it, and a token without one reads
 as `""`). `preflight_transaction` and `simulate_transaction` take
 the same `intent` and report the gate's `problems` without signing.
+
+The gate holds **transactions**. `sign_message` signs a raw digest for the
+uncapped workspace token in the default mode, and a digest can be a safe
+transaction hash: that is the guardrail's restricted mode to turn off, not
+the gate's to check (a value-capped token cannot sign one at all).
 
 ## Guardrail
 
@@ -372,7 +389,8 @@ native `value`), which the intent gate then holds the transaction to; a capped
 budget is drawn down when a call is authorized, whether or not the send then
 succeeds, so it can be spent early but never exceeded; a child's spend is drawn
 on every capped token it was minted from as well, so minting more children
-never multiplies a budget. What a cap cannot bound, a value-capped token may not
+never multiplies a budget. A declared approval draws on the session budget as
+its spend does, since its spender can take that much later. What a cap cannot bound, a value-capped token may not
 do: approve more of a token than its caps allow (an approval is spend the
 spender takes later), sign a raw digest (`sign_message`: a digest can authorize
 any safe transaction), or move an ERC-721/1155 position out of the safe (the
@@ -382,7 +400,11 @@ gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
 not a whole number >= 0), come back as the HTTP 403/401 detail or the MCP tool
 error, and are recorded as activity `refusal` entries. MCP calls are authorized
 in the mount's middleware, which reads each JSON-RPC `tools/call` before the
-MCP server does.
+MCP server does, and stamps the token on the request; whether its intent is
+held as capped is decided from the token in one place (`GrantStore.intent_for`)
+for both surfaces, and a call with no known token is treated as capped. A mech
+payment (`mech_request`) is held to `max_mech_payment` per request and draws
+nothing from a session cap.
 
 Out of scope for v1: SSH port forwarding or running on a shared/remote
 machine voids the loopback assumption entirely, and same-user local malware
@@ -546,7 +568,8 @@ server can only promise what it can actually know:
 
 A request that returned before its delivery reports the ids still awaited in
 `pending_request_ids`; one whose delivery could not be read in that wait
-carries the cause in `watch_errors`, keyed by id. The request was paid for, so
+carries the cause in `watch_errors`, keyed by id; a chat delivery that cannot
+be read leaves the cause in `chat_error` instead of losing the report. The request was paid for, so
 the report is never lost to a failed read: `mech_result` picks it up.
 
 - **It returned.** The replay resumes each watch still outstanding and picks

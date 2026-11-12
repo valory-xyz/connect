@@ -369,6 +369,12 @@ def test_send_transaction_forwards_the_intent(monkeypatch) -> None:
     client.send_transaction({"to": ADDR_A, "intent": {"spend": {"native": 1}}})
     client.send_transaction({"to": ADDR_A}, intent={"recipients": [ADDR_B]})
     client.send_transaction({"to": ADDR_A})
+    client.send_transaction({"to": ADDR_A}, intent={})  # "moves nothing", kept
+    client.send_transaction(  # the argument wins over the tx's own key
+        {"to": ADDR_A, "intent": {"spend": {"native": 1}}}, intent={}
+    )
     assert sent[0]["intent"] == {"spend": {"native": 1}}
     assert sent[1]["intent"] == {"recipients": [ADDR_B]}
     assert "intent" not in sent[2]
+    assert sent[3]["intent"] == {}
+    assert sent[4]["intent"] == {}

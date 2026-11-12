@@ -133,6 +133,15 @@ def deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
         return None, False
 
 
+def marketplace_contract(service: t.Any) -> t.Any:
+    """Return a mech-client service's marketplace contract.
+
+    mech-client exposes it only through a private helper; every use in Connect
+    goes through here, so a rename upstream breaks one place, not three.
+    """
+    return service._get_marketplace_contract()  # pylint: disable=protected-access
+
+
 def read_map_nonces(contract: t.Any, safe: str) -> int:
     """Read the marketplace's settled nonce for `safe` (an RPC read)."""
     return int(contract.functions.mapNonces(Web3.to_checksum_address(safe)).call())
@@ -229,9 +238,7 @@ class MechAllowances:
                 "off-chain requester of record is the safe"
             )
         try:
-            # same private-but-pinned helper _watch already leans on
-            # pylint: disable-next=protected-access
-            contract = service._get_marketplace_contract()
+            contract = marketplace_contract(service)
             domain_separator = bytes(contract.functions.domainSeparator().call())
             marketplace = str(contract.address)
         except Exception as e:

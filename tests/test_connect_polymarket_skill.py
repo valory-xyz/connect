@@ -4726,6 +4726,8 @@ def test_v2_position_funds_through_position_manager(monkeypatch, command) -> Non
         for token_id in (_V2_HELD, _V1_HELD):
             funds.cmd_return_position(cs, token_id, None)
         moved = cs.sent
+        # a position leaves the safe to the DW, the one recipient it names
+        assert cs.intents == [{"recipients": [DW_ADDR.lower()]}] * 2
 
     assert moved == [
         (
@@ -4734,6 +4736,37 @@ def test_v2_position_funds_through_position_manager(monkeypatch, command) -> Non
         ),
         (_CTF, _calldata(_TRANSFER, holder, receiver, _V1_HELD, 7_000_000, b"")),
     ]
+
+
+def test_wrap_and_top_up_carry_their_intents(monkeypatch) -> None:
+    """The approval the wrap grants, what it spends, and the top-up's recipient."""
+    cs = _SafeChain(monkeypatch, {})
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 5_000_000)
+    monkeypatch.setattr(funds, "dw_or_exit", lambda cs: DW_ADDR)
+    monkeypatch.setattr(pm, "print_json", lambda payload: None)
+    funds.cmd_wrap(cs, 2.0)
+    funds.cmd_top_up(cs, 1.0)
+    usdc_e, onramp, pusd = (
+        a.lower() for a in (pm.USDC_E, pm.COLLATERAL_ONRAMP, pm.PUSD)
+    )
+    assert cs.intents == [
+        {"approvals": [{"token": usdc_e, "spender": onramp, "amount": 2_000_000}]},
+        {"spend": {usdc_e: 2_000_000}},
+        {"spend": {pusd: 1_000_000}, "recipients": [DW_ADDR.lower()]},
+    ]
+
+
+def test_the_connect_signer_sends_the_intent_it_is_given(monkeypatch) -> None:
+    """ConnectSigner.safe_transaction forwards `intent` to /safe-transaction."""
+    sent: list = []
+    cs = pm.ConnectSigner.__new__(pm.ConnectSigner)
+    cs.chain = "polygon"
+    monkeypatch.setattr(
+        cs, "_post", lambda path, payload: sent.append(payload) or {"tx_hash": "0x1"}
+    )
+    cs.safe_transaction(pm.PUSD, "0x", intent={"spend": {"native": 0}})
+    cs.safe_transaction(pm.PUSD, "0x", intent={})
+    assert [p["intent"] for p in sent] == [{"spend": {"native": 0}}, {}]
 
 
 # A resolved binary V2 market, as the data API lists the safe's sides of it.

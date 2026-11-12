@@ -76,10 +76,91 @@ OTHER_SIGNATURES = (
     "multicall(bytes[])",
 )
 
+# the calls Connect's own skills make, named per contract
+MULTICALL3_SIGNATURES = ("aggregate3((address,bool,bytes)[])",)
+PERMIT2_SIGNATURES = (
+    "permit(address,((address,uint160,uint48,uint48),address,uint256),bytes)",
+    "approve(address,address,uint160,uint48)",
+    "allowance(address,address,address)",
+)
+UNIVERSAL_ROUTER_SIGNATURES = (
+    "execute(bytes,bytes[],uint256)",
+    "execute(bytes,bytes[])",
+)
+CTF_SIGNATURES = ERC1155_SIGNATURES + (
+    "splitPosition(address,bytes32,bytes32,uint256[],uint256)",
+    "mergePositions(address,bytes32,bytes32,uint256[],uint256)",
+    "redeemPositions(address,bytes32,bytes32,uint256[])",
+)
+CTF_ADAPTER_SIGNATURES = ("redeemPositions(address,bytes32,bytes32,uint256[])",)
+ONRAMP_SIGNATURES = ("wrap(address,address,uint256)",)
+PONS_FEE_ESCROW_SIGNATURES = ("claim()", "claimToken(address)")
+PONS_HOOK_SIGNATURES = ("sweepPoolFees(bytes32,uint256,uint256)",)
+SKILL_SIGNATURES = (
+    MULTICALL3_SIGNATURES
+    + PERMIT2_SIGNATURES
+    + UNIVERSAL_ROUTER_SIGNATURES
+    + CTF_SIGNATURES
+    + ONRAMP_SIGNATURES
+    + PONS_FEE_ESCROW_SIGNATURES
+    + PONS_HOOK_SIGNATURES
+)
+
+# Contracts Connect ships an ABI for: the shared ones, and the ones its bundled
+# skills call (connect-polymarket's pm_common, the lib's uniswap DEPLOYMENTS,
+# connect-pons's pons.py), lower-case. tests/test_chain_read.py reads those
+# files to keep the two in step.
 KNOWN_CONTRACTS: dict[str, tuple[str, tuple[str, ...]]] = {
     # the same address on every chain these are deployed to
-    "0xca11bde05977b3631167028862be2a173976ca11": ("Multicall3", OTHER_SIGNATURES[1:2]),
-    "0x000000000022d473030f116ddee9f6b43ac78ba3": ("Permit2", OTHER_SIGNATURES[4:5]),
+    "0xca11bde05977b3631167028862be2a173976ca11": ("Multicall3", MULTICALL3_SIGNATURES),
+    "0x000000000022d473030f116ddee9f6b43ac78ba3": ("Permit2", PERMIT2_SIGNATURES),
+    # Uniswap Universal Router: Robinhood Chain, Polygon, Gnosis
+    "0x8876789976decbfcbbbe364623c63652db8c0904": (
+        "Uniswap Universal Router",
+        UNIVERSAL_ROUTER_SIGNATURES,
+    ),
+    "0x1095692a6237d83c6a72f3f5efedb9a670c49223": (
+        "Uniswap Universal Router",
+        UNIVERSAL_ROUTER_SIGNATURES,
+    ),
+    "0x75fc67473a91335b5b8f8821277262a13b38c9b3": (
+        "Uniswap Universal Router",
+        UNIVERSAL_ROUTER_SIGNATURES,
+    ),
+    # Polymarket, Polygon
+    "0x4d97dcd97ec945f40cf65f87097ace5ea0476045": (
+        "Polymarket ConditionalTokens",
+        CTF_SIGNATURES,
+    ),
+    "0xada100db00ca00073811820692005400218fce1f": (
+        "Polymarket CTF collateral adapter",
+        CTF_ADAPTER_SIGNATURES,
+    ),
+    "0xada2005600dec949baf300f4c6120000bdb6eaab": (
+        "Polymarket NegRisk CTF collateral adapter",
+        CTF_ADAPTER_SIGNATURES,
+    ),
+    "0x93070a847efef7f70739046a929d47a521f5b8ee": (
+        "Polymarket collateral onramp",
+        ONRAMP_SIGNATURES,
+    ),
+    "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb": ("Polymarket pUSD", ERC20_SIGNATURES),
+    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": ("USDC.e", ERC20_SIGNATURES),
+    "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": ("USDC", ERC20_SIGNATURES),
+    # Pons, Robinhood Chain
+    "0xd3afeb2a57f70ef218aa82451c51b2fb0416ac9e": (
+        "Pons fee escrow",
+        PONS_FEE_ESCROW_SIGNATURES,
+    ),
+    "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044": (
+        "Pons meme hook",
+        PONS_HOOK_SIGNATURES,
+    ),
+    "0x0bd7d308f8e1639fab988df18a8011f41eacad73": (
+        "WETH",
+        ERC20_SIGNATURES + WETH_SIGNATURES,
+    ),
+    "0x5fc5360d0400a0fd4f2af552add042d716f1d168": ("USDG", ERC20_SIGNATURES),
 }
 
 COMMON_SIGNATURES = (
@@ -88,6 +169,7 @@ COMMON_SIGNATURES = (
     + ERC1155_SIGNATURES
     + WETH_SIGNATURES
     + OTHER_SIGNATURES
+    + SKILL_SIGNATURES
 )
 
 

@@ -53,7 +53,7 @@ from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
 from connect.run_goal import RunGoal
-from connect.server.auth import AuthFailureLimiter, AuthMiddleware
+from connect.server.auth import AuthFailureLimiter, AuthMiddleware, GrantStore
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError, _IdempotencyCache
@@ -1004,6 +1004,7 @@ class TestMcpTools:
             guard=guard,
             mech=mech_service,
             settings_store=settings_store,
+            grants=GrantStore("workspace-token"),
         )
         manager = mcp._tool_manager  # pylint: disable=protected-access
         return {tool.name: tool.fn for tool in manager.list_tools()}

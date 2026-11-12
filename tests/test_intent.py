@@ -413,6 +413,89 @@ def test_a_token_symbol_is_read_for_the_report_only(answer: t.Any, symbol: str) 
     assert intent._symbol(rpc, TOKEN) == symbol  # pylint: disable=protected-access
 
 
+@pytest.mark.parametrize("raw", [0.9, 1.0, True])
+def test_an_amount_is_never_truncated(raw: t.Any) -> None:
+    """A float minimum of 0.9 must not become 0: floats and bools are refused."""
+    _, problems = intent.parse_intent({"receive_min": {TOKEN: raw}})
+    assert rules(problems) == ["bad-intent"]
+    assert "whole number" in problems[0]["detail"]
+
+
+def _with_allowance(logs: list[dict], allowance: int | None) -> intent.Rpc:
+    """Answer the simulation with `logs`, and allowance() with `allowance`."""
+    simulated = rpc_with(logs)
+
+    def rpc(method: str, params: list) -> t.Any:
+        if method == "eth_call" and params[0]["data"].startswith(
+            intent.ALLOWANCE_SELECTOR
+        ):
+            assert params[0]["data"][10:74] == SAFE[2:].rjust(64, "0")
+            assert params[0]["data"][74:] == SPENDER[2:].rjust(64, "0")
+            if allowance is None:
+                raise intent.SimulationUnavailable("down")
+            return "0x" + _word(allowance)
+        return simulated(method, params)
+
+    return rpc
+
+
+@pytest.mark.parametrize(
+    ("allowance", "kept"), [(1000, False), (600, False), (599, True), (None, True)]
+)
+def test_an_approval_that_only_spends_an_allowance_down_is_no_grant(
+    allowance: int | None, kept: bool
+) -> None:
+    """An OpenZeppelin 4.x transferFrom emits Approval(holder, spender, left)."""
+    logs = [
+        transfer(TOKEN, SAFE, CONTRACT, 400),
+        approval(TOKEN, SAFE, SPENDER, 600),
+    ]
+    diff = intent.simulate(
+        _with_allowance(logs, allowance),
+        sender=SAFE,
+        to=CONTRACT,
+        value=0,
+        data="0x",
+        get_code=lambda a: b"\x01",
+    )
+    assert bool(diff["approvals"]) is kept
+    spend_only: intent.Intent = {"spend": {TOKEN: 400}}
+    expected = ["undeclared-approval"] if kept else []
+    assert rules(intent.check_intent(diff, spend_only)) == expected
+
+
+def test_a_value_send_the_rpc_did_not_trace_fails_closed() -> None:
+    """With no native Transfer log, a value send would look like it moves nothing."""
+    for logs in ([], [native_transfer_log(SAFE, EOA, 3)]):
+        with pytest.raises(intent.SimulationUnavailable, match="traceTransfers"):
+            intent.simulate(
+                rpc_with(logs),
+                sender=SAFE,
+                to=EOA,
+                value=5,
+                data="0x",
+                get_code=lambda a: b"",
+            )
+    traced = intent.simulate(
+        rpc_with([native_transfer_log(SAFE, EOA, 5)]),
+        sender=SAFE,
+        to=EOA,
+        value=5,
+        data="0x",
+        get_code=lambda a: b"",
+    )
+    assert traced["native"] == "-5"
+    reverted = intent.simulate(  # a revert moves nothing, traced or not
+        rpc_with([], status="0x0"),
+        sender=SAFE,
+        to=EOA,
+        value=5,
+        data="0x",
+        get_code=lambda a: b"",
+    )
+    assert reverted["ok"] is False
+
+
 def test_reverts_is_refused_even_with_an_intent() -> None:
     """A call that reverts is never signed."""
     assert rules(intent.check_intent(_diff(ok=False, revert="no"), {})) == ["reverts"]
