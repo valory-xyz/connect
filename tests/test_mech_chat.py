@@ -20,7 +20,11 @@
 """Chat tools over mech_request."""
 
 import json
+import typing as t
 
+import pytest
+
+from connect import mech_chat
 from connect.mech_chat import chat_report, is_chat_prompt
 
 
@@ -98,10 +102,18 @@ def test_a_malformed_choice_from_an_untrusted_delivery_is_no_crash() -> None:
     assert chat_report({"choices": ["hi"]}) is None
 
 
-def test_a_deeply_nested_delivery_or_prompt_is_no_crash() -> None:
-    """json.loads overflows on deep nesting: read as text, never raised."""
-    deep = "[" * 100_000 + "]" * 100_000
-    assert is_chat_prompt(deep) is False
-    report = chat_report({"result": deep})
+def test_a_decoder_overflow_is_no_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A delivery deep enough to overflow json.loads reads as text, never raised.
+
+    How deep that is depends on the interpreter (3.14's decoder takes far more
+    than 3.12's), so the overflow is raised directly rather than built.
+    """
+
+    def overflow(_text: str) -> t.Any:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(mech_chat.json, "loads", overflow)
+    assert is_chat_prompt("[[[]]]") is False
+    report = chat_report({"result": "[[[]]]"})
     assert report is not None
-    assert report["completion"] == deep  # undecodable text is the completion
+    assert report["completion"] == "[[[]]]"  # undecodable text is the completion
