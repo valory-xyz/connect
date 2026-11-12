@@ -213,10 +213,14 @@ def test_on_chain_requests_wait_for_an_empty_queue(
         pass
     with take(allocator, 5) as slot:
         slot.answered("accepted", mech=MECH_A, salt="")
+    start = clock.now
     with pytest.raises(NonceRefused, match="on-chain request must wait"):
         _enter(allocator.exclusive("gnosis", SAFE, lambda: 5, timeout=3))
-    with allocator.exclusive("gnosis", SAFE, lambda: 6, timeout=1):
-        pass
+    assert clock.now - start >= 3  # it waited out its timeout first
+    map_nonces = iter([5, 5, 6])
+    with allocator.exclusive("gnosis", SAFE, lambda: next(map_nonces), timeout=30):
+        pass  # the slot settled during the wait
+    assert held(allocator, 5) is None
 
 
 def test_outcomes_follow_the_mechs_answers() -> None:
