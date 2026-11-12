@@ -56,13 +56,16 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
-from connect.mech_allowances import MechAllowances
+from connect.mech_allowances import MechAllowances, OffchainDigests, read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
+from connect.mech_chat import chat_report, is_chat_prompt
+from connect.mech_nonces import NonceAllocator, NonceRefused, send_with_nonce
 from connect.mech_rpc import RPC_LOCK, listing_mechs
 from connect.mech_signer import MechSigner
 from connect.mech_types import (
     MechError,
     MechUnknownRequest,
+    PendingDelivery,
     PricedMech,
     SPEND_UNCERTAIN,
 )
@@ -97,27 +100,12 @@ class _RequestPlan(t.NamedTuple):
     service: MarketplaceService
     priced: PricedMech
     extra_attributes: dict | None
+    offchain: OffchainDigests | None
     auto_deposit: bool
     legacy_on_chain: bool
     tool: str
     max_payment: int
     terms: dict  # mech-client's mech report, merged into the request's report
-
-
-class PendingDelivery(t.NamedTuple):
-    """Where to resume looking for a request whose delivery had not arrived.
-
-    `from_block` is the request's own transaction block: the on-chain watcher
-    otherwise scans from the head minus a hundred blocks, which finds nothing
-    for a request that has been waiting a while — exactly the case this exists
-    to serve.
-    """
-
-    chain: str
-    mech: str
-    service_id: int
-    offchain: bool
-    from_block: int | None
 
 
 def _clamp_timeout(timeout: float) -> float:
@@ -217,7 +205,7 @@ def _offchain_blocker(read: MetadataRead) -> str | None:
     return None
 
 
-class MechService:
+class MechService:  # pylint: disable=too-many-instance-attributes
     """Per-chain mech-client marketplace services over the guarded signer."""
 
     def __init__(
@@ -234,6 +222,8 @@ class MechService:
         # mech_result can resume the watch a paid-for request deserves
         self._pending: dict[str, PendingDelivery] = {}
         self._requests = RequestLedger()
+        # Connect, not mech-client, allocates off-chain nonces (OPE-2035 T3)
+        self._nonces = NonceAllocator(config.store_path)
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
@@ -678,7 +668,7 @@ class MechService:
             # matching allowance is registered before the send. Armed in
             # every mode so both leave the same audit trail.
             extra_attributes = _metadata_extras(request_context)
-            self._allowances.register_offchain_digest(
+            offchain: OffchainDigests | None = self._allowances.offchain_digests(
                 service,
                 chain=chain,
                 priced=priced,
@@ -691,6 +681,7 @@ class MechService:
         else:
             # nothing reads the document on-chain, so no operator link here
             terms = service.tool_manager.terms_report(priority_mech, None)
+            offchain = None
             extra_attributes = (
                 None
                 if request_context is None
@@ -701,6 +692,7 @@ class MechService:
             service=service,
             priced=priced,
             extra_attributes=extra_attributes,
+            offchain=offchain,
             auto_deposit=auto_deposit,
             legacy_on_chain=legacy_on_chain,
             tool=tool,
@@ -726,17 +718,12 @@ class MechService:
             # it reads this variable again; see _service
             os.environ["MECHX_CHAIN_RPC"] = self._config.chain(plan.chain).rpc_url
         try:
-            result = asyncio.run(
-                plan.service.send_request(
-                    prompts=(prompt,),
-                    tools=(plan.tool,),
-                    priority_mech=plan.priced.mech,
-                    use_offchain=not plan.legacy_on_chain,
-                    auto_deposit=plan.auto_deposit,
-                    extra_attributes=plan.extra_attributes,
-                    timeout=timeout,
-                )
-            )
+            result = self._send(plan, prompt, timeout)
+        except NonceRefused as e:
+            self._blocked(plan.chain, plan.tool, e.rule, e.detail)
+            safe = t.cast(str, self._config.chain(plan.chain).safe_address)
+            note = self._nonces.stall_note(plan.chain, safe)
+            raise MechError(f"rule '{e.rule}': {e}{note}") from e
         except (MechError, SignerError):
             raise
         except Exception as e:
@@ -769,7 +756,57 @@ class MechService:
             offchain=not plan.legacy_on_chain,
         )
         payload.update(plan.terms)
+        if plan.offchain is not None:
+            # nothing in the signed request expires it (mech-client sends no
+            # deadline): it can settle whenever the mech delivers it
+            payload["expires"] = None
+        if is_chat_prompt(prompt):
+            for data in (payload.get("delivery_results") or {}).values():
+                chat = chat_report(data)
+                if chat is not None:
+                    payload.update(chat)
         return payload
+
+    def _send(self, plan: _RequestPlan, prompt: str, timeout: float) -> dict:
+        """Send the planned request with a nonce Connect allocated (T3, D24)."""
+        safe = t.cast(str, self._config.chain(plan.chain).safe_address)
+
+        def send(**extra: t.Any) -> dict:
+            return asyncio.run(
+                plan.service.send_request(
+                    prompts=(prompt,),
+                    tools=(plan.tool,),
+                    priority_mech=plan.priced.mech,
+                    use_offchain=not plan.legacy_on_chain,
+                    auto_deposit=plan.auto_deposit,
+                    extra_attributes=plan.extra_attributes,
+                    timeout=timeout,
+                    **extra,
+                )
+            )
+
+        if plan.offchain is None:  # on-chain takes mapNonces itself: none held
+            # pylint: disable-next=protected-access
+            contract = plan.service._get_marketplace_contract()
+            with self._nonces.exclusive(
+                plan.chain,
+                safe,
+                lambda: read_map_nonces(contract, safe),
+                timeout=timeout,
+            ):
+                return send()
+        hook, salt = plan.offchain.on_request_id, (plan.extra_attributes or {})["nonce"]
+        return send_with_nonce(
+            self._nonces,
+            chain=plan.chain,
+            safe=safe,
+            mech=plan.priced.mech,
+            salt=str(salt),
+            read_map_nonces=plan.offchain.map_nonces,
+            send=lambda nonce: send(nonces=[nonce], on_request_id=hook),
+            not_sent=(MechError, SignerError),
+            timeout=timeout,
+        )
 
     def _with_pending(  # pylint: disable=too-many-locals
         self,
@@ -858,6 +895,9 @@ class MechService:
             "mech": pending.mech,
             "delivered": key in data,
         }
+        safe = self._config.chain(pending.chain).safe_address
+        if pending.offchain and safe and self._nonces.stalled(pending.chain, safe):
+            report["mech_queue_stalled"] = True
         if key not in data:
             unreadable = split.get(key)
             if unreadable is None:

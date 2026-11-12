@@ -384,6 +384,53 @@ endpoint in its on-chain metadata — few have, so `mech_tools` reports
 refused before any payment. The on-chain path sends through the
 MechMarketplace via the service safe and works for any listed mech.
 
+### One payer per safe: nonces
+
+Connect, not mech-client, allocates off-chain marketplace nonces
+(`connect/mech_nonces.py`), so concurrent requests from one safe never share
+one. It follows the deployed sequential marketplace: the mech admits only
+`mapNonces + accepted + settling` for a sender, so one mech is in flight per
+safe and chain (a request to another mech waits for the first one's slots to
+settle, and is refused as `mech-in-flight` when its wait runs out), the lock is
+held from reservation until the mech answers, and a slot is held until
+`mapNonces > n`. mech-client signs the nonce it is given (`send_request(...,
+nonces=[n], on_request_id=...)`, valory-xyz/mech-client#272) and reports the
+request id just before signing. Connect still recomputes that id itself from
+what it assembled and the nonce it allocated: mech-client asks the contract
+for it over `eth_call`, and an id signed on faith would let a lying RPC
+collect the safe's ERC-1271 signature on any 32 bytes, so a mismatch is
+refused before anything is signed. The mech's answer decides the slot: 200
+holds it; 503 (a gap) resends the same nonce and id up to `MAX_GAP_RETRIES`
+times, then refuses as `mech-nonce-gap`; a 401 whose reason is exactly
+`wire nonce below sender's next expected slot` means the nonce is taken
+(`mech-nonce-taken`: our own unknown slot is then accepted, otherwise the queue
+stalls); any other 4xx, a 402 after the top-up retry included, frees it
+(`mech-request-rejected`); any other 5xx or a transport error holds it, since
+the mech may have stored the request. A queue whose accepted slot does not
+settle within the settle timeout, or whose nonce another signer took, stalls:
+only a probe at `mapNonces` is sent until one is accepted again, and refusals
+and `mech_result` say `mech_queue_stalled`. An on-chain request takes
+`mapNonces` itself, so it waits until no off-chain slot is held. Held slots,
+their metadata salt and the stall are persisted in `mech_nonces.json` under
+STORE_PATH, so a restart never reissues a held nonce; an unreadable file
+refuses every request (`mech-queue-unreadable`) rather than guess.
+
+**Validity.** An off-chain request carries no deadline (mech-client sends
+none), so it can settle whenever the mech delivers it, also after the
+requester stopped waiting: `mech_request` reports `"expires": null`.
+
+**Chat tools.** A prompt that is an OpenAI-style `messages` list as JSON gets
+the shared chat contract: the report adds `completion` (text) and `usage`
+(`prompt_tokens`, `completion_tokens`), read from the delivery in pmini's
+`MechModel` order (the delivery, then `response`/`result`, then
+`content`/`text`/`completion`, or `choices[0].message`); a native tool call the
+model returned unrequested comes back as a fenced bash block in `completion`
+(`connect/mech_chat.py`). Until the mechs team's chat mechs and the
+facilitator's standard request path exist, do not use the facilitator's
+`/mech/chat` route and `mech_request` from one safe at once: the facilitator
+signs its own marketplace nonces for the safe, and two payers on one safe
+collide.
+
 Each request carries a spending budget, `max_payment`, checked against the
 mech's price before anything is paid. It is denominated in the mech's payment
 asset, so its default is 0.1 of that asset — 10^17 base units for native and

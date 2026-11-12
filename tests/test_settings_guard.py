@@ -39,6 +39,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client import OffchainRequestRejected
 from mech_client.domain import identification
 from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
@@ -53,7 +54,9 @@ from web3.datastructures import AttributeDict
 
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
-from connect import mech_budget, mech_rpc
+from connect import mech_budget
+from connect import mech_nonces as mech_nonces_module
+from connect import mech_rpc
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -1888,14 +1891,19 @@ class FakeMarketplaceService:
             tools = t.cast(tuple, kwargs["tools"])
             extra = t.cast(dict, kwargs.get("extra_attributes") or {})
             data_hash, _, _ = ipfs_metadata.fetch_ipfs_hash(prompts[0], tools[0], extra)
+            # mech-client#272: the caller's nonce, else mapNonces as before
+            nonces = t.cast(list, kwargs.get("nonces") or [self.contract.nonce])
             request_id = self.contract.functions.getRequestId(
                 kwargs["priority_mech"],
                 self.safe_address,
                 bytes.fromhex(data_hash.removeprefix("0x")),
                 self.mech_info[2],
                 bytes.fromhex(self.mech_info[0].value),
-                self.contract.nonce,
+                nonces[0],
             ).call()
+            hook = kwargs.get("on_request_id")
+            if callable(hook):
+                hook(request_id, nonces[0])  # just before signing, as #272 does
             self.signer.sign_safe_message(
                 self.safe_address,
                 self.mech_config.ledger_config.chain_id,
@@ -2149,7 +2157,7 @@ class TestMech:
         allowances = mech_service._allowances  # pylint: disable=protected-access
         monkeypatch.setattr(
             allowances,
-            "register_offchain_digest",
+            "offchain_digests",
             lambda *a, **k: armed.append("digest"),
         )
 
@@ -3246,15 +3254,17 @@ class TestMech:
         This is the lying-RPC case: mech-client asks the contract for the id
         over eth_call, so a hostile RPC can hand back any 32 bytes — a safe
         transaction hash included. The local derivation turns that into a
-        mismatch, and the mismatch into a refusal.
+        mismatch, and the mismatch into a refusal. Since mech-client#272 the id
+        is checked in its pre-sign hook, so the refusal comes before anything
+        is signed, in every mode.
         """
         patched_mech.contract.request_id_override = b"\xee" * 32
         service, _ = self._restricted_mech_service(
             account, app_config, activity, settings_store
         )
-        with pytest.raises(SignerError, match="digest signing is disabled"):
+        with pytest.raises(MechError, match="not the one this server derives"):
             service.request("q", "tool", chain="testchain", priority_mech=OTHER)
-        assert "blocked" in audit_kinds(store_path)
+        assert "mech_offchain_digest_mismatch" in audit_kinds(store_path)
 
     def test_restricted_auto_deposit_is_armed_via_allowance(  # pylint: disable=too-many-arguments
         self,
@@ -3374,7 +3384,7 @@ class TestMech:
         mech_service._config.chains["testchain"].safe_address = None
         with pytest.raises(MechError, match="no service safe"):
             # pylint: disable-next=protected-access
-            mech_service._allowances.register_offchain_digest(
+            mech_service._allowances.offchain_digests(
                 t.cast(t.Any, patched_mech),
                 chain="testchain",
                 priced=PricedMech(
@@ -4444,6 +4454,126 @@ class TestMech:
             priority_mech=OTHER,
         )
         assert patched_mech.calls[-1]["timeout"] == 1.0
+
+    def test_offchain_request_signs_the_nonce_connect_allocated(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """mech-client is handed the allocated nonce and the verifying hook (T3)."""
+        report = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER
+        )
+        call = patched_mech.calls[-1]
+        assert call["nonces"] == [patched_mech.contract.nonce]
+        assert callable(call["on_request_id"])
+        assert report["expires"] is None  # an off-chain request has no deadline
+        second = mech_service.request(
+            "q2", "tool", chain="testchain", priority_mech=OTHER
+        )
+        # the first is accepted but unsettled, so the next nonce is taken
+        assert patched_mech.calls[-1]["nonces"] == [patched_mech.contract.nonce + 1]
+        assert second["expires"] is None
+
+    def test_a_chat_tool_reports_the_completion_and_usage(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Messages JSON in; completion text plus usage out (the shared contract)."""
+        patched_mech.result["deliveries"] = {
+            "ab": DeliveryResult(
+                request_id="ab",
+                data={
+                    "result": json.dumps(
+                        {
+                            "content": "Hello",
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+                        }
+                    )
+                },
+                url=None,
+            )
+        }
+        report = mech_service.request(
+            json.dumps([{"role": "user", "content": "hi"}]),
+            "chat",
+            chain="testchain",
+            priority_mech=OTHER,
+        )
+        assert report["completion"] == "Hello"
+        assert report["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
+
+    def test_a_rejected_request_names_its_rule(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """The mech's answer becomes a refusal naming the nonce rule."""
+        patched_mech.raises = OffchainRequestRejected(
+            "HTTP 402",
+            request_id="0x01",
+            nonce=5,
+            status=402,
+            reason="Payment Required",
+            unsent=[],
+        )
+        with pytest.raises(MechError, match="rule 'mech-request-rejected'"):
+            mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert "mech_request_blocked" in audit_kinds(store_path)
+
+    def test_a_stalled_queue_is_reported(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mech_request and mech_result both say mech_queue_stalled."""
+
+        async def no_delivery(*_args: t.Any) -> dict:
+            return {}
+
+        monkeypatch.setattr(
+            mech_module.MechService, "_watch", staticmethod(no_delivery)
+        )
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        patched_mech.result["deliveries"] = {}  # the answer is still pending
+        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+            slot.answered("taken", mech=OTHER, salt="")  # another signer took it
+        assert nonces.stalled("testchain", SAFE)
+        assert mech_service.result("ab", timeout=1)["mech_queue_stalled"] is True
+        patched_mech.raises = OffchainRequestRejected(
+            "HTTP 401",
+            request_id="0x01",
+            nonce=5,
+            status=401,
+            reason=mech_nonces_module.NONCE_TAKEN_REASON,
+            unsent=[],
+        )
+        with pytest.raises(MechError, match="mech_queue_stalled"):
+            mech_service.request("q2", "tool", chain="testchain", priority_mech=OTHER)
+
+    def test_an_on_chain_request_waits_for_held_offchain_slots(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An on-chain request would take mapNonces, which a held slot claims."""
+        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        monkeypatch.setattr(mech_nonces_module, "POLL_SECONDS", 0.01, raising=True)
+        with pytest.raises(MechError, match="rule 'mech-in-flight'"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                legacy_on_chain=True,
+                timeout=1,
+            )
+        patched_mech.contract.nonce += 1  # the off-chain one settled
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, legacy_on_chain=True
+        )
+        assert "nonces" not in patched_mech.calls[-1]
 
 
 class TestSettingsEndpoints:

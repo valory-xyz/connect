@@ -20,6 +20,7 @@
 """The single-use grants the mech flow registers with the guard."""
 
 import logging
+import typing as t
 
 from eth_abi import encode as abi_encode
 from mech_client.infrastructure.config import (
@@ -132,6 +133,64 @@ def deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
         return None, False
 
 
+def read_map_nonces(contract: t.Any, safe: str) -> int:
+    """Read the marketplace's settled nonce for `safe` (an RPC read)."""
+    return int(contract.functions.mapNonces(Web3.to_checksum_address(safe)).call())
+
+
+class OffchainDigests:  # pylint: disable=too-many-instance-attributes
+    """Everything an off-chain request id commits to, except its nonce."""
+
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        *,
+        allowances: "MechAllowances",
+        contract: t.Any,
+        chain: str,
+        safe: str,
+        chain_id: int,
+        domain_separator: bytes,
+        marketplace: str,
+        mech: str,
+        data_hash: bytes,
+        delivery_rate: int,
+        payment_type: bytes,
+    ) -> None:
+        """Initialize."""
+        self._allowances = allowances
+        self._contract = contract
+        self.chain = chain
+        self.safe = safe
+        self.chain_id = chain_id
+        self.domain_separator = domain_separator
+        self.marketplace = marketplace
+        self.mech = mech
+        self.data_hash = data_hash
+        self.delivery_rate = delivery_rate
+        self.payment_type = payment_type
+
+    def map_nonces(self) -> int:
+        """Read the marketplace's settled nonce for the safe."""
+        return read_map_nonces(self._contract, self.safe)
+
+    def request_id(self, nonce: int) -> bytes:
+        """Recompute the request id for `nonce`, trusting no RPC for it."""
+        return request_digest(
+            domain_separator=self.domain_separator,
+            marketplace=self.marketplace,
+            mech=self.mech,
+            requester=self.safe,
+            data_hash=self.data_hash,
+            delivery_rate=self.delivery_rate,
+            payment_type=self.payment_type,
+            nonce=nonce,
+        )
+
+    def on_request_id(self, request_id: bytes, nonce: int) -> None:
+        """mech-client's pre-sign hook: verify the id, then arm its signature."""
+        self._allowances.arm(self, request_id, nonce)
+
+
 class MechAllowances:
     """Registers the single-use grants an off-chain mech request needs."""
 
@@ -141,7 +200,7 @@ class MechAllowances:
         self._guard = guard
         self._activity = activity
 
-    def register_offchain_digest(  # pylint: disable=too-many-arguments,too-many-locals
+    def offchain_digests(  # pylint: disable=too-many-arguments
         self,
         service: MarketplaceService,
         *,
@@ -150,28 +209,16 @@ class MechAllowances:
         prompt: str,
         tool: str,
         extra_attributes: dict,
-    ) -> None:
-        """Derive the digest mech-client will sign, and pre-authorize it once.
+    ) -> "OffchainDigests":
+        """Read what the request id depends on, before anything is armed.
 
-        The requester of record is the service safe (mech-client ≥0.21.3
-        binds agent-mode off-chain requests to the safe on every surface),
-        so the request id commits to the safe, the marketplace nonce is the
-        safe's, and what actually gets signed is the ERC-1271 SafeMessage
-        wrap of the request id — the allowance registers that wrapped hash,
-        the same bytes MechSigner.sign_safe_message will produce.
-
-        The request id commits to the metadata CID, which is deterministic
-        here because the salt is pinned: fetch_ipfs_hash generates a random
-        nonce but merges ``extra_attributes`` over it, so this method and
-        mech-client (handed the same dict moments later) run the same pure
-        function on the same inputs and get the same CID. The domain separator
-        and the marketplace nonce are RPC reads; a wrong answer makes the
-        derived digest mismatch the one mech-client asks to sign, so the
-        failure mode is a refusal, never a wrong signature.
-
-        Audited: the allowance is what lets funds-adjacent signing happen in
-        restricted mode, so the trail must show each one that was granted,
-        not only the signatures that followed.
+        The requester of record is the service safe (mech-client >=0.21.3
+        binds agent-mode off-chain requests to the safe on every surface), so
+        the request id commits to the safe and the marketplace nonce is the
+        safe's. The id also commits to the metadata CID, which is
+        deterministic here because the salt is pinned: fetch_ipfs_hash merges
+        ``extra_attributes`` over its random nonce, so this and mech-client
+        run the same pure function on the same inputs.
         """
         safe = self._config.chain(chain).safe_address
         if safe is None:
@@ -186,35 +233,61 @@ class MechAllowances:
             # pylint: disable-next=protected-access
             contract = service._get_marketplace_contract()
             domain_separator = bytes(contract.functions.domainSeparator().call())
-            nonce = int(
-                contract.functions.mapNonces(Web3.to_checksum_address(safe)).call()
-            )
             marketplace = str(contract.address)
         except Exception as e:
             raise MechError(
                 f"could not derive the off-chain request digest: {e}"
             ) from e
         data_hash, _, _ = fetch_ipfs_hash(prompt, tool, extra_attributes)
-        request_id = request_digest(
+        return OffchainDigests(
+            allowances=self,
+            contract=contract,
+            chain=chain,
+            safe=safe,
+            # the chain id mech-client passes to sign_safe_message here
+            chain_id=int(service.mech_config.ledger_config.chain_id),
             domain_separator=domain_separator,
             marketplace=marketplace,
             mech=priced.mech,
-            requester=safe,
             data_hash=bytes.fromhex(data_hash.removeprefix("0x")),
             delivery_rate=priced.rate,
             payment_type=bytes.fromhex(priced.payment_type),
-            nonce=nonce,
         )
-        # the chain id mech-client passes to sign_safe_message for this chain
-        chain_id = int(service.mech_config.ledger_config.chain_id)
-        digest = safe_message_hash(safe, chain_id, request_id)
+
+    def arm(self, digests: "OffchainDigests", request_id: bytes, nonce: int) -> None:
+        """Pre-authorize, once, the signature on a request id mech-client reports.
+
+        mech-client hands the id over just before signing (``on_request_id``),
+        but it asked the *contract* for that id over eth_call: signed on
+        faith, a lying RPC could return any 32 bytes, a Permit2 digest
+        included, and collect the safe's ERC-1271 signature on it. So the id
+        is recomputed here from what Connect assembled and the nonce Connect
+        allocated, and a mismatch is refused before anything is signed.
+
+        Audited in every mode; the allowance is armed only while restricted.
+        """
+        expected = digests.request_id(nonce)
+        if bytes(request_id) != expected:
+            self._activity.record(
+                "mech_offchain_digest_mismatch",
+                chain=digests.chain,
+                mech=digests.mech,
+                reported="0x" + bytes(request_id).hex(),
+                expected="0x" + expected.hex(),
+                nonce=nonce,
+            )
+            raise MechError(
+                "the request id mech-client is about to sign is not the one "
+                "this server derives for it; nothing was signed"
+            )
+        digest = safe_message_hash(digests.safe, digests.chain_id, expected)
         if self._guard.mode() == MODE_RESTRICTED:
             self._guard.allow_digest_once(digest)
         self._activity.record(
             "mech_offchain_digest",
-            chain=chain,
-            mech=priced.mech,
-            request_id="0x" + request_id.hex(),
+            chain=digests.chain,
+            mech=digests.mech,
+            request_id="0x" + expected.hex(),
             digest="0x" + digest.hex(),
             nonce=nonce,
         )

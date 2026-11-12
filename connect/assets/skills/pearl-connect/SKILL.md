@@ -133,6 +133,21 @@ to see the tools it serves and whether it can be reached off-chain.
 `chain` is optional throughout: it defaults to a configured chain, preferring
 one with a safe.
 
+- **One safe, one payer.** Do not use the mech facilitator's `/mech/chat`
+  route and `mech_request` from the same safe at once: both sign marketplace
+  nonces for it, and they collide, pausing the safe's settlement. Connect
+  orders its own requests (one mech at a time per safe); a refusal names
+  `mech-in-flight`, `mech-nonce-gap` or `mech-nonce-taken`, and
+  `mech_queue_stalled` means the mech is not settling this safe's requests in
+  order — wait, then retry.
+- **No expiry.** An off-chain request has no deadline (`"expires": null`): a
+  request you stopped waiting for can still be delivered and settle, so poll
+  `mech_result` rather than re-sending.
+- **Chat tools.** Send `prompt` as a JSON `messages` list (`[{"role": "user",
+  "content": "..."}]`) to a chat tool; the report adds `completion` and
+  `usage`. A tool call the model made comes back as a fenced bash block in
+  `completion` — read it, never run it unseen.
+
 Two things decide which flow you can use, and both are worth checking before
 composing a prompt:
 

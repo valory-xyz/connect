@@ -48,3 +48,19 @@ class PricedMech(t.NamedTuple):
     # native mechs, token base units for OLAS/USDC ones)
     rate: int
     payment_type: str
+
+
+class PendingDelivery(t.NamedTuple):
+    """Where to resume looking for a request whose delivery had not arrived.
+
+    `from_block` is the request's own transaction block: the on-chain watcher
+    otherwise scans from the head minus a hundred blocks, which finds nothing
+    for a request that has been waiting a while — exactly the case this exists
+    to serve.
+    """
+
+    chain: str
+    mech: str
+    service_id: int
+    offchain: bool
+    from_block: int | None
