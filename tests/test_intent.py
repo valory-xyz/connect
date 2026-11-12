@@ -67,6 +67,10 @@ def rpc_with(
     """Return an rpc callable answering eth_simulateV1 with these logs."""
 
     def rpc(method: str, params: list) -> t.Any:
+        if method == "eth_call":  # symbol(): an ABI string for TOKEN, else none
+            if params[0]["to"] == TOKEN:
+                return "0x" + _word(32) + _word(4) + b"USDC".hex().ljust(64, "0")
+            return "0x"
         assert method == "eth_simulateV1"
         call: dict = {"status": status, "gasUsed": "0x10", "logs": logs}
         if error is not None:
@@ -101,7 +105,7 @@ def test_native_and_token_spend_are_netted_per_asset() -> None:
     )
     assert diff["ok"] is True
     assert diff["native"] == "-70"
-    assert diff["tokens"] == {TOKEN: {"delta": "-25"}}
+    assert diff["tokens"] == {TOKEN: {"symbol": "USDC", "delta": "-25"}}
     assert diff["recipients"] == [{"address": CONTRACT, "contract": True}]
     assert diff["called"] == [CONTRACT, TOKEN]
     assert diff["gas_used"] == 16
@@ -122,6 +126,38 @@ def test_celo_native_moves_from_both_sources_are_summed() -> None:
     )
     assert diff["native"] == "-10"
     assert diff["tokens"] == {}
+
+
+def test_an_approval_by_the_celo_face_is_an_approval() -> None:
+    """Only the face's Transfer is native: CELO.approve is still checked."""
+    diff = simulate([approval(CELO_FACE, SAFE, SPENDER, intent.MAX_UINT256)])
+    assert diff["approvals"] == [
+        {
+            "token": CELO_FACE,
+            "spender": SPENDER,
+            "amount": str(intent.MAX_UINT256),
+            "infinite": True,
+        }
+    ]
+    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert rules(intent.check_intent(diff, intent.parse_intent({})[0])) == [
+        "undeclared-approval"
+    ]
+
+
+def test_a_spend_naming_the_celo_face_is_a_native_spend() -> None:
+    """Face moves are booked under native, so an intent naming the face is too."""
+    parsed, problems = intent.parse_intent(
+        {"spend": {CELO_FACE.upper().replace("0X", "0x"): 3}}
+    )
+    assert problems == []
+    assert parsed is not None
+    assert parsed["spend"] == {"native": 3}
+    diff = simulate([transfer(CELO_FACE, SAFE, CONTRACT, 3)])
+    assert rules(intent.check_intent(diff, parsed)) == []
+    _, twice = intent.parse_intent({"spend": {"native": 1, CELO_FACE: 2}})
+    assert rules(twice) == ["bad-intent"]
+    assert "twice" in twice[0]["detail"]
 
 
 def test_polygons_own_log_transfer_is_not_counted() -> None:
@@ -253,7 +289,7 @@ def test_weth_and_nft_moves_and_approvals() -> None:
         {"address": TOKEN, "topics": [], "data": "0x"},  # anonymous log
     ]
     diff = simulate(logs)
-    assert diff["tokens"] == {TOKEN: {"delta": "5"}}
+    assert diff["tokens"] == {TOKEN: {"symbol": "USDC", "delta": "5"}}
     assert diff["positions"] == [
         {"token": TOKEN, "id": "1", "delta": "2"},
         {"token": TOKEN, "id": "2", "delta": "6"},
@@ -340,6 +376,41 @@ def test_value_moving_needs_an_intent() -> None:
     ) == ["missing-intent"]
     # a claim moves nothing of the sender's, so it needs none
     assert intent.check_intent(_diff(tokens={TOKEN: {"delta": "3"}}), None) == []
+
+
+def test_a_token_the_spend_does_not_name_may_not_be_spent_at_all() -> None:
+    """An unlisted ERC-20 has a budget of 0, never an unlimited one."""
+    native_only: intent.Intent = {"spend": {"native": 10}}
+    out = _diff(tokens={TOKEN: {"delta": "-1"}})
+    assert rules(intent.check_intent(out, native_only)) == ["overspend"]
+    assert rules(intent.check_intent(out, {"spend": {TOKEN: 0}})) == ["overspend"]
+    assert intent.check_intent(out, {"spend": {TOKEN: 1}}) == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "symbol"),
+    [
+        ("0x" + b"MKR".hex().ljust(64, "0"), "MKR"),  # bytes32, as early tokens
+        ("0x" + _word(32) + _word(80) + ("41" * 80).ljust(192, "0"), "A" * 32),
+        ("0x", ""),
+        ("0x1234", ""),
+        ("not hex", ""),
+        (intent.SimulationUnavailable("down"), ""),
+    ],
+)
+def test_a_token_symbol_is_read_for_the_report_only(answer: t.Any, symbol: str) -> None:
+    """symbol() is display only: any odd or failed answer reads as ""."""
+
+    def rpc(method: str, params: list) -> t.Any:
+        assert (method, params) == (
+            "eth_call",
+            [{"to": TOKEN, "data": intent.SYMBOL_SELECTOR}, "latest"],
+        )
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    assert intent._symbol(rpc, TOKEN) == symbol  # pylint: disable=protected-access
 
 
 def test_reverts_is_refused_even_with_an_intent() -> None:

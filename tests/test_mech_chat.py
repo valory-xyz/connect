@@ -90,3 +90,9 @@ def test_a_delivery_without_a_completion_is_not_a_chat_report() -> None:
     assert chat_report({"answer": "42"}) is None
     assert chat_report([1, 2]) is None
     assert chat_report({"choices": []}) is None
+
+
+def test_a_malformed_choice_from_an_untrusted_delivery_is_no_crash() -> None:
+    """A delivery is the mech's to shape: a string message or choice reports nothing."""
+    assert chat_report({"choices": [{"message": "hi"}]}) is None
+    assert chat_report({"choices": ["hi"]}) is None

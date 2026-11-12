@@ -288,10 +288,10 @@ def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
     bad = {"Authorization": "Bearer nope"}
     outcomes: list[tuple[str, str]] = []
 
-    def send(chain="testchain", to="0x" + "aa" * 20, headers=None) -> None:
+    def send(chain="testchain", to="0x" + "aa" * 20, headers=None, **extra) -> None:
         response = client.post(
             "/safe-transaction",
-            json={"chain": chain, "target": to},
+            json={"chain": chain, "target": to, **extra},
             headers=good if headers is None else headers,
         )
         error = _as_client_error(response)
@@ -303,6 +303,17 @@ def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         send(chain="mystery")
         send(chain="nosafe")
+        send(value=1)  # moves value with no intent: the intent gate refuses
+        capped = client.post(
+            "/tokens",
+            json={"scopes": ["tx"], "max_value_per_tx": {"native": 1}},
+            headers=good,
+        ).json()["token"]
+        send(value=2, headers={"Authorization": f"Bearer {capped}"})
+        expired = client.post(
+            "/tokens", json={"scopes": ["tx"], "expires_at": 1}, headers=good
+        ).json()["token"]
+        send(headers={"Authorization": f"Bearer {expired}"})
         send(to="0x1234")
         send(to=safe)
         with monkeypatch.context() as patched:

@@ -22,10 +22,10 @@
 The workspace token is minted per run and reaches the agent harness only via
 the .mcp.json and .codex/config.toml files in STORE_PATH. It is a *scoped*
 token: `read` + `mech` + `tx` with no caps of its own, so a
-session can do what it always could, but a harness can mint narrower tokens
-from it for the scripts it runs (fewer scopes, value caps per transaction and
-per session, a mech payment cap, an expiry). The full credential is held in
-this process only and is written to no file. Origin validation
+session can do what it always could, and it is the root every narrower token
+is minted from: a harness mints them for the scripts it runs (fewer scopes,
+value caps per transaction and per session, a mech payment cap, an expiry).
+Origin validation
 defends the localhost server against DNS-rebinding: browsers always attach an
 Origin to cross-origin requests, so anything non-local is rejected before
 auth. Repeated auth failures across
@@ -44,10 +44,11 @@ from collections import deque
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import field_validator
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
+from connect.server.strict import StrictBody
 
 Scope = t.Literal["read", "mech", "tx"]
 SCOPES: tuple[Scope, ...] = ("read", "mech", "tx")
@@ -71,10 +72,11 @@ ACTION_SCOPES: dict[str, Scope] = {
 }
 
 
-class TokenGrant(BaseModel):
-    """What a bearer token may do; a token can only mint a narrower one."""
+class TokenGrant(StrictBody):
+    """What a bearer token may do; a token can only mint a narrower one.
 
-    model_config = ConfigDict(extra="forbid")
+    Unknown fields are refused by name, like every other HTTP body.
+    """
 
     scopes: list[Scope]
     max_value_per_tx: dict[str, int] | None = None
@@ -82,8 +84,33 @@ class TokenGrant(BaseModel):
     max_mech_payment: int | None = None
     expires_at: int | None = None  # unix seconds
 
+    @field_validator("max_value_per_tx", "max_value_per_session")
+    @classmethod
+    def _cap_keys(cls, caps: dict[str, int] | None) -> dict[str, int] | None:
+        """Key caps as the intent gate keys balances: "native", or an address."""
+        if caps is None:
+            return None
+        keyed: dict[str, int] = {}
+        for token, amount in caps.items():
+            key = intent_module.balance_key(token)  # ValueError: not a token
+            if amount < 0:
+                raise ValueError(f"cap for {token} must be >= 0")
+            if key in keyed:
+                raise ValueError(f"caps name {key} twice")
+            keyed[key] = amount
+        return keyed
+
+    def value_capped(self) -> bool:
+        """Whether any value cap binds this grant."""
+        return (
+            self.max_value_per_tx is not None or self.max_value_per_session is not None
+        )
+
 
 WORKSPACE_GRANT = TokenGrant(scopes=list(SCOPES))
+
+# the request-state key the MCP mount sets: whether the token is value-capped
+VALUE_CAPPED = "value_capped"
 
 
 class GrantRefused(Exception):
@@ -101,11 +128,6 @@ class GrantRefused(Exception):
         return self.detail
 
 
-def _caps_key(token: str) -> str:
-    """Return an intent's token key for a cap: "native", or the address."""
-    return token.lower()
-
-
 def _within(child: dict[str, int] | None, parent: dict[str, int] | None) -> bool:
     """Whether a child's caps are no wider than its parent's (None is no cap)."""
     if parent is None:
@@ -113,8 +135,7 @@ def _within(child: dict[str, int] | None, parent: dict[str, int] | None) -> bool
     if child is None:
         return False
     return all(
-        _caps_key(token) in parent and amount <= parent[_caps_key(token)]
-        for token, amount in child.items()
+        token in parent and amount <= parent[token] for token, amount in child.items()
     )
 
 
@@ -138,8 +159,12 @@ def narrower(child: TokenGrant, parent: TokenGrant) -> bool:
     return True
 
 
-def _declared_spend(arguments: t.Mapping[str, t.Any]) -> dict[str, int]:
-    """Return what a call may spend: its intent's `spend`, and its native value.
+def _declared(
+    arguments: t.Mapping[str, t.Any],
+) -> tuple[dict[str, int], list[intent_module.IntentApproval]]:
+    """Return what a call may spend, and the approvals its intent allows.
+
+    The spend is the intent's `spend` and the call's native value.
 
     The intent is read exactly as the tool will read it: a JSON string is
     decoded first (FastMCP does the same before validating), and the intent
@@ -169,23 +194,16 @@ def _declared_spend(arguments: t.Mapping[str, t.Any]) -> dict[str, int]:
     if value < 0:
         raise GrantRefused("bad-value", "value must be a non-negative amount")
     declared[intent_module.NATIVE] = max(declared.get(intent_module.NATIVE, 0), value)
-    return declared
+    return declared, list((parsed or {}).get("approvals", []))
 
 
 class GrantStore:
     """The bearer tokens this process honours, and what each may do."""
 
     def __init__(self, workspace_token: str) -> None:
-        """Hold the workspace token and an in-process root credential."""
+        """Hold the workspace token, the root every other token is minted from."""
         self._lock = threading.Lock()
-        # the root credential is held here and written nowhere: no file can
-        # leak it. The workspace token has the same scopes, so a session can
-        # do what it always could; what it adds is that every token, the
-        # workspace's included, can only mint narrower ones
-        self._grants: dict[str, TokenGrant] = {
-            secrets.token_urlsafe(32): TokenGrant(scopes=list(SCOPES)),
-            workspace_token: WORKSPACE_GRANT,
-        }
+        self._grants: dict[str, TokenGrant] = {workspace_token: WORKSPACE_GRANT}
         self._spent: dict[str, dict[str, int]] = {}
         # a minted token's parent: a session cap binds every descendant
         self._parents: dict[str, str] = {}
@@ -237,9 +255,13 @@ class GrantStore:
         """Raise unless `token` may perform `action` with `arguments`.
 
         Value caps are checked against the spend the call's intent declares,
-        which the intent gate then holds the transaction to. A capped token's
-        per-session budget is drawn down when a call is authorized, whether or
-        not the send then succeeds: it can be spent early, never exceeded.
+        which the intent gate then holds the transaction to, and bound the
+        approvals it declares too. What a cap cannot bound, a capped token may
+        not do: sign a raw digest (it can authorize any safe transaction), or
+        move a position (`intent.Capped`, which the send surfaces apply).
+        A capped token's per-session budget is drawn down when a call is
+        authorized, whether or not the send then succeeds: it can be spent
+        early, never exceeded.
         """
         grant = self._live(token)
         scope = ACTION_SCOPES.get(action)
@@ -251,8 +273,18 @@ class GrantStore:
             )
         if action == "mech_request":
             self._check_mech_payment(grant, arguments)
+        if action == "sign_message" and grant.value_capped():
+            raise GrantRefused(
+                "token-cap-per-tx",
+                "a value-capped token may not sign raw digests: a digest can "
+                "authorize a safe transaction that no cap or intent sees",
+            )
         if scope == "tx" and action != "sign_message":
             self._check_value(token, grant, arguments)
+
+    def value_capped(self, token: str) -> bool:
+        """Whether a value cap binds `token` (a child of a capped one is capped)."""
+        return self.grant(token).value_capped()
 
     @staticmethod
     def _check_mech_payment(
@@ -272,7 +304,8 @@ class GrantStore:
     def _check_value(
         self, token: str, grant: TokenGrant, arguments: t.Mapping[str, t.Any]
     ) -> None:
-        declared = _declared_spend(arguments)  # refuses malformed amounts first
+        declared, approvals = _declared(arguments)  # refuses malformed first
+        self._check_approvals(grant, approvals)
         per_tx = grant.max_value_per_tx
         if per_tx is not None:
             for asset, amount in declared.items():
@@ -309,6 +342,28 @@ class GrantStore:
                 spent = self._spent.setdefault(holder, {})
                 for asset, amount in declared.items():
                     spent[asset] = spent.get(asset, 0) + amount
+
+    @staticmethod
+    def _check_approvals(
+        grant: TokenGrant, approvals: list[intent_module.IntentApproval]
+    ) -> None:
+        """Hold a capped token's declared approvals to its caps.
+
+        An approval lets the spender move up to its amount later, outside any
+        transaction this token sends, so it is held to the per-transaction and
+        the per-session cap alike; a token with no cap may not be approved.
+        """
+        for caps in (grant.max_value_per_tx, grant.max_value_per_session):
+            if caps is None:
+                continue
+            for approval in approvals:
+                token = intent_module.balance_key(approval["token"])
+                if approval["amount"] > caps.get(token, 0):
+                    raise GrantRefused(
+                        "token-cap-per-tx",
+                        f"this token may approve at most {caps.get(token, 0)} of "
+                        f"{token} (the intent approves {approval['amount']})",
+                    )
 
 
 def as_store(grants: "GrantStore | str") -> GrantStore:
@@ -467,6 +522,8 @@ class AuthMiddleware:
         if refusal is not None:
             await _send_json(send, 200, refusal)
             return
+        # read back by the send tools through the MCP request context
+        scope.setdefault("state", {})[VALUE_CAPPED] = self._grants.value_capped(token)
         await self._app(scope, _replay(body, receive), send)
 
     def _refusal(self, token: str, body: bytes) -> dict | None:

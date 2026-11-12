@@ -19,9 +19,10 @@
 
 """The single signing choke point.
 
-Every on-chain action of the Claude agent reduces to one EOA transaction sent
-through Signer.send(); off-chain mech requests use Signer.sign_digest(). The
-key never leaves this module's LocalAccount.
+Every on-chain action of the Claude agent reduces to one EOA transaction that
+Signer._send_guarded() checks (guard, then intent gate) and broadcasts — send()
+and send_via_safe() are its two callers; off-chain mech requests use
+Signer.sign_digest(). The key never leaves this module's LocalAccount.
 """
 
 import hashlib
@@ -378,8 +379,9 @@ class Signer:
         the safe rather than the EOA. The distinct parameter name is deliberate:
         this is not send()'s outer recipient, and the two must not be confused.
 
-        The composed transaction goes back through send(), so it meets the same
-        guard as anything else — a caller of the gate, not a way around it.
+        The composed transaction goes through _send_guarded(), the one path
+        send() takes too, so it meets the same guard and intent gate as
+        anything else — a caller of the gate, not a way around it.
         """
         safe, calldata = self._compose_safe_call(chain, target, value, data)
         return self._send_guarded(
@@ -405,7 +407,8 @@ class Signer:
     def _eoa_gate(self, to: str, value: int, data: str) -> _GateCall:
         """Return the call to gate for an EOA send: the safe's, if it is execTransaction.
 
-        :raises SignerError: an execTransaction that also carries EOA value.
+        :raises SignerError: an execTransaction that also carries EOA value,
+            or one that pays a gas refund, which the gate cannot see.
         """
         inner = safe_module.inner_call(data)
         if inner is None:
@@ -415,20 +418,24 @@ class Signer:
                 "an execTransaction to a safe may not also carry value from the "
                 "EOA; send the value as part of the safe's own call"
             )
-        target, inner_value, inner_data = inner
-        return _GateCall(sender=to, to=target, value=inner_value, data=inner_data)
+        if inner.pays_refund:
+            raise SignerError(
+                "an execTransaction may not pay a gas refund: gasPrice, gasToken "
+                "and refundReceiver must be zero (safe_transaction sets them so)"
+            )
+        return _GateCall(sender=to, to=inner.to, value=inner.value, data=inner.data)
 
     def _simulate(self, chain: str, call: _GateCall) -> intent_module.AssetDiff:
         """Simulate one call at head over the chain's RPC.
 
         :raises intent_module.SimulationUnavailable: the RPC cannot simulate.
         """
+        self._config.chain(chain)  # ValueError: an unknown chain is the caller's
         try:
             w3 = self.w3(chain)
-        except ValueError:
-            raise  # an unknown chain is the caller's mistake, not the RPC's
         except Exception as e:  # pylint: disable=broad-exception-caught
-            # the client is built on first use, and that needs the RPC too
+            # the client is built on first use, and that needs the RPC too: a
+            # garbled eth_chainId answer is a ValueError, and still the RPC's
             raise intent_module.SimulationUnavailable(str(e)) from e
 
         def rpc(method: str, params: list) -> t.Any:

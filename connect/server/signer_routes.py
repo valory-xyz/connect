@@ -29,6 +29,7 @@ import typing as t
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import Field, field_validator
 
+from connect import intent as intent_module
 from connect import settings as settings_config
 from connect import wallet
 from connect.server.auth import GrantRefused, TokenGrant, authorize_route
@@ -82,13 +83,19 @@ class SignMessageRequest(StrictBody):
     digest: str = Field(description="0x-hex 32-byte digest, signed unprefixed")
 
 
-def _dispatch(method: t.Callable[..., str], body: _SendBody, address: str) -> dict:
+def _dispatch(
+    request: Request, method: t.Callable[..., str], body: _SendBody, address: str
+) -> dict:
     """Run one signer method and map its input errors to a 400.
 
     The address is passed positionally: `send` reads it as the EOA's outer
     recipient, `send_via_safe` as the safe's call target — the one field whose
-    meaning the two endpoints deliberately keep distinct.
+    meaning the two endpoints deliberately keep distinct. A value-capped
+    token's intent is `intent.Capped`: no position may leave under it.
     """
+    intent: t.Any = body.intent
+    if request.app.state.grants.value_capped(request.state.auth_token):
+        intent = intent_module.Capped(intent)
     try:
         tx_hash = method(
             body.chain,
@@ -97,7 +104,7 @@ def _dispatch(method: t.Callable[..., str], body: _SendBody, address: str) -> di
             data=body.data,
             request_id=body.request_id,
             gas=body.gas,
-            intent=body.intent,
+            intent=intent,
         )
     except (SignerError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -114,7 +121,7 @@ def _authorize(request: Request, action: str, body: _SendBody | None = None) -> 
 def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
     """Sign and send one transaction from the agent EOA."""
     _authorize(request, "send_transaction", body)
-    return _dispatch(request.app.state.signer.send, body, body.to)
+    return _dispatch(request, request.app.state.signer.send, body, body.to)
 
 
 @router.post("/safe-transaction")
@@ -125,7 +132,7 @@ def safe_transaction(body: SafeTransactionRequest, request: Request) -> dict:
     leaves the safe.
     """
     _authorize(request, "safe_transaction", body)
-    return _dispatch(request.app.state.signer.send_via_safe, body, body.target)
+    return _dispatch(request, request.app.state.signer.send_via_safe, body, body.target)
 
 
 @router.post("/sign-message")

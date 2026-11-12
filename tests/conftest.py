@@ -450,9 +450,12 @@ class FakeProvider:
         self.status = "0x1"
         self.error: dict | None = None
         self.unavailable = False
+        self.symbols: dict[str, str] = {}  # token -> symbol() answer, 0x-hex
 
     def make_request(self, method: str, params: list) -> dict:
-        """Answer eth_simulateV1; nothing else is asked of this provider."""
+        """Answer eth_simulateV1, and a token's symbol() read with no answer."""
+        if method == "eth_call":
+            return {"result": self.symbols.get(params[0]["to"], "0x")}
         assert method == "eth_simulateV1"
         # what the gate's diff depends on: without traceTransfers a real node
         # emits no native Transfer logs, and a plain value send would look

@@ -541,7 +541,8 @@ REFUSED_BEFORE_SIGNING = "The signer refused it before signing; nothing was broa
 REVERTED_BEFORE_SIGNING = (
     "It reverted in simulation before signing; nothing was broadcast."
 )
-# /safe-transaction refusals raised before signing; pinned to the server by a test.
+# /safe-transaction refusals raised before signing, the guard's, the intent
+# gate's and a scoped token's; pinned to the server by a test.
 SIGNER_REFUSALS: dict[int, tuple[str, ...]] = {
     400: (
         "unknown chain '",
@@ -550,9 +551,11 @@ SIGNER_REFUSALS: dict[int, tuple[str, ...]] = {
         "the safe may not call itself ",
         "the operator's guardrail settings do not allow the safe to call ",
         "the guardrail only allows approve(spender=",
+        "refused by the intent gate: ",
     ),
-    401: ("invalid or missing bearer token",),
-    403: ("cross-origin requests are not allowed",),
+    # a scoped token's refusal names its rule: an expired token is a 401
+    401: ("invalid or missing bearer token", "rule 'token-expired': "),
+    403: ("cross-origin requests are not allowed", "rule '"),
     429: ("too many failed authentication attempts",),
 }
 SIGNER_SIMULATION_REVERT = re.compile(r"send failed: .*execution reverted", re.DOTALL)

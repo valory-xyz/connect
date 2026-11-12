@@ -28,6 +28,8 @@ from mech_client import OffchainRequestRejected
 
 from connect import mech_nonces
 from connect.mech_nonces import NonceAllocator, NonceRefused, send_with_nonce
+from connect.mech_types import MechError, MechNotSent
+from connect.signer import SignerError
 
 SAFE = "0x" + "22" * 20
 MECH_A = "0x" + "a1" * 20
@@ -75,6 +77,13 @@ def salt_of(allocator: NonceAllocator, nonce: int) -> str | None:
     """Return the salt persisted with a held slot, or None if n is free."""
     slot = held(allocator, nonce)
     return None if slot is None else slot["salt"]
+
+
+def _sync(allocator: NonceAllocator, map_nonces: int) -> None:
+    """Re-read mapNonces for the test safe, as every reserve does."""
+    key = allocator.key("gnosis", SAFE)
+    # pylint: disable-next=protected-access
+    allocator._sync(key, allocator._queue(key), map_nonces)
 
 
 def reject(status: int, reason: str = "no", nonce: int = 0) -> OffchainRequestRejected:
@@ -170,12 +179,41 @@ def test_taken_resolves_our_unknown_or_stalls(allocator: NonceAllocator) -> None
 def test_an_overdue_slot_stalls_the_queue(
     allocator: NonceAllocator, clock: Clock
 ) -> None:
-    """Accepted but never settled within the settle timeout: stop sending."""
+    """Timed out, then not settled within the settle timeout: stop sending.
+
+    The settle clock starts when the request's own response timeout ends, or
+    at its delivery if that came first: a mech still working within its time
+    stalls nothing.
+    """
     with take(allocator, 5) as slot:
         slot.answered("accepted", mech=MECH_A, salt="")
+    clock.now += mech_nonces.RESPONSE_TIMEOUT_SECONDS
+    _sync(allocator, 5)
+    assert not allocator.stalled("gnosis", SAFE)  # still within the settle time
     clock.now += 61
-    allocator.sync("gnosis", SAFE, 5)
+    _sync(allocator, 5)
     assert allocator.stalled("gnosis", SAFE)
+
+
+def test_a_delivery_starts_the_settle_clock(
+    tmp_path: Path, allocator: NonceAllocator, clock: Clock
+) -> None:
+    """Delivered, then not settled within the settle timeout: stop sending."""
+    with take(allocator, 5) as slot:
+        slot.answered("accepted", mech=MECH_A, salt="")
+    clock.now += 10
+    allocator.delivered("gnosis", SAFE, [5, 9])  # 9 is not held: ignored
+    assert held(allocator, 5)["delivered_at"] == clock.now  # type: ignore[index]
+    clock.now += 50
+    allocator.delivered("gnosis", SAFE, [5])  # a second sighting keeps the first
+    clock.now += 11
+    _sync(allocator, 5)
+    assert allocator.stalled("gnosis", SAFE)
+    restarted = NonceAllocator(tmp_path, clock=clock, sleep=clock.sleep)
+    queue = restarted._queue(  # pylint: disable=protected-access
+        restarted.key("gnosis", SAFE)
+    )
+    assert queue.slots[5].delivered_at == 1010.0
 
 
 def test_queues_survive_a_restart(tmp_path: Path, clock: Clock) -> None:
@@ -275,10 +313,10 @@ def test_send_with_nonce_retries_a_gap_then_succeeds(
 def test_send_with_nonce_refuses_a_persistent_gap(
     allocator: NonceAllocator, clock: Clock
 ) -> None:
-    """After MAX_GAP_RETRIES the request is refused as mech-nonce-gap; n is free."""
-    answers = [reject(503)] * (mech_nonces.MAX_GAP_RETRIES + 1)
+    """After gap_retries resends the request is refused as mech-nonce-gap; n is free."""
+    answers = [reject(503)] * (mech_nonces.DEFAULT_MECH_GAP_RETRIES + 1)
     sent, error = _send(allocator, answers, clock)
-    assert len(sent) == mech_nonces.MAX_GAP_RETRIES + 1
+    assert len(sent) == mech_nonces.DEFAULT_MECH_GAP_RETRIES + 1
     assert isinstance(error, NonceRefused)
     assert error.rule == "mech-nonce-gap"
     assert salt_of(allocator, 5) is None
@@ -348,11 +386,11 @@ def test_the_settle_timeout_boundary_and_an_overdue_unknown(
     """Exactly at the timeout is not overdue; past it, accepted or unknown stalls."""
     with take(allocator, 5) as slot:
         slot.answered("unknown", mech=MECH_A, salt="")
-    clock.now += 60
-    allocator.sync("gnosis", SAFE, 5)
+    clock.now += mech_nonces.RESPONSE_TIMEOUT_SECONDS + 60
+    _sync(allocator, 5)
     assert not allocator.stalled("gnosis", SAFE)
     clock.now += 1
-    allocator.sync("gnosis", SAFE, 5)
+    _sync(allocator, 5)
     assert allocator.stalled("gnosis", SAFE)  # a lost POST stalls, not wedges
 
 
@@ -394,16 +432,41 @@ def test_an_unwritable_store_refuses_requests_not_answers(
     allocator: NonceAllocator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed write never fails an accepted request; it stops the next one."""
+    real_write = Path.write_text
+    writes: list[int] = []
+
+    def full_after_one(self: Path, *args: t.Any, **kwargs: t.Any) -> int:
+        writes.append(1)
+        if len(writes) > 1:
+            raise OSError(28, "No space left on device")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", full_after_one)
+    with take(allocator, 5) as slot:  # the placeholder is on disk
+        slot.answered("accepted", mech=MECH_A, salt="")  # does not raise
+    with pytest.raises(NonceRefused) as refused:
+        _enter(take(allocator, 6))
+    assert refused.value.rule == "mech-queue-unwritable"
+
+
+def test_a_placeholder_that_cannot_be_saved_is_never_sent(
+    allocator: NonceAllocator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Held only in memory, n would be reissued after a restart: refuse first."""
 
     def full(*_args: t.Any, **_kwargs: t.Any) -> None:
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(Path, "write_text", full)
-    with take(allocator, 5) as slot:
-        slot.answered("accepted", mech=MECH_A, salt="")  # does not raise
-    with pytest.raises(NonceRefused) as refused:
+    with pytest.raises(NonceRefused) as refused:  # before the body would run
         _enter(take(allocator, 5))
     assert refused.value.rule == "mech-queue-unwritable"
+    assert (
+        allocator._queue(  # pylint: disable=protected-access
+            allocator.key("gnosis", SAFE)
+        ).slots
+        == {}
+    )
 
 
 @pytest.mark.parametrize(
@@ -419,3 +482,32 @@ def test_a_wrong_shaped_queue_file_is_unreadable(
     with pytest.raises(NonceRefused) as refused:
         _enter(take(allocator, 5))
     assert refused.value.rule == "mech-queue-unreadable"
+
+
+def test_offchain_send_tells_a_failure_before_the_post_apart() -> None:
+    """Before mech-client's pre-sign hook nothing was sent; after it, maybe."""
+    seen: list[tuple] = []
+
+    def failing(before_hook: bool, error: Exception) -> t.Callable[..., dict]:
+        def send(on_request_id: t.Callable[..., None]) -> dict:
+            if not before_hook:
+                on_request_id(b"id", 5)
+            raise error
+
+        return send
+
+    with pytest.raises(MechNotSent, match="not sent: rpc"):
+        mech_nonces.offchain_send(failing(True, ConnectionError("rpc")), seen.append)
+    with pytest.raises(ConnectionError):  # the POST may have reached the mech
+        mech_nonces.offchain_send(
+            failing(False, ConnectionError("rpc")), lambda *a: seen.append(a)
+        )
+    assert seen == [(b"id", 5)]
+    for refused in (MechError("id mismatch"), SignerError("guard")):
+        with pytest.raises(MechNotSent):  # Connect's own refusals precede the POST
+            mech_nonces.offchain_send(failing(False, refused), lambda *a: None)
+    with pytest.raises(OffchainRequestRejected):  # the mech's answer: mapped later
+        mech_nonces.offchain_send(failing(False, reject(401)), lambda *a: None)
+    assert mech_nonces.offchain_send(lambda on_request_id: {"ok": 1}, print) == {
+        "ok": 1
+    }

@@ -65,8 +65,10 @@ def _message(data: t.Any) -> t.Any:
             break
     if isinstance(data, dict) and isinstance(data.get("choices"), list):
         choices = data["choices"]
-        if choices and isinstance(choices[0], dict):
-            return {**data, **(choices[0].get("message") or {})}
+        first = choices[0] if choices else None
+        message = first.get("message") if isinstance(first, dict) else None
+        if isinstance(message, dict):  # an untrusted delivery: any shape
+            return {**data, **message}
     return data
 
 

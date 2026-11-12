@@ -17,13 +17,20 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Shared between connect/mech.py and connect/mech_allowances.py."""
+"""Errors and shapes shared by connect/mech.py, mech_allowances.py and mech_nonces.py."""
 
 import typing as t
 
 
 class MechError(Exception):
     """A mech request failure with an agent-facing message."""
+
+
+class MechNotSent(MechError):
+    """A request refused or failed before anything reached the mech.
+
+    Nothing was paid for, so a caller's request_id is free to use again.
+    """
 
 
 class MechUnknownRequest(MechError):
@@ -64,3 +71,40 @@ class PendingDelivery(t.NamedTuple):
     service_id: int
     offchain: bool
     from_block: int | None
+
+
+class MetadataRead(t.NamedTuple):
+    """A service-metadata read: the document, or why it could not be read.
+
+    The reason travels with the result because the two failure modes it
+    separates need opposite responses — a gateway that timed out may well
+    answer on the next call, while a mech that never published metadata never
+    will — and nothing downstream can tell them apart from a bare ``None``.
+    """
+
+    document: dict | None
+    error: str | None
+
+
+def offchain_blocker(read: MetadataRead) -> str | None:
+    """Why this mech cannot serve an off-chain request, or None if it can.
+
+    The off-chain flow resolves the mech's endpoint from the ``url`` field of
+    the service metadata, so a document we cannot read and a document without
+    a ``url`` both rule the flow out entirely — but they earn different advice,
+    which is why each reason carries its own. A mech that published no ``url``
+    never will serve off-chain; a fetch that failed may simply succeed next
+    time, and sending that one on-chain spends gas to avoid a retry.
+    """
+    if read.document is None:
+        cause = read.error or "no cause reported"
+        # "may be" is load-bearing: nothing here distinguishes a mech that
+        # never published from a gateway that was briefly slow.
+        return (
+            f"metadata unreadable ({cause}); may be transient or never "
+            "published — retry before paying to send this on-chain"
+        )
+    url = read.document.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return "no 'url' in metadata; this mech serves on-chain requests only"
+    return None

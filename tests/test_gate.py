@@ -19,6 +19,7 @@
 
 """The intent gate at the signing choke point, and the read tools."""
 
+import json
 import typing as t
 
 import pytest
@@ -237,12 +238,13 @@ class TestSignerGate:
         )
 
         calldata = safe_module.exec_transaction(
-            target=EOA, value=7, data="0x", owner=test_signer.address
+            target=EOA, value=7, data="0xabcdef", owner=test_signer.address
         )
         with pytest.raises(SignerError, match="'missing-intent'"):
             test_signer.send("testchain", SAFE, data=calldata)
         assert fake_w3.provider.simulated[-1]["from"] == SAFE
         assert fake_w3.provider.simulated[-1]["to"] == EOA
+        assert fake_w3.provider.simulated[-1]["data"] == "0xabcdef"
         test_signer.send("testchain", SAFE, data=calldata, intent=pay(EOA, 7))
         assert len(fake_w3.eth.sent) == 1
         with pytest.raises(SignerError, match="may not also carry value"):
@@ -250,6 +252,31 @@ class TestSignerGate:
                 "testchain", SAFE, value=1, data=calldata, intent=pay(EOA, 7)
             )
         assert safe_module.inner_call("0x6a761202" + "zz") is None
+
+    @pytest.mark.parametrize("field", [6, 7, 8])
+    def test_an_eoa_exec_transaction_may_not_pay_a_gas_refund(
+        self, test_signer: Signer, fake_w3: FakeW3, field: int
+    ) -> None:
+        """A refund in gasToken to refundReceiver is paid outside the inner call.
+
+        The gate simulates only the inner call, so a refund would move the
+        safe's assets unseen: gasPrice, gasToken and refundReceiver must be 0.
+        """
+        from eth_abi import encode  # pylint: disable=import-outside-toplevel
+
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        args: list = [EOA, 0, b"", 0, 0, 0, 0, safe_module.ZERO_ADDRESS]
+        args += [safe_module.ZERO_ADDRESS, b""]
+        args[field] = 10**18 if field == 6 else EOA
+        calldata = "0x" + safe_module.EXEC_TRANSACTION_SELECTOR
+        calldata += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()
+        with pytest.raises(SignerError, match="may not pay a gas refund"):
+            test_signer.send("testchain", SAFE, data=calldata, intent={})
+        assert fake_w3.provider.simulated == []
+        assert fake_w3.eth.sent == []
 
     def test_the_guard_answers_before_anything_is_simulated(
         self, test_signer: Signer, fake_w3: FakeW3, guard: Guard
@@ -277,6 +304,23 @@ class TestSignerGate:
         monkeypatch.setattr(fake_w3.provider, "make_request", lambda m, p: {})
         with pytest.raises(SignerError, match="no result in the answer"):
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
+
+    def test_a_garbled_answer_building_the_client_is_the_rpcs_fault(
+        self, test_signer: Signer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """eth_chainId answering non-JSON is a ValueError, but not the caller's."""
+
+        def garbled(chain: str) -> t.Any:
+            raise json.JSONDecodeError("Expecting value", "<html>", 0)
+
+        monkeypatch.setattr(test_signer, "w3", garbled)
+        reason, problems = test_signer.check(
+            "testchain", EOA, value=1, intent=pay(EOA, 1)
+        )
+        assert "'simulation-unavailable'" in str(reason)
+        assert problems[0]["rule"] == "simulation-unavailable"
+        with pytest.raises(ValueError, match="mystery"):  # an unknown chain is
+            test_signer.simulate("mystery", EOA, via_safe=False)
 
 
 class TestSimulate:

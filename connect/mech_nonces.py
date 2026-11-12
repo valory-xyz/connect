@@ -47,17 +47,24 @@ from pathlib import Path
 
 from mech_client import OffchainRequestRejected
 
+from connect.config import DEFAULT_MECH_GAP_RETRIES, DEFAULT_MECH_SETTLE_TIMEOUT
+from connect.mech_types import MechError, MechNotSent
+from connect.signer import SignerError
+
 logger = logging.getLogger("agent")
 
 NONCES_FILE = "mech_nonces.json"
 # how often a waiting reserve re-reads mapNonces
 POLL_SECONDS = 2.0
-# an accepted slot whose delivery should have settled by now but has not
-DEFAULT_SETTLE_TIMEOUT = 1800.0
+# a held slot whose delivery is done, or timed out, but mapNonces has not
+# passed it within this many seconds stalls its queue
+DEFAULT_SETTLE_TIMEOUT = float(DEFAULT_MECH_SETTLE_TIMEOUT)
+# mech-client writes responseTimeout=300 into every request: past that the
+# mech is out of time by the request's own terms, so its delivery timed out
+RESPONSE_TIMEOUT_SECONDS = 300.0
 
 # a 503 is a nonce gap behind a slot still settling: resend the same nonce and
 # id this many times, this far apart, then refuse as mech-nonce-gap
-MAX_GAP_RETRIES = 3
 GAP_RETRY_SECONDS = 2.0
 # the mech's 401 for a stale or duplicate nonce, verbatim: n is taken
 NONCE_TAKEN_REASON = "wire nonce below sender's next expected slot"
@@ -89,6 +96,17 @@ class _Slot:
     mech: str
     salt: str
     at: float
+    delivered_at: float | None = None
+
+    def settle_from(self) -> float:
+        """Return when mapNonces should start to pass this slot.
+
+        That is its delivery, or the end of the mech's response timeout if no
+        delivery was seen first.
+        """
+        if self.delivered_at is not None:
+            return self.delivered_at
+        return self.at + RESPONSE_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -133,12 +151,14 @@ class NonceAllocator:  # pylint: disable=too-many-instance-attributes
         store_path: Path,
         *,
         settle_timeout: float = DEFAULT_SETTLE_TIMEOUT,
+        gap_retries: int = DEFAULT_MECH_GAP_RETRIES,
         clock: t.Callable[[], float] = time.time,
         sleep: t.Callable[[float], None] = time.sleep,
     ) -> None:
         """Load the persisted queues from STORE_PATH."""
         self._path = store_path / NONCES_FILE
         self._settle_timeout = settle_timeout
+        self.gap_retries = gap_retries
         self._clock = clock
         self._sleep = sleep
         self._lock = threading.Lock()
@@ -171,19 +191,31 @@ class NonceAllocator:  # pylint: disable=too-many-instance-attributes
             "until one is accepted again"
         )
 
-    def sync(self, chain: str, safe: str, map_nonces: int) -> None:
-        """Free every slot below mapNonces (settled), and stall an overdue queue.
+    def delivered(self, chain: str, safe: str, nonces: t.Iterable[int]) -> None:
+        """Start the settle clock of each held nonce whose delivery arrived.
 
-        An accepted slot that mapNonces has not passed within the settle
-        timeout means the mech dropped or never settled it: later nonces would
-        gap behind it, so the queue stalls until a probe at mapNonces is
-        accepted again.
+        mapNonces should pass a delivered request soon after; one it has not
+        passed within the settle timeout stalls the queue (see _sync).
         """
         key = self.key(chain, safe)
         queue = self._queue(key)
-        self._sync(key, queue, map_nonces)
+        now = self._clock()
+        with self._lock:
+            marked = [n for n in nonces if n in queue.slots]
+            for nonce in marked:
+                if queue.slots[nonce].delivered_at is None:
+                    queue.slots[nonce].delivered_at = now
+        if marked:
+            self._save()
 
     def _sync(self, key: str, queue: _Queue, map_nonces: int) -> None:
+        """Free every slot below mapNonces (settled), and stall an overdue queue.
+
+        A held slot whose delivery is done or timed out, and that mapNonces has
+        not passed within the settle timeout, means the mech dropped or never
+        settled it: later nonces would gap behind it, so the queue stalls until
+        a probe at mapNonces is accepted again.
+        """
         now = self._clock()
         settled = [n for n in queue.slots if n < map_nonces]
         for nonce in settled:
@@ -192,7 +224,8 @@ class NonceAllocator:  # pylint: disable=too-many-instance-attributes
         # whose answer was lost) nothing resolved: later nonces would gap
         # behind it, so the queue probes at mapNonces until one is accepted
         overdue = any(
-            now - slot.at > self._settle_timeout for slot in queue.slots.values()
+            now - slot.settle_from() > self._settle_timeout
+            for slot in queue.slots.values()
         )
         if overdue and not queue.stalled:
             logger.warning("mech nonce queue %s stalled: a slot never settled", key)
@@ -246,6 +279,9 @@ class NonceAllocator:  # pylint: disable=too-many-instance-attributes
             prior = queue.slots.get(nonce)  # held already only for a probe
             queue.slots[nonce] = _Slot(UNKNOWN, mech.lower(), salt, self._clock())
             self._save()
+            if self._unwritable:  # held in memory only: a restart would reissue n
+                self._restore(queue, nonce, prior)
+                self._check_readable()  # raises mech-queue-unwritable
             reservation = Reservation(self, key, nonce, prior)
             try:
                 yield reservation
@@ -369,7 +405,13 @@ class NonceAllocator:  # pylint: disable=too-many-instance-attributes
             queues = {
                 key: _Queue(
                     slots={
-                        int(n): _Slot(s["state"], s["mech"], s["salt"], float(s["at"]))
+                        int(n): _Slot(
+                            s["state"],
+                            s["mech"],
+                            s["salt"],
+                            float(s["at"]),
+                            _optional_time(s.get("delivered_at")),
+                        )
                         for n, s in entry.get("slots", {}).items()
                     },
                     stalled=bool(entry.get("stalled")),
@@ -409,6 +451,7 @@ class NonceAllocator:  # pylint: disable=too-many-instance-attributes
                         "mech": s.mech,
                         "salt": s.salt,
                         "at": s.at,
+                        "delivered_at": s.delivered_at,
                     }
                     for n, s in sorted(dict(queue.slots).items())
                 },
@@ -418,6 +461,10 @@ class NonceAllocator:  # pylint: disable=too-many-instance-attributes
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
         tmp.replace(self._path)
+
+
+def _optional_time(raw: t.Any) -> float | None:
+    return None if raw is None else float(raw)
 
 
 def outcome_of(rejection: OffchainRequestRejected) -> Outcome:
@@ -431,12 +478,53 @@ def outcome_of(rejection: OffchainRequestRejected) -> Outcome:
     return UNKNOWN
 
 
+ANSWER_UNKNOWN_RULE = "mech-answer-unknown"
 REJECTION_RULES = {
     "retry": "mech-nonce-gap",
     "taken": "mech-nonce-taken",
     "not_accepted": "mech-request-rejected",
-    "unknown": "mech-answer-unknown",
+    "unknown": ANSWER_UNKNOWN_RULE,
 }
+
+
+def not_sent_on_error(read: t.Callable[[], int]) -> t.Callable[[], int]:
+    """Wrap a mapNonces read: an RPC failure there means nothing was sent."""
+
+    def wrapped() -> int:
+        try:
+            return read()
+        except Exception as e:
+            raise MechNotSent(f"could not read the marketplace nonce: {e}") from e
+
+    return wrapped
+
+
+def offchain_send(
+    send: t.Callable[..., dict], on_request_id: t.Callable[..., None]
+) -> dict:
+    """Send one off-chain request, telling a failure before the POST apart.
+
+    mech-client calls `on_request_id` just before it signs, so whatever fails
+    before that call has not reached the mech; Connect's own refusals (the
+    hook's id check, the signer) come before the POST too. Those raise
+    MechNotSent, and leave the nonce free. Anything else may have reached it.
+    """
+    hooked: list[bool] = []
+
+    def hook(*args: t.Any) -> None:
+        hooked.append(True)
+        on_request_id(*args)
+
+    try:
+        return send(on_request_id=hook)
+    except (MechError, SignerError) as e:
+        raise MechNotSent(str(e)) from e
+    except OffchainRequestRejected:
+        raise
+    except Exception as e:
+        if not hooked:
+            raise MechNotSent(f"mech request not sent: {e}") from e
+        raise
 
 
 def send_with_nonce(  # pylint: disable=too-many-arguments
@@ -455,7 +543,7 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
     """Reserve a nonce, send with it, and record what the mech answered.
 
     A 503 resends the same nonce (and, the salt being kept, the same id) up
-    to MAX_GAP_RETRIES times. An exception in `not_sent` was raised before
+    to the allocator's gap_retries times. An exception in `not_sent` was raised before
     anything was signed, so the nonce is free again; any other failure (a
     transport error) leaves the slot held, since the mech may have stored it.
 
@@ -464,12 +552,12 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
     with allocator.reserve(
         chain, safe, mech, read_map_nonces, timeout=timeout, salt=salt
     ) as slot:
-        for attempt in range(MAX_GAP_RETRIES + 1):
+        for attempt in range(allocator.gap_retries + 1):
             try:
                 result = send(slot.nonce)
             except OffchainRequestRejected as e:
                 outcome = outcome_of(e)
-                if outcome == "retry" and attempt < MAX_GAP_RETRIES:
+                if outcome == "retry" and attempt < allocator.gap_retries:
                     sleep(GAP_RETRY_SECONDS)
                     continue
                 slot.answered(

@@ -29,17 +29,19 @@ import asyncio
 import typing as t
 
 from hexbytes import HexBytes
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from connect import chain_read
+from connect import intent as intent_module
 from connect import settings as settings_config
 from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
+from connect.server.auth import VALUE_CAPPED
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer
@@ -102,6 +104,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         data: str = "0x",
         *,
         intent: dict | None = None,
+        ctx: Context | None = None,
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
@@ -127,7 +130,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             address=target,
             value=value,
             data=data,
-            intent=intent,
+            intent=_for_token(ctx, intent),
             request_id=request_id,
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
@@ -141,6 +144,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         data: str = "0x",
         *,
         intent: dict | None = None,
+        ctx: Context | None = None,
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
@@ -158,7 +162,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             address=to,
             value=value,
             data=data,
-            intent=intent,
+            intent=_for_token(ctx, intent),
             request_id=request_id,
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
@@ -173,6 +177,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         *,
         via_safe: bool = True,
         intent: dict | None = None,
+        ctx: Context | None = None,
     ) -> dict:
         """Ask whether a call would be permitted, before you build on it.
 
@@ -190,7 +195,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             value=value,
             data=data,
             via_safe=via_safe,
-            intent=intent,
+            intent=_for_token(ctx, intent),
         )
         if reason is None:
             return {"allowed": True}
@@ -208,10 +213,12 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         *,
         via_safe: bool = True,
         intent: dict | None = None,
+        ctx: Context | None = None,
     ) -> dict:
         """Simulate a call at head and say what it does to the safe's assets.
 
-        Returns the asset diff — `native` and `tokens` deltas, `recipients`
+        Returns the asset diff — `native` and `tokens` deltas (each token with
+        its `symbol`, display only), `recipients`
         (each with `contract`), `approvals`, ERC-721/1155 `positions`,
         `called` (the target plus every contract that emitted a log; one
         called without emitting is not listed), `revert`, `gas_used` — with
@@ -226,7 +233,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             value=value,
             data=data,
             via_safe=via_safe,
-            intent=intent,
+            intent=_for_token(ctx, intent),
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -403,6 +410,22 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     return mcp
 
 
+def _for_token(ctx: Context | None, intent: dict | None) -> t.Any:
+    """Return the intent the gate holds this call to, for the calling token.
+
+    The MCP mount marks a value-capped token's request; its intent is then
+    `intent.Capped`, so the gate refuses any position the call moves out.
+    """
+    try:
+        request = ctx.request_context.request if ctx is not None else None
+    except ValueError:  # no request: called in-process, not through the mount
+        request = None
+    state = getattr(request, "state", None)
+    if getattr(state, VALUE_CAPPED, False):
+        return intent_module.Capped(intent)
+    return intent
+
+
 async def _dispatch(  # pylint: disable=too-many-arguments
     method: t.Callable[..., str],
     signer: Signer,
@@ -411,7 +434,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     address: str,
     value: int,
     data: str,
-    intent: dict | None,
+    intent: t.Any,
     request_id: str | None,
     wait_for_receipt: bool,
     timeout: int,

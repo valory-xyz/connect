@@ -57,16 +57,26 @@ from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances, OffchainDigests, read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
 from connect.mech_chat import chat_report, is_chat_prompt
-from connect.mech_nonces import NonceAllocator, NonceRefused, send_with_nonce
+from connect.mech_nonces import (
+    ANSWER_UNKNOWN_RULE,
+    NonceAllocator,
+    NonceRefused,
+    not_sent_on_error,
+    offchain_send,
+    send_with_nonce,
+)
 from connect.mech_rpc import RPC_LOCK, listing_mechs
 from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
 from connect.mech_types import (
     MechError,
+    MechNotSent,
     MechUnknownRequest,
+    MetadataRead,
     PendingDelivery,
     PricedMech,
     SPEND_UNCERTAIN,
+    offchain_blocker,
 )
 from connect.signer import Signer, SignerError
 
@@ -120,43 +130,6 @@ def _request_key(request_id: object) -> str:
     return str(request_id).lower().removeprefix("0x")
 
 
-class MetadataRead(t.NamedTuple):
-    """A service-metadata read: the document, or why it could not be read.
-
-    The reason travels with the result because the two failure modes it
-    separates need opposite responses — a gateway that timed out may well
-    answer on the next call, while a mech that never published metadata never
-    will — and nothing downstream can tell them apart from a bare ``None``.
-    """
-
-    document: dict | None
-    error: str | None
-
-
-def _offchain_blocker(read: MetadataRead) -> str | None:
-    """Why this mech cannot serve an off-chain request, or None if it can.
-
-    The off-chain flow resolves the mech's endpoint from the ``url`` field of
-    the service metadata, so a document we cannot read and a document without
-    a ``url`` both rule the flow out entirely — but they earn different advice,
-    which is why each reason carries its own. A mech that published no ``url``
-    never will serve off-chain; a fetch that failed may simply succeed next
-    time, and sending that one on-chain spends gas to avoid a retry.
-    """
-    if read.document is None:
-        cause = read.error or "no cause reported"
-        # "may be" is load-bearing: nothing here distinguishes a mech that
-        # never published from a gateway that was briefly slow.
-        return (
-            f"metadata unreadable ({cause}); may be transient or never "
-            "published — retry before paying to send this on-chain"
-        )
-    url = read.document.get("url")
-    if not isinstance(url, str) or not url.strip():
-        return "no 'url' in metadata; this mech serves on-chain requests only"
-    return None
-
-
 class MechService:  # pylint: disable=too-many-instance-attributes
     """Per-chain mech-client marketplace services over the guarded signer."""
 
@@ -175,7 +148,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         self._pending: dict[str, PendingDelivery] = {}
         self._requests = RequestLedger()
         # Connect, not mech-client, allocates off-chain nonces
-        self._nonces = NonceAllocator(config.store_path)
+        self._nonces = NonceAllocator(
+            config.store_path,
+            settle_timeout=config.mech_settle_timeout,
+            gap_retries=config.mech_gap_retries,
+        )
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
@@ -330,7 +307,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             info["tools_note"] = "tool metadata unreadable; a known tool still works"
         else:
             info["tools_note"] = "metadata lists no tools; a known tool still works"
-        blocker = _offchain_blocker(read)
+        blocker = offchain_blocker(read)
         info["offchain_capable"] = blocker is None
         if blocker is not None:
             info["offchain_note"] = blocker
@@ -456,7 +433,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 return merged
             payload = attempt()
         except Exception as e:
-            if planned is not None:
+            if planned is not None and not isinstance(e, MechNotSent):
                 self._requests.complete(
                     request_id,
                     self._uncertain(planned, e, request_id),
@@ -603,7 +580,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # problem. Most listed mechs publish no endpoint at all, so decide
             # it here, before any payment, and name the flow that does work.
             read = self._service_metadata(service, service_id)
-            blocker = _offchain_blocker(read)
+            blocker = offchain_blocker(read)
             if blocker is not None:
                 self._blocked(chain, tool, "offchain-unreachable", blocker)
                 raise MechError(
@@ -673,10 +650,26 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         try:
             result = self._send(plan, prompt, timeout)
         except NonceRefused as e:
-            self._blocked(plan.chain, plan.tool, e.rule, e.detail)
             safe = t.cast(str, self._config.chain(plan.chain).safe_address)
             note = self._nonces.stall_note(plan.chain, safe)
-            raise MechError(f"rule '{e.rule}': {e}{note}") from e
+            if e.rule == ANSWER_UNKNOWN_RULE:  # the mech may hold it: not a refusal
+                self._activity.record(
+                    "mech_request_failed",
+                    chain=plan.chain,
+                    tool=plan.tool,
+                    request_id=request_id,
+                    error=str(e),
+                )
+                raise MechError(f"rule '{e.rule}': {e}{note}") from e
+            self._activity.record(
+                "refusal",
+                rule=e.rule,
+                chain=plan.chain,
+                tool=plan.tool,
+                request_id=request_id,
+                reason=str(e),
+            )
+            raise MechNotSent(f"rule '{e.rule}': {e}{note}") from e
         except (MechError, SignerError):
             raise
         except Exception as e:
@@ -713,7 +706,18 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # nothing in the signed request expires it (mech-client sends no
             # deadline): it can settle whenever the mech delivers it
             payload["expires"] = None
-            self._resume_watch(payload, deadline)
+        self._resume_watch(payload, deadline)
+        if plan.offchain is not None:  # a delivery starts the settle clock
+            by_key = zip(
+                map(_request_key, result.get("request_ids") or []),
+                result.get("nonces") or [],
+            )
+            got = payload.get("delivery_results") or {}
+            self._nonces.delivered(
+                plan.chain,
+                t.cast(str, self._config.chain(plan.chain).safe_address),
+                [nonce for key, nonce in by_key if key in got],
+            )
         if is_chat_prompt(prompt):
             for data in (payload.get("delivery_results") or {}).values():
                 chat = chat_report(data)
@@ -724,14 +728,21 @@ class MechService:  # pylint: disable=too-many-instance-attributes
     def _resume_watch(self, payload: dict, deadline: float) -> None:
         """Spend the rest of the caller's wait on deliveries, off the nonce lock.
 
-        The off-chain send waits only ACK_WAIT_SECONDS under the queue's lock,
-        so other requests from the safe queue for its POST, not its delivery.
+        Both sends wait only ACK_WAIT_SECONDS under the queue's lock, so other
+        requests from the safe queue for a send, not for its delivery. The
+        request is paid for by now: a failed read keeps its id pending, with
+        the cause in `watch_errors`, and never loses the payload.
         """
         for key in list(payload.get("pending_request_ids") or []):
             remaining = deadline - time.monotonic()
             if remaining < 1:
-                return
-            report = self.result(key, timeout=remaining)
+                break
+            try:
+                report = self.result(key, timeout=remaining)
+            except MechError as e:
+                logger.warning("could not read the delivery for %s: %s", key, e)
+                payload.setdefault("watch_errors", {})[key] = str(e)
+                continue
             if report.get("delivered"):
                 payload.setdefault("delivery_results", {})[key] = report["result"]
                 payload["pending_request_ids"].remove(key)
@@ -756,29 +767,33 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 )
             )
 
+        # a short wait under the queue's lock; _resume_watch spends the rest
+        wait = min(timeout, ACK_WAIT_SECONDS)
         if plan.offchain is None:  # on-chain takes mapNonces itself: none held
-            # pylint: disable-next=protected-access
-            contract = plan.service._get_marketplace_contract()
+            try:
+                # pylint: disable-next=protected-access
+                contract = plan.service._get_marketplace_contract()
+            except Exception as e:
+                raise MechNotSent(f"could not read the marketplace: {e}") from e
             with self._nonces.exclusive(
                 plan.chain,
                 safe,
-                lambda: read_map_nonces(contract, safe),
+                not_sent_on_error(lambda: read_map_nonces(contract, safe)),
                 timeout=timeout,
             ):
-                return send(timeout)
-        hook, salt = plan.offchain.on_request_id, (plan.extra_attributes or {})["nonce"]
+                return send(wait)
+        offchain, salt = plan.offchain, (plan.extra_attributes or {})["nonce"]
         return send_with_nonce(
             self._nonces,
             chain=plan.chain,
             safe=safe,
             mech=plan.priced.mech,
             salt=str(salt),
-            read_map_nonces=plan.offchain.map_nonces,
-            # a short wait under the lock; _resume_watch spends the rest
-            send=lambda nonce: send(
-                min(timeout, ACK_WAIT_SECONDS), nonces=[nonce], on_request_id=hook
+            read_map_nonces=not_sent_on_error(offchain.map_nonces),
+            send=lambda nonce: offchain_send(
+                lambda **kw: send(wait, nonces=[nonce], **kw), offchain.on_request_id
             ),
-            not_sent=(MechError, SignerError),
+            not_sent=(MechNotSent,),
             timeout=timeout,
         )
 

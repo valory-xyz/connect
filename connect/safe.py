@@ -32,6 +32,8 @@ no safe nonce appears anywhere here. Nothing is signed over it, so nobody has
 to predict it; the Safe reads and increments its own.
 """
 
+import typing as t
+
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from web3 import Web3
@@ -180,20 +182,37 @@ def decode_deposit(data: str) -> int | None:
     return int(amount)
 
 
-def inner_call(data: str) -> tuple[str, int, str] | None:
-    """Return the (to, value, data) an execTransaction makes, or None if not one.
+class InnerCall(t.NamedTuple):
+    """The call an execTransaction makes, and whether it pays a gas refund."""
+
+    to: str
+    value: int
+    data: str
+    pays_refund: bool
+
+
+def inner_call(data: str) -> InnerCall | None:
+    """Return the call an execTransaction makes, or None if not one.
 
     The intent gate simulates this call as the safe whatever path sends it:
     an EOA transaction to the safe carrying execTransaction moves the safe's
-    assets, not the EOA's.
+    assets, not the EOA's. `pays_refund` is set when any gas-refund field is:
+    the safe would then also pay gasPrice per gas in gasToken to
+    refundReceiver, which the inner call's simulation does not show.
     """
     calldata = (data or "0x").removeprefix("0x").lower()
     if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
         return None
     try:
-        target, value, inner, *_ = abi_decode(
-            EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:])
-        )
+        decoded = tuple(abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:])))
     except Exception:  # pylint: disable=broad-exception-caught
         return None  # the guard refuses calldata it cannot decode first
-    return str(target), int(value), "0x" + bytes(inner).hex()
+    target, value, inner, _, _, _, gas_price, gas_token, refund_receiver, _ = decoded
+    return InnerCall(
+        to=str(target),
+        value=int(value),
+        data="0x" + bytes(inner).hex(),
+        pays_refund=bool(gas_price)
+        or str(gas_token).lower() != ZERO_ADDRESS
+        or str(refund_receiver).lower() != ZERO_ADDRESS,
+    )

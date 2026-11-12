@@ -105,10 +105,13 @@ POST /tokens  (Authorization: Bearer <your token>)
 ```
 
 It answers `{token, grant}`. Scopes are `read`, `mech` and `tx`; caps are per
-token (`"native"` or a lower-case address) in base units, checked against the
-spend the call's intent declares; `max_mech_payment` caps `mech_request`'s
-`max_payment`. A token can only mint a narrower one. Anything outside a token's
-grant is refused naming the rule (`token-scope`, `token-cap-per-tx`, ...).
+token (`"native"` or a token address) in base units, checked against the
+spend and the approvals the call's intent declares; `max_mech_payment` caps
+`mech_request`'s `max_payment`. A token with a value cap cannot do what a cap
+cannot bound: sign a raw digest, approve more than its cap, or move an NFT or
+outcome-token position out of the safe. A token can only mint a narrower one.
+Anything outside a token's grant is refused naming the rule (`token-scope`,
+`token-cap-per-tx`, `token-cap-positions`, ...).
 
 ## The guardrail
 
@@ -243,11 +246,18 @@ the sender the send will really have:
 ```python
 token = w3.eth.contract(address=usdc, abi=ERC20_ABI)
 token.functions.balanceOf(w3.eth.default_account).call()        # read
-tx_hash = token.functions.approve(spender, amount).transact()   # sent by the safe
+data = token.encode_abi("approve", args=[spender, amount])      # calldata only
+tx_hash = signer.send_transaction(                              # sent by the safe
+    {"to": usdc, "data": data},
+    intent={"approvals": [{"token": usdc.lower(), "spender": spender.lower(), "amount": amount}]},
+)
 ```
 
-`signer.send_transaction({...})` is the same send one layer down, and the one
-to reach for when you need to pass a `request_id` (below).
+A call that moves value needs an intent, and only `signer.send_transaction`
+carries one. `.transact()` and `w3.eth.send_transaction` send the bare call,
+so they work only for calls that move nothing of the safe's; anything else is
+refused as `missing-intent`. `signer.send_transaction` is also the one to
+reach for when you need to pass a `request_id` (below).
 
 Two things `connect()` handles that hand-rolled web3 code gets wrong: PoA
 chains (Polygon above all) pad `extraData` past 32 bytes and break every block

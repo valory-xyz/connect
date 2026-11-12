@@ -191,13 +191,23 @@ the refusal and recorded as an activity `refusal` entry: `reverts`,
 `bad-intent`, `missing-intent`, `overspend`, `receive-min`,
 `undeclared-recipient` (EOAs only; burns to the zero address skipped) and
 `undeclared-approval` (a 0 approval is not checked; `setApprovalForAll` counts
-as a maximum, even when revoking). An RPC that cannot simulate refuses the send
+as a maximum, even when revoking). Only the CELO face's `Transfer` is native:
+its `Approval` is an approval like any other, and an intent naming the face in
+`spend` or `receive_min` means `"native"` (naming both is `bad-intent`). Under a
+value-capped token the gate also refuses any ERC-721/1155 position leaving the
+sender (`token-cap-positions`; README, "Scoped tokens"). A `send_transaction`
+to the safe whose calldata is `execTransaction` is gated as the safe's inner
+call, and refused before simulating if it also carries value from the EOA or
+pays a gas refund (any of `gasPrice`, `gasToken`, `refundReceiver` set), which
+the inner call's simulation would not show. An RPC that cannot simulate refuses the send
 as `simulation-unavailable`, so Pearl must give Connect, on every chain, an RPC
 that serves `eth_simulateV1` (Celo's `forno.celo.org` does not). The
 transactions the server builds itself — the mech flow (`MechSigner`) and the
 agent top-up — pass the private `SERVER_BUILT` marker and skip the gate; they
 are bounded by `max_payment` and the top-up plan, and while restricted by their
-single-use allowances. `preflight_transaction` and `simulate_transaction` take
+single-use allowances. The diff names each token's `symbol()` for the reader
+(display only: nothing is checked against it, and a token without one reads
+as `""`). `preflight_transaction` and `simulate_transaction` take
 the same `intent` and report the gate's `problems` without signing.
 
 ## Guardrail
@@ -341,13 +351,14 @@ not read into session transcripts.
 ### Scoped tokens
 
 The token in the workspace is a **scoped** token: `read` + `mech` + `tx`, with no
-caps of its own, so a session can do what it always could. The full credential
-is held in the server process only and written to no file. Any token can mint a
-narrower one with `POST /tokens` (`{scopes, max_value_per_tx,
+caps of its own, so a session can do what it always could, and it is the root
+every other token is minted from. Any token can mint a narrower one with `POST /tokens` (`{scopes, max_value_per_tx,
 max_value_per_session, max_mech_payment, expires_at}`), for the scripts a
 harness runs: fewer scopes, value caps per transaction and per session (per
-token, `"native"` or a lower-case address, in base units), a mech payment cap,
-an expiry. A grant wider than the presenting token's is refused (`token-scope`).
+token, `"native"` or an address in any case, in base units; Celo's CELO face
+counts as `"native"`), a mech payment cap, an expiry. A grant wider than the
+presenting token's is refused (`token-scope`), and unknown fields are refused by
+name like every other body.
 
 | Scope | Allows |
 |---|---|
@@ -359,9 +370,16 @@ Value caps are checked against the spend the call's intent declares (and its
 native `value`), which the intent gate then holds the transaction to; a capped
 `mech` token must pass a `max_payment` within `max_mech_payment`. A per-session
 budget is drawn down when a call is authorized, whether or not the send then
-succeeds, so it can be spent early but never exceeded. Refusals name their rule
-(`token-scope`, `token-expired`, `token-cap-per-tx`, `token-cap-per-session`,
-`token-mech-payment-cap`), come back as the HTTP 403/401 detail or the MCP tool
+succeeds, so it can be spent early but never exceeded; a child's spend is drawn
+on every capped token it was minted from as well, so minting more children
+never multiplies a budget. What a cap cannot bound, a value-capped token may not
+do: approve more of a token than its caps allow (an approval is spend the
+spender takes later), sign a raw digest (`sign_message`: a digest can authorize
+any safe transaction), or move an ERC-721/1155 position out of the safe (the
+gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
+`token-expired`, `token-cap-per-tx`, `token-cap-per-session`,
+`token-mech-payment-cap`, and `bad-intent` or `bad-value` for an amount that is
+not a whole number >= 0), come back as the HTTP 403/401 detail or the MCP tool
 error, and are recorded as activity `refusal` entries. MCP calls are authorized
 in the mount's middleware, which reads each JSON-RPC `tools/call` before the
 MCP server does.
@@ -402,27 +420,39 @@ what it assembled and the nonce it allocated: mech-client asks the contract
 for it over `eth_call`, and an id signed on faith would let a lying RPC
 collect the safe's ERC-1271 signature on any 32 bytes, so a mismatch is
 refused before anything is signed. The mech's answer decides the slot: 200
-holds it; 503 (a gap) resends the same nonce and id up to `MAX_GAP_RETRIES`
-times, then refuses as `mech-nonce-gap`; a 401 whose reason is exactly
+holds it; 503 (a gap) resends the same nonce and id up to
+`CONNECTION_CONFIGS_CONFIG_MECH_GAP_RETRIES` times (default 3), then refuses as
+`mech-nonce-gap`; a 401 whose reason is exactly
 `wire nonce below sender's next expected slot` means the nonce is taken
 (`mech-nonce-taken`: our own unknown slot is then accepted, otherwise the queue
 stalls); any other 4xx, a 402 after the top-up retry included, frees it
 (`mech-request-rejected`); any other 5xx or a transport error holds it, since
-the mech may have stored the request. A queue with any held slot (accepted or
-unknown) that does not settle within the settle timeout, or whose nonce
-another signer took, stalls:
-only a probe at `mapNonces` is sent until one is accepted again, and refusals
-and `mech_result` say `mech_queue_stalled`. An on-chain request takes
+the mech may have stored the request. A failure before mech-client's pre-sign
+hook (an RPC or gateway error assembling the request) never reached the mech,
+so it frees the nonce too. A held slot's settle clock starts when its delivery
+arrives, or when the request's own response timeout (300 s, which mech-client
+writes into every request) runs out if no delivery was seen first; a queue
+with a slot that `mapNonces` has not passed within the settle timeout after
+that (`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s), or
+whose nonce another signer took, stalls: only a probe at `mapNonces` is sent
+until one is accepted again, and refusals and `mech_result` say
+`mech_queue_stalled`. A slot whose answer was lost (unknown) is resolved
+through that stall and probe; it is not resent by its salt. An on-chain request takes
 `mapNonces` itself, so it waits until no off-chain slot is held. Held slots,
 their metadata salt and the stall are persisted in `mech_nonces.json` under
 STORE_PATH, and a slot is written there as unknown before its request is
 POSTed, so a restart or a crash mid-send never reissues a held nonce. An
 unreadable file refuses every request (`mech-queue-unreadable`) rather than
 guess, and a file that cannot be written refuses new ones
-(`mech-queue-unwritable`). The lock is held only `ACK_WAIT_SECONDS` (1 s) for
-the mech's answer; the wait for the delivery runs after it is released, up to
-the request's `timeout`, so other requests from the safe are not held behind
-it.
+(`mech-queue-unwritable`), the request whose own slot could not be written
+included. Every refusal above is recorded as an activity `refusal` with its
+`rule`, and leaves a caller's `request_id` free to send again, since nothing
+reached the mech; only `mech-answer-unknown` is recorded as possibly paid for.
+On both paths the lock is held only `ACK_WAIT_SECONDS` (1 s) of the delivery
+wait: the rest runs after it is released, up to the request's `timeout`, so
+other requests from the safe are not held behind a delivery. A read that fails
+during that wait keeps the request pending, with its cause in
+`watch_errors`, and never loses the report of a request already paid for.
 
 **Validity.** An off-chain request carries no deadline (mech-client sends
 none), so it can settle whenever the mech delivers it, also after the
@@ -514,6 +544,11 @@ comes back marked `replayed`.
 What the id covers depends on where the first attempt stopped, because the
 server can only promise what it can actually know:
 
+A request that returned before its delivery reports the ids still awaited in
+`pending_request_ids`; one whose delivery could not be read in that wait
+carries the cause in `watch_errors`, keyed by id. The request was paid for, so
+the report is never lost to a failed read: `mech_result` picks it up.
+
 - **It returned.** The replay resumes each watch still outstanding and picks
   up whatever landed since — the usual case, since a caller retries precisely
   because the first call returned before the mech answered. Ids that resolve
@@ -578,7 +613,7 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN}`)
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES}`)
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
   vendorable dependencies, synced on demand)
 

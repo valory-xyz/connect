@@ -131,16 +131,40 @@ def chain_call(w3: Web3, to: str, data: str, block: str = "latest") -> dict:
     """Run an eth_call; return {result} or {reverted, reason}.
 
     Only a revert is reported as one: an RPC that is down or times out raises,
-    so an unreachable chain never reads as a contract that said no.
+    so an unreachable chain never reads as a contract that said no, and a
+    malformed argument raises ValueError naming it before anything is asked.
     """
+    address = to_checksum_address(to)  # ValueError: not an address
+    data = data or "0x"
+    if not data.startswith("0x"):
+        raise ValueError(f"data must be 0x-hex, got '{data}'")
+    bytes.fromhex(data[2:])  # ValueError: not hex
     try:
         raw = w3.eth.call(
-            {"to": to_checksum_address(to), "data": t.cast(t.Any, data or "0x")},
-            block_identifier=t.cast(t.Any, block),
+            {"to": address, "data": t.cast(t.Any, data)},
+            block_identifier=_block(block),
         )
-    except (ContractLogicError, ValueError) as e:
-        return {"reverted": True, "reason": str(e)}
+    except ContractLogicError as e:
+        return {"reverted": True, "reason": e.message or str(e)}
     return {"result": "0x" + bytes(raw).hex()}
+
+
+BLOCK_TAGS = ("latest", "pending", "earliest", "safe", "finalized")
+
+
+def _block(block: str) -> t.Any:
+    """Return a block tag or number for eth_call; ValueError for anything else."""
+    if block in BLOCK_TAGS:
+        return block
+    try:
+        number = int(block, 0)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"block must be one of {', '.join(BLOCK_TAGS)} or a number, got '{block}'"
+        ) from e
+    if number < 0:
+        raise ValueError(f"block must be >= 0, got {number}")
+    return number
 
 
 def _answers(w3: Web3, address: str, signature: str, args: bytes = b"") -> bool:

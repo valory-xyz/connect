@@ -28,6 +28,8 @@ import pytest
 from connect.config import (
     FUND_REQUIREMENTS_ENV,
     LOG_LEVEL_ENV,
+    MECH_GAP_RETRIES_ENV,
+    MECH_SETTLE_TIMEOUT_ENV,
     MINUTES_PER_RUN_ENV,
     SAFES_ENV,
     STORE_PATH_ENV,
@@ -195,6 +197,21 @@ def test_invalid_minutes_per_run_is_a_configuration_error(
     """A value that is not a whole number >= 0 fails like any other bad config."""
     with pytest.raises(ValueError, match=MINUTES_PER_RUN_ENV):
         load_config(base_env(tmp_path) | {MINUTES_PER_RUN_ENV: raw})
+
+
+def test_mech_settle_timeout_and_gap_retries_are_configurable(tmp_path: Path) -> None:
+    """Both default as before; any whole number >= 0 is taken; junk is refused."""
+    env = base_env(tmp_path)
+    config = load_config(env)
+    assert (config.mech_settle_timeout, config.mech_gap_retries) == (1800, 3)
+    config = load_config(
+        env | {MECH_SETTLE_TIMEOUT_ENV: " 600 ", MECH_GAP_RETRIES_ENV: "0"}
+    )
+    assert (config.mech_settle_timeout, config.mech_gap_retries) == (600, 0)
+    for name in (MECH_SETTLE_TIMEOUT_ENV, MECH_GAP_RETRIES_ENV):
+        for raw in ("-1", "1.5", "soon"):
+            with pytest.raises(ValueError, match=name):
+                load_config(env | {name: raw})
 
 
 def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:

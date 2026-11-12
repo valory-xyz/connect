@@ -23,6 +23,7 @@ import typing as t
 
 import pytest
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 
 from connect import chain_read
 
@@ -47,7 +48,7 @@ class _Eth:
     def call(self, tx: dict, block_identifier: t.Any = "latest") -> bytes:
         to = tx["to"].lower()
         if to in self.raise_for:
-            raise ValueError("execution reverted")
+            raise ContractLogicError("execution reverted")
         if to in self.down:
             raise ConnectionError("rpc down")
         data = tx["data"]
@@ -98,6 +99,32 @@ def test_chain_call_reports_result_or_revert() -> None:
     w3.eth.down.add(NFT)
     with pytest.raises(ConnectionError):  # unreachable is not a revert
         chain_read.chain_call(t.cast(Web3, w3), NFT, "0x313ce567")
+
+
+@pytest.mark.parametrize(
+    ("to", "data", "block", "match"),
+    [
+        ("0x1234", "0x", "latest", None),
+        (TOKEN, "313ce567", "latest", "0x-hex"),
+        (TOKEN, "0xzz", "latest", None),
+        (TOKEN, "0x", "yesterday", "block must be"),
+        (TOKEN, "0x", "-1", "block must be >= 0"),
+    ],
+)
+def test_chain_call_refuses_a_malformed_argument_rather_than_reverting(
+    to: str, data: str, block: str, match: str | None
+) -> None:
+    """A typo is the caller's mistake: it raises, it never reads as a revert."""
+    w3 = _w3()
+    with pytest.raises(ValueError, match=match):
+        chain_read.chain_call(t.cast(Web3, w3), to, data, block)
+
+
+def test_chain_call_takes_a_block_tag_or_number() -> None:
+    """Named tags pass through; a number in decimal or hex is read at that block."""
+    w3 = _w3()
+    for block in ("finalized", "123", "0x7b"):
+        assert "result" in chain_read.chain_call(t.cast(Web3, w3), TOKEN, "0x", block)
 
 
 def test_get_abi_by_interface_and_known_address() -> None:

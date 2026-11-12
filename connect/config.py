@@ -48,10 +48,16 @@ SAFES_ENV = CUSTOM_ENV_VARS_PREFIX + "SAFE_CONTRACT_ADDRESSES"
 FUND_REQUIREMENTS_ENV = CUSTOM_ENV_VARS_PREFIX + "FUND_REQUIREMENTS"
 LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
+MECH_SETTLE_TIMEOUT_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_SETTLE_TIMEOUT"
+MECH_GAP_RETRIES_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_GAP_RETRIES"
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_MINUTES_PER_RUN = 15
+# seconds mapNonces may take to pass a delivered (or timed-out) mech request
+# before its safe's queue stalls; and how often a 503 gap resends a nonce
+DEFAULT_MECH_SETTLE_TIMEOUT = 1800
+DEFAULT_MECH_GAP_RETRIES = 3
 
 
 class FundRequirement(TypedDict):
@@ -83,6 +89,8 @@ class AppConfig:
     # the starting run window; the first write stores it, and the stored value
     # wins from then on, so changing this never reaches an existing install
     minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
+    mech_settle_timeout: int = DEFAULT_MECH_SETTLE_TIMEOUT
+    mech_gap_retries: int = DEFAULT_MECH_GAP_RETRIES
 
     def chain(self, name: str) -> ChainConfig:
         """Chain."""
@@ -210,6 +218,20 @@ def _parse_minutes_per_run(raw: str) -> int:
         ) from e
 
 
+def _parse_count(env: dict[str, str], name: str, default: int) -> int:
+    """Parse a whole number >= 0 from the environment; unset means the default."""
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ValueError(f"{name} is not a whole number >= 0: {raw!r}")
+    return value
+
+
 def load_config(env: dict[str, str] | None = None) -> AppConfig:
     """Load config."""
     env = dict(os.environ) if env is None else env
@@ -251,4 +273,10 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         fund_requirements=fund_requirements,
         log_level=log_level,
         minutes_per_run=_parse_minutes_per_run(env.get(MINUTES_PER_RUN_ENV, "")),
+        mech_settle_timeout=_parse_count(
+            env, MECH_SETTLE_TIMEOUT_ENV, DEFAULT_MECH_SETTLE_TIMEOUT
+        ),
+        mech_gap_retries=_parse_count(
+            env, MECH_GAP_RETRIES_ENV, DEFAULT_MECH_GAP_RETRIES
+        ),
     )

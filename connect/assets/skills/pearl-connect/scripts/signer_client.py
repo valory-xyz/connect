@@ -26,7 +26,13 @@ goes straight to the chain RPC. No key material in this process.
 Usage:
     from signer_client import connect
     w3, signer = connect("gnosis")
-    tx_hash = w3.eth.send_transaction({"to": "0x...", "value": 0, "data": "0x"})
+    tx_hash = signer.send_transaction(
+        {"to": "0x...", "value": 10**16, "data": "0x"},
+        intent={"spend": {"native": 10**16}, "recipients": ["0x..."]},
+    )
+
+A call that moves value needs an intent, which only signer.send_transaction
+carries: w3.eth.send_transaction and .transact() suit calls that move nothing.
 """
 
 import http.client

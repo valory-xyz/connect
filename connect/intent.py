@@ -27,7 +27,9 @@ and the transaction is simulated at head with `eth_simulateV1` before it is
 signed. The asset diff comes from the simulated logs: ERC-20/721 `Transfer`,
 `Approval`, `ApprovalForAll`, ERC-1155 `TransferSingle`/`TransferBatch`, WETH
 `Deposit`/`Withdrawal`, and the synthetic `Transfer` logs `traceTransfers`
-emits from `0xeeee...eeee` for native value. There is no fork and no trace,
+emits from `0xeeee...eeee` for native value (with the `Transfer` logs of a
+native ERC-20 face, Celo's CELO; its other logs count as any token's). There is
+no fork and no trace,
 so "contracts touched" is the target plus every contract that emitted
 a log; a contract called without emitting one is not listed.
 
@@ -38,7 +40,9 @@ The rules:
 maximum approval, even when revoking). The intent is required:
 `missing-intent` refuses a value-moving call that carries
 none, and `simulation-unavailable` refuses anything an RPC cannot simulate —
-nothing falls back to signing unchecked.
+nothing falls back to signing unchecked. Under a value-capped token (`Capped`)
+`token-cap-positions` refuses any ERC-721/1155 position leaving the sender,
+which no cap can bound.
 """
 
 import typing as t
@@ -72,6 +76,7 @@ Rule = t.Literal[
     "undeclared-recipient",
     "undeclared-approval",
     "simulation-unavailable",
+    "token-cap-positions",
 ]
 RULES: tuple[str, ...] = t.get_args(Rule)
 
@@ -91,6 +96,19 @@ class Intent(t.TypedDict, total=False):
     receive_min: dict[TokenKey, int]
     recipients: list[str]
     approvals: list[IntentApproval]
+    # set only through Capped, never by a caller: no position may leave
+    positions_locked: bool
+
+
+class Capped(t.NamedTuple):
+    """The intent of a call made with a value-capped token.
+
+    A cap is a limit per token, and an ERC-721/1155 position is not one, so
+    no cap can bound it: under a capped token no position may leave the
+    sender. Only the server wraps an intent so; no request body can.
+    """
+
+    raw: t.Any
 
 
 class Problem(t.TypedDict):
@@ -207,7 +225,7 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
         ),
         native=str(diff["native"]),
         tokens={
-            token: {"delta": str(delta)}
+            token: {"symbol": _symbol(rpc, token), "delta": str(delta)}
             for token, delta in sorted(diff["tokens"].items())
             if delta
         },
@@ -217,6 +235,33 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
         called=called,
         gas_used=gas_used,
     )
+
+
+SYMBOL_SELECTOR = "0x95d89b41"  # symbol()
+MAX_SYMBOL_CHARS = 32
+
+
+def _symbol(rpc: Rpc, token: str) -> str:
+    """Read an ERC-20's symbol() for the report; "" when it has none to give.
+
+    Display only: nothing is checked against it, and a token answers what it
+    likes, so a failed or odd read never fails the simulation.
+    """
+    try:
+        raw = bytes.fromhex(
+            str(
+                rpc("eth_call", [{"to": token, "data": SYMBOL_SELECTOR}, "latest"])
+            ).removeprefix("0x")
+        )
+    except (SimulationUnavailable, ValueError):
+        return ""
+    if len(raw) == 32:  # bytes32, as MKR and other early tokens answer
+        text = raw.rstrip(b"\0")
+    elif len(raw) >= 64:  # an ABI string: offset, length, bytes
+        text = raw[64 : 64 + int.from_bytes(raw[32:64], "big")]
+    else:
+        return ""
+    return text.decode("utf-8", "replace")[:MAX_SYMBOL_CHARS]
 
 
 def _native_moves(logs: list[dict]) -> list[tuple[str, str, int]]:
@@ -267,13 +312,13 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
 
     for log in logs:
         address = str(log.get("address", "")).lower()
-        if address in (NATIVE_LOG_ADDRESS, *NATIVE_ERC20_FACES):
-            continue
         topics = [str(x).lower() for x in log.get("topics") or []]
-        if not topics:
+        if address == NATIVE_LOG_ADDRESS or not topics:
             continue
         data = str(log.get("data", "0x"))
         kind = topics[0]
+        if address in NATIVE_ERC20_FACES and kind == TRANSFER and len(topics) == 3:
+            continue  # counted as native above; the face's other logs are not
         if kind == TRANSFER and len(topics) == 3:  # ERC-20
             src, dst = _topic_address(topics[1]), _topic_address(topics[2])
             amount = _word(data, 0)
@@ -391,6 +436,15 @@ def is_value_moving(diff: AssetDiff) -> bool:
 
 def parse_intent(raw: t.Any) -> tuple[Intent | None, list[Problem]]:
     """Validate a caller's intent; return it normalised, or a bad-intent problem."""
+    if not isinstance(raw, Capped):
+        return _parse(raw)
+    parsed, problems = _parse(raw.raw)
+    if parsed is not None:
+        parsed["positions_locked"] = True
+    return parsed, problems
+
+
+def _parse(raw: t.Any) -> tuple[Intent | None, list[Problem]]:
     if raw is None:
         return None, []
     if not isinstance(raw, dict):
@@ -440,10 +494,27 @@ def _amount(value: t.Any) -> int:
     return amount
 
 
+def balance_key(key: t.Any) -> TokenKey:
+    """Return the key a balance change of `key` is booked under in a diff.
+
+    A native ERC-20 face (Celo's CELO) moves the native balance, and its
+    moves are booked under "native", so a spend or receive_min naming the face
+    must too. Raises ValueError for anything but "native" or an address.
+    """
+    token = _token(key)
+    return NATIVE if token in NATIVE_ERC20_FACES else token
+
+
 def _amounts(raw: t.Any, where: str) -> dict[TokenKey, int]:
     if not isinstance(raw, dict):
         raise TypeError(f"intent '{where}' must be an object of token -> amount")
-    return {_token(token): _amount(amount) for token, amount in raw.items()}
+    amounts: dict[TokenKey, int] = {}
+    for token, amount in raw.items():
+        key = balance_key(token)
+        if key in amounts:
+            raise ValueError(f"intent '{where}' names {key} twice")
+        amounts[key] = _amount(amount)
+    return amounts
 
 
 def _approval(raw: t.Any) -> IntentApproval:
@@ -520,6 +591,16 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
                     f"{entry['token']}, which the intent's approvals do not cover",
                 )
             )
+    if intent.get("positions_locked"):
+        for position in diff["positions"]:
+            if int(position["delta"]) < 0:
+                problems.append(
+                    Problem(
+                        rule="token-cap-positions",
+                        detail=f"moves {position['token']} #{position['id']} out, "
+                        "and a value-capped token may not move positions",
+                    )
+                )
     return problems
 
 
