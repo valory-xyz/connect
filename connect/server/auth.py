@@ -380,6 +380,15 @@ class GrantStore:
                     )
 
 
+def request_token(request: t.Any) -> str | None:
+    """Return the bearer token the auth layer stamped on a request, if any.
+
+    Both surfaces stamp it under AUTH_TOKEN: `RequireAuth` on an HTTP route's
+    request, the MCP mount's middleware on the scope the tool's request reads.
+    """
+    return getattr(getattr(request, "state", None), AUTH_TOKEN, None)
+
+
 def as_store(grants: "GrantStore | str") -> GrantStore:
     """Accept a GrantStore, or a bare workspace token for a store of one."""
     return GrantStore(grants) if isinstance(grants, str) else grants
@@ -484,7 +493,7 @@ class RequireAuth:
             raise HTTPException(
                 status_code=401, detail="invalid or missing bearer token"
             )
-        request.state.auth_token = token
+        setattr(request.state, AUTH_TOKEN, token)
 
     def _fail(self, path: str, reason: str) -> None:
         self._activity.record("auth_failed", path=path, reason=reason)
@@ -633,7 +642,7 @@ def authorize_route(
     """
     grants: GrantStore = request.app.state.grants
     try:
-        grants.authorize(request.state.auth_token, action, arguments)
+        grants.authorize(getattr(request.state, AUTH_TOKEN), action, arguments)
     except GrantRefused as e:
         activity.record("refusal", rule=e.rule, path=request.url.path, reason=str(e))
         raise HTTPException(status_code=e.status, detail=f"rule '{e.rule}': {e}") from e

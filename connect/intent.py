@@ -59,6 +59,13 @@ NATIVE_LOG_ADDRESS = "0x" + "ee" * 20
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 APPROVAL = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
 APPROVAL_FOR_ALL = "0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31"
+# Permit2 (the same address on every chain) grants allowances of its own:
+# Approval(owner, token, spender, amount, expiration) from approve(), and
+# Permit(owner, token, spender, amount, expiration, nonce) from a signed permit
+PERMIT2 = "0x000000000022d473030f116ddee9f6b43ac78ba3"
+PERMIT2_APPROVAL = "0xda9fa7c1b00402c17d0161b249b1ab8bbec047c5a52207b9c112deffd817036b"
+PERMIT2_PERMIT = "0xc6a377bfc4eb120024a8ac08eef205be16b817020812c73223e81d1bdb9708ec"
+MAX_UINT160 = 2**160 - 1
 TRANSFER_SINGLE = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
 TRANSFER_BATCH = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
 DEPOSIT = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c"
@@ -204,10 +211,10 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
     result = rpc("eth_simulateV1", [payload, "latest"])
     try:
         call = result[0]["calls"][0]
-    except (IndexError, KeyError, TypeError) as e:
+        ok = str(call.get("status", "0x0")) in ("0x1", "1")
+        logs = list(call.get("logs") or [])
+    except (IndexError, KeyError, TypeError, AttributeError) as e:
         raise SimulationUnavailable(f"unexpected eth_simulateV1 answer: {e}") from e
-    ok = str(call.get("status", "0x0")) in ("0x1", "1")
-    logs = list(call.get("logs") or [])
     try:
         diff = _diff(sender.lower(), logs, get_code)
         gas_used = int(str(call.get("gasUsed", "0x0")), 16)
@@ -263,8 +270,10 @@ def _lowers_an_allowance(rpc: Rpc, holder: str, entry: dict[str, t.Any]) -> bool
     The allowance is read at head, before the call; a read that fails keeps
     the approval, so a doubt is checked rather than waved through.
     """
-    if "id" in entry or entry["amount"] in ("0", "all"):
-        return False  # a revoke is skipped anyway; NFTs have no allowance
+    if "id" in entry or "via" in entry or entry["amount"] in ("0", "all"):
+        # a revoke is skipped anyway; NFTs have no allowance; a Permit2 grant
+        # is not an ERC-20 allowance, so the token's allowance() says nothing
+        return False
     data = (
         ALLOWANCE_SELECTOR
         + holder.removeprefix("0x").rjust(64, "0")
@@ -392,6 +401,24 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
         elif kind == WITHDRAWAL and len(topics) == 2:  # WETH burned from src
             if _topic_address(topics[1]) == holder:
                 tokens[address] = tokens.get(address, 0) - _word(data, 0)
+        elif (
+            address == PERMIT2
+            and kind in (PERMIT2_APPROVAL, PERMIT2_PERMIT)
+            and len(topics) == 4
+        ):
+            # Permit2 lets the spender move the token itself: a grant of the
+            # token, keyed as an ERC-20 approval of it would be
+            if _topic_address(topics[1]) == holder:
+                amount = _word(data, 0)
+                approvals.append(
+                    {
+                        "token": _topic_address(topics[2]),
+                        "spender": _topic_address(topics[3]),
+                        "amount": str(amount),
+                        "infinite": amount == MAX_UINT160,
+                        "via": "permit2",
+                    }
+                )
         elif kind == APPROVAL and len(topics) == 4:  # ERC-721: all indexed
             if _topic_address(topics[1]) == holder:
                 spender = _topic_address(topics[2])

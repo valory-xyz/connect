@@ -146,6 +146,10 @@ def router_swap(  # pylint: disable=too-many-arguments,too-many-positional-argum
             "receive_min": {evm.intent_token(token_out): minimum},
         },
     }
+    if fold:  # the signed permit the router carries is Permit2's own grant
+        swap["intent"]["approvals"] = [
+            {"token": token_in.lower(), "spender": spender.lower(), "amount": amount}
+        ]
     if native:
         swap["value"] = amount
     calls.append(swap)

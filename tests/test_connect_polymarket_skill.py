@@ -4827,9 +4827,14 @@ def test_v2_position_claim_through_router(monkeypatch, command, won) -> None:
     # grant (setApprovalForAll as the maximum), a claim nothing to spend
     for (target, data), intent in zip(cs.sent, cs.intents):
         if data.startswith(_APPROVAL):
-            ((grant,),) = [intent["approvals"]]
-            assert grant["token"] == target.lower()
-            assert grant["amount"] == 2**256 - 1
+            operator, _ = abi_decode(["address", "bool"], bytes.fromhex(data[10:]))
+            assert intent["approvals"] == [
+                {
+                    "token": target.lower(),
+                    "spender": operator.lower(),
+                    "amount": 2**256 - 1,
+                }
+            ]
         else:
             assert intent == {}
 

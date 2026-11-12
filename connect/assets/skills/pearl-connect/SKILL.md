@@ -78,7 +78,9 @@ approval — needs an `intent`, saying what it may do:
  "approvals": [{"token": "0xtoken...", "spender": "0xrouter...", "amount": 500}]}
 ```
 
-Tokens are lower-case addresses or `"native"`; amounts are base units. Before
+Tokens are addresses (any case) or `"native"`; amounts are base units. A
+Permit2 approval (`approve` on Permit2, or a permit the router carries) is an
+approval of the token to that spender, and is declared like one. Before
 signing, the server simulates the call at head (`eth_simulateV1`) and refuses
 it, naming the rule, if it: reverts (`reverts`), spends more of a token than
 `spend` allows (`overspend`), receives less than `receive_min` (`receive-min`),

@@ -496,6 +496,63 @@ def test_a_value_send_the_rpc_did_not_trace_fails_closed() -> None:
     assert reverted["ok"] is False
 
 
+@pytest.mark.parametrize("event", [intent.PERMIT2_APPROVAL, intent.PERMIT2_PERMIT])
+def test_a_permit2_grant_is_an_approval_the_intent_must_declare(event: str) -> None:
+    """Permit2 lets its spender move the token: approve() and permit() both grant."""
+    log = {
+        "address": intent.PERMIT2,
+        "topics": [event, _topic(SAFE), _topic(TOKEN), _topic(SPENDER)],
+        "data": "0x" + _word(intent.MAX_UINT160) + _word(99),
+    }
+    diff = simulate([log])
+    assert diff["approvals"] == [
+        {
+            "token": TOKEN,
+            "spender": SPENDER,
+            "amount": str(intent.MAX_UINT160),
+            "infinite": True,
+            "via": "permit2",
+        }
+    ]
+    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert rules(intent.check_intent(diff, {})) == ["undeclared-approval"]
+    declared = {
+        "approvals": [
+            {"token": TOKEN, "spender": SPENDER, "amount": intent.MAX_UINT160}
+        ]
+    }
+    assert intent.check_intent(diff, intent.parse_intent(declared)[0]) == []
+    elsewhere = simulate([{**log, "address": TOKEN}])  # not Permit2: not its grant
+    assert elsewhere["approvals"] == []
+    for_another = simulate(
+        [{**log, "topics": [event, _topic(EOA), *log["topics"][2:]]}]
+    )
+    assert for_another["approvals"] == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        [{"calls": [None]}],
+        [{"calls": ["0x01"]}],
+        [{"calls": [{"status": "0x1", "logs": 5}]}],
+    ],
+)
+def test_a_malformed_simulation_answer_is_simulation_unavailable(
+    answer: t.Any,
+) -> None:
+    """Any shape the RPC answers that is not a call result is a named refusal."""
+    with pytest.raises(intent.SimulationUnavailable, match="unexpected"):
+        intent.simulate(
+            lambda method, params: answer,
+            sender=SAFE,
+            to=CONTRACT,
+            value=0,
+            data="0x",
+            get_code=lambda a: b"",
+        )
+
+
 def test_reverts_is_refused_even_with_an_intent() -> None:
     """A call that reverts is never signed."""
     assert rules(intent.check_intent(_diff(ok=False, revert="no"), {})) == ["reverts"]

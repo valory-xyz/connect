@@ -211,7 +211,10 @@ call (read at head; OpenZeppelin 4.x tokens emit one from `transferFrom` as
 they spend an allowance down) is no new grant and needs no declaring; a read
 that fails keeps it. A call that sends native value but whose simulation logs
 no native transfer of it fails closed as `simulation-unavailable`: the RPC
-ignored `traceTransfers`. An RPC that cannot simulate refuses the send
+ignored `traceTransfers`. Permit2's own grants (its `Approval` from
+`approve()` and its `Permit` from a signed permit, from the canonical Permit2
+address) are approvals of the token to their spender, declared and capped like
+an ERC-20 approval. An RPC that cannot simulate refuses the send
 as `simulation-unavailable`, so Pearl must give Connect, on every chain, an RPC
 that serves `eth_simulateV1` (Celo's `forno.celo.org` does not). The
 transactions the server builds itself — the mech flow (`MechSigner`) and the
@@ -563,14 +566,15 @@ find out costs another payment. `mech_request` therefore takes an optional
 caller-chosen `request_id`; repeating it never sends again, and the report
 comes back marked `replayed`.
 
-What the id covers depends on where the first attempt stopped, because the
-server can only promise what it can actually know:
-
 A request that returned before its delivery reports the ids still awaited in
 `pending_request_ids`; one whose delivery could not be read in that wait
 carries the cause in `watch_errors`, keyed by id; a chat delivery that cannot
-be read leaves the cause in `chat_error` instead of losing the report. The request was paid for, so
-the report is never lost to a failed read: `mech_result` picks it up.
+be read leaves the cause in `chat_error` instead of losing the report. The
+request was paid for, so the report is never lost to a failed read:
+`mech_result` picks it up.
+
+What the id covers depends on where the first attempt stopped, because the
+server can only promise what it can actually know:
 
 - **It returned.** The replay resumes each watch still outstanding and picks
   up whatever landed since — the usual case, since a caller retries precisely

@@ -597,10 +597,10 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 terms = service.tool_manager.mech_report_or_terms(
                     priority_mech, read.document
                 )
-            # Pin the metadata salt so the CID — and with it the request id
-            # mech-client will derive and sign — is known here first; the
-            # matching allowance is registered before the send. Armed in
-            # every mode so both leave the same audit trail.
+            # Pin the metadata salt so the CID, and with it the request id
+            # mech-client will sign, is known here first; the pre-sign hook
+            # checks that id in every mode and arms its allowance (restricted
+            # mode only).
             extra_attributes = metadata_extras(request_context)
             offchain: OffchainDigests | None = self._allowances.offchain_digests(
                 service,

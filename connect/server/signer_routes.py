@@ -31,7 +31,12 @@ from pydantic import Field, field_validator
 
 from connect import settings as settings_config
 from connect import wallet
-from connect.server.auth import GrantRefused, TokenGrant, authorize_route
+from connect.server.auth import (
+    GrantRefused,
+    TokenGrant,
+    authorize_route,
+    request_token,
+)
 from connect.server.strict import StrictBody
 from connect.signer import SignerError
 
@@ -92,9 +97,7 @@ def _dispatch(
     meaning the two endpoints deliberately keep distinct. A value-capped
     token's intent is `intent.Capped`: no position may leave under it.
     """
-    intent = request.app.state.grants.intent_for(
-        getattr(request.state, "auth_token", None), body.intent
-    )
+    intent = request.app.state.grants.intent_for(request_token(request), body.intent)
     try:
         tx_hash = method(
             body.chain,
@@ -166,7 +169,7 @@ def mint_token(grant: TokenGrant, request: Request) -> dict:
     powers, never extend them.
     """
     try:
-        token = request.app.state.grants.mint(request.state.auth_token, grant)
+        token = request.app.state.grants.mint(request_token(request), grant)
     except GrantRefused as e:
         request.app.state.activity.record(
             "refusal", rule=e.rule, path=request.url.path, reason=str(e)

@@ -538,6 +538,14 @@ def test_router_swap_folds_the_permit_for_a_token(
     assert routed.calls[1]["intent"] == {
         "spend": {TOKEN.lower(): 10},
         "receive_min": {"native": 9},
+        # the signed permit is Permit2's own grant of the token to the router
+        "approvals": [
+            {
+                "token": TOKEN.lower(),
+                "spender": WHERE["universal_router"].lower(),
+                "amount": 10,
+            }
+        ],
     }
     assert asked[0][1] == CHAIN_ID
     assert asked[0][3:] == (
@@ -1540,3 +1548,11 @@ def test_calls_carry_the_intent_the_signer_checks() -> None:
     }
     assert evm.intent_token(NATIVE) == "native"
     assert evm.intent_token(WETH) == WETH.lower()
+
+
+def test_a_permit2_approval_call_declares_its_grant() -> None:
+    """Permit2.approve is a grant of the token to the spender: its intent says so."""
+    call = permit.approval_call(WHERE["permit2"], TOKEN, SAFE, 10, 99)
+    assert call["intent"] == {
+        "approvals": [{"token": TOKEN.lower(), "spender": SAFE.lower(), "amount": 10}]
+    }

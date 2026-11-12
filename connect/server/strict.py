@@ -30,6 +30,7 @@ import typing as t
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic_core import PydanticCustomError
 
 from connect.activity import ActivityLog
 
@@ -83,7 +84,8 @@ def _check_known(
         if message is not None:
             if on_refusal is not None:
                 on_refusal(message)
-            raise ValueError(message)
+            # typed, so the HTTP audit finds its own refusals by type, not text
+            raise PydanticCustomError(UNKNOWN_PARAMETER_RULE, message)
     return data
 
 
@@ -134,11 +136,10 @@ def audit_unknown_parameters(
 ) -> None:
     """Record an HTTP body's unknown-parameter refusal in the activity log."""
     for error in errors:
-        message = str(error.get("msg", ""))
-        if "unknown parameter" in message:
+        if error.get("type") == UNKNOWN_PARAMETER_RULE:
             activity.record(
                 "refusal",
                 rule=UNKNOWN_PARAMETER_RULE,
                 path=path,
-                reason=message.removeprefix("Value error, "),
+                reason=str(error.get("msg", "")),
             )

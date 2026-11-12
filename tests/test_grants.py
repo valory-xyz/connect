@@ -643,6 +643,38 @@ def test_mcp_capped_token_may_not_move_a_position(
     assert len(fake_w3.eth.sent) == 1
 
 
+@pytest.mark.parametrize("tool", ["preflight_transaction", "simulate_transaction"])
+def test_mcp_dry_runs_hold_a_capped_token_as_the_send_would(
+    client: TestClient, fake_w3: FakeW3, tool: str
+) -> None:
+    """A capped token's preflight and simulation answer as its real call would."""
+    fake_w3.provider.logs = [_position_out_log()]
+    call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool,
+            "arguments": {
+                "chain": "testchain",
+                "target": POSITIONS,
+                "intent": {"recipients": [RECIPIENT]},
+            },
+        },
+    }
+    headers = {"Accept": "application/json, text/event-stream"}
+    capped = client.post(
+        "/tokens",
+        json={"scopes": ["read", "tx"], "max_value_per_tx": {"native": 5}},
+        headers=_bearer(WORKSPACE),
+    ).json()["token"]
+    refused = client.post("/mcp/", json=call, headers={**headers, **_bearer(capped)})
+    assert "token-cap-positions" in refused.text
+    allowed = client.post("/mcp/", json=call, headers={**headers, **_bearer(WORKSPACE)})
+    assert "token-cap-positions" not in allowed.text
+    assert not fake_w3.eth.sent
+
+
 def test_http_sign_and_send_holds_a_capped_token_to_its_positions(
     client: TestClient, fake_w3: FakeW3, test_signer: Signer
 ) -> None:

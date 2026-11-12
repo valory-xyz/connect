@@ -40,7 +40,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
-from connect.server.auth import AUTH_TOKEN, GrantStore
+from connect.server.auth import GrantStore, request_token
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer
@@ -119,7 +119,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         `intent` is required whenever the call moves value (spends or sends
         anything of the safe's, or grants an approval): {spend: {token: max},
         receive_min: {token: min}, recipients: [eoa, ...], approvals: [{token,
-        spender, amount}]}, tokens as lower-case addresses or "native", amounts
+        spender, amount}]}, tokens as addresses (any case) or "native", amounts
         in base units. The call is simulated before it is signed and refused,
         naming the rule, if it would do more than the intent allows.
         """
@@ -247,8 +247,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def get_abi(chain: str, address: str) -> dict:
         """Report what Connect can say about a contract's ABI, following EIP-1967.
 
-        Only ABIs Connect ships: well-known contracts by address (`verified`)
-        and the standard interfaces a contract answers to; no explorer lookup.
+        Only ABIs Connect ships: well-known contracts by address on the chains
+        they are deployed to (`verified`, for the queried address alone; a
+        proxy's implementation has its own `implementation_verified`) and the
+        standard interfaces a contract answers to; no explorer lookup.
         """
         return await asyncio.to_thread(chain_read.get_abi, signer.w3(chain), address)
 
@@ -420,8 +422,7 @@ def _for_token(grants: GrantStore, ctx: Context | None, intent: dict | None) -> 
         request = ctx.request_context.request if ctx is not None else None
     except ValueError:  # no request: called in-process, not through the mount
         request = None
-    token = getattr(getattr(request, "state", None), AUTH_TOKEN, None)
-    return grants.intent_for(token, intent)
+    return grants.intent_for(request_token(request), intent)
 
 
 async def _dispatch(  # pylint: disable=too-many-arguments

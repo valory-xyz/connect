@@ -45,6 +45,7 @@ class _Eth:
         self.raise_for: set[str] = set()
         self.down: set[str] = set()
         self.blocks: list[t.Any] = []
+        self.chain_id = 137  # Polygon, where the Polymarket contracts live
 
     def call(self, tx: dict, block_identifier: t.Any = "latest") -> bytes:
         self.blocks.append(block_identifier)
@@ -255,7 +256,7 @@ def test_every_universal_router_is_shipped() -> None:
     routers = re.findall(r'"universal_router": "(0x[0-9a-fA-F]{40})"', source)
     assert routers
     for router in routers:
-        name, signatures = chain_read.KNOWN_CONTRACTS[router.lower()]
+        name, signatures, _ = chain_read.KNOWN_CONTRACTS[router.lower()]
         assert name == "Uniswap Universal Router"
         assert "execute(bytes,bytes[],uint256)" in signatures
 
@@ -267,3 +268,41 @@ def test_a_skill_contract_is_verified_with_its_calls() -> None:
     )
     assert ctf["verified"] is True
     assert {"redeemPositions", "setApprovalForAll"} <= _names(ctf["abi"])
+
+
+def test_a_proxy_pointing_at_a_known_contract_is_not_verified_itself() -> None:
+    """The EIP-1967 slot is the contract's own storage: it can claim anything."""
+    w3 = _w3()
+    w3.eth.slots[PROXY] = int(MULTICALL3, 16)
+    proxy = chain_read.get_abi(t.cast(Web3, w3), PROXY)
+    assert proxy["verified"] is False
+    assert proxy["implementation_verified"] is True
+    assert "aggregate3" in _names(proxy["implementation_abi"])
+
+
+def test_a_known_address_is_known_only_on_its_own_chain() -> None:
+    """Polygon's CTF address on Gnosis may hold anything: it is not verified there."""
+    w3 = _w3()
+    ctf = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    assert chain_read.get_abi(t.cast(Web3, w3), ctf)["verified"] is True
+    w3.eth.chain_id = 100
+    assert chain_read.get_abi(t.cast(Web3, w3), ctf)["verified"] is False
+    multicall = chain_read.get_abi(t.cast(Web3, w3), MULTICALL3)
+    assert multicall["verified"] is True  # the same address on every chain
+
+
+def test_calldata_that_is_not_hex_is_a_named_error() -> None:
+    """Odd or non-hex digits after a known selector answer {selector, error}."""
+    assert chain_read.decode_calldata("0xa9059cbb0") == {
+        "selector": "0xa9059cbb",
+        "error": "calldata is not hex",
+    }
+
+
+def test_a_bad_signature_in_the_tables_is_not_blamed_on_the_calldata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only bytes that do not fit read as a mismatch; a broken table entry raises."""
+    monkeypatch.setitem(chain_read.SELECTORS, "0xdeadbeef", ["broken(uintx)"])
+    with pytest.raises(Exception, match="uintx"):  # noqa: PT011
+        chain_read.decode_calldata("0xdeadbeef" + "00" * 32)

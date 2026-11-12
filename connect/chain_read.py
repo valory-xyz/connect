@@ -30,6 +30,7 @@ contract Connect knows by address rather than from an interface it answers to.
 import typing as t
 
 from eth_abi import decode as abi_decode
+from eth_abi.exceptions import DecodingError
 from eth_utils import keccak, to_checksum_address
 from web3 import Web3
 from web3.exceptions import ContractLogicError
@@ -106,61 +107,74 @@ SKILL_SIGNATURES = (
     + PONS_HOOK_SIGNATURES
 )
 
+
 # Contracts Connect ships an ABI for: the shared ones, and the ones its bundled
 # skills call (connect-polymarket's pm_common, the lib's uniswap DEPLOYMENTS,
 # connect-pons's pons.py), lower-case. tests/test_chain_read.py reads those
 # files to keep the two in step.
-KNOWN_CONTRACTS: dict[str, tuple[str, tuple[str, ...]]] = {
+class KnownContract(t.NamedTuple):
+    """A contract Connect ships an ABI for, and the chains it is deployed on."""
+
+    name: str
+    signatures: tuple[str, ...]
+    chains: frozenset[int] | None  # None: the same address on every chain
+
+
+KNOWN_CONTRACTS: dict[str, "KnownContract"] = {
     # the same address on every chain these are deployed to
-    "0xca11bde05977b3631167028862be2a173976ca11": ("Multicall3", MULTICALL3_SIGNATURES),
-    "0x000000000022d473030f116ddee9f6b43ac78ba3": ("Permit2", PERMIT2_SIGNATURES),
+    "0xca11bde05977b3631167028862be2a173976ca11": KnownContract(
+        "Multicall3", MULTICALL3_SIGNATURES, None
+    ),
+    "0x000000000022d473030f116ddee9f6b43ac78ba3": KnownContract(
+        "Permit2", PERMIT2_SIGNATURES, None
+    ),
     # Uniswap Universal Router: Robinhood Chain, Polygon, Gnosis
-    "0x8876789976decbfcbbbe364623c63652db8c0904": (
-        "Uniswap Universal Router",
-        UNIVERSAL_ROUTER_SIGNATURES,
+    "0x8876789976decbfcbbbe364623c63652db8c0904": KnownContract(
+        "Uniswap Universal Router", UNIVERSAL_ROUTER_SIGNATURES, frozenset({4663})
     ),
-    "0x1095692a6237d83c6a72f3f5efedb9a670c49223": (
-        "Uniswap Universal Router",
-        UNIVERSAL_ROUTER_SIGNATURES,
+    "0x1095692a6237d83c6a72f3f5efedb9a670c49223": KnownContract(
+        "Uniswap Universal Router", UNIVERSAL_ROUTER_SIGNATURES, frozenset({137})
     ),
-    "0x75fc67473a91335b5b8f8821277262a13b38c9b3": (
-        "Uniswap Universal Router",
-        UNIVERSAL_ROUTER_SIGNATURES,
+    "0x75fc67473a91335b5b8f8821277262a13b38c9b3": KnownContract(
+        "Uniswap Universal Router", UNIVERSAL_ROUTER_SIGNATURES, frozenset({100})
     ),
     # Polymarket, Polygon
-    "0x4d97dcd97ec945f40cf65f87097ace5ea0476045": (
-        "Polymarket ConditionalTokens",
-        CTF_SIGNATURES,
+    "0x4d97dcd97ec945f40cf65f87097ace5ea0476045": KnownContract(
+        "Polymarket ConditionalTokens", CTF_SIGNATURES, frozenset({137})
     ),
-    "0xada100db00ca00073811820692005400218fce1f": (
-        "Polymarket CTF collateral adapter",
-        CTF_ADAPTER_SIGNATURES,
+    "0xada100db00ca00073811820692005400218fce1f": KnownContract(
+        "Polymarket CTF collateral adapter", CTF_ADAPTER_SIGNATURES, frozenset({137})
     ),
-    "0xada2005600dec949baf300f4c6120000bdb6eaab": (
+    "0xada2005600dec949baf300f4c6120000bdb6eaab": KnownContract(
         "Polymarket NegRisk CTF collateral adapter",
         CTF_ADAPTER_SIGNATURES,
+        frozenset({137}),
     ),
-    "0x93070a847efef7f70739046a929d47a521f5b8ee": (
-        "Polymarket collateral onramp",
-        ONRAMP_SIGNATURES,
+    "0x93070a847efef7f70739046a929d47a521f5b8ee": KnownContract(
+        "Polymarket collateral onramp", ONRAMP_SIGNATURES, frozenset({137})
     ),
-    "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb": ("Polymarket pUSD", ERC20_SIGNATURES),
-    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": ("USDC.e", ERC20_SIGNATURES),
-    "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": ("USDC", ERC20_SIGNATURES),
+    "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb": KnownContract(
+        "Polymarket pUSD", ERC20_SIGNATURES, frozenset({137})
+    ),
+    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": KnownContract(
+        "USDC.e", ERC20_SIGNATURES, frozenset({137})
+    ),
+    "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": KnownContract(
+        "USDC", ERC20_SIGNATURES, frozenset({137})
+    ),
     # Pons, Robinhood Chain
-    "0xd3afeb2a57f70ef218aa82451c51b2fb0416ac9e": (
-        "Pons fee escrow",
-        PONS_FEE_ESCROW_SIGNATURES,
+    "0xd3afeb2a57f70ef218aa82451c51b2fb0416ac9e": KnownContract(
+        "Pons fee escrow", PONS_FEE_ESCROW_SIGNATURES, frozenset({4663})
     ),
-    "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044": (
-        "Pons meme hook",
-        PONS_HOOK_SIGNATURES,
+    "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044": KnownContract(
+        "Pons meme hook", PONS_HOOK_SIGNATURES, frozenset({4663})
     ),
-    "0x0bd7d308f8e1639fab988df18a8011f41eacad73": (
-        "WETH",
-        ERC20_SIGNATURES + WETH_SIGNATURES,
+    "0x0bd7d308f8e1639fab988df18a8011f41eacad73": KnownContract(
+        "WETH", ERC20_SIGNATURES + WETH_SIGNATURES, frozenset({4663})
     ),
-    "0x5fc5360d0400a0fd4f2af552add042d716f1d168": ("USDG", ERC20_SIGNATURES),
+    "0x5fc5360d0400a0fd4f2af552add042d716f1d168": KnownContract(
+        "USDG", ERC20_SIGNATURES, frozenset({4663})
+    ),
 }
 
 COMMON_SIGNATURES = (
@@ -264,11 +278,15 @@ def _supports(w3: Web3, address: str, interface_id: str) -> bool:
     return answer.get("result", "0x")[-1:] == "1"
 
 
-def _interfaces(w3: Web3, address: str) -> tuple[bool, list[str]]:
-    """Return (verified, signatures) for one address, without following proxies."""
+def _interfaces(w3: Web3, address: str, chain_id: int) -> tuple[bool, list[str]]:
+    """Return (verified, signatures) for one address, without following proxies.
+
+    An address is known only on the chains its contract is deployed on: the
+    same address elsewhere may hold anything.
+    """
     known = KNOWN_CONTRACTS.get(address.lower())
-    if known is not None:
-        return True, list(known[1])
+    if known is not None and (known.chains is None or chain_id in known.chains):
+        return True, list(known.signatures)
     signatures: list[str] = []
     if _supports(w3, address, "0xd9b67a26"):
         signatures += ERC1155_SIGNATURES
@@ -280,9 +298,15 @@ def _interfaces(w3: Web3, address: str) -> tuple[bool, list[str]]:
 
 
 def get_abi(w3: Web3, address: str) -> dict:
-    """Return what Connect can say about a contract's ABI."""
+    """Return what Connect can say about a contract's ABI.
+
+    `verified` speaks for the queried address alone. A proxy's EIP-1967 slot
+    is storage the contract writes itself, so whatever it points at is
+    reported as `implementation_verified`, never as the contract's own.
+    """
     address = to_checksum_address(address)
-    verified, signatures = _interfaces(w3, address)
+    chain_id = int(w3.eth.chain_id)
+    verified, signatures = _interfaces(w3, address, chain_id)
     report: dict = {
         "address": address,
         "verified": verified,
@@ -293,12 +317,12 @@ def get_abi(w3: Web3, address: str) -> dict:
     )
     if slot:
         implementation = to_checksum_address("0x" + hex(slot)[2:].rjust(40, "0")[-40:])
-        impl_verified, impl_signatures = _interfaces(w3, implementation)
+        impl_verified, impl_signatures = _interfaces(w3, implementation, chain_id)
         report["implementation"] = implementation
+        report["implementation_verified"] = impl_verified
         report["implementation_abi"] = [
             _abi_entry(s) for s in dict.fromkeys(impl_signatures)
         ]
-        report["verified"] = verified or impl_verified
     if not report["abi"] and not report.get("implementation_abi"):
         report["note"] = (
             "no ABI Connect ships matches this contract; decode its calls with "
@@ -316,7 +340,10 @@ def decode_calldata(data: str) -> dict:
     candidates = SELECTORS.get(selector)
     if not candidates:
         return {"selector": selector, "error": "unknown selector"}
-    args_raw = bytes.fromhex(raw[8:])
+    try:
+        args_raw = bytes.fromhex(raw[8:])
+    except ValueError:
+        return {"selector": selector, "error": "calldata is not hex"}
     for signature in candidates:
         args = _decode_args(signature, args_raw)
         if args is not None:
@@ -332,9 +359,10 @@ def _decode_args(signature: str, args_raw: bytes) -> list | None:
     """Decode arguments as `signature` takes them, or None if they do not fit."""
     types = _split_types(signature.partition("(")[2][:-1])
     try:
-        return _jsonable(abi_decode(types, args_raw))
-    except Exception:  # pylint: disable=broad-exception-caught
+        decoded = abi_decode(types, args_raw)
+    except DecodingError:  # the bytes do not fit; a bad signature still raises
         return None
+    return _jsonable(decoded)
 
 
 def _jsonable(value: t.Any) -> t.Any:
