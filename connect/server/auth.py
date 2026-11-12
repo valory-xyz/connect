@@ -49,7 +49,7 @@ from pydantic import field_validator
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
-from connect.chain_read import KNOWN_CONTRACTS, UNIVERSAL_ROUTER
+from connect.chain_read import UNIVERSAL_ROUTER_NAME, known_contract
 from connect.chains import chain_info
 from connect.server.strict import StrictBody
 
@@ -201,13 +201,10 @@ def _declared(
 def _is_universal_router(spender: str, chain: t.Any) -> bool:
     """Whether `spender` is a Uniswap Universal Router Connect ships on `chain`."""
     info = chain_info(chain) if isinstance(chain, str) else None
-    known = KNOWN_CONTRACTS.get(spender.lower())
-    return (
-        info is not None
-        and known is not None
-        and known.name == UNIVERSAL_ROUTER
-        and (known.chains is None or info["chain_id"] in known.chains)
-    )
+    if info is None:
+        return False
+    known = known_contract(spender, info["chain_id"])
+    return known is not None and known.name == UNIVERSAL_ROUTER_NAME
 
 
 class GrantStore:

@@ -278,6 +278,18 @@ def test_a_universal_router_approval_on_its_chain_draws_nothing() -> None:
     store.authorize(capped, "safe_transaction", {"intent": {"spend": {USDC: 100}}})
 
 
+def test_an_unknown_spender_on_a_listed_chain_draws_on_the_session() -> None:
+    """Only a router Connect ships is exempt; any other spender draws."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
+    approval = {"token": USDC, "spender": RECIPIENT, "amount": 100}
+    arguments = {"chain": "robinhood", "intent": {"approvals": [approval]}}
+    store.authorize(capped, "safe_transaction", arguments)
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(capped, "safe_transaction", arguments)
+    assert refused.value.rule == "token-cap-per-session"
+
+
 @pytest.mark.parametrize("chain", ["gnosis", "not-a-chain", None])
 def test_a_universal_router_draws_off_the_chain_it_is_deployed_on(
     chain: str | None,
@@ -294,7 +306,7 @@ def test_a_universal_router_draws_off_the_chain_it_is_deployed_on(
 
 
 def test_an_approval_of_permit2_is_still_held_to_the_caps() -> None:
-    """Not drawing it on the session does not let it exceed a cap."""
+    """An approval of Permit2 may not exceed a cap."""
     store = GrantStore(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 80}))
     approval = {"token": USDC, "spender": intent_module.PERMIT2, "amount": 81}
