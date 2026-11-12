@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Chat tools over mech_request: messages in, completion and usage out (T3, D7).
+"""Chat tools over mech_request: messages in, completion and usage out.
 
 The contract agreed with the mechs team: the prompt is an OpenAI-style
 `messages` list as JSON, and the delivery carries the completion text plus

@@ -21,7 +21,7 @@
 
 The workspace token is minted per run and reaches the agent harness only via
 the .mcp.json and .codex/config.toml files in STORE_PATH. It is a *scoped*
-token (OPE-2035 T4, D10): `read` + `mech` + `tx` with no caps of its own, so a
+token: `read` + `mech` + `tx` with no caps of its own, so a
 session can do what it always could, but a harness can mint narrower tokens
 from it for the scripts it runs (fewer scopes, value caps per transaction and
 per session, a mech payment cap, an expiry). The full credential is held in
@@ -46,6 +46,7 @@ from urllib.parse import urlparse
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
+from connect import intent as intent_module
 from connect.activity import ActivityLog
 
 Scope = t.Literal["read", "mech", "tx"]
@@ -138,19 +139,36 @@ def narrower(child: TokenGrant, parent: TokenGrant) -> bool:
 
 
 def _declared_spend(arguments: t.Mapping[str, t.Any]) -> dict[str, int]:
-    """Return the spend a call's intent declares; the gate holds the call to it."""
-    intent = arguments.get("intent")
-    spend = intent.get("spend") if isinstance(intent, dict) else None
-    if not isinstance(spend, dict):
-        return {}
-    declared: dict[str, int] = {}
-    for token, amount in spend.items():
+    """Return what a call may spend: its intent's `spend`, and its native value.
+
+    The intent is read exactly as the tool will read it: a JSON string is
+    decoded first (FastMCP does the same before validating), and the intent
+    gate's own parser decides what it declares, so the cap and the gate can
+    never read two different intents.
+
+    :raises GrantRefused: a malformed intent or a value that is not a whole
+        number >= 0, before any budget is drawn on.
+    """
+    raw = arguments.get("intent")
+    if isinstance(raw, str):
         try:
-            declared[_caps_key(str(token))] = (
-                int(amount, 0) if isinstance(amount, str) else int(amount)
-            )
-        except (TypeError, ValueError):
-            continue  # the gate refuses a malformed intent as bad-intent
+            raw = json.loads(raw)
+        except ValueError:
+            pass  # left as a string: parse_intent refuses it below
+    parsed, problems = intent_module.parse_intent(raw)
+    if problems:
+        raise GrantRefused("bad-intent", problems[0]["detail"])
+    declared = dict((parsed or {}).get("spend", {}))
+    value = arguments.get("value") or 0
+    try:
+        if isinstance(value, bool):
+            raise TypeError("a boolean")
+        value = int(value, 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError) as e:
+        raise GrantRefused("bad-value", f"value is not a whole number: {e}") from e
+    if value < 0:
+        raise GrantRefused("bad-value", "value must be a non-negative amount")
+    declared[intent_module.NATIVE] = max(declared.get(intent_module.NATIVE, 0), value)
     return declared
 
 
@@ -160,13 +178,17 @@ class GrantStore:
     def __init__(self, workspace_token: str) -> None:
         """Hold the workspace token and an in-process root credential."""
         self._lock = threading.Lock()
-        # the root credential is never written anywhere: nothing outside
-        # this process can present it, and the workspace token is narrower
+        # the root credential is held here and written nowhere: no file can
+        # leak it. The workspace token has the same scopes, so a session can
+        # do what it always could; what it adds is that every token, the
+        # workspace's included, can only mint narrower ones
         self._grants: dict[str, TokenGrant] = {
             secrets.token_urlsafe(32): TokenGrant(scopes=list(SCOPES)),
             workspace_token: WORKSPACE_GRANT,
         }
         self._spent: dict[str, dict[str, int]] = {}
+        # a minted token's parent: a session cap binds every descendant
+        self._parents: dict[str, str] = {}
 
     def lookup(self, header: str | None) -> str | None:
         """Return the presented token if it is one we issued, else None."""
@@ -200,6 +222,7 @@ class GrantStore:
         token = secrets.token_urlsafe(32)
         with self._lock:
             self._grants[token] = grant
+            self._parents[token] = parent
         return token
 
     def _live(self, token: str) -> TokenGrant:
@@ -249,13 +272,7 @@ class GrantStore:
     def _check_value(
         self, token: str, grant: TokenGrant, arguments: t.Mapping[str, t.Any]
     ) -> None:
-        if grant.max_value_per_tx is None and grant.max_value_per_session is None:
-            return
-        declared = _declared_spend(arguments)
-        value = arguments.get("value") or 0
-        if isinstance(value, str):
-            value = int(value, 16) if value.startswith("0x") else int(value)
-        declared["native"] = max(declared.get("native", 0), int(value))
+        declared = _declared_spend(arguments)  # refuses malformed amounts first
         per_tx = grant.max_value_per_tx
         if per_tx is not None:
             for asset, amount in declared.items():
@@ -263,23 +280,35 @@ class GrantStore:
                     raise GrantRefused(
                         "token-cap-per-tx",
                         f"this token spends at most {per_tx.get(asset, 0)} of "
-                        f"{asset} per transaction (the intent declares {amount})",
+                        f"{asset} per transaction (the call declares {amount})",
                     )
-        per_session = grant.max_value_per_session
-        if per_session is None:
-            return
         with self._lock:
-            spent = self._spent.setdefault(token, {})
-            for asset, amount in declared.items():
-                if spent.get(asset, 0) + amount > per_session.get(asset, 0):
-                    raise GrantRefused(
-                        "token-cap-per-session",
-                        f"this token spends at most {per_session.get(asset, 0)} "
-                        f"of {asset} in all; {spent.get(asset, 0)} is spent "
-                        f"and this declares {amount}",
-                    )
-            for asset, amount in declared.items():
-                spent[asset] = spent.get(asset, 0) + amount
+            # this token and every ancestor it was minted from: minting more
+            # children must not multiply a parent's session budget
+            chain = [token]
+            while chain[-1] in self._parents:
+                chain.append(self._parents[chain[-1]])
+            capped = [
+                (holder, self._grants[holder].max_value_per_session)
+                for holder in chain
+                if self._grants[holder].max_value_per_session is not None
+            ]
+            for holder, per_session in capped:
+                spent = self._spent.get(holder, {})
+                for asset, amount in declared.items():
+                    cap = t.cast(dict, per_session).get(asset, 0)
+                    if spent.get(asset, 0) + amount > cap:
+                        raise GrantRefused(
+                            "token-cap-per-session",
+                            f"this token spends at most {cap} of {asset} in all "
+                            f"(with every token minted from it); "
+                            f"{spent.get(asset, 0)} is spent and this declares "
+                            f"{amount}",
+                        )
+            for holder, _ in capped:
+                spent = self._spent.setdefault(holder, {})
+                for asset, amount in declared.items():
+                    spent[asset] = spent.get(asset, 0) + amount
 
 
 def as_store(grants: "GrantStore | str") -> GrantStore:

@@ -182,9 +182,11 @@ simulated at head over the chain's RPC with `eth_simulateV1`
 (`traceTransfers: true`, `validation: false`) before it is signed. The asset
 diff comes from the simulated logs (`connect/intent.py`): no fork, no trace, so
 `called` lists the target plus every contract that emitted a log. Native value
-counts only once: from the synthetic `0xeeee…eeee` logs, matched against
-Celo's `0x471E…` CELO face, which logs the same coins; Polygon's own
-`LogTransfer` is a different event and never counted. The rules, each named in
+comes from the synthetic `0xeeee…eeee` logs plus, on Celo, the `0x471E…` CELO
+face's `Transfer` logs, summed: a native send logs only the synthetic one and a
+`transfer` on the face logs only its own, so neither is counted twice
+(`chains.NATIVE_ERC20_FACES`). Polygon's own `LogTransfer` is a different event
+and never counted. The rules, each named in
 the refusal and recorded as an activity `refusal` entry: `reverts`,
 `bad-intent`, `missing-intent`, `overspend`, `receive-min`,
 `undeclared-recipient` (EOAs only; burns to the zero address skipped) and
@@ -394,7 +396,7 @@ safe and chain (a request to another mech waits for the first one's slots to
 settle, and is refused as `mech-in-flight` when its wait runs out), the lock is
 held from reservation until the mech answers, and a slot is held until
 `mapNonces > n`. mech-client signs the nonce it is given (`send_request(...,
-nonces=[n], on_request_id=...)`, valory-xyz/mech-client#272) and reports the
+nonces=[n], on_request_id=...)`, the pinned mech-client) and reports the
 request id just before signing. Connect still recomputes that id itself from
 what it assembled and the nonce it allocated: mech-client asks the contract
 for it over `eth_call`, and an id signed on faith would let a lying RPC
@@ -406,14 +408,21 @@ times, then refuses as `mech-nonce-gap`; a 401 whose reason is exactly
 (`mech-nonce-taken`: our own unknown slot is then accepted, otherwise the queue
 stalls); any other 4xx, a 402 after the top-up retry included, frees it
 (`mech-request-rejected`); any other 5xx or a transport error holds it, since
-the mech may have stored the request. A queue whose accepted slot does not
-settle within the settle timeout, or whose nonce another signer took, stalls:
+the mech may have stored the request. A queue with any held slot (accepted or
+unknown) that does not settle within the settle timeout, or whose nonce
+another signer took, stalls:
 only a probe at `mapNonces` is sent until one is accepted again, and refusals
 and `mech_result` say `mech_queue_stalled`. An on-chain request takes
 `mapNonces` itself, so it waits until no off-chain slot is held. Held slots,
 their metadata salt and the stall are persisted in `mech_nonces.json` under
-STORE_PATH, so a restart never reissues a held nonce; an unreadable file
-refuses every request (`mech-queue-unreadable`) rather than guess.
+STORE_PATH, and a slot is written there as unknown before its request is
+POSTed, so a restart or a crash mid-send never reissues a held nonce. An
+unreadable file refuses every request (`mech-queue-unreadable`) rather than
+guess, and a file that cannot be written refuses new ones
+(`mech-queue-unwritable`). The lock is held only `ACK_WAIT_SECONDS` (1 s) for
+the mech's answer; the wait for the delivery runs after it is released, up to
+the request's `timeout`, so other requests from the safe are not held behind
+it.
 
 **Validity.** An off-chain request carries no deadline (mech-client sends
 none), so it can settle whenever the mech delivers it, also after the

@@ -17,10 +17,11 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Tests for the read-only chain tools (OPE-2035 T5)."""
+"""Tests for the read-only chain tools."""
 
 import typing as t
 
+import pytest
 from web3 import Web3
 
 from connect import chain_read
@@ -31,6 +32,7 @@ IMPL = "0x" + "72" * 20
 NFT = "0x" + "73" * 20
 MULTI = "0x" + "74" * 20
 MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
+EIP1967_SLOT = 0x360894A13BA1A3210667C828492DB98DCA3E2076CC3735A920A3CA505D382BBC
 
 
 class _Eth:
@@ -40,11 +42,14 @@ class _Eth:
         self.answers: dict[tuple[str, str], bytes] = {}
         self.slots: dict[str, int] = {}
         self.raise_for: set[str] = set()
+        self.down: set[str] = set()
 
     def call(self, tx: dict, block_identifier: t.Any = "latest") -> bytes:
         to = tx["to"].lower()
         if to in self.raise_for:
             raise ValueError("execution reverted")
+        if to in self.down:
+            raise ConnectionError("rpc down")
         data = tx["data"]
         for (address, prefix), answer in self.answers.items():
             if address == to and data.startswith(prefix):
@@ -52,6 +57,9 @@ class _Eth:
         return b""
 
     def get_storage_at(self, address: str, slot: int) -> bytes:
+        # keyed on the literal EIP-1967 slot, not the module's constant
+        if slot != EIP1967_SLOT:
+            return b"\0" * 32
         return self.slots.get(address.lower(), 0).to_bytes(32, "big")
 
 
@@ -87,6 +95,9 @@ def test_chain_call_reports_result_or_revert() -> None:
     w3.eth.raise_for.add(TOKEN)
     reverted = chain_read.chain_call(t.cast(Web3, w3), TOKEN, "0x313ce567")
     assert reverted == {"reverted": True, "reason": "execution reverted"}
+    w3.eth.down.add(NFT)
+    with pytest.raises(ConnectionError):  # unreachable is not a revert
+        chain_read.chain_call(t.cast(Web3, w3), NFT, "0x313ce567")
 
 
 def test_get_abi_by_interface_and_known_address() -> None:

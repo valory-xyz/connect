@@ -30,8 +30,10 @@ from connect.signer import SERVER_BUILT, Signer
 class MechSigner:
     """mech-client ``Signer`` protocol adapter over our guarded Signer.
 
-    No special privileges: every transaction goes through Signer.send() and
-    every digest through Signer.sign_digest(), both guardrail-checked.
+    Every transaction goes through Signer.send() and every digest through
+    Signer.sign_digest(), both guardrail-checked. Transactions go as
+    SERVER_BUILT and skip the intent gate: the mech flow builds them itself,
+    bounded by max_payment and its single-use allowances.
     """
 
     def __init__(self, signer: Signer, chain: str) -> None:

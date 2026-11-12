@@ -30,7 +30,7 @@ import json
 import typing as t
 from importlib import resources
 
-ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+from connect.safe import ZERO_ADDRESS
 
 # Connect's chain names are the middleware's Chain values; mech-client names a
 # few of them differently in its own config.
@@ -60,9 +60,16 @@ _CHAINS: dict[str, tuple[int, str]] = {
     "robinhood": (4663, "ETH"),
 }
 
+# Chains whose native coin also has an ERC-20 face (Celo's CELO): a transfer
+# through the face logs its own Transfer, while a plain native send logs only
+# the synthetic one eth_simulateV1 emits, so the gate counts both as native.
+NATIVE_ERC20_FACES: dict[str, str] = {
+    "celo": "0x471ece3750da237f93b8e339c536989b8978a438",
+}
+
 # No facilitator route is configured in Connect, and no repo it reads lists
 # the facilitator's chains, so every chain starts without one; the facilitator
-# team says where it runs (OPE-2035 D2).
+# team says where it runs.
 FACILITATOR_CHAINS: frozenset[str] = frozenset()
 
 

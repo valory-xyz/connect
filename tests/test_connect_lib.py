@@ -515,6 +515,11 @@ def test_router_swap_with_the_native_coin_needs_no_approval(
     assert call["to"] == WHERE["universal_router"]
     assert call["value"] == 10
     assert uniswap.permit_action_in(call["data"]) is None
+    # spend at most the amount in, receive at least the slippage floor out
+    assert call["intent"] == {
+        "spend": {"native": 10},
+        "receive_min": {TOKEN.lower(): 9},
+    }
 
 
 def test_router_swap_folds_the_permit_for_a_token(
@@ -530,6 +535,10 @@ def test_router_swap_folds_the_permit_for_a_token(
     assert routed.deadline == 1_000 + router.DEADLINE_S + 2 * evm.RECEIPT_TIMEOUT_S
     assert [c["what"] for c in routed.calls] == ["approve Permit2", "swap"]
     assert all("value" not in c for c in routed.calls)
+    assert routed.calls[1]["intent"] == {
+        "spend": {TOKEN.lower(): 10},
+        "receive_min": {"native": 9},
+    }
     assert asked[0][1] == CHAIN_ID
     assert asked[0][3:] == (
         SAFE,

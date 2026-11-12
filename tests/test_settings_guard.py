@@ -4473,6 +4473,37 @@ class TestMech:
         assert patched_mech.calls[-1]["nonces"] == [patched_mech.contract.nonce + 1]
         assert second["expires"] is None
 
+    def test_the_delivery_wait_runs_off_the_nonce_lock(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under the lock the send waits only ACK_WAIT_SECONDS; the rest resumes after."""
+        patched_mech.result["deliveries"] = {}  # nothing yet when the POST returns
+        answers = [{}, {"ab": DeliveryResult(request_id="ab", data={"a": 1}, url=None)}]
+
+        async def watch(*_args: t.Any) -> dict:
+            return answers.pop(0)
+
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(watch))
+        still = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, timeout=30
+        )
+        assert patched_mech.calls[-1]["timeout"] == mech_module.ACK_WAIT_SECONDS
+        assert still["pending_request_ids"] == ["ab"]  # the resumed watch saw none
+        patched_mech.contract.nonce += 1
+        done = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, timeout=30
+        )
+        assert done["delivery_results"] == {"ab": {"a": 1}}
+        assert "pending_request_ids" not in done
+        patched_mech.contract.nonce += 1
+        short = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, timeout=0.5
+        )
+        assert short["pending_request_ids"] == ["ab"]  # no time left to resume
+
     def test_a_chat_tool_reports_the_completion_and_usage(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:

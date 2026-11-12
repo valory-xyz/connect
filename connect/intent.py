@@ -17,9 +17,9 @@
 #
 # ------------------------------------------------------------------------------
 
-"""The intent gate: simulate a send and check it against its intent (OPE-2035 T5).
+"""The intent gate: simulate a send and check it against its intent.
 
-D11, D17 and D19 of the scope. A model can report success on a transaction
+A model can report success on a transaction
 that moved the wrong amount. So every agent-originated value-moving send
 carries an *intent* (what it may spend, the least it must receive, who may
 receive and what may be approved),
@@ -27,26 +27,28 @@ and the transaction is simulated at head with `eth_simulateV1` before it is
 signed. The asset diff comes from the simulated logs: ERC-20/721 `Transfer`,
 `Approval`, `ApprovalForAll`, ERC-1155 `TransferSingle`/`TransferBatch`, WETH
 `Deposit`/`Withdrawal`, and the synthetic `Transfer` logs `traceTransfers`
-emits from `0xeeee...eeee` for native value. There is no fork and no trace
-(D17), so "contracts touched" is the target plus every contract that emitted
-a log; a contract called without emitting one is not listed (D20).
+emits from `0xeeee...eeee` for native value. There is no fork and no trace,
+so "contracts touched" is the target plus every contract that emitted
+a log; a contract called without emitting one is not listed.
 
-The rules follow the reference gate (`fork_connect.py` `check_intent`):
+The rules:
 `reverts`, `bad-intent`, `overspend`, `receive-min`, `undeclared-recipient`
 (EOAs only; burns to the zero address are skipped) and `undeclared-approval`
 (a 0 approval, a revoke, is not checked; `setApprovalForAll` counts as a
-maximum approval, even when revoking). Unlike the reference the intent is
-required (D11): `missing-intent` refuses a value-moving call that carries
+maximum approval, even when revoking). The intent is required:
+`missing-intent` refuses a value-moving call that carries
 none, and `simulation-unavailable` refuses anything an RPC cannot simulate —
 nothing falls back to signing unchecked.
 """
 
 import typing as t
 
+from connect.chains import NATIVE_ERC20_FACES as _FACES
+from connect.safe import ZERO_ADDRESS
+
 TokenKey = str  # an ERC-20 address, lower-case, or "native"
 NATIVE = "native"
 MAX_UINT256 = 2**256 - 1
-ZERO_ADDRESS = "0x" + "00" * 20
 # traceTransfers reports native value as Transfer logs from this address
 NATIVE_LOG_ADDRESS = "0x" + "ee" * 20
 
@@ -58,10 +60,8 @@ TRANSFER_BATCH = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8
 DEPOSIT = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c"
 WITHDRAWAL = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"
 
-# Chains whose native coin also has an ERC-20 face that logs its own Transfer
-# for the same coins (Celo's CELO at 0x471E...). Those logs are native moves,
-# and must not be counted again beside the synthetic one.
-NATIVE_ERC20_FACES = {"0x471ece3750da237f93b8e339c536989b8978a438"}
+# native ERC-20 faces (Celo's CELO): their Transfer logs are native moves
+NATIVE_ERC20_FACES = frozenset(_FACES.values())
 
 Rule = t.Literal[
     "reverts",
@@ -188,7 +188,11 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
         raise SimulationUnavailable(f"unexpected eth_simulateV1 answer: {e}") from e
     ok = str(call.get("status", "0x0")) in ("0x1", "1")
     logs = list(call.get("logs") or [])
-    diff = _diff(sender.lower(), logs, get_code)
+    try:
+        diff = _diff(sender.lower(), logs, get_code)
+        gas_used = int(str(call.get("gasUsed", "0x0")), 16)
+    except (TypeError, ValueError, AttributeError) as e:
+        raise SimulationUnavailable(f"unreadable eth_simulateV1 answer: {e}") from e
     called = [to.lower()]
     for log in logs:
         address = str(log.get("address", "")).lower()
@@ -211,35 +215,32 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
         approvals=diff["approvals"],
         positions=diff["positions"],
         called=called,
-        gas_used=int(str(call.get("gasUsed", "0x0")), 16),
+        gas_used=gas_used,
     )
 
 
 def _native_moves(logs: list[dict]) -> list[tuple[str, str, int]]:
-    """Return native (from, to, amount) moves, each counted once.
+    """Return native (from, to, amount) moves.
 
-    Synthetic 0xeeee logs and a native ERC-20 face's own Transfer logs report
-    the same coins; per (from, to, amount) the larger count of the two wins.
+    Two sources, which never report the same move: the synthetic 0xeeee logs
+    `traceTransfers` emits for native value, and the Transfer logs of a native
+    ERC-20 face (a CELO.transfer emits only the face's). Checked against Celo's
+    RPC: a plain send logs only the synthetic one, a face transfer only its own.
     """
-    synthetic: dict[tuple[str, str, int], int] = {}
-    face: dict[tuple[str, str, int], int] = {}
+    moves = []
     for log in logs:
         topics = [str(x).lower() for x in log.get("topics") or []]
         if len(topics) != 3 or topics[0] != TRANSFER:
             continue
         address = str(log.get("address", "")).lower()
-        key = (
-            _topic_address(topics[1]),
-            _topic_address(topics[2]),
-            _word(str(log.get("data", "0x")), 0),
-        )
-        if address == NATIVE_LOG_ADDRESS:
-            synthetic[key] = synthetic.get(key, 0) + 1
-        elif address in NATIVE_ERC20_FACES:
-            face[key] = face.get(key, 0) + 1
-    moves = []
-    for key in sorted(set(synthetic) | set(face)):
-        moves += [key] * max(synthetic.get(key, 0), face.get(key, 0))
+        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES:
+            moves.append(
+                (
+                    _topic_address(topics[1]),
+                    _topic_address(topics[2]),
+                    _word(str(log.get("data", "0x")), 0),
+                )
+            )
     return moves
 
 
@@ -304,6 +305,19 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
         elif kind == WITHDRAWAL and len(topics) == 2:  # WETH burned from src
             if _topic_address(topics[1]) == holder:
                 tokens[address] = tokens.get(address, 0) - _word(data, 0)
+        elif kind == APPROVAL and len(topics) == 4:  # ERC-721: all indexed
+            if _topic_address(topics[1]) == holder:
+                spender = _topic_address(topics[2])
+                approvals.append(
+                    {
+                        "token": address,
+                        "spender": spender,
+                        # approving the zero address clears it: a revoke
+                        "amount": "0" if spender == ZERO_ADDRESS else "1",
+                        "infinite": False,
+                        "id": str(int(topics[3], 16)),
+                    }
+                )
         elif kind == APPROVAL and len(topics) == 3:
             if _topic_address(topics[1]) == holder:
                 amount = _word(data, 0)
@@ -347,8 +361,17 @@ def _erc1155_items(kind: str, data: str) -> list[tuple[int, int]]:
     """Return (id, amount) pairs of a TransferSingle or TransferBatch."""
     if kind == TRANSFER_SINGLE:
         return [(_word(data, 0), _word(data, 1))]
+    words = len(data.removeprefix("0x")) // 64
     ids_at, amounts_at = _word(data, 0) // 32, _word(data, 1) // 32
     count = _word(data, ids_at)
+    # the contract controls these words: an array longer than the data is a
+    # malformed log, and must not make the gate loop over it
+    if (
+        count != _word(data, amounts_at)
+        or ids_at + 1 + count > words
+        or amounts_at + 1 + count > words
+    ):
+        raise SimulationUnavailable("malformed TransferBatch log in the simulation")
     return [
         (_word(data, ids_at + 1 + i), _word(data, amounts_at + 1 + i))
         for i in range(count)
@@ -482,7 +505,7 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
     granted = intent.get("approvals", [])
     for entry in diff["approvals"]:
         if entry["amount"] == "0":
-            continue  # a revoke is never refused
+            continue  # an approval of 0 (a revoke) is never refused
         amount = MAX_UINT256 if entry["amount"] == "all" else int(entry["amount"])
         if not any(
             g["token"] == entry["token"]

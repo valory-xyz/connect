@@ -4790,6 +4790,15 @@ def test_v2_position_claim_through_router(monkeypatch, command, won) -> None:
         granted = [(_CTF, _calldata(_APPROVE_ALL, a, True)) for a in _ADAPTERS]
         assert sorted(approvals) == sorted([*granted[: 2 * won], _ROUTER_APPROVAL])
         assert claims == [(_ROUTER, claim), *[_adapter_claim(0)] * 2 * won]
+    # every call carries the intent the server re-checks: an approval its
+    # grant (setApprovalForAll as the maximum), a claim nothing to spend
+    for (target, data), intent in zip(cs.sent, cs.intents):
+        if data.startswith(_APPROVAL):
+            ((grant,),) = [intent["approvals"]]
+            assert grant["token"] == target.lower()
+            assert grant["amount"] == 2**256 - 1
+        else:
+            assert intent == {}
 
 
 def test_v2_position_losing_row_not_claimed(monkeypatch, capsys) -> None:

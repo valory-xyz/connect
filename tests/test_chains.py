@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Tests for the supported-chain table (OPE-2035 T8)."""
+"""Tests for the supported-chain table."""
 
 import threading
 import typing as t

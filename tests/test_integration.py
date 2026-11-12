@@ -350,6 +350,7 @@ def test_sign_and_send_mines_on_fork(
             "to": account.address,
             "value": 10**15,
             "data": "0x",
+            "intent": {"spend": {"native": 10**15}},
             "request_id": request_id,
         }
         headers = {"Authorization": f"Bearer {token}"}
@@ -399,6 +400,12 @@ def test_safe_transaction_mines_a_server_composed_call_on_fork(
                 "chain": "gnosis",
                 "target": recipient,  # the call the *safe* makes
                 "value": 10**17,
+                # value-moving, so it says what it may do; the gate simulates
+                # it on the fork over eth_simulateV1 before signing
+                "intent": {
+                    "spend": {"native": 10**17},
+                    "recipients": [recipient.lower()],
+                },
                 "request_id": f"it-{secrets.token_hex(8)}",
             },
             headers={"Authorization": f"Bearer {token}"},
@@ -519,7 +526,12 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
 
         allowed = client.post(
             "/sign-and-send",
-            json={"chain": "gnosis", "to": account.address, "value": 1},
+            json={
+                "chain": "gnosis",
+                "to": account.address,
+                "value": 1,
+                "intent": {"spend": {"native": 1}},
+            },
             headers=headers,
         )
         assert allowed.status_code == 200, allowed.text

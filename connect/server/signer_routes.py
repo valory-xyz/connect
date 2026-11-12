@@ -48,7 +48,7 @@ class _SendBody(StrictBody):
     data: str = "0x"
     request_id: str | None = None
     gas: int | None = Field(default=None, ge=0)
-    # what the call may do; required when it moves value (OPE-2035 T5)
+    # what the call may do; required when it moves value
     intent: dict | None = None
 
     @field_validator("value", "gas", mode="before")
@@ -70,7 +70,7 @@ class SafeTransactionRequest(_SendBody):
     """A call the service safe makes: `target` is what the safe calls.
 
     The same name as the safe_transaction MCP tool's, so the two surfaces
-    cannot be confused for one another (OPE-2035 T6).
+    cannot be confused for one another.
     """
 
     target: str
@@ -105,7 +105,7 @@ def _dispatch(method: t.Callable[..., str], body: _SendBody, address: str) -> di
 
 
 def _authorize(request: Request, action: str, body: _SendBody | None = None) -> None:
-    """Hold this request's token to its grant: scope, caps, expiry (T4)."""
+    """Hold this request's token to its grant: scope, caps, expiry."""
     arguments = {} if body is None else body.model_dump()
     authorize_route(request, request.app.state.activity, action, arguments)
 

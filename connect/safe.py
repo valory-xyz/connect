@@ -178,3 +178,22 @@ def decode_deposit(data: str) -> int | None:
     except Exception:  # pylint: disable=broad-exception-caught
         return None
     return int(amount)
+
+
+def inner_call(data: str) -> tuple[str, int, str] | None:
+    """Return the (to, value, data) an execTransaction makes, or None if not one.
+
+    The intent gate simulates this call as the safe whatever path sends it:
+    an EOA transaction to the safe carrying execTransaction moves the safe's
+    assets, not the EOA's.
+    """
+    calldata = (data or "0x").removeprefix("0x").lower()
+    if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
+        return None
+    try:
+        target, value, inner, *_ = abi_decode(
+            EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:])
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None  # the guard refuses calldata it cannot decode first
+    return str(target), int(value), "0x" + bytes(inner).hex()

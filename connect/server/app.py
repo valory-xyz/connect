@@ -229,7 +229,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
 
     @app.exception_handler(RequestValidationError)
     async def refused_body(request: Request, exc: RequestValidationError) -> Response:
-        """Audit an unknown-parameter refusal (D12), then answer as FastAPI would."""
+        """Audit an unknown-parameter refusal, then answer as FastAPI would."""
         strict.audit_unknown_parameters(activity, request.url.path, exc.errors())
         return await request_validation_exception_handler(request, exc)
 

@@ -454,6 +454,12 @@ class FakeProvider:
     def make_request(self, method: str, params: list) -> dict:
         """Answer eth_simulateV1; nothing else is asked of this provider."""
         assert method == "eth_simulateV1"
+        # what the gate's diff depends on: without traceTransfers a real node
+        # emits no native Transfer logs, and a plain value send would look
+        # like it moves nothing
+        assert params[0]["traceTransfers"] is True
+        assert params[0]["validation"] is False
+        assert params[1] == "latest"
         if self.unavailable:
             return {"error": {"code": -32601, "message": "method not whitelisted"}}
         call = params[0]["blockStateCalls"][0]["calls"][0]

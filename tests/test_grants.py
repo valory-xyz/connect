@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Scoped tokens (OPE-2035 T4, D10)."""
+"""Scoped tokens."""
 
 import json
 import time
@@ -52,7 +52,7 @@ def grant(**kwargs: t.Any) -> TokenGrant:
 
 
 def test_the_workspace_token_can_do_what_a_session_always_could() -> None:
-    """Check read + mech + tx with no caps: D10 changes nothing for a session."""
+    """Check read + mech + tx with no caps: the workspace token loses nothing."""
     store = GrantStore(WORKSPACE)
     assert store.lookup(f"Bearer {WORKSPACE}") == WORKSPACE
     assert store.grant(WORKSPACE) == WORKSPACE_GRANT
@@ -162,16 +162,62 @@ def test_value_caps_per_tx_and_per_session() -> None:
     with pytest.raises(GrantRefused) as session:
         store.authorize(capped, "send_transaction", {"value": "6"})
     assert session.value.rule == "token-cap-per-session"
-    # a malformed amount is the gate's to refuse (bad-intent); the cap skips it
-    store.authorize(
-        capped,
-        "safe_transaction",
-        {"intent": {"spend": {USDC: "lots", "native": "0x5"}}},
-    )
+    store.authorize(capped, "safe_transaction", {"value": 5})  # 10 + 5 of 15
     with pytest.raises(GrantRefused):
         store.authorize(capped, "safe_transaction", {"value": 1})
     store.authorize(capped, "sign_message", {})  # digests carry no value
-    store.authorize(capped, "safe_transaction", {"intent": "not an object"})
+
+
+def test_a_json_string_intent_is_capped_like_the_tool_reads_it() -> None:
+    """Decode a string intent before capping it, as FastMCP does before the tool."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(max_value_per_tx={USDC: 10}))
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(
+            capped,
+            "safe_transaction",
+            {"intent": json.dumps({"spend": {USDC: 10**12}})},
+        )
+    assert refused.value.rule == "token-cap-per-tx"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "rule"),
+    [
+        ({"intent": {"spend": {USDC: -(10**30)}}}, "bad-intent"),
+        ({"intent": {"spend": {USDC: "lots"}}}, "bad-intent"),
+        ({"intent": "not json"}, "bad-intent"),
+        ({"value": -(10**30)}, "bad-value"),
+        ({"value": "abc"}, "bad-value"),
+        ({"value": True}, "bad-value"),
+    ],
+)
+def test_malformed_amounts_are_refused_before_any_budget_moves(
+    arguments: dict, rule: str
+) -> None:
+    """A negative or malformed amount can never refill a session budget."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(capped, "safe_transaction", arguments)
+    assert refused.value.rule == rule
+    store.authorize(capped, "safe_transaction", {"intent": {"spend": {USDC: 100}}})
+    with pytest.raises(GrantRefused):
+        store.authorize(capped, "safe_transaction", {"intent": {"spend": {USDC: 1}}})
+
+
+def test_children_draw_on_their_parents_session_budget() -> None:
+    """Minting more children does not multiply a parent's session cap."""
+    store = GrantStore(WORKSPACE)
+    parent = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
+    children = [
+        store.mint(parent, grant(max_value_per_session={"native": 10}))
+        for _ in range(3)
+    ]
+    store.authorize(children[0], "safe_transaction", {"value": 6})
+    store.authorize(children[1], "safe_transaction", {"value": 4})
+    with pytest.raises(GrantRefused, match="every token minted from it"):
+        store.authorize(children[2], "safe_transaction", {"value": 1})
 
 
 def test_per_tx_only_caps_do_not_track_a_session() -> None:

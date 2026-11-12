@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Chat tools over mech_request (OPE-2035 T3, D7)."""
+"""Chat tools over mech_request."""
 
 import json
 

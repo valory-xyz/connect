@@ -17,12 +17,12 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Refuse unknown parameters on every agent-facing surface (OPE-2035 T6).
+"""Refuse unknown parameters on every agent-facing surface.
 
-A parameter a tool does not take used to be dropped without a word: a
-session that sent `to` to `safe_transaction` had its recipient ignored and
-the call made with the default. Both surfaces now refuse it and name the
-parameters the tool does take, so the mistake is visible and fixable.
+A parameter a tool does not take would otherwise be dropped without a word:
+a session that sent `to` to `safe_transaction` would have its recipient
+ignored and the call made with the default. Both surfaces refuse it and name
+the parameters the tool does take, so the mistake is visible and fixable.
 """
 
 import difflib

@@ -33,13 +33,11 @@ points a request needs them; the reasoning for each lives there.
 """
 
 import asyncio
-import hashlib
-import json
 import logging
 import os
 import threading
+import time
 import typing as t
-import uuid
 from collections.abc import Mapping
 
 from eth_typing import URI
@@ -62,6 +60,7 @@ from connect.mech_chat import chat_report, is_chat_prompt
 from connect.mech_nonces import NonceAllocator, NonceRefused, send_with_nonce
 from connect.mech_rpc import RPC_LOCK, listing_mechs
 from connect.mech_signer import MechSigner
+from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
 from connect.mech_types import (
     MechError,
     MechUnknownRequest,
@@ -85,6 +84,9 @@ MAX_DELIVERY_TIMEOUT = 900.0
 # default: the caller decides when to give up, and a long block here buys
 # nothing a second call would not.
 DEFAULT_RESULT_TIMEOUT = 30.0
+# how long an off-chain send waits for a delivery under the nonce lock;
+# positive, since mech-client reads 0 as its 300 s default
+ACK_WAIT_SECONDS = 1.0
 DEFAULT_MECH_PAGE_SIZE = 20
 MAX_MECH_PAGE_SIZE = 100
 
@@ -116,56 +118,6 @@ def _clamp_timeout(timeout: float) -> float:
 def _request_key(request_id: object) -> str:
     """Normalize a request id: the two flows disagree about the 0x prefix."""
     return str(request_id).lower().removeprefix("0x")
-
-
-def _canonical_context(request_context: dict | None) -> str:
-    """Encode a context as the stamp, the metadata and the trail all read it.
-
-    Sorted, so the fingerprint does not turn key order into a new question —
-    which also refuses the mixed-type keys ``sorted()`` chokes on, before a
-    payment rather than while logging the delivery it bought.
-    """
-    try:
-        return json.dumps(request_context, sort_keys=True)
-    except (TypeError, ValueError) as e:
-        raise MechError(f"request_context could not be encoded: {e}") from e
-
-
-def _metadata_extras(request_context: dict | None) -> dict:
-    """Build the metadata extras mech-client merges over prompt/tool/nonce."""
-    extras: dict = {"nonce": str(uuid.uuid4())}
-    if request_context is not None:
-        extras["request_context"] = request_context
-    return extras
-
-
-def _request_stamp(
-    prompt: str,
-    tool: str,
-    *,
-    chain: str,
-    priority_mech: str | None,
-    legacy_on_chain: bool,
-    request_context: dict | None,
-) -> str:
-    """Fingerprint what a request asked.
-
-    A ledger keyed on the caller's id alone would answer a new question with
-    an old answer if that id were reused — and the caller acts on the answer,
-    so the mistake would be silent and expensive.
-    """
-    context = _canonical_context(request_context)
-    raw = "\x1f".join(
-        (
-            prompt,
-            tool,
-            chain.lower(),
-            (priority_mech or "").lower(),
-            str(legacy_on_chain),
-            context,
-        )
-    )
-    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 class MetadataRead(t.NamedTuple):
@@ -222,7 +174,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         # mech_result can resume the watch a paid-for request deserves
         self._pending: dict[str, PendingDelivery] = {}
         self._requests = RequestLedger()
-        # Connect, not mech-client, allocates off-chain nonces (OPE-2035 T3)
+        # Connect, not mech-client, allocates off-chain nonces
         self._nonces = NonceAllocator(config.store_path)
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
@@ -477,7 +429,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
 
         if request_id is None:
             return attempt()
-        stamp = _request_stamp(
+        stamp = request_stamp(
             prompt,
             tool,
             chain=self._resolve_chain(chain),
@@ -618,7 +570,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         what an operator reconstructs an incident from, and a request blocked
         by policy must not look identical there to one never attempted.
         """
-        _canonical_context(request_context)
+        canonical_context(request_context)
         chain = self._resolve_chain(chain)
         service = self._service(chain)
         priced = self._priced_mech(service, chain, priority_mech)
@@ -667,7 +619,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # mech-client will derive and sign — is known here first; the
             # matching allowance is registered before the send. Armed in
             # every mode so both leave the same audit trail.
-            extra_attributes = _metadata_extras(request_context)
+            extra_attributes = metadata_extras(request_context)
             offchain: OffchainDigests | None = self._allowances.offchain_digests(
                 service,
                 chain=chain,
@@ -717,6 +669,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # an auto-deposit builds a fresh mech-client service mid-send, and
             # it reads this variable again; see _service
             os.environ["MECHX_CHAIN_RPC"] = self._config.chain(plan.chain).rpc_url
+        deadline = time.monotonic() + timeout
         try:
             result = self._send(plan, prompt, timeout)
         except NonceRefused as e:
@@ -760,6 +713,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # nothing in the signed request expires it (mech-client sends no
             # deadline): it can settle whenever the mech delivers it
             payload["expires"] = None
+            self._resume_watch(payload, deadline)
         if is_chat_prompt(prompt):
             for data in (payload.get("delivery_results") or {}).values():
                 chat = chat_report(data)
@@ -767,11 +721,28 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     payload.update(chat)
         return payload
 
+    def _resume_watch(self, payload: dict, deadline: float) -> None:
+        """Spend the rest of the caller's wait on deliveries, off the nonce lock.
+
+        The off-chain send waits only ACK_WAIT_SECONDS under the queue's lock,
+        so other requests from the safe queue for its POST, not its delivery.
+        """
+        for key in list(payload.get("pending_request_ids") or []):
+            remaining = deadline - time.monotonic()
+            if remaining < 1:
+                return
+            report = self.result(key, timeout=remaining)
+            if report.get("delivered"):
+                payload.setdefault("delivery_results", {})[key] = report["result"]
+                payload["pending_request_ids"].remove(key)
+        if not payload.get("pending_request_ids"):
+            payload.pop("pending_request_ids", None)
+
     def _send(self, plan: _RequestPlan, prompt: str, timeout: float) -> dict:
-        """Send the planned request with a nonce Connect allocated (T3, D24)."""
+        """Send the planned request with a nonce Connect allocated."""
         safe = t.cast(str, self._config.chain(plan.chain).safe_address)
 
-        def send(**extra: t.Any) -> dict:
+        def send(wait: float, **extra: t.Any) -> dict:
             return asyncio.run(
                 plan.service.send_request(
                     prompts=(prompt,),
@@ -780,7 +751,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     use_offchain=not plan.legacy_on_chain,
                     auto_deposit=plan.auto_deposit,
                     extra_attributes=plan.extra_attributes,
-                    timeout=timeout,
+                    timeout=wait,
                     **extra,
                 )
             )
@@ -794,7 +765,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 lambda: read_map_nonces(contract, safe),
                 timeout=timeout,
             ):
-                return send()
+                return send(timeout)
         hook, salt = plan.offchain.on_request_id, (plan.extra_attributes or {})["nonce"]
         return send_with_nonce(
             self._nonces,
@@ -803,7 +774,10 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             mech=plan.priced.mech,
             salt=str(salt),
             read_map_nonces=plan.offchain.map_nonces,
-            send=lambda nonce: send(nonces=[nonce], on_request_id=hook),
+            # a short wait under the lock; _resume_watch spends the rest
+            send=lambda nonce: send(
+                min(timeout, ACK_WAIT_SECONDS), nonces=[nonce], on_request_id=hook
+            ),
             not_sent=(MechError, SignerError),
             timeout=timeout,
         )

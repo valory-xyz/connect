@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Read-only chain tools: call a contract, find its ABI, decode calldata (T5).
+"""Read-only chain tools: call a contract, find its ABI, decode calldata.
 
 Nothing here signs or spends. `get_abi` resolves only what Connect ships: a
 few well-known contracts by address, and the standard interfaces a contract
@@ -32,6 +32,7 @@ import typing as t
 from eth_abi import decode as abi_decode
 from eth_utils import keccak, to_checksum_address
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 
 # EIP-1967: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
 IMPLEMENTATION_SLOT = int(
@@ -127,13 +128,17 @@ def _split_types(text: str) -> list[str]:
 
 
 def chain_call(w3: Web3, to: str, data: str, block: str = "latest") -> dict:
-    """Run an eth_call; return {result} or {reverted, reason}."""
+    """Run an eth_call; return {result} or {reverted, reason}.
+
+    Only a revert is reported as one: an RPC that is down or times out raises,
+    so an unreachable chain never reads as a contract that said no.
+    """
     try:
         raw = w3.eth.call(
             {"to": to_checksum_address(to), "data": t.cast(t.Any, data or "0x")},
             block_identifier=t.cast(t.Any, block),
         )
-    except Exception as e:  # pylint: disable=broad-exception-caught
+    except (ContractLogicError, ValueError) as e:
         return {"reverted": True, "reason": str(e)}
     return {"result": "0x" + bytes(raw).hex()}
 

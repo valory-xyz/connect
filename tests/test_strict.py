@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Unknown parameters are refused by name on both surfaces (OPE-2035 T6)."""
+"""Unknown parameters are refused by name on both surfaces."""
 
 import typing as t
 

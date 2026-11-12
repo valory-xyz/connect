@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""The intent gate at the signing choke point, and the read tools (OPE-2035 T5)."""
+"""The intent gate at the signing choke point, and the read tools."""
 
 import typing as t
 
@@ -223,6 +223,60 @@ class TestSignerGate:
         assert test_signer.check(
             "testchain", EOA, value=5, intent=pay(EOA, 5), via_safe=False
         ) == (None, [])
+
+    def test_an_eoa_exec_transaction_is_gated_as_the_safe(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """send_transaction to the safe with execTransaction moves the safe's assets.
+
+        Simulated as the EOA it would look like it moves nothing; the gate
+        simulates the call inside it, as the safe, so it needs an intent.
+        """
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        calldata = safe_module.exec_transaction(
+            target=EOA, value=7, data="0x", owner=test_signer.address
+        )
+        with pytest.raises(SignerError, match="'missing-intent'"):
+            test_signer.send("testchain", SAFE, data=calldata)
+        assert fake_w3.provider.simulated[-1]["from"] == SAFE
+        assert fake_w3.provider.simulated[-1]["to"] == EOA
+        test_signer.send("testchain", SAFE, data=calldata, intent=pay(EOA, 7))
+        assert len(fake_w3.eth.sent) == 1
+        with pytest.raises(SignerError, match="may not also carry value"):
+            test_signer.send(
+                "testchain", SAFE, value=1, data=calldata, intent=pay(EOA, 7)
+            )
+        assert safe_module.inner_call("0x6a761202" + "zz") is None
+
+    def test_the_guard_answers_before_anything_is_simulated(
+        self, test_signer: Signer, fake_w3: FakeW3, guard: Guard
+    ) -> None:
+        """A floor refusal (the safe calling itself) never reaches the RPC."""
+        test_signer.set_guard(guard)
+        with pytest.raises(SignerError, match="may not call itself"):
+            test_signer.send_via_safe("testchain", SAFE, value=1, intent=pay(SAFE, 1))
+        assert fake_w3.provider.simulated == []
+
+    def test_unreadable_rpc_answers_are_simulation_unavailable(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A recipient lookup that fails, or an answer with no result, refuses by rule."""
+
+        def no_code(address: str) -> bytes:
+            raise ConnectionError("getCode timed out")
+
+        monkeypatch.setattr(fake_w3.eth, "get_code", no_code)
+        with pytest.raises(SignerError, match="'simulation-unavailable'.*getCode"):
+            test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
+        monkeypatch.setattr(fake_w3.provider, "make_request", lambda m, p: {})
+        with pytest.raises(SignerError, match="no result in the answer"):
+            test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
 
 
 class TestSimulate:

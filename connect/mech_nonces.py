@@ -17,15 +17,14 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Connect's marketplace nonce allocator: one per safe and chain (OPE-2035 T3).
+"""Connect's marketplace nonce allocator: one per safe and chain.
 
-Two off-chain requests from one safe used to get the same nonce: mech-client
-set each to the marketplace's `mapNonces(safe)`, which only moves when a
-delivery settles. Connect now owns the allocation and hands mech-client the
-nonce to sign (`send_request(nonces=[n])`), on the marketplace as deployed
-(D24): the mech admits only `nonce == mapNonces + accepted + settling` (503 on
-a gap, 401 on a stale or duplicate nonce), and settlement rebuilds every id
-from `mapNonces`, so
+mech-client's own choice of nonce is the marketplace's `mapNonces(safe)`,
+which only moves when a delivery settles, so two off-chain requests from one
+safe would share it. Connect owns the allocation instead and hands mech-client
+the nonce to sign (`send_request(nonces=[n])`). The mech admits only
+`nonce == mapNonces + accepted + settling` (503 on a gap, 401 on a stale or
+duplicate nonce), and settlement rebuilds every id from `mapNonces`, so
 
 - one mech is in flight per safe and chain: a request to another mech waits
   until the first mech's slots settle, and is refused as `mech-in-flight`
@@ -104,22 +103,29 @@ class _Queue:
 class Reservation:
     """A nonce reserved under the queue's lock, until the mech answers."""
 
-    def __init__(self, allocator: "NonceAllocator", key: str, nonce: int) -> None:
-        """Initialize."""
+    def __init__(
+        self,
+        allocator: "NonceAllocator",
+        key: str,
+        nonce: int,
+        prior: "_Slot | None",
+    ) -> None:
+        """Initialize; `prior` is what held this nonce before this reservation."""
         self._allocator = allocator
         self._key = key
         self.nonce = nonce
+        self.prior = prior
         self.outcome: Outcome | None = None
 
     def answered(self, outcome: Outcome, *, mech: str, salt: str) -> None:
         """Record the mech's answer to this nonce."""
         self.outcome = outcome
         self._allocator._answered(  # pylint: disable=protected-access
-            self._key, self.nonce, outcome, mech=mech, salt=salt
+            self._key, self.nonce, outcome, mech=mech, salt=salt, prior=self.prior
         )
 
 
-class NonceAllocator:
+class NonceAllocator:  # pylint: disable=too-many-instance-attributes
     """Allocates off-chain marketplace nonces, one queue per (chain, safe)."""
 
     def __init__(
@@ -136,7 +142,10 @@ class NonceAllocator:
         self._clock = clock
         self._sleep = sleep
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()
         self._queues: dict[str, _Queue] = {}
+        self._broken = False
+        self._unwritable = False
         self._load()
 
     @staticmethod
@@ -162,11 +171,6 @@ class NonceAllocator:
             "until one is accepted again"
         )
 
-    def salt(self, chain: str, safe: str, nonce: int) -> str | None:
-        """Return the salt kept with a held slot, so a resend signs the same id."""
-        slot = self._queue(self.key(chain, safe)).slots.get(nonce)
-        return None if slot is None else slot.salt
-
     def sync(self, chain: str, safe: str, map_nonces: int) -> None:
         """Free every slot below mapNonces (settled), and stall an overdue queue.
 
@@ -184,9 +188,11 @@ class NonceAllocator:
         settled = [n for n in queue.slots if n < map_nonces]
         for nonce in settled:
             del queue.slots[nonce]
+        # an accepted slot the mech never settled, or an unknown one (a POST
+        # whose answer was lost) nothing resolved: later nonces would gap
+        # behind it, so the queue probes at mapNonces until one is accepted
         overdue = any(
-            slot.state == ACCEPTED and now - slot.at > self._settle_timeout
-            for slot in queue.slots.values()
+            now - slot.at > self._settle_timeout for slot in queue.slots.values()
         )
         if overdue and not queue.stalled:
             logger.warning("mech nonce queue %s stalled: a slot never settled", key)
@@ -195,7 +201,7 @@ class NonceAllocator:
             self._save()
 
     @contextlib.contextmanager
-    def reserve(
+    def reserve(  # pylint: disable=too-many-arguments
         self,
         chain: str,
         safe: str,
@@ -203,6 +209,7 @@ class NonceAllocator:
         read_map_nonces: t.Callable[[], int],
         *,
         timeout: float,
+        salt: str = "",
     ) -> t.Iterator[Reservation]:
         """Reserve the next nonce for `mech`, holding the queue until it answers.
 
@@ -215,7 +222,7 @@ class NonceAllocator:
         key = self.key(chain, safe)
         queue = self._queue(key)
         deadline = self._clock() + timeout
-        with queue.lock:
+        with self._locked(queue, timeout):
             while True:
                 map_nonces = read_map_nonces()
                 self._sync(key, queue, map_nonces)
@@ -234,15 +241,19 @@ class NonceAllocator:
                 nonce = map_nonces  # the probe that can clear the stall
             else:
                 nonce = map_nonces + len(queue.slots)
-            reservation = Reservation(self, key, nonce)
+            # written down before the POST: if the process dies mid-send the
+            # mech may hold n, and a restart must not hand it out again
+            prior = queue.slots.get(nonce)  # held already only for a probe
+            queue.slots[nonce] = _Slot(UNKNOWN, mech.lower(), salt, self._clock())
+            self._save()
+            reservation = Reservation(self, key, nonce, prior)
             try:
                 yield reservation
             finally:
                 if reservation.outcome is None:
-                    # the caller never heard from the mech (an exception, a
-                    # crash mid-send): whether it stored the request is
-                    # unknown, so the slot is held, never reused
-                    reservation.answered(UNKNOWN, mech=mech, salt="")
+                    # an exception mid-send: whether the mech stored the
+                    # request is unknown, so the slot stays held
+                    reservation.answered(UNKNOWN, mech=mech, salt=salt)
 
     @contextlib.contextmanager
     def exclusive(
@@ -263,7 +274,7 @@ class NonceAllocator:
         key = self.key(chain, safe)
         queue = self._queue(key)
         deadline = self._clock() + timeout
-        with queue.lock:
+        with self._locked(queue, timeout):
             while True:
                 self._sync(key, queue, read_map_nonces())
                 if not queue.slots:
@@ -277,6 +288,21 @@ class NonceAllocator:
                 self._sleep(POLL_SECONDS)
             yield
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _locked(queue: _Queue, timeout: float) -> t.Iterator[None]:
+        """Hold a queue's lock, waiting at most `timeout` for it."""
+        if not queue.lock.acquire(timeout=max(timeout, 0)):
+            raise NonceRefused(
+                "mech-in-flight",
+                "another request from this safe is still being sent on this "
+                "chain; try again shortly",
+            )
+        try:
+            yield
+        finally:
+            queue.lock.release()
+
     def _check_readable(self) -> None:
         if self._broken:
             raise NonceRefused(
@@ -285,51 +311,95 @@ class NonceAllocator:
                 "told from free ones; no mech request is sent until the operator "
                 "restores or removes it",
             )
+        if self._unwritable:
+            raise NonceRefused(
+                "mech-queue-unwritable",
+                f"{self._path.name} could not be written, so a held nonce would "
+                "not survive a restart; no mech request is sent until STORE_PATH "
+                "is writable again and Connect restarts",
+            )
 
-    def _answered(
-        self, key: str, nonce: int, outcome: Outcome, *, mech: str, salt: str
+    def _answered(  # pylint: disable=too-many-arguments
+        self,
+        key: str,
+        nonce: int,
+        outcome: Outcome,
+        *,
+        mech: str,
+        salt: str,
+        prior: _Slot | None,
     ) -> None:
-        """Apply the mech's answer to a reserved nonce (the queue lock is held)."""
+        """Apply the mech's answer to a reserved nonce (the queue lock is held).
+
+        `prior` is the slot that held n before this reservation's placeholder:
+        only a stalled queue's probe can reserve a nonce that is already held.
+        """
         queue = self._queue(key)
-        held = queue.slots.get(nonce)
+        now = self._clock()
         if outcome == "accepted":
-            queue.slots[nonce] = _Slot(ACCEPTED, mech.lower(), salt, self._clock())
+            queue.slots[nonce] = _Slot(ACCEPTED, mech.lower(), salt, now)
             queue.stalled = False
         elif outcome == "taken":
-            if held is not None and held.state == UNKNOWN:
-                held.state = ACCEPTED  # our own earlier request holds it
+            if prior is not None and prior.state == UNKNOWN:
+                # our own earlier request holds n: it was accepted after all
+                queue.slots[nonce] = _Slot(ACCEPTED, prior.mech, prior.salt, now)
             else:
                 # another signer took n, or the mech still settles slots we
                 # think free: sending more would only gap behind it
+                self._restore(queue, nonce, prior)
                 queue.stalled = True
         elif outcome == UNKNOWN:
-            queue.slots[nonce] = _Slot(UNKNOWN, mech.lower(), salt, self._clock())
-        # "not_accepted": n is free, reused next; "retry": the caller resends
+            queue.slots[nonce] = _Slot(UNKNOWN, mech.lower(), salt, now)
+        elif outcome == "not_accepted":
+            self._restore(queue, nonce, prior)  # n is reused next
+        # "retry": the caller resends the same nonce, under the placeholder
         self._save()
+
+    @staticmethod
+    def _restore(queue: _Queue, nonce: int, prior: _Slot | None) -> None:
+        """Put back what held n before the placeholder, or free n."""
+        if prior is None:
+            queue.slots.pop(nonce, None)
+        else:
+            queue.slots[nonce] = prior
 
     def _load(self) -> None:
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
+            queues = {
+                key: _Queue(
+                    slots={
+                        int(n): _Slot(s["state"], s["mech"], s["salt"], float(s["at"]))
+                        for n, s in entry.get("slots", {}).items()
+                    },
+                    stalled=bool(entry.get("stalled")),
+                )
+                for key, entry in raw.items()
+            }
         except FileNotFoundError:
             return
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             # held slots cannot be told apart from free ones any more, so stop
             # every queue rather than risk reissuing a nonce the mech holds
             logger.error("unreadable %s (%s); mech requests refused", self._path, e)
             self._broken = True
             return
-        for key, entry in raw.items():
-            self._queues[key] = _Queue(
-                slots={
-                    int(n): _Slot(s["state"], s["mech"], s["salt"], float(s["at"]))
-                    for n, s in entry.get("slots", {}).items()
-                },
-                stalled=bool(entry.get("stalled")),
-            )
-
-    _broken = False
+        self._queues.update(queues)
 
     def _save(self) -> None:
+        """Write every queue down; a failure refuses requests, never an answer."""
+        with self._save_lock:
+            try:
+                self._write()
+            except OSError as e:
+                logger.error(
+                    "could not write %s (%s); mech requests refused", self._path, e
+                )
+                self._unwritable = True
+
+    def _write(self) -> None:
+        with self._lock:
+            queues = list(self._queues.items())
         state = {
             key: {
                 "stalled": queue.stalled,
@@ -340,10 +410,10 @@ class NonceAllocator:
                         "salt": s.salt,
                         "at": s.at,
                     }
-                    for n, s in sorted(queue.slots.items())
+                    for n, s in sorted(dict(queue.slots).items())
                 },
             }
-            for key, queue in self._queues.items()
+            for key, queue in queues
         }
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -351,7 +421,7 @@ class NonceAllocator:
 
 
 def outcome_of(rejection: OffchainRequestRejected) -> Outcome:
-    """Map the mech's HTTP answer to what it means for the nonce (D24)."""
+    """Map the mech's HTTP answer to what it means for the nonce."""
     if rejection.status == 503:
         return "retry"
     if rejection.status == 401 and rejection.reason == NONCE_TAKEN_REASON:
@@ -391,7 +461,9 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
 
     :raises NonceRefused: naming the rule, when the mech did not accept it.
     """
-    with allocator.reserve(chain, safe, mech, read_map_nonces, timeout=timeout) as slot:
+    with allocator.reserve(
+        chain, safe, mech, read_map_nonces, timeout=timeout, salt=salt
+    ) as slot:
         for attempt in range(MAX_GAP_RETRIES + 1):
             try:
                 result = send(slot.nonce)

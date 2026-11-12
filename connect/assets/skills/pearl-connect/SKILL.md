@@ -101,7 +101,7 @@ script or another tool a token, mint a narrower one first:
 POST /tokens  (Authorization: Bearer <your token>)
 {"scopes": ["read"]}                                    # balances and reads only
 {"scopes": ["tx"], "max_value_per_tx": {"native": 1000000000000000},
- "max_value_per_session": {"native": 5000000000000000}, "expires_at": 1767225600}
+ "max_value_per_session": {"native": 5000000000000000}, "expires_at": <unix seconds, e.g. now + 3600>}
 ```
 
 It answers `{token, grant}`. Scopes are `read`, `mech` and `tx`; caps are per

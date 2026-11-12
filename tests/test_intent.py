@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Tests for the intent gate (OPE-2035 T5)."""
+"""Tests for the intent gate."""
 
 import typing as t
 
@@ -107,17 +107,96 @@ def test_native_and_token_spend_are_netted_per_asset() -> None:
     assert diff["gas_used"] == 16
 
 
-def test_celo_native_face_is_not_counted_twice() -> None:
-    """Celo's CELO logs its own Transfer for the same coins as the synthetic one."""
+def test_celo_native_moves_from_both_sources_are_summed() -> None:
+    """A plain CELO send logs only the synthetic Transfer, a CELO.transfer only its own.
+
+    Shapes as Celo's RPC answers eth_simulateV1 (checked against
+    celo-rpc.publicnode.com): the two never report one move, so both count,
+    and the face's logs are never also counted as an ERC-20.
+    """
     diff = simulate(
         [
             native_transfer_log(SAFE, EOA, 7),
-            transfer(CELO_FACE, SAFE, EOA, 7),
-            transfer(CELO_FACE, SAFE, EOA, 3),  # a face-only move still counts
+            transfer(CELO_FACE, SAFE, EOA, 3),
         ]
     )
     assert diff["native"] == "-10"
     assert diff["tokens"] == {}
+
+
+def test_polygons_own_log_transfer_is_not_counted() -> None:
+    """Polygon's 0x...1010 emits LogTransfer, a different event, beside the synthetic one."""
+    log_transfer = {
+        "address": "0x0000000000000000000000000000000000001010",
+        "topics": [
+            "0xe6497e3e18d9b3f9d0b14a1ea4b4b8e8cc8b25ae2c7e4e1b5f4d8b1e5b6b7c8d",
+            "0x" + "00" * 32,
+            _topic(SAFE),
+            _topic(EOA),
+        ],
+        "data": "0x" + _word(5) + _word(0) + _word(0),
+    }
+    diff = simulate([native_transfer_log(SAFE, EOA, 5), log_transfer])
+    assert diff["native"] == "-5"
+    assert diff["tokens"] == {}
+
+
+def test_burns_and_self_transfers_are_not_recipients() -> None:
+    """A burn to the zero address and a transfer to oneself name no recipient."""
+    diff = simulate(
+        [
+            transfer(TOKEN, SAFE, "0x" + "00" * 20, 4),
+            transfer(TOKEN, SAFE, SAFE, 1),
+        ]
+    )
+    assert diff["recipients"] == []
+    assert intent.check_intent(diff, {"spend": {TOKEN: 4}}) == []
+
+
+def test_an_nft_approval_is_value_moving_and_checked() -> None:
+    """ERC-721 Approval has every field indexed; it is a grant like any other."""
+
+    def nft_approval(spender: str) -> dict:
+        return {
+            "address": CONTRACT,
+            "topics": [intent.APPROVAL, _topic(SAFE), _topic(spender), "0x" + _word(9)],
+            "data": "0x",
+        }
+
+    diff = simulate([nft_approval(SPENDER)])
+    assert diff["approvals"] == [
+        {
+            "token": CONTRACT,
+            "spender": SPENDER,
+            "amount": "1",
+            "infinite": False,
+            "id": "9",
+        }
+    ]
+    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert rules(intent.check_intent(diff, {})) == ["undeclared-approval"]
+    cleared = simulate([nft_approval("0x" + "00" * 20)])
+    assert intent.check_intent(cleared, None) == []  # approving nobody clears it
+
+
+def test_a_malformed_batch_is_simulation_unavailable() -> None:
+    """A TransferBatch whose arrays outrun its data cannot make the gate loop."""
+    huge = {
+        "address": TOKEN,
+        "topics": [intent.TRANSFER_BATCH, _topic(SAFE), _topic(SAFE), _topic(EOA)],
+        "data": "0x" + _word(64) + _word(96) + hex(2**200)[2:].rjust(64, "0"),
+    }
+    with pytest.raises(intent.SimulationUnavailable, match="TransferBatch"):
+        simulate([huge])
+    with pytest.raises(intent.SimulationUnavailable, match="unreadable"):
+        intent.simulate(
+            lambda m, p: [{"calls": [{"status": "0x1", "gasUsed": "zz", "logs": []}]}],
+            sender=SAFE,
+            to=CONTRACT,
+            value=0,
+            data="0x",
+            get_code=lambda a: b"",
+        )
 
 
 def test_weth_and_nft_moves_and_approvals() -> None:
@@ -346,3 +425,21 @@ def test_refusal_message_names_every_rule() -> None:
     assert message == (
         "refused by the intent gate: rule 'overspend': a; rule 'reverts': b"
     )
+
+
+def test_an_approval_is_covered_only_by_the_same_token_spender_and_enough() -> None:
+    """One unit short, a different spender, a different token: each is refused."""
+    diff = _diff(approvals=[{"token": TOKEN, "spender": SPENDER, "amount": "10"}])
+    all_diff = _diff(approvals=[{"token": TOKEN, "spender": SPENDER, "amount": "all"}])
+    for granted in (
+        {"token": TOKEN, "spender": SPENDER, "amount": 9},
+        {"token": TOKEN, "spender": EOA, "amount": 10},
+        {"token": CONTRACT, "spender": SPENDER, "amount": 10},
+    ):
+        assert rules(
+            intent.check_intent(diff, t.cast(intent.Intent, {"approvals": [granted]}))
+        ) == ["undeclared-approval"]
+    below_max = {"token": TOKEN, "spender": SPENDER, "amount": intent.MAX_UINT256 - 1}
+    assert rules(
+        intent.check_intent(all_diff, t.cast(intent.Intent, {"approvals": [below_max]}))
+    ) == ["undeclared-approval"]

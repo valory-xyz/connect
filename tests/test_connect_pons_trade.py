@@ -224,12 +224,14 @@ def test_a_native_buy_is_one_call_carrying_the_value() -> None:
     assert call["value"] == 5
     assert call["to"] == CURVE
     assert bytes.fromhex(call["data"][2:10]) == curve.SEL_BUY
+    assert call["intent"] == {"spend": {"native": 5}}
 
 
 def test_an_erc20_buy_approves_exactly_then_buys_without_value() -> None:
     """ERC-20 pairs approve the curve for the spend and send no value."""
     approve, buy = curve.buy_calls(CURVE, pons.USDG, 5, 4, SAFE)
     assert approve["to"] == pons.USDG
+    assert buy["intent"] == {"spend": {pons.USDG.lower(): 5}}
     assert abi_decode(["address", "uint256"], bytes.fromhex(approve["data"][10:])) == (
         CURVE.lower(),
         5,
@@ -241,6 +243,7 @@ def test_a_sell_approves_the_tokens_then_sells() -> None:
     """The sell approval is for the token and the exact amount."""
     approve, sell = curve.sell_calls(CURVE, TOKEN, 9, 3, SAFE)
     assert approve["to"] == TOKEN
+    assert sell["intent"] == {"spend": {TOKEN.lower(): 9}}
     assert bytes.fromhex(sell["data"][2:10]) == curve.SEL_SELL
     assert abi_decode(curve.TRADE_ARGS, bytes.fromhex(sell["data"][10:])) == (
         9,
