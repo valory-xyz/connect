@@ -51,19 +51,13 @@ cannot tell you is which to reach for:
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
-- `simulate_transaction` — what a call would do to the safe's assets, at head,
-  before you send it: native and token deltas, recipients, approvals, NFT
-  positions, the contracts that emitted logs, the revert reason, gas. Pass the
-  `intent` you plan to send and it says whether the call fits it.
-- `chain_call`, `get_abi`, `decode_calldata` — read a contract, see the ABI
-  Connect knows for it (following an EIP-1967 proxy), and decode calldata.
-  None of them signs anything.
+- `simulate_transaction` — dry-run a call, with the `intent` you plan to send,
+  to see what it would do to the safe's assets before you commit to it.
+- `chain_call`, `get_abi`, `decode_calldata` — read-only contract reads; none
+  signs anything.
 
-**Use the exact parameter names.** The safe's call target is `target` on
-`safe_transaction` and `preflight_transaction` (and `POST /safe-transaction`);
-only `send_transaction` and `POST /sign-and-send` take `to`. A parameter a
-tool does not take is refused with an error naming the ones it does — never
-silently dropped — so read that error and resend with the named parameter.
+The safe's call is `target`; only `send_transaction` and `POST /sign-and-send`
+take `to`.
 
 ## Intents
 
@@ -78,22 +72,19 @@ approval — needs an `intent`, saying what it may do:
  "approvals": [{"token": "0xtoken...", "spender": "0xrouter...", "amount": 500}]}
 ```
 
-Tokens are addresses (any case) or `"native"`; amounts are base units. A
-Permit2 approval (`approve` on Permit2, or a permit the router carries) is an
-approval of the token to that spender, and is declared like one, always: unlike
-an ERC-20 approval, it is never exempt for staying within the token's existing
-allowance. Before signing, the server simulates the call at head (`eth_simulateV1`) and refuses
-it, naming the rule, if it: reverts (`reverts`), spends more of a token than
-`spend` allows (`overspend`), receives less than `receive_min` (`receive-min`),
-sends to an account (not a contract) `recipients` does not name
-(`undeclared-recipient`), or grants an approval `approvals` does not cover
-(`undeclared-approval`; a revoke to 0 is never refused, `setApprovalForAll`
-counts as a maximum). A value-moving call without an intent is refused as
-`missing-intent`, a malformed one as `bad-intent`, and a chain whose RPC cannot
-simulate refuses every call as `simulation-unavailable` — nothing is signed
-unchecked. A call that moves nothing (a claim, a vote) needs none. Check a plan
-first with `simulate_transaction` or `preflight_transaction`, which take the
-same `intent`; the bundled skills attach the intents of the calls they build.
+The call is simulated before signing and refused, naming the rule, if it does
+more than that. What a refusal won't tell you:
+
+- `recipients` lists accounts only; contracts the call pays need no entry.
+- A revoke to 0 needs no declaring; `setApprovalForAll` counts as a maximum.
+- A Permit2 grant (`approve` on Permit2, or a permit the router carries) is
+  always declared as an approval of the token to its spender, even within an
+  existing allowance.
+- A call that moves nothing (a claim, a vote) needs no intent.
+- `simulation-unavailable` means that chain's RPC cannot simulate: no
+  value-moving call can be sent there.
+
+The bundled skills attach the intents of the calls they build.
 
 ## Narrower tokens for scripts
 
@@ -113,8 +104,6 @@ spend and the approvals the call's intent declares; `max_mech_payment` caps
 `mech_request`'s `max_payment`. A token with a value cap cannot do what a cap
 cannot bound: sign a raw digest, approve more than its cap, or move an NFT or
 outcome-token position out of the safe. A token can only mint a narrower one.
-Anything outside a token's grant is refused naming the rule (`token-scope`,
-`token-cap-per-tx`, `token-cap-positions`, ...).
 
 ## The guardrail
 
@@ -136,19 +125,11 @@ payment via the service safe, request, and delivery watching. Start with
 `mech_tools()` to pick a mech, then call it again with that `priority_mech`
 to see the tools it serves and whether it can be reached off-chain.
 
-`chain` is optional throughout: it defaults to a configured chain, preferring
-one with a safe.
-
 - **One safe, one payer.** Do not use the mech facilitator's `/mech/chat`
   route and `mech_request` from the same safe at once: both sign marketplace
   nonces for it, and they collide, pausing the safe's settlement. Connect
-  orders its own requests (one mech at a time per safe); a refusal names
-  `mech-in-flight`, `mech-nonce-gap` or `mech-nonce-taken`, and
-  `mech_queue_stalled` means the mech is not settling this safe's requests in
-  order — wait, then retry.
-- **No expiry.** An off-chain request has no deadline (`"expires": null`): a
-  request you stopped waiting for can still be delivered and settle, so poll
-  `mech_result` rather than re-sending.
+  orders its own requests, one mech at a time per safe; on
+  `mech_queue_stalled`, wait, then retry.
 - **Chat tools.** Send `prompt` as a JSON `messages` list (`[{"role": "user",
   "content": "..."}]`) to a chat tool; the report adds `completion` and
   `usage`. A tool call the model made comes back as a fenced bash block in
@@ -163,22 +144,13 @@ composing a prompt:
   `null` means this server does not know the token on that chain: do not pay
   that mech. A mech pricing in an asset the safe does not hold cannot be paid,
   and `auto_deposit` will fail rather than convert anything.
-- **Whose terms apply.** `mech_tools(priority_mech=...)` reports
-  `valory_operated`. When it is true the mech is operated by Valory and
-  submitting a request means agreeing to Valory AG's Mech Terms, which the
-  report states in `terms`. When it is false the mech is run by someone else,
-  or the check could not complete, in which case `identification_note` says
-  so; its operator's own terms apply. The report passes through whatever link
-  that operator published as `terms_url`, which is reported as found, not
-  endorsed. `mech_request` reports the same fields (`terms_url` only on
-  the off-chain flow). Each report is its own check, so the two can differ
-  after a DNS hiccup: state whose terms apply from `mech_request`'s report,
-  which governs the request it sent. Tell the user whose terms a request
-  falls under before spending their funds on an unfamiliar mech.
-  When saying who runs a mech, name `operator.domain` and whether it is
-  verified; `claimed_name` is only the operator's claim. With no `operator`,
-  who runs the mech is unknown unless `valory_operated` is true, so do not
-  guess. Tell the user if the domain is unverified before paying.
+- **Whose terms apply.** Before spending on an unfamiliar mech, tell the user
+  whose terms apply and who runs it. `valory_operated: true` means Valory AG's
+  Mech Terms (`terms`); otherwise the operator's own apply, and `terms_url` is
+  their link as found, not endorsed. If `mech_tools` and `mech_request`
+  disagree, `mech_request`'s report governs. Name `operator.domain` and
+  whether it is verified; with no `operator`, who runs the mech is unknown
+  unless `valory_operated`, so do not guess.
 - **`offchain_capable`.** The off-chain flow needs an endpoint published in
   the mech's service metadata, and few mechs publish one; the rest serve
   on-chain requests only. When it is `false`, `offchain_note` says why — a
@@ -194,7 +166,8 @@ composing a prompt:
 - `timeout` (seconds, default 300, max 900) bounds each phase of the wait —
   the marketplace naming a delivering mech, then reading that mech's logs —
   so the call itself can take up to twice it. A timeout does not lose the
-  request — it is paid for, and the ids come back as `pending_request_ids`.
+  request — it is paid for, an off-chain request has no deadline
+  (`"expires": null`), and the ids come back as `pending_request_ids`.
   Poll them with `mech_result(request_id)`, which resumes the watch and never
   resends.
 - `request_context` (the keys `mech_request` documents) is worth choosing
@@ -259,8 +232,7 @@ tx_hash = signer.send_transaction(                              # sent by the sa
 A call that moves value needs an intent, and only `signer.send_transaction`
 carries one. `.transact()` and `w3.eth.send_transaction` send the bare call,
 so they work only for calls that move nothing of the safe's; anything else is
-refused as `missing-intent`. `signer.send_transaction` is also the one to
-reach for when you need to pass a `request_id` (below).
+refused as `missing-intent`.
 
 Two things `connect()` handles that hand-rolled web3 code gets wrong: PoA
 chains (Polygon above all) pad `extraData` past 32 bytes and break every block

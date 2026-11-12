@@ -72,11 +72,9 @@ For **any** on-chain action — checking balances, sending transactions,
 acting through the service safe, making mech requests, signing mech-request
 digests — use the **pearl-connect skill**. It documents which tool
 to reach for, `scripts/signer_client.py` for web3.py code run by spawned
-scripts, the guardrail, and **intents**: every call that moves value needs an
-`intent` saying what it may spend, receive, send to and approve, and is
-simulated and refused if it would do more. Either gate may refuse a request,
-always naming the rule it violated. You cannot lift it yourself — when a task needs
-more than it allows, tell the user what was blocked and why.
+scripts, the guardrail, and **intents**. Either may refuse a request, always
+naming the rule it violated. You cannot lift them yourself — when a task needs
+more than they allow, tell the user what was blocked and why.
 
 Don't hand-roll signing, key loading, or raw RPC sends — the skill's paths
 are the supported, audited ones. Start any on-chain task with `wallet_info`
