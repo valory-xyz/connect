@@ -336,6 +336,34 @@ provisioned workspace ships a `.gitignore` so it is never committed and, for
 Claude Code, `Read` deny rules on `.mcp.json*` and `.codex/config.toml*` so it is
 not read into session transcripts.
 
+### Scoped tokens
+
+The token in the workspace is a **scoped** token: `read` + `mech` + `tx`, with no
+caps of its own, so a session can do what it always could. The full credential
+is held in the server process only and written to no file. Any token can mint a
+narrower one with `POST /tokens` (`{scopes, max_value_per_tx,
+max_value_per_session, max_mech_payment, expires_at}`), for the scripts a
+harness runs: fewer scopes, value caps per transaction and per session (per
+token, `"native"` or a lower-case address, in base units), a mech payment cap,
+an expiry. A grant wider than the presenting token's is refused (`token-scope`).
+
+| Scope | Allows |
+|---|---|
+| `read` | `wallet_info`, `mech_tools`, `mech_result`, `transaction_status`, `preflight_transaction`, `simulate_transaction`, `chain_call`, `get_abi`, `decode_calldata`, `settings`, `GET /wallet` |
+| `mech` | `mech_request` |
+| `tx` | `safe_transaction`, `send_transaction`, `sign_message`, `POST /safe-transaction`, `POST /sign-and-send`, `POST /sign-message` |
+
+Value caps are checked against the spend the call's intent declares (and its
+native `value`), which the intent gate then holds the transaction to; a capped
+`mech` token must pass a `max_payment` within `max_mech_payment`. A per-session
+budget is drawn down when a call is authorized, whether or not the send then
+succeeds, so it can be spent early but never exceeded. Refusals name their rule
+(`token-scope`, `token-expired`, `token-cap-per-tx`, `token-cap-per-session`,
+`token-mech-payment-cap`), come back as the HTTP 403/401 detail or the MCP tool
+error, and are recorded as activity `refusal` entries. MCP calls are authorized
+in the mount's middleware, which reads each JSON-RPC `tools/call` before the
+MCP server does.
+
 Out of scope for v1: SSH port forwarding or running on a shared/remote
 machine voids the loopback assumption entirely, and same-user local malware
 can read `.mcp.json` directly — the guardrail (not the token) is the defense

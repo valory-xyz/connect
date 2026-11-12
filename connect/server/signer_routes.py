@@ -31,6 +31,7 @@ from pydantic import Field, field_validator
 
 from connect import settings as settings_config
 from connect import wallet
+from connect.server.auth import GrantRefused, TokenGrant, authorize_route
 from connect.server.strict import StrictBody
 from connect.signer import SignerError
 
@@ -103,9 +104,16 @@ def _dispatch(method: t.Callable[..., str], body: _SendBody, address: str) -> di
     return {"tx_hash": tx_hash}
 
 
+def _authorize(request: Request, action: str, body: _SendBody | None = None) -> None:
+    """Hold this request's token to its grant: scope, caps, expiry (T4)."""
+    arguments = {} if body is None else body.model_dump()
+    authorize_route(request, request.app.state.activity, action, arguments)
+
+
 @router.post("/sign-and-send")
 def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
     """Sign and send one transaction from the agent EOA."""
+    _authorize(request, "send_transaction", body)
     return _dispatch(request.app.state.signer.send, body, body.to)
 
 
@@ -116,12 +124,14 @@ def safe_transaction(body: SafeTransactionRequest, request: Request) -> dict:
     `target`, `value` and `data` are the call the *safe* makes, and the value
     leaves the safe.
     """
+    _authorize(request, "safe_transaction", body)
     return _dispatch(request.app.state.signer.send_via_safe, body, body.target)
 
 
 @router.post("/sign-message")
 def sign_message(body: SignMessageRequest, request: Request) -> dict:
     """Sign message."""
+    _authorize(request, "sign_message")
     try:
         digest = bytes.fromhex(body.digest.removeprefix("0x"))
         signature = request.app.state.signer.sign_digest(digest)
@@ -133,9 +143,28 @@ def sign_message(body: SignMessageRequest, request: Request) -> dict:
 @router.get("/wallet")
 def wallet_info(request: Request) -> dict:
     """Wallet info."""
+    _authorize(request, "wallet_info")
     overview = wallet.wallet_overview(
         request.app.state.config, request.app.state.signer
     )
     if settings_config.EXPOSE_MODE_TO_AGENT:
         overview["mode"] = request.app.state.guard.mode()
     return overview
+
+
+@router.post("/tokens")
+def mint_token(grant: TokenGrant, request: Request) -> dict:
+    """Mint a token no wider than the one presented, for a harness's scripts.
+
+    A wider grant is refused (rule "token-scope"): a token can narrow its own
+    powers, never extend them.
+    """
+    try:
+        token = request.app.state.grants.mint(request.state.auth_token, grant)
+    except GrantRefused as e:
+        request.app.state.activity.record(
+            "refusal", rule=e.rule, path=request.url.path, reason=str(e)
+        )
+        raise HTTPException(status_code=e.status, detail=f"rule '{e.rule}': {e}") from e
+    request.app.state.activity.record("token_minted", scopes=grant.scopes)
+    return {"token": token, "grant": grant.model_dump()}

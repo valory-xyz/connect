@@ -17,10 +17,15 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Bearer-token auth, Origin validation and auth-failure braking.
+"""Bearer-token auth, scoped grants, Origin validation and auth-failure braking.
 
-The token is minted per run and reaches the agent harness only via the
-.mcp.json and .codex/config.toml files in STORE_PATH. Origin validation
+The workspace token is minted per run and reaches the agent harness only via
+the .mcp.json and .codex/config.toml files in STORE_PATH. It is a *scoped*
+token (OPE-2035 T4, D10): `read` + `mech` + `tx` with no caps of its own, so a
+session can do what it always could, but a harness can mint narrower tokens
+from it for the scripts it runs (fewer scopes, value caps per transaction and
+per session, a mech payment cap, an expiry). The full credential is held in
+this process only and is written to no file. Origin validation
 defends the localhost server against DNS-rebinding: browsers always attach an
 Origin to cross-origin requests, so anything non-local is rejected before
 auth. Repeated auth failures across
@@ -30,6 +35,8 @@ loud and slow, not silent.
 """
 
 import hmac
+import json
+import secrets
 import threading
 import time
 import typing as t
@@ -37,8 +44,248 @@ from collections import deque
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
+from pydantic import BaseModel, ConfigDict
 
 from connect.activity import ActivityLog
+
+Scope = t.Literal["read", "mech", "tx"]
+SCOPES: tuple[Scope, ...] = ("read", "mech", "tx")
+
+# what each action needs: MCP tools by name, HTTP routes by the same names
+ACTION_SCOPES: dict[str, Scope] = {
+    "wallet_info": "read",
+    "mech_tools": "read",
+    "mech_result": "read",
+    "transaction_status": "read",
+    "preflight_transaction": "read",
+    "simulate_transaction": "read",
+    "chain_call": "read",
+    "get_abi": "read",
+    "decode_calldata": "read",
+    "settings": "read",
+    "mech_request": "mech",
+    "safe_transaction": "tx",
+    "send_transaction": "tx",
+    "sign_message": "tx",
+}
+
+
+class TokenGrant(BaseModel):
+    """What a bearer token may do; a token can only mint a narrower one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scopes: list[Scope]
+    max_value_per_tx: dict[str, int] | None = None
+    max_value_per_session: dict[str, int] | None = None
+    max_mech_payment: int | None = None
+    expires_at: int | None = None  # unix seconds
+
+
+WORKSPACE_GRANT = TokenGrant(scopes=list(SCOPES))
+
+
+class GrantRefused(Exception):
+    """A token may not do this; `rule` names why."""
+
+    def __init__(self, rule: str, detail: str, status: int = 403) -> None:
+        """Initialize."""
+        super().__init__(rule, detail, status)
+        self.rule = rule
+        self.detail = detail
+        self.status = status
+
+    def __str__(self) -> str:
+        """Return the refusal a caller reads."""
+        return self.detail
+
+
+def _caps_key(token: str) -> str:
+    """Return an intent's token key for a cap: "native", or the address."""
+    return token.lower()
+
+
+def _within(child: dict[str, int] | None, parent: dict[str, int] | None) -> bool:
+    """Whether a child's caps are no wider than its parent's (None is no cap)."""
+    if parent is None:
+        return True
+    if child is None:
+        return False
+    return all(
+        _caps_key(token) in parent and amount <= parent[_caps_key(token)]
+        for token, amount in child.items()
+    )
+
+
+def narrower(child: TokenGrant, parent: TokenGrant) -> bool:
+    """Whether `child` allows nothing `parent` does not."""
+    if not set(child.scopes) <= set(parent.scopes):
+        return False
+    if not _within(child.max_value_per_tx, parent.max_value_per_tx):
+        return False
+    if not _within(child.max_value_per_session, parent.max_value_per_session):
+        return False
+    if parent.max_mech_payment is not None and (
+        child.max_mech_payment is None
+        or child.max_mech_payment > parent.max_mech_payment
+    ):
+        return False
+    if parent.expires_at is not None and (
+        child.expires_at is None or child.expires_at > parent.expires_at
+    ):
+        return False
+    return True
+
+
+def _declared_spend(arguments: t.Mapping[str, t.Any]) -> dict[str, int]:
+    """Return the spend a call's intent declares; the gate holds the call to it."""
+    intent = arguments.get("intent")
+    spend = intent.get("spend") if isinstance(intent, dict) else None
+    if not isinstance(spend, dict):
+        return {}
+    declared: dict[str, int] = {}
+    for token, amount in spend.items():
+        try:
+            declared[_caps_key(str(token))] = (
+                int(amount, 0) if isinstance(amount, str) else int(amount)
+            )
+        except (TypeError, ValueError):
+            continue  # the gate refuses a malformed intent as bad-intent
+    return declared
+
+
+class GrantStore:
+    """The bearer tokens this process honours, and what each may do."""
+
+    def __init__(self, workspace_token: str) -> None:
+        """Hold the workspace token and an in-process root credential."""
+        self._lock = threading.Lock()
+        # the root credential is never written anywhere: nothing outside
+        # this process can present it, and the workspace token is narrower
+        self._grants: dict[str, TokenGrant] = {
+            secrets.token_urlsafe(32): TokenGrant(scopes=list(SCOPES)),
+            workspace_token: WORKSPACE_GRANT,
+        }
+        self._spent: dict[str, dict[str, int]] = {}
+
+    def lookup(self, header: str | None) -> str | None:
+        """Return the presented token if it is one we issued, else None."""
+        if not header or not header.startswith("Bearer "):
+            return None
+        presented = header.removeprefix("Bearer ").encode()
+        with self._lock:
+            tokens = list(self._grants)
+        found = None
+        for token in tokens:  # compare against every token, in constant time
+            if hmac.compare_digest(token.encode(), presented):
+                found = token
+        return found
+
+    def grant(self, token: str) -> TokenGrant:
+        """Return a known token's grant."""
+        with self._lock:
+            return self._grants[token]
+
+    def mint(self, parent: str, grant: TokenGrant) -> str:
+        """Mint a token for `grant`, which must be no wider than `parent`'s.
+
+        :raises GrantRefused: rule "token-scope" for a wider grant.
+        """
+        if not narrower(grant, self._live(parent)):
+            raise GrantRefused(
+                "token-scope",
+                "a token can only mint a narrower one: the requested grant "
+                "allows something this token does not",
+            )
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._grants[token] = grant
+        return token
+
+    def _live(self, token: str) -> TokenGrant:
+        grant = self.grant(token)
+        if grant.expires_at is not None and time.time() >= grant.expires_at:
+            raise GrantRefused("token-expired", "this token has expired", 401)
+        return grant
+
+    def authorize(
+        self, token: str, action: str, arguments: t.Mapping[str, t.Any]
+    ) -> None:
+        """Raise unless `token` may perform `action` with `arguments`.
+
+        Value caps are checked against the spend the call's intent declares,
+        which the intent gate then holds the transaction to. A capped token's
+        per-session budget is drawn down when a call is authorized, whether or
+        not the send then succeeds: it can be spent early, never exceeded.
+        """
+        grant = self._live(token)
+        scope = ACTION_SCOPES.get(action)
+        if scope is None or scope not in grant.scopes:
+            raise GrantRefused(
+                "token-scope",
+                f"this token does not allow {action} (it needs the "
+                f"'{scope or 'unknown'}' scope)",
+            )
+        if action == "mech_request":
+            self._check_mech_payment(grant, arguments)
+        if scope == "tx" and action != "sign_message":
+            self._check_value(token, grant, arguments)
+
+    @staticmethod
+    def _check_mech_payment(
+        grant: TokenGrant, arguments: t.Mapping[str, t.Any]
+    ) -> None:
+        cap = grant.max_mech_payment
+        if cap is None:
+            return
+        asked = arguments.get("max_payment")
+        if not isinstance(asked, int) or isinstance(asked, bool) or asked > cap:
+            raise GrantRefused(
+                "token-mech-payment-cap",
+                f"this token pays a mech at most {cap} base units; pass a "
+                f"max_payment no higher than that (got {asked})",
+            )
+
+    def _check_value(
+        self, token: str, grant: TokenGrant, arguments: t.Mapping[str, t.Any]
+    ) -> None:
+        if grant.max_value_per_tx is None and grant.max_value_per_session is None:
+            return
+        declared = _declared_spend(arguments)
+        value = arguments.get("value") or 0
+        if isinstance(value, str):
+            value = int(value, 16) if value.startswith("0x") else int(value)
+        declared["native"] = max(declared.get("native", 0), int(value))
+        per_tx = grant.max_value_per_tx
+        if per_tx is not None:
+            for asset, amount in declared.items():
+                if amount > per_tx.get(asset, 0):
+                    raise GrantRefused(
+                        "token-cap-per-tx",
+                        f"this token spends at most {per_tx.get(asset, 0)} of "
+                        f"{asset} per transaction (the intent declares {amount})",
+                    )
+        per_session = grant.max_value_per_session
+        if per_session is None:
+            return
+        with self._lock:
+            spent = self._spent.setdefault(token, {})
+            for asset, amount in declared.items():
+                if spent.get(asset, 0) + amount > per_session.get(asset, 0):
+                    raise GrantRefused(
+                        "token-cap-per-session",
+                        f"this token spends at most {per_session.get(asset, 0)} "
+                        f"of {asset} in all; {spent.get(asset, 0)} is spent "
+                        f"and this declares {amount}",
+                    )
+            for asset, amount in declared.items():
+                spent[asset] = spent.get(asset, 0) + amount
+
+
+def as_store(grants: "GrantStore | str") -> GrantStore:
+    """Accept a GrantStore, or a bare workspace token for a store of one."""
+    return GrantStore(grants) if isinstance(grants, str) else grants
+
 
 LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
 # TrustedHostMiddleware wants patterns, not a set; port is ignored by it.
@@ -100,23 +347,21 @@ def origin_is_local(origin: str | None) -> bool:
     return hostname in LOCAL_HOSTNAMES
 
 
-def token_matches(expected: str, header: str | None) -> bool:
-    """Token matches."""
-    if not header or not header.startswith("Bearer "):
-        return False
-    return hmac.compare_digest(
-        expected.encode(), header.removeprefix("Bearer ").encode()
-    )
-
-
 class RequireAuth:
-    """FastAPI dependency enforcing Origin locality + bearer token."""
+    """FastAPI dependency enforcing Origin locality + a bearer token we issued.
+
+    The route itself then authorizes its action against the token's grant
+    (`authorize_route`), because a cap is checked against the request body.
+    """
 
     def __init__(
-        self, token: str, activity: ActivityLog, limiter: AuthFailureLimiter
+        self,
+        grants: "GrantStore | str",
+        activity: ActivityLog,
+        limiter: AuthFailureLimiter,
     ) -> None:
         """Initialize."""
-        self._token = token
+        self._grants = as_store(grants)
         self._activity = activity
         self._limiter = limiter
 
@@ -135,11 +380,13 @@ class RequireAuth:
             )
         if self._limiter.blocked():
             raise HTTPException(status_code=429, detail=_RATE_LIMIT_MESSAGE)
-        if not token_matches(self._token, request.headers.get("authorization")):
+        token = self._grants.lookup(request.headers.get("authorization"))
+        if token is None:
             self._fail(request.url.path, "bad token")
             raise HTTPException(
                 status_code=401, detail="invalid or missing bearer token"
             )
+        request.state.auth_token = token
 
     def _fail(self, path: str, reason: str) -> None:
         self._activity.record("auth_failed", path=path, reason=reason)
@@ -152,13 +399,13 @@ class AuthMiddleware:
     def __init__(
         self,
         app: t.Callable,
-        token: str,
+        grants: "GrantStore | str",
         activity: ActivityLog,
         limiter: AuthFailureLimiter,
     ) -> None:
         """Initialize."""
         self._app = app
-        self._token = token
+        self._grants = as_store(grants)
         self._activity = activity
         self._limiter = limiter
 
@@ -181,11 +428,46 @@ class AuthMiddleware:
         if self._limiter.blocked():
             await _reject(send, 429, _RATE_LIMIT_MESSAGE)
             return
-        if not token_matches(self._token, headers.get("authorization")):
+        token = self._grants.lookup(headers.get("authorization"))
+        if token is None:
             self._fail(path, "bad token")
             await _reject(send, 401, "invalid or missing bearer token")
             return
-        await self._app(scope, receive, send)
+        body = await _read_body(receive)
+        refusal = self._refusal(token, body)
+        if refusal is not None:
+            await _send_json(send, 200, refusal)
+            return
+        await self._app(scope, _replay(body, receive), send)
+
+    def _refusal(self, token: str, body: bytes) -> dict | None:
+        """Return a JSON-RPC error for the first tool call this token may not make."""
+        try:
+            message = json.loads(body or b"null")
+        except ValueError:
+            return None  # the MCP server answers a malformed body itself
+        for call in message if isinstance(message, list) else [message]:
+            if not isinstance(call, dict) or call.get("method") != "tools/call":
+                continue
+            params = call.get("params")
+            params = params if isinstance(params, dict) else {}
+            arguments = params.get("arguments")
+            try:
+                self._grants.authorize(
+                    token,
+                    str(params.get("name")),
+                    arguments if isinstance(arguments, dict) else {},
+                )
+            except GrantRefused as e:
+                self._activity.record(
+                    "refusal", rule=e.rule, tool=params.get("name"), reason=str(e)
+                )
+                return {
+                    "jsonrpc": "2.0",
+                    "id": call.get("id"),
+                    "error": {"code": -32001, "message": f"rule '{e.rule}': {e}"},
+                }
+        return None
 
     def _fail(self, path: str, reason: str) -> None:
         self._activity.record("auth_failed", path=path, reason=reason)
@@ -201,7 +483,10 @@ def require_local_origin(request: Request) -> None:
 
 
 async def _reject(send: t.Any, status: int, message: str) -> None:
-    body = f'{{"error": "{message}"}}'.encode()
+    await _send_json(send, status, {"error": message})
+
+
+async def _send_json(send: t.Any, status: int, payload: t.Any) -> None:
     await send(
         {
             "type": "http.response.start",
@@ -209,4 +494,46 @@ async def _reject(send: t.Any, status: int, message: str) -> None:
             "headers": [(b"content-type", b"application/json")],
         }
     )
-    await send({"type": "http.response.body", "body": body})
+    await send({"type": "http.response.body", "body": json.dumps(payload).encode()})
+
+
+async def _read_body(receive: t.Any) -> bytes:
+    """Read the whole request body, so its tool calls can be authorized."""
+    chunks = []
+    while True:
+        message = await receive()
+        if message["type"] != "http.request":
+            break
+        chunks.append(message.get("body", b""))
+        if not message.get("more_body"):
+            break
+    return b"".join(chunks)
+
+
+def _replay(body: bytes, receive: t.Any) -> t.Callable[[], t.Awaitable[dict]]:
+    """Return a receive that yields the read body, then the real stream."""
+    sent = False
+
+    async def replay() -> dict:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return replay
+
+
+def authorize_route(
+    request: Request, activity: ActivityLog, action: str, arguments: dict
+) -> None:
+    """Authorize an HTTP route's action against the request's token.
+
+    :raises HTTPException: 403 (401 for an expired token) naming the rule.
+    """
+    grants: GrantStore = request.app.state.grants
+    try:
+        grants.authorize(request.state.auth_token, action, arguments)
+    except GrantRefused as e:
+        activity.record("refusal", rule=e.rule, path=request.url.path, reason=str(e))
+        raise HTTPException(status_code=e.status, detail=f"rule '{e.rule}': {e}") from e

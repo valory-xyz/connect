@@ -92,6 +92,24 @@ unchecked. A call that moves nothing (a claim, a vote) needs none. Check a plan
 first with `simulate_transaction` or `preflight_transaction`, which take the
 same `intent`; the bundled skills attach the intents of the calls they build.
 
+## Narrower tokens for scripts
+
+The token in `.mcp.json` can do anything this session can. When you hand a
+script or another tool a token, mint a narrower one first:
+
+```
+POST /tokens  (Authorization: Bearer <your token>)
+{"scopes": ["read"]}                                    # balances and reads only
+{"scopes": ["tx"], "max_value_per_tx": {"native": 1000000000000000},
+ "max_value_per_session": {"native": 5000000000000000}, "expires_at": 1767225600}
+```
+
+It answers `{token, grant}`. Scopes are `read`, `mech` and `tx`; caps are per
+token (`"native"` or a lower-case address) in base units, checked against the
+spend the call's intent declares; `max_mech_payment` caps `mech_request`'s
+`max_payment`. A token can only mint a narrower one. Anything outside a token's
+grant is refused naming the rule (`token-scope`, `token-cap-per-tx`, ...).
+
 ## The guardrail
 
 Every signing request passes a guardrail. Two of its rules never move: the

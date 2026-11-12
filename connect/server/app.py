@@ -43,6 +43,7 @@ from connect.server.auth import (
     ALLOWED_HOSTS,
     AuthFailureLimiter,
     AuthMiddleware,
+    GrantStore,
     RequireAuth,
     require_local_origin,
 )
@@ -205,6 +206,10 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     # attacker's Host header — refuse anything that isn't a loopback name
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
     limiter = AuthFailureLimiter()
+    # the run's token is the workspace's scoped token (read + mech + tx);
+    # narrower ones are minted from it through POST /tokens
+    grants = GrantStore(token)
+    app.state.grants = grants
     app.state.signer = signer
     app.state.config = config
     app.state.activity = activity
@@ -234,11 +239,11 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     )
     app.include_router(
         signer_routes.router,
-        dependencies=[Depends(RequireAuth(token, activity, limiter))],
+        dependencies=[Depends(RequireAuth(grants, activity, limiter))],
     )
     app.mount(
         "/mcp",
-        AuthMiddleware(mcp.streamable_http_app(), token, activity, limiter),
+        AuthMiddleware(mcp.streamable_http_app(), grants, activity, limiter),
     )
 
     # the agent UI last, so it can own / without shadowing an endpoint: routes

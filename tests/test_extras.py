@@ -928,7 +928,10 @@ class TestAuthMiddlewareASGI:
         async def send(message: dict) -> None:
             sent.append(message)
 
-        await middleware(scope, None, send)
+        async def receive() -> dict:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await middleware(scope, receive, send)
         return sent, passed
 
     async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
