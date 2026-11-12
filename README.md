@@ -48,7 +48,8 @@ other non-aea agent. It:
      tools carry `readOnlyHint`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `safe_transaction`, `send_transaction`, `preflight_transaction`,
-     `transaction_status`,
+     `simulate_transaction`, `transaction_status`, `chain_call`, `get_abi`,
+     `decode_calldata`,
      `sign_message`, `mech_tools`, `mech_request`, `mech_result` (plus a
      read-only `settings` tool when `EXPOSE_MODE_TO_AGENT` is on).
 
@@ -171,6 +172,31 @@ list would differ per operator. Two differences from Claude Code remain. Every M
 for approval, as Claude Code's do without an allow rule. And there is no
 equivalent of the `Read` deny rule: the token in `.codex/config.toml` is
 gitignored, not kept out of transcripts.
+
+## Intent gate
+
+After the guardrail, every agent-originated value-moving send (`safe_transaction`
+and `send_transaction`, MCP and HTTP alike) must carry an **intent** — spend
+caps per token, minimum receive, allowed recipients, approvals — and is
+simulated at head over the chain's RPC with `eth_simulateV1`
+(`traceTransfers: true`, `validation: false`) before it is signed. The asset
+diff comes from the simulated logs (`connect/intent.py`): no fork, no trace, so
+`called` lists the target plus every contract that emitted a log. Native value
+counts only once: from the synthetic `0xeeee…eeee` logs, matched against
+Celo's `0x471E…` CELO face, which logs the same coins; Polygon's own
+`LogTransfer` is a different event and never counted. The rules, each named in
+the refusal and recorded as an activity `refusal` entry: `reverts`,
+`bad-intent`, `missing-intent`, `overspend`, `receive-min`,
+`undeclared-recipient` (EOAs only; burns to the zero address skipped) and
+`undeclared-approval` (a 0 approval is not checked; `setApprovalForAll` counts
+as a maximum, even when revoking). An RPC that cannot simulate refuses the send
+as `simulation-unavailable`, so Pearl must give Connect, on every chain, an RPC
+that serves `eth_simulateV1` (Celo's `forno.celo.org` does not). The
+transactions the server builds itself — the mech flow (`MechSigner`) and the
+agent top-up — pass the private `SERVER_BUILT` marker and skip the gate; they
+are bounded by `max_payment` and the top-up plan, and while restricted by their
+single-use allowances. `preflight_transaction` and `simulate_transaction` take
+the same `intent` and report the gate's `problems` without signing.
 
 ## Guardrail
 

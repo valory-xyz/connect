@@ -213,7 +213,14 @@ def test_to_base_units_reads_native_decimals_without_a_call() -> None:
 def test_weth_deposit_carries_the_value_it_wraps() -> None:
     """deposit() takes no argument; the amount is the call's value."""
     call = evm.weth_deposit_call(WETH, 7)
-    assert call == {"to": WETH, "data": "0xd0e30db0", "what": "wrap ETH", "value": 7}
+    assert call == {
+        "to": WETH,
+        "data": "0xd0e30db0",
+        "what": "wrap ETH",
+        "value": 7,
+        # what the signer re-checks: 7 native out, at least 7 WETH back
+        "intent": {"spend": {"native": 7}, "receive_min": {WETH.lower(): 7}},
+    }
 
 
 def test_weth_withdraw_encodes_the_amount_and_sends_no_value() -> None:
@@ -1508,3 +1515,19 @@ def test_constant_product_in_refuses_to_exhaust_the_reserve(reserve_out: int) ->
     """An output at or past the reserve is refused, not divided by."""
     with pytest.raises(evm.SwapError, match="cannot cover a 10-unit output"):
         uniswap.constant_product_in(10, 10**18, reserve_out)
+
+
+def test_calls_carry_the_intent_the_signer_checks() -> None:
+    """Approvals declare the grant; unwraps the spend and the floor (OPE-2035 T5)."""
+    spender = "0x" + "5E" * 20
+    approve = evm.erc20_approval_call(WETH, spender, 9, "approve")
+    assert approve["intent"] == {
+        "approvals": [{"token": WETH.lower(), "spender": spender.lower(), "amount": 9}]
+    }
+    unwrap = evm.weth_withdraw_call(WETH, 4)
+    assert unwrap["intent"] == {
+        "spend": {WETH.lower(): 4},
+        "receive_min": {"native": 4},
+    }
+    assert evm.intent_token(NATIVE) == "native"
+    assert evm.intent_token(WETH) == WETH.lower()

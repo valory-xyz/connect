@@ -345,11 +345,16 @@ class FakeEth:
         self.fail_broadcast = False
         self.base_fee: int | None = 10**9
         self.priority_fee_raises = False
+        self.contracts: set[str] = set()
         self._lock = threading.Lock()
 
     def get_balance(self, address: str) -> int:
         """Return the fixed balance."""
         return self.balance
+
+    def get_code(self, address: str) -> bytes:
+        """Return code for the addresses configured as contracts, else none."""
+        return b"\x01" if address.lower() in self.contracts else b""
 
     def get_transaction_receipt(self, tx_hash: object) -> dict:
         """Return the configured receipt or raise TransactionNotFound (as web3 does)."""
@@ -414,6 +419,60 @@ class FakeMiddlewareOnion:
         self.injected.append((middleware, layer))
 
 
+NATIVE_LOG = "0x" + "ee" * 20
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def native_transfer_log(src: str, dst: str, amount: int) -> dict:
+    """Return the synthetic log eth_simulateV1's traceTransfers emits for value."""
+    return {
+        "address": NATIVE_LOG,
+        "topics": [
+            TRANSFER_TOPIC,
+            "0x" + src.lower().removeprefix("0x").rjust(64, "0"),
+            "0x" + dst.lower().removeprefix("0x").rjust(64, "0"),
+        ],
+        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
+    }
+
+
+class FakeProvider:
+    """eth_simulateV1 stand-in: the call succeeds, and native value is logged.
+
+    `logs` adds logs to every simulation; `status` and `error` make it revert;
+    `unavailable` makes the RPC refuse the method, as forno.celo.org does.
+    """
+
+    def __init__(self) -> None:
+        """Initialize."""
+        self.simulated: list[dict] = []
+        self.logs: list[dict] = []
+        self.status = "0x1"
+        self.error: dict | None = None
+        self.unavailable = False
+
+    def make_request(self, method: str, params: list) -> dict:
+        """Answer eth_simulateV1; nothing else is asked of this provider."""
+        assert method == "eth_simulateV1"
+        if self.unavailable:
+            return {"error": {"code": -32601, "message": "method not whitelisted"}}
+        call = params[0]["blockStateCalls"][0]["calls"][0]
+        self.simulated.append(call)
+        logs = list(self.logs)
+        value = int(call["value"], 16)
+        if value:
+            logs.insert(0, native_transfer_log(call["from"], call["to"], value))
+        result: dict[str, t.Any] = {
+            "status": self.status,
+            "returnData": "0x",
+            "gasUsed": "0x5208",
+        }
+        result["logs"] = logs
+        if self.error is not None:
+            result["error"] = self.error
+        return {"result": [{"calls": [result]}]}
+
+
 class FakeW3:
     """Minimal Web3 stand-in for signer tests."""
 
@@ -421,6 +480,7 @@ class FakeW3:
         """Initialize."""
         self.eth = FakeEth()
         self.middleware_onion = FakeMiddlewareOnion()
+        self.provider = FakeProvider()
 
     def to_wei(self, value: float, unit: str) -> int:
         """Convert gwei to wei."""
@@ -612,3 +672,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """End a run that stopped on a failed collection with exit 1, not 2."""
     if exitstatus == pytest.ExitCode.INTERRUPTED and session.testsfailed:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def pay(to: str, value: int) -> dict:
+    """Return the intent for sending `value` native to `to`, and nothing else."""
+    return {"spend": {"native": value}, "recipients": [to]}

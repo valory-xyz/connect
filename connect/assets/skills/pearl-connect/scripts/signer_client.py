@@ -106,7 +106,9 @@ class SignerClient:
         except urllib.error.HTTPError as e:
             _raise_with_detail(e)
 
-    def send_transaction(self, tx: dict, request_id: str | None = None) -> str:
+    def send_transaction(
+        self, tx: dict, request_id: str | None = None, intent: dict | None = None
+    ) -> str:
         """Have the service safe make this call; retries stay idempotent.
 
         `tx` is the call the *safe* makes — to, value, data. The safe is the
@@ -127,6 +129,11 @@ class SignerClient:
             "data": tx.get("data", "0x"),
             "request_id": request_id,
         }
+        # what the call may do; the server refuses a value-moving call without
+        # one, after simulating it (see "Intents" in SKILL.md)
+        intent = intent if intent is not None else tx.get("intent")
+        if intent is not None:
+            payload["intent"] = intent
         # tx["gas"], if the caller set it, was estimated against this inner call;
         # the server wraps it in an execTransaction whose gas is larger (safe
         # dispatch, signature check, nonce write). Forwarding the inner estimate

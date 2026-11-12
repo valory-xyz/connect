@@ -341,3 +341,23 @@ def test_send_outcome_treats_a_failed_broadcast_as_possibly_sent(
             headers={"Authorization": "Bearer tok"},
         )
     assert evm.send_outcome(_as_client_error(response)) == evm.MAY_HAVE_BROADCAST
+
+
+def test_send_transaction_forwards_the_intent(monkeypatch) -> None:
+    """A call's intent, or one passed directly, reaches /safe-transaction."""
+    sent: list = []
+    monkeypatch.setattr(
+        signer_client.SignerClient,
+        "_post",
+        lambda self, path, payload: sent.append(payload)
+        or {"tx_hash": "0x" + "ab" * 32},
+    )
+    client = signer_client.SignerClient(
+        "http://127.0.0.1:9", "tok", chain="polygon"  # nosec B106
+    )
+    client.send_transaction({"to": ADDR_A, "intent": {"spend": {"native": 1}}})
+    client.send_transaction({"to": ADDR_A}, intent={"recipients": [ADDR_B]})
+    client.send_transaction({"to": ADDR_A})
+    assert sent[0]["intent"] == {"spend": {"native": 1}}
+    assert sent[1]["intent"] == {"recipients": [ADDR_B]}
+    assert "intent" not in sent[2]

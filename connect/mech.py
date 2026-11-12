@@ -59,13 +59,13 @@ from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
 from connect.mech_rpc import RPC_LOCK, listing_mechs
+from connect.mech_signer import MechSigner
 from connect.mech_types import (
     MechError,
     MechUnknownRequest,
     PricedMech,
     SPEND_UNCERTAIN,
 )
-from connect.safe import safe_message_hash
 from connect.signer import Signer, SignerError
 
 logger = logging.getLogger("agent")
@@ -215,58 +215,6 @@ def _offchain_blocker(read: MetadataRead) -> str | None:
     if not isinstance(url, str) or not url.strip():
         return "no 'url' in metadata; this mech serves on-chain requests only"
     return None
-
-
-class MechSigner:
-    """mech-client ``Signer`` protocol adapter over our guarded Signer.
-
-    No special privileges: every transaction goes through Signer.send() and
-    every digest through Signer.sign_digest(), both guardrail-checked.
-    """
-
-    def __init__(self, signer: Signer, chain: str) -> None:
-        """Initialize."""
-        self._signer = signer
-        self._chain = chain
-
-    @property
-    def address(self) -> str:
-        """The agent EOA address."""
-        return self._signer.address
-
-    def send_transaction(self, unsigned_tx: dict) -> str:
-        """Fill, sign and broadcast the transaction via the choke point."""
-        data = unsigned_tx.get("data") or "0x"
-        if isinstance(data, (bytes, bytearray)):
-            data = "0x" + bytes(data).hex()
-        return self._signer.send(
-            chain=self._chain,
-            to=unsigned_tx["to"],
-            value=int(unsigned_tx.get("value") or 0),
-            data=data,
-            gas=unsigned_tx.get("gas"),
-        )
-
-    def sign_message(self, message: bytes) -> bytes:
-        """Sign a raw digest via the choke point (guardrail-checked)."""
-        signature = self._signer.sign_digest(bytes(message))
-        return bytes.fromhex(signature.removeprefix("0x"))
-
-    def sign_safe_message(
-        self, safe_address: str, chain_id: int, message: bytes
-    ) -> bytes:
-        """Sign the Safe-wrapped hash of a digest (ERC-1271 owner signature).
-
-        Agent-mode off-chain requests are verified with
-        ``Safe.isValidSignature``, so mech-client hands the request id here
-        to be wrapped and signed (``Signer.sign_safe_message`` contract).
-        The wrap is computed by the same safe_message_hash the mech flow
-        registered its allowance with, and the signature still goes through
-        Signer.sign_digest — same choke point, same guardrail.
-        """
-        wrapped = safe_message_hash(safe_address, chain_id, bytes(message))
-        signature = self._signer.sign_digest(wrapped)
-        return bytes.fromhex(signature.removeprefix("0x"))
 
 
 class MechService:

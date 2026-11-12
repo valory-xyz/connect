@@ -33,6 +33,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
+from connect import chain_read
 from connect import settings as settings_config
 from connect import wallet
 from connect.activity import ActivityLog
@@ -100,6 +101,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         value: int = 0,
         data: str = "0x",
         *,
+        intent: dict | None = None,
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
@@ -111,6 +113,12 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         `status` (mined / reverted / pending) and the receipt when
         wait_for_receipt. Reusing a request_id replays the original tx_hash
         instead of spending twice.
+        `intent` is required whenever the call moves value (spends or sends
+        anything of the safe's, or grants an approval): {spend: {token: max},
+        receive_min: {token: min}, recipients: [eoa, ...], approvals: [{token,
+        spender, amount}]}, tokens as lower-case addresses or "native", amounts
+        in base units. The call is simulated before it is signed and refused,
+        naming the rule, if it would do more than the intent allows.
         """
         return await _dispatch(
             signer.send_via_safe,
@@ -119,6 +127,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             address=target,
             value=value,
             data=data,
+            intent=intent,
             request_id=request_id,
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
@@ -131,6 +140,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         value: int = 0,
         data: str = "0x",
         *,
+        intent: dict | None = None,
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
@@ -139,7 +149,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
         `to` is the EOA's own recipient, not a call the safe makes, and the
         EOA's funds are for gas: to spend or act on-chain use safe_transaction.
-        Returns and request_id semantics are safe_transaction's.
+        Returns, request_id and `intent` semantics are safe_transaction's.
         """
         return await _dispatch(
             signer.send,
@@ -148,6 +158,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             address=to,
             value=value,
             data=data,
+            intent=intent,
             request_id=request_id,
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
@@ -161,26 +172,88 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         data: str = "0x",
         *,
         via_safe: bool = True,
+        intent: dict | None = None,
     ) -> dict:
         """Ask whether a call would be permitted, before you build on it.
 
         Takes what safe_transaction takes (or send_transaction's, with
         via_safe=false) and answers {allowed}, plus the same `reason` the real
         call would have refused with. Nothing is signed, broadcast or paid for.
-        `allowed` means the guardrail permits these bytes — not that the call
-        will succeed on-chain, which only sending finds out.
+        `allowed` means the guardrail and the intent gate permit these bytes
+        at head — with the `intent` you give, as the real call would be
+        checked; any `problems` name the gate's rules.
         """
-        reason = await asyncio.to_thread(
-            signer.refusal_reason,
+        reason, problems = await asyncio.to_thread(
+            signer.check,
             chain,
             target,
             value=value,
             data=data,
             via_safe=via_safe,
+            intent=intent,
         )
         if reason is None:
             return {"allowed": True}
-        return {"allowed": False, "reason": reason}
+        result: dict = {"allowed": False, "reason": reason}
+        if problems:
+            result["problems"] = problems
+        return result
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def simulate_transaction(  # pylint: disable=too-many-arguments
+        chain: str,
+        target: str,
+        value: int = 0,
+        data: str = "0x",
+        *,
+        via_safe: bool = True,
+        intent: dict | None = None,
+    ) -> dict:
+        """Simulate a call at head and say what it does to the safe's assets.
+
+        Returns the asset diff — `native` and `tokens` deltas, `recipients`
+        (each with `contract`), `approvals`, ERC-721/1155 `positions`,
+        `called` (the target plus every contract that emitted a log; one
+        called without emitting is not listed), `revert`, `gas_used` — with
+        `fits_intent` (null without an intent) and the `problems` the send
+        would be refused for. Nothing is signed. via_safe=false simulates
+        send_transaction's call from the EOA.
+        """
+        return await asyncio.to_thread(
+            signer.simulate,
+            chain,
+            target,
+            value=value,
+            data=data,
+            via_safe=via_safe,
+            intent=intent,
+        )
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def chain_call(chain: str, to: str, data: str, block: str = "latest") -> dict:
+        """Read a contract with eth_call: {result} or {reverted, reason}."""
+        return await asyncio.to_thread(
+            chain_read.chain_call, signer.w3(chain), to, data, block
+        )
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def get_abi(chain: str, address: str) -> dict:
+        """Report what Connect can say about a contract's ABI, following EIP-1967.
+
+        Only ABIs Connect ships: well-known contracts by address (`verified`)
+        and the standard interfaces a contract answers to; no explorer lookup.
+        """
+        return await asyncio.to_thread(chain_read.get_abi, signer.w3(chain), address)
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def decode_calldata(chain: str, data: str) -> dict:
+        """Decode calldata against the signatures Connect ships.
+
+        Returns {selector, signature, args}, or {selector, error} for a
+        selector Connect does not know. `chain` is accepted for symmetry with
+        the other read tools; decoding needs no RPC.
+        """
+        return chain_read.decode_calldata(data)
 
     @mcp.tool(annotations=READ_ONLY)
     async def transaction_status(chain: str, tx_hash: str) -> dict:
@@ -326,7 +399,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 
     # a parameter a tool does not take is refused by name, never dropped
-    make_tools_strict(mcp)
+    make_tools_strict(mcp, activity)
     return mcp
 
 
@@ -338,6 +411,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     address: str,
     value: int,
     data: str,
+    intent: dict | None,
     request_id: str | None,
     wait_for_receipt: bool,
     timeout: int,
@@ -352,7 +426,14 @@ async def _dispatch(  # pylint: disable=too-many-arguments
         raise ValueError("value must be a non-negative amount in wei")
 
     def _run() -> dict:
-        tx_hash = method(chain, address, value=value, data=data, request_id=request_id)
+        tx_hash = method(
+            chain,
+            address,
+            value=value,
+            data=data,
+            request_id=request_id,
+            intent=intent,
+        )
         return _settled(signer, chain, tx_hash, wait_for_receipt, timeout)
 
     return await asyncio.to_thread(_run)

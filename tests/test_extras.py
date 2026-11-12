@@ -58,7 +58,7 @@ from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError, _IdempotencyCache
 
-from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds, pay
 
 
 class StubServer:
@@ -1043,7 +1043,10 @@ class TestMcpTools:
     ) -> None:
         """The tool names the inner call; the server wraps it and broadcasts."""
         result = await tools["safe_transaction"](
-            "testchain", "0x" + "aa" * 20, value=10**18
+            "testchain",
+            "0x" + "aa" * 20,
+            value=10**18,
+            intent=pay("0x" + "aa" * 20, 10**18),
         )
         assert result["tx_hash"].startswith("0x")
         assert len(fake_w3.eth.sent) == 1
@@ -1657,7 +1660,12 @@ class TestSignerRoutesExtras:
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             response = client.post(
                 "/sign-and-send",
-                json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": 5},
+                json={
+                    "chain": "testchain",
+                    "to": "0x" + "aa" * 20,
+                    "value": 5,
+                    "intent": pay("0x" + "aa" * 20, 5),
+                },
                 headers={"Authorization": "Bearer tok"},
             )
         assert response.status_code == 200

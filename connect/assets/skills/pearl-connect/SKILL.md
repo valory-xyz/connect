@@ -51,12 +51,46 @@ cannot tell you is which to reach for:
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
+- `simulate_transaction` — what a call would do to the safe's assets, at head,
+  before you send it: native and token deltas, recipients, approvals, NFT
+  positions, the contracts that emitted logs, the revert reason, gas. Pass the
+  `intent` you plan to send and it says whether the call fits it.
+- `chain_call`, `get_abi`, `decode_calldata` — read a contract, see the ABI
+  Connect knows for it (following an EIP-1967 proxy), and decode calldata.
+  None of them signs anything.
 
 **Use the exact parameter names.** The safe's call target is `target` on
 `safe_transaction` and `preflight_transaction` (and `POST /safe-transaction`);
 only `send_transaction` and `POST /sign-and-send` take `to`. A parameter a
 tool does not take is refused with an error naming the ones it does — never
 silently dropped — so read that error and resend with the named parameter.
+
+## Intents
+
+Every `safe_transaction` or `send_transaction` that **moves value** — spends
+or sends anything (native coin, a token, an NFT position) or grants an
+approval — needs an `intent`, saying what it may do:
+
+```json
+{"spend": {"native": 10000, "0xtoken...": 500},
+ "receive_min": {"0xother...": 490},
+ "recipients": ["0xeoa..."],
+ "approvals": [{"token": "0xtoken...", "spender": "0xrouter...", "amount": 500}]}
+```
+
+Tokens are lower-case addresses or `"native"`; amounts are base units. Before
+signing, the server simulates the call at head (`eth_simulateV1`) and refuses
+it, naming the rule, if it: reverts (`reverts`), spends more of a token than
+`spend` allows (`overspend`), receives less than `receive_min` (`receive-min`),
+sends to an account (not a contract) `recipients` does not name
+(`undeclared-recipient`), or grants an approval `approvals` does not cover
+(`undeclared-approval`; a revoke to 0 is never refused, `setApprovalForAll`
+counts as a maximum). A value-moving call without an intent is refused as
+`missing-intent`, a malformed one as `bad-intent`, and a chain whose RPC cannot
+simulate refuses every call as `simulation-unavailable` — nothing is signed
+unchecked. A call that moves nothing (a claim, a vote) needs none. Check a plan
+first with `simulate_transaction` or `preflight_transaction`, which take the
+same `intent`; the bundled skills attach the intents of the calls they build.
 
 ## The guardrail
 
@@ -161,11 +195,10 @@ your script. On web3 6 it fails at import (the middleware moved in 7), so an
 from signer_client import connect
 
 w3, signer = connect("gnosis")        # reads .mcp.json for URL + token
-tx_hash = w3.eth.send_transaction({   # intercepted: signer fills nonce/gas, signs, broadcasts
-    "to": "0x...",
-    "value": 10**16,
-    "data": "0x",
-})
+tx_hash = signer.send_transaction(    # the safe makes this call; signer fills nonce/gas, signs, broadcasts
+    {"to": "0x...", "value": 10**16, "data": "0x"},
+    intent={"spend": {"native": 10**16}, "recipients": ["0x..."]},
+)
 receipt = w3.eth.wait_for_transaction_receipt(tx_hash)   # plain RPC read
 signature = signer.sign_digest("0x" + "11" * 32)          # raw digest signing
 ```

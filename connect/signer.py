@@ -38,6 +38,7 @@ from web3 import Web3
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 from web3.types import TxParams
 
+from connect import intent as intent_module
 from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
@@ -50,6 +51,34 @@ GAS_ESTIMATE_BUFFER = 1.2
 
 class SignerError(Exception):
     """Signing or broadcast failure."""
+
+
+class _ServerBuilt:
+    """Marks a transaction the server built itself, which the intent gate skips.
+
+    The mech flow and the agent top-up build their own transactions, already
+    bounded by their own caps and, while restricted, by single-use guard
+    allowances; no session intent describes them. This is a private object, so
+    no request body or tool argument can produce it: every agent surface
+    reaches the gate.
+    """
+
+    def __repr__(self) -> str:
+        """Repr."""
+        return "SERVER_BUILT"
+
+
+SERVER_BUILT = _ServerBuilt()
+
+
+@dataclass(frozen=True)
+class _GateCall:
+    """The call the intent gate simulates: what `sender` itself does."""
+
+    sender: str
+    to: str
+    value: int
+    data: str
 
 
 @dataclass
@@ -225,13 +254,47 @@ class Signer:
         request_id: str | None = None,
         gas: int | None = None,
         audit: bool = True,
+        intent: t.Any = None,
     ) -> str:
         """Fill, sign and broadcast one EOA transaction; returns the tx hash.
 
         With a request_id the call is idempotent: repeating a completed send
         returns the original tx hash without rebroadcasting. audit=False is for
-        a caller that audits the outcome itself, under its own kind.
+        a caller that audits the outcome itself, under its own kind. `intent`
+        is what the transaction may do; a value-moving one without it is
+        refused (`SERVER_BUILT` is for the server's own transactions).
         """
+        gate = (
+            None
+            if intent is SERVER_BUILT
+            else _GateCall(sender=self.address, to=to, value=value, data=data)
+        )
+        return self._send_guarded(
+            chain,
+            to,
+            value=value,
+            data=data,
+            request_id=request_id,
+            gas=gas,
+            audit=audit,
+            gate=gate,
+            intent=intent,
+        )
+
+    def _send_guarded(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        to: str,
+        *,
+        value: int,
+        data: str,
+        request_id: str | None,
+        gas: int | None,
+        audit: bool,
+        gate: _GateCall | None,
+        intent: t.Any,
+    ) -> str:
+        """Replay, guard, intent gate, then broadcast: the one path to signing."""
         stamp = _call_stamp(chain, to, value, data)
         if request_id is not None:
             # a completed send stays answerable even if the guardrail has
@@ -241,6 +304,22 @@ class Signer:
             if cached is not None:
                 return cached
         self._check_transaction(chain=chain, to=to, value=value, data=data, audit=audit)
+        if gate is not None:
+            # after the guard, so the cheap static rules answer first and the
+            # simulation only ever runs on a call the guard already permits
+            problems = self._gate_problems(chain, gate, intent)
+            if problems:
+                if audit:
+                    self._activity.record(
+                        "refusal",
+                        chain=chain,
+                        to=gate.to,
+                        value=str(gate.value),
+                        rule=problems[0]["rule"],
+                        rules=[p["rule"] for p in problems],
+                        reason=intent_module.refusal_message(problems),
+                    )
+                raise SignerError(intent_module.refusal_message(problems))
 
         def broadcast() -> str:
             return self._send(
@@ -294,6 +373,7 @@ class Signer:
         request_id: str | None = None,
         gas: int | None = None,
         audit: bool = True,
+        intent: t.Any = None,
     ) -> str:
         """Act as the service safe: wrap one inner call and send it.
 
@@ -306,7 +386,7 @@ class Signer:
         guard as anything else — a caller of the gate, not a way around it.
         """
         safe, calldata = self._compose_safe_call(chain, target, value, data)
-        return self.send(
+        return self._send_guarded(
             chain,
             safe,
             value=0,  # the outer transaction carries none; the safe pays
@@ -316,9 +396,70 @@ class Signer:
             request_id=None if request_id is None else f"safe:{request_id}",
             gas=gas,
             audit=audit,
+            # the gate simulates the call the safe makes, as the safe: that is
+            # whose assets move, and what the intent describes
+            gate=(
+                None
+                if intent is SERVER_BUILT
+                else _GateCall(sender=safe, to=target, value=value, data=data)
+            ),
+            intent=intent,
         )
 
-    def refusal_reason(
+    def _simulate(self, chain: str, call: _GateCall) -> intent_module.AssetDiff:
+        """Simulate one call at head over the chain's RPC.
+
+        :raises intent_module.SimulationUnavailable: the RPC cannot simulate.
+        """
+        try:
+            w3 = self.w3(chain)
+        except ValueError:
+            raise  # an unknown chain is the caller's mistake, not the RPC's
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # the client is built on first use, and that needs the RPC too
+            raise intent_module.SimulationUnavailable(str(e)) from e
+
+        def rpc(method: str, params: list) -> t.Any:
+            try:
+                response = w3.provider.make_request(t.cast(t.Any, method), params)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                raise intent_module.SimulationUnavailable(str(e)) from e
+            if "error" in response:
+                raise intent_module.SimulationUnavailable(str(response["error"]))
+            return response["result"]
+
+        def get_code(address: str) -> bytes:
+            return bytes(w3.eth.get_code(Web3.to_checksum_address(address)))
+
+        return intent_module.simulate(
+            rpc,
+            sender=call.sender,
+            to=call.to,
+            value=call.value,
+            data=call.data or "0x",
+            get_code=get_code,
+        )
+
+    def _gate_problems(
+        self, chain: str, call: _GateCall, raw_intent: t.Any
+    ) -> list[intent_module.Problem]:
+        """Every intent-gate rule this call breaks, simulating it at head."""
+        intent, problems = intent_module.parse_intent(raw_intent)
+        if problems:
+            return problems
+        try:
+            diff = self._simulate(chain, call)
+        except intent_module.SimulationUnavailable as e:
+            return [
+                intent_module.Problem(
+                    rule="simulation-unavailable",
+                    detail=f"the RPC for '{chain}' cannot simulate this call, "
+                    f"so it is not signed unchecked ({e})",
+                )
+            ]
+        return intent_module.check_intent(diff, intent)
+
+    def simulate(  # pylint: disable=too-many-arguments
         self,
         chain: str,
         target: str,
@@ -326,15 +467,90 @@ class Signer:
         value: int = 0,
         data: str = "0x",
         via_safe: bool = True,
+        intent: t.Any = None,
+    ) -> dict:
+        """Simulate a call at head and report its asset diff and intent verdict."""
+        sender = self._sender(chain, via_safe)
+        parsed, problems = intent_module.parse_intent(intent)
+        if problems:
+            return {"fits_intent": False, "problems": problems}
+        call = _GateCall(sender=sender, to=target, value=value, data=data)
+        try:
+            diff = self._simulate(chain, call)
+        except intent_module.SimulationUnavailable as e:
+            return {
+                "fits_intent": False,
+                "problems": [
+                    intent_module.Problem(
+                        rule="simulation-unavailable",
+                        detail=f"the RPC for '{chain}' cannot simulate this call ({e})",
+                    )
+                ],
+            }
+        problems = intent_module.check_intent(diff, parsed)
+        return {
+            **diff,
+            "fits_intent": None if parsed is None else not problems,
+            "problems": problems,
+        }
+
+    def _sender(self, chain: str, via_safe: bool) -> str:
+        """Whose call it is: the chain's safe, or the agent EOA."""
+        if not via_safe:
+            self._config.chain(chain)  # raises on an unknown chain
+            return self.address
+        safe = self._config.chain(chain).safe_address
+        if safe is None:
+            raise SignerError(
+                f"no service safe is configured for chain '{chain}', so the "
+                "agent cannot act there"
+            )
+        return safe
+
+    def refusal_reason(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        target: str,
+        *,
+        value: int = 0,
+        data: str = "0x",
+        via_safe: bool = True,
+        intent: t.Any = None,
     ) -> str | None:
-        """Say why the guardrail would refuse this call, or None if it passes."""
+        """Say why the call would be refused, or None if it passes."""
+        reason, _ = self.check(
+            chain, target, value=value, data=data, via_safe=via_safe, intent=intent
+        )
+        return reason
+
+    def check(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        chain: str,
+        target: str,
+        *,
+        value: int = 0,
+        data: str = "0x",
+        via_safe: bool = True,
+        intent: t.Any = None,
+    ) -> tuple[str | None, list[intent_module.Problem]]:
+        """Ask the guardrail, then the intent gate, consuming and signing nothing.
+
+        Returns the refusal (None if the call passes) and the gate's problems.
+        """
         probed_target, probed_value = target, value
+        problems: list[intent_module.Problem] = []
         try:
             self._config.chain(chain)
         except ValueError as e:  # an unknown chain
             reason: str | None = str(e)
         else:
             try:
+                gate = _GateCall(
+                    sender=self._sender(chain, via_safe),
+                    to=target,
+                    value=value,
+                    data=data,
+                )
                 if via_safe:
                     target, data = self._compose_safe_call(chain, target, value, data)
                     value = 0
@@ -343,6 +559,10 @@ class Signer:
                         raise SignerError("value must be a non-negative amount in wei")
                     _decode_calldata(data)
                 reason = self._refused_by_guard(chain, target, value, data)
+                if reason is None:
+                    problems = self._gate_problems(chain, gate, intent)
+                    if problems:
+                        reason = intent_module.refusal_message(problems)
             except SignerError as e:
                 reason = str(e)
         self._activity.record(
@@ -356,7 +576,7 @@ class Signer:
             probed_value=str(probed_value),
             via_safe=via_safe,
         )
-        return reason
+        return reason, problems
 
     def _refused_by_guard(
         self, chain: str, to: str, value: int, data: str

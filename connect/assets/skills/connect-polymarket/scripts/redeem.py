@@ -72,7 +72,18 @@ def _ensure_adapter_approvals(
             results.append({"adapter": adapter, "approved": "already"})
             continue
         tx_hash = cs.safe_transaction(
-            token, pm.encode_set_approval_for_all(adapter, True)
+            token,
+            pm.encode_set_approval_for_all(adapter, True),
+            # setApprovalForAll counts as a maximum approval
+            intent={
+                "approvals": [
+                    {
+                        "token": token.lower(),
+                        "spender": adapter.lower(),
+                        "amount": 2**256 - 1,
+                    }
+                ]
+            },
         )
         receipt = cs.wait_receipt(tx_hash)
         results.append({"adapter": adapter, **receipt})
@@ -95,7 +106,8 @@ def _redeem_one(
     # The deployed adapters ignore the index-set argument (they read both
     # position balances themselves); [1 << outcomeIndex] documents intent.
     data = pm.encode_redeem_positions(condition_id, [1 << outcome_index])
-    tx_hash = cs.safe_transaction(adapter, data)
+    # positions are burned for collateral; nothing else may leave the safe
+    tx_hash = cs.safe_transaction(adapter, data, intent={})
     return {
         "condition_id": condition_id,
         "adapter": adapter,
@@ -124,7 +136,7 @@ def _redeem_v2(cs: pm.ConnectSigner, position_id: int) -> dict | None:
         amount=amount,
     )
     _ensure_router_approval(cs)
-    tx_hash = cs.safe_transaction(call.to, call.data)
+    tx_hash = cs.safe_transaction(call.to, call.data, intent={})
     return {
         "condition_id": condition_id,
         "adapter": pm.ROUTER,

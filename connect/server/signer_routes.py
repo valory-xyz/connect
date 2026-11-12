@@ -47,6 +47,8 @@ class _SendBody(StrictBody):
     data: str = "0x"
     request_id: str | None = None
     gas: int | None = Field(default=None, ge=0)
+    # what the call may do; required when it moves value (OPE-2035 T5)
+    intent: dict | None = None
 
     @field_validator("value", "gas", mode="before")
     @classmethod
@@ -94,6 +96,7 @@ def _dispatch(method: t.Callable[..., str], body: _SendBody, address: str) -> di
             data=body.data,
             request_id=body.request_id,
             gas=body.gas,
+            intent=body.intent,
         )
     except (SignerError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

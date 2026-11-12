@@ -4635,6 +4635,7 @@ class _SafeChain:
 
     def __init__(self, monkeypatch, balances: dict, approved=()) -> None:
         """Hold `balances`, (contract, owner, id) -> units, and `approved` pairs."""
+        self.intents: list = []  # the intent each safe call carried
         self.balances = {_key(*k): units for k, units in balances.items()}
         self.approved = {_key(*pair) for pair in approved}
         self.sent: list = []
@@ -4644,10 +4645,13 @@ class _SafeChain:
         ):
             monkeypatch.setattr(pm, name, read)
 
-    def safe_transaction(self, to, data, value=0, request_id=None) -> str:
+    def safe_transaction(  # pylint: disable=too-many-arguments
+        self, to, data, value=0, request_id=None, intent=None
+    ) -> str:
         """Record one safe call and apply it as the chain would."""
         target, data = _call(to, data)
         self.sent.append((target, data))
+        self.intents.append(intent)
         args = bytes.fromhex(data[10:])
         if data.startswith(_APPROVAL):
             operator, granted = abi_decode(["address", "bool"], args)

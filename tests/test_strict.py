@@ -35,7 +35,7 @@ from connect.server.strict import unknown_parameters_message
 from connect.settings import SettingsStore
 from connect.signer import Signer
 
-from tests.conftest import FakeW3
+from tests.conftest import FakeW3, audit_entries
 
 TOKEN = "strict-test-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
@@ -50,7 +50,7 @@ def mcp(  # pylint: disable=too-many-arguments
     mech_service: MechService,
     settings_store: SettingsStore,
 ) -> FastMCP:
-    """The MCP server as Connect builds it."""
+    """Return the MCP server as Connect builds it."""
     return build_mcp(
         test_signer,
         app_config,
@@ -76,9 +76,7 @@ def client(
 
 def test_message_names_the_unknown_and_the_expected() -> None:
     """The refusal says what was wrong and what the call takes."""
-    message = unknown_parameters_message(
-        {"chain", "to"}, {"chain", "target", "value"}
-    )
+    message = unknown_parameters_message({"chain", "to"}, {"chain", "target", "value"})
     assert message == (
         "unknown parameter 'to' (did you mean 'target'?); this call takes "
         "chain, target, value"
@@ -97,12 +95,14 @@ def test_message_falls_back_to_the_closest_name_or_none() -> None:
 
 
 async def test_mcp_tool_refuses_to_on_safe_transaction(
-    mcp: FastMCP, fake_w3: FakeW3
+    mcp: FastMCP, fake_w3: FakeW3, store_path: t.Any
 ) -> None:
     """`to` on safe_transaction was silently dropped; now it is refused by name."""
     with pytest.raises(ToolError, match=r"'to' \(did you mean 'target'\?\)"):
         await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
     assert not fake_w3.eth.sent
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert entry == {**entry, "rule": "unknown-parameter", "tool": "safe_transaction"}
 
 
 async def test_send_transaction_hints_the_other_way(mcp: FastMCP) -> None:
@@ -133,10 +133,16 @@ async def test_read_only_tools_carry_read_only_hint(mcp: FastMCP) -> None:
         "transaction_status",
         "mech_result",
         "mech_tools",
+        "simulate_transaction",
+        "chain_call",
+        "get_abi",
+        "decode_calldata",
     }
 
 
-def test_http_safe_transaction_refuses_to(client: TestClient, fake_w3: FakeW3) -> None:
+def test_http_safe_transaction_refuses_to(
+    client: TestClient, fake_w3: FakeW3, store_path: t.Any
+) -> None:
     """The HTTP route takes `target`, like the tool, and names it when given `to`."""
     response = client.post(
         "/safe-transaction",
@@ -146,6 +152,9 @@ def test_http_safe_transaction_refuses_to(client: TestClient, fake_w3: FakeW3) -
     assert response.status_code == 422
     assert "did you mean 'target'" in response.text
     assert not fake_w3.eth.sent
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert entry["rule"] == "unknown-parameter"
+    assert entry["path"] == "/safe-transaction"
 
 
 def test_http_sign_message_refuses_unknown_fields(client: TestClient) -> None:

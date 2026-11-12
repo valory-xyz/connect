@@ -103,14 +103,26 @@ def cmd_wrap(cs: pm.ConnectSigner, amount: float | None) -> None:
         )
     steps = []
     approve_hash = cs.safe_transaction(
-        pm.USDC_E, pm.encode_erc20_approve(pm.COLLATERAL_ONRAMP, units)
+        pm.USDC_E,
+        pm.encode_erc20_approve(pm.COLLATERAL_ONRAMP, units),
+        intent={
+            "approvals": [
+                {
+                    "token": pm.USDC_E.lower(),
+                    "spender": pm.COLLATERAL_ONRAMP.lower(),
+                    "amount": units,
+                }
+            ]
+        },
     )
     steps.append({"step": "approve", **cs.wait_receipt(approve_hash)})
     if steps[-1]["status"] != 1:
         pm.print_json({"wrapped": False, "steps": steps})
         raise SystemExit("USDC.e approve to the onramp did not succeed")
     wrap_hash = cs.safe_transaction(
-        pm.COLLATERAL_ONRAMP, pm.encode_onramp_wrap(pm.USDC_E, safe, units)
+        pm.COLLATERAL_ONRAMP,
+        pm.encode_onramp_wrap(pm.USDC_E, safe, units),
+        intent={"spend": {pm.USDC_E.lower(): units}},
     )
     wrap_receipt = {"step": "wrap", **cs.wait_receipt(wrap_hash)}
     steps.append(wrap_receipt)
@@ -132,7 +144,11 @@ def cmd_top_up(cs: pm.ConnectSigner, amount: float) -> None:
             f"safe pUSD balance {pm.units_to_usd(safe_balance)} < requested {amount}; "
             "wrap USDC.e first (funds.py wrap) or fund the safe"
         )
-    tx_hash = cs.safe_transaction(pm.PUSD, pm.encode_erc20_transfer(dw, units))
+    tx_hash = cs.safe_transaction(
+        pm.PUSD,
+        pm.encode_erc20_transfer(dw, units),
+        intent={"spend": {pm.PUSD.lower(): units}, "recipients": [dw.lower()]},
+    )
     receipt = cs.wait_receipt(tx_hash)
     pm.check_mined(receipt, f"top-up of {pm.units_to_usd(units)} pUSD")
     pm.print_json({"topped_up": pm.units_to_usd(units), "to": dw, **receipt})
@@ -372,7 +388,9 @@ def cmd_return_position(
             f"({pm.units_to_usd(balance)})"
         )
     tx_hash = cs.safe_transaction(
-        token, pm.encode_erc1155_safe_transfer(safe, dw, token_id, units)
+        token,
+        pm.encode_erc1155_safe_transfer(safe, dw, token_id, units),
+        intent={"recipients": [dw.lower()]},
     )
     receipt = cs.wait_receipt(tx_hash)
     pm.check_mined(receipt, f"return of position {token_id} to the DW")

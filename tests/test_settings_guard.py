@@ -108,7 +108,7 @@ from connect.settings import (
 )
 from connect.signer import Signer, SignerError, _ChainState
 
-from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds, pay
 
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
@@ -1320,10 +1320,14 @@ class TestSignerGuardIntegration:
         different check: the guardrail's rules are about the composed
         execTransaction, so the two must be built the same way.
         """
-        reason = restricted_signer.refusal_reason("testchain", OTHER, value=5)
+        reason = restricted_signer.refusal_reason(
+            "testchain", OTHER, value=5, intent=pay(OTHER, 5)
+        )
         assert reason is not None
         with pytest.raises(SignerError) as raised:
-            restricted_signer.send_via_safe("testchain", OTHER, value=5)
+            restricted_signer.send_via_safe(
+                "testchain", OTHER, value=5, intent=pay(OTHER, 5)
+            )
         assert str(raised.value) == reason
         assert not fake_w3.eth.sent
 
@@ -1358,17 +1362,26 @@ class TestSignerGuardIntegration:
         guard.allow_safe_deposit_once(
             chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
         )
-        over_cap = restricted_signer.refusal_reason("testchain", TRACKER, value=101)
+        over_cap = restricted_signer.refusal_reason(
+            "testchain", TRACKER, value=101, intent=pay(TRACKER, 101)
+        )
         assert over_cap is not None
         assert "do not allow the safe to call" in over_cap
         wrong_shape = restricted_signer.refusal_reason(
-            "testchain", TRACKER, value=50, data="0x0102"
+            "testchain", TRACKER, value=50, intent=pay(TRACKER, 50), data="0x0102"
         )
         assert wrong_shape is not None
-        assert restricted_signer.refusal_reason("testchain", TRACKER, value=50) is None
+        assert (
+            restricted_signer.refusal_reason(
+                "testchain", TRACKER, value=50, intent=pay(TRACKER, 50)
+            )
+            is None
+        )
         # every one of those asked the guardrail, and none of them spent the
         # allowance the mech flow armed for the send it is about to make
-        restricted_signer.send_via_safe("testchain", TRACKER, value=50)
+        restricted_signer.send_via_safe(
+            "testchain", TRACKER, value=50, intent=pay(TRACKER, 50)
+        )
         assert len(fake_w3.eth.sent) == 1
 
     def test_dry_run_records_a_check_and_never_a_block(
@@ -1380,7 +1393,9 @@ class TestSignerGuardIntegration:
         so it must leave a trace — but not one that reads as a request the
         guardrail actually stopped.
         """
-        restricted_signer.refusal_reason("testchain", OTHER, value=5)
+        restricted_signer.refusal_reason(
+            "testchain", OTHER, value=5, intent=pay(OTHER, 5)
+        )
         restricted_signer.refusal_reason("testchain", OTHER)
         kinds = audit_kinds(store_path)
         assert kinds == ["checked", "checked"]
@@ -1393,7 +1408,12 @@ class TestSignerGuardIntegration:
         self, store_path: Path, test_signer: Signer
     ) -> None:
         """An allowed probe must not be forensically blank."""
-        assert test_signer.refusal_reason("testchain", OTHER, value=50) is None
+        assert (
+            test_signer.refusal_reason(
+                "testchain", OTHER, value=50, intent=pay(OTHER, 50)
+            )
+            is None
+        )
         entry = audit_entries(store_path)[0]
         assert entry["to"] == SAFE
         assert entry["value"] == "0"
@@ -1417,11 +1437,11 @@ class TestSignerGuardIntegration:
     ) -> None:
         """via_safe=False asks about send_transaction's call, not the safe's."""
         reason = restricted_signer.refusal_reason(
-            "testchain", OTHER, value=1, via_safe=False
+            "testchain", OTHER, value=1, intent=pay(OTHER, 1), via_safe=False
         )
         assert reason is not None
         with pytest.raises(SignerError) as raised:
-            restricted_signer.send("testchain", OTHER, value=1)
+            restricted_signer.send("testchain", OTHER, value=1, intent=pay(OTHER, 1))
         assert str(raised.value) == reason
 
     def test_dry_run_refuses_a_negative_value_the_send_would_reject(
@@ -1473,10 +1493,15 @@ class TestSignerGuardIntegration:
     ) -> None:
         """A consulted guardrail that says yes reports nothing, then it goes."""
         test_signer.set_guard(guard)
-        assert test_signer.refusal_reason("testchain", OTHER, value=1) is None
+        assert (
+            test_signer.refusal_reason(
+                "testchain", OTHER, value=1, intent=pay(OTHER, 1)
+            )
+            is None
+        )
         assert not fake_w3.eth.sent
         assert audit_kinds(store_path) == ["checked"]
-        test_signer.send_via_safe("testchain", OTHER, value=1)
+        test_signer.send_via_safe("testchain", OTHER, value=1, intent=pay(OTHER, 1))
         assert len(fake_w3.eth.sent) == 1
 
     def test_dry_run_without_a_guard_allows_and_says_so(
@@ -1485,11 +1510,18 @@ class TestSignerGuardIntegration:
         app_config: AppConfig,
         activity: ActivityLog,
         caplog: pytest.LogCaptureFixture,
+        fake_w3: FakeW3,
     ) -> None:
         """A choke point with no gate attached is worth a line in the log."""
         signer = Signer(account=account, config=app_config, activity=activity)
+        signer._chains._states["testchain"] = (  # pylint: disable=protected-access
+            _ChainState(w3=t.cast(Web3, fake_w3), lock=threading.Lock(), chain_id=1)
+        )
         with caplog.at_level(logging.ERROR, logger="agent"):
-            assert signer.refusal_reason("testchain", OTHER, value=1) is None
+            assert (
+                signer.refusal_reason("testchain", OTHER, value=1, intent=pay(OTHER, 1))
+                is None
+            )
         assert "no guardrail attached" in caplog.text
 
     def test_blocked_send_is_audited(
@@ -1501,7 +1533,7 @@ class TestSignerGuardIntegration:
     ) -> None:
         """A denied send raises SignerError, records 'blocked', broadcasts nothing."""
         with pytest.raises(SignerError, match="only allow transactions targeting"):
-            restricted_signer.send("testchain", OTHER, value=1)
+            restricted_signer.send("testchain", OTHER, value=1, intent=pay(OTHER, 1))
         assert "blocked" in audit_kinds(store_path)
         assert not fake_w3.eth.sent
 
@@ -1527,17 +1559,21 @@ class TestSignerGuardIntegration:
             )
         )
         sent: dict = {}
-        original = restricted_signer.send
+        original = restricted_signer._send_guarded  # pylint: disable=protected-access
         monkeypatch.setattr(
             restricted_signer,
-            "send",
+            "_send_guarded",
             lambda chain, to, **kw: (
                 sent.update({"chain": chain, "to": to, **kw}),
                 original(chain, to, **kw),
             )[1],
         )
         tx_hash = restricted_signer.send_via_safe(
-            "testchain", WHITELISTED, value=10**18, data="0xabcd"
+            "testchain",
+            WHITELISTED,
+            value=10**18,
+            intent=pay(WHITELISTED, 10**18),
+            data="0xabcd",
         )
 
         assert tx_hash.startswith("0x")
@@ -1563,7 +1599,9 @@ class TestSignerGuardIntegration:
         design exists to not have.
         """
         with pytest.raises(SignerError, match="do not allow the safe to call"):
-            restricted_signer.send_via_safe("testchain", OTHER, value=1)
+            restricted_signer.send_via_safe(
+                "testchain", OTHER, value=1, intent=pay(OTHER, 1)
+            )
         assert not fake_w3.eth.sent
 
     def test_the_composer_cannot_open_the_safe_to_itself(
@@ -1612,7 +1650,9 @@ class TestSignerGuardIntegration:
         with pytest.raises(SignerError, match="cannot compose"):
             restricted_signer.send_via_safe("testchain", "0x1234", value=1)
         with pytest.raises(SignerError, match="cannot compose"):
-            restricted_signer.send_via_safe("testchain", WHITELISTED, value=2**256)
+            restricted_signer.send_via_safe(
+                "testchain", WHITELISTED, value=2**256, intent=pay(WHITELISTED, 2**256)
+            )
         assert not fake_w3.eth.sent
 
     def test_the_safe_path_has_its_own_idempotency_namespace(
@@ -1631,16 +1671,28 @@ class TestSignerGuardIntegration:
             Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}))
         )
         eoa = restricted_signer.send(
-            "testchain", WHITELISTED, value=1, request_id="dup"
+            "testchain",
+            WHITELISTED,
+            value=1,
+            intent=pay(WHITELISTED, 1),
+            request_id="dup",
         )
         via_safe = restricted_signer.send_via_safe(
-            "testchain", WHITELISTED, value=1, request_id="dup"
+            "testchain",
+            WHITELISTED,
+            value=1,
+            intent=pay(WHITELISTED, 1),
+            request_id="dup",
         )
         assert eoa != via_safe
         assert len(fake_w3.eth.sent) == 2  # no cross-path collision
         # ...but a real retry on the safe path with the same id is still deduped
         again = restricted_signer.send_via_safe(
-            "testchain", WHITELISTED, value=1, request_id="dup"
+            "testchain",
+            WHITELISTED,
+            value=1,
+            intent=pay(WHITELISTED, 1),
+            request_id="dup",
         )
         assert again == via_safe
         assert len(fake_w3.eth.sent) == 2
@@ -1670,17 +1722,23 @@ class TestSignerGuardIntegration:
         settings_store.save(
             Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}))
         )
-        tx_hash = restricted_signer.send("testchain", OTHER, value=1, request_id="r1")
+        tx_hash = restricted_signer.send(
+            "testchain", OTHER, value=1, intent=pay(OTHER, 1), request_id="r1"
+        )
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
         )
         assert (
-            restricted_signer.send("testchain", OTHER, value=1, request_id="r1")
+            restricted_signer.send(
+                "testchain", OTHER, value=1, intent=pay(OTHER, 1), request_id="r1"
+            )
             == tx_hash
         )
         assert len(fake_w3.eth.sent) == 1  # no second broadcast
         with pytest.raises(SignerError, match="only allow transactions targeting"):
-            restricted_signer.send("testchain", OTHER, value=1, request_id="r2")
+            restricted_signer.send(
+                "testchain", OTHER, value=1, intent=pay(OTHER, 1), request_id="r2"
+            )
 
 
 class FakeMarketplaceContract:
@@ -5138,11 +5196,11 @@ class TestMcpGuardrailTools:
         """via_safe decides which call is being asked about, so it must arrive."""
         calls: list[dict] = []
 
-        def fake_reason(chain: str, target: str, **kwargs: object) -> str | None:
+        def fake_check(chain: str, target: str, **kwargs: object) -> tuple:
             calls.append({"chain": chain, "target": target, **kwargs})
-            return None
+            return None, []
 
-        monkeypatch.setattr(test_signer, "refusal_reason", fake_reason)
+        monkeypatch.setattr(test_signer, "check", fake_check)
         assert await tools["preflight_transaction"](
             "testchain", OTHER, 5, "0xab", via_safe=False
         ) == {"allowed": True}
@@ -5152,6 +5210,7 @@ class TestMcpGuardrailTools:
             "value": 5,
             "data": "0xab",
             "via_safe": False,
+            "intent": None,
         }
 
     async def test_preflight_tool_carries_the_refusal(
@@ -5162,7 +5221,7 @@ class TestMcpGuardrailTools:
     ) -> None:
         """A refusal must arrive verbatim: it is the whole answer."""
         monkeypatch.setattr(
-            test_signer, "refusal_reason", lambda *a, **k: "the guardrail said no"
+            test_signer, "check", lambda *a, **k: ("the guardrail said no", [])
         )
         assert await tools["preflight_transaction"]("testchain", OTHER) == {
             "allowed": False,

@@ -38,7 +38,7 @@ from connect.server import app as app_module
 from connect.settings import HARNESSES
 from connect.signer import Signer
 
-from tests.conftest import FakeW3, audit_entries, audit_kinds
+from tests.conftest import FakeW3, audit_entries, audit_kinds, pay
 
 TOKEN = "unit-test-token"  # nosec B105
 
@@ -517,7 +517,12 @@ class TestAuth:
         """Test sign and send."""
         response = client.post(
             "/sign-and-send",
-            json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": "0x10"},
+            json={
+                "chain": "testchain",
+                "to": "0x" + "aa" * 20,
+                "value": "0x10",
+                "intent": pay("0x" + "aa" * 20, 16),
+            },
             headers=auth(),
         )
         assert response.status_code == 200
@@ -528,7 +533,12 @@ class TestAuth:
         """The route names the inner call; the server composes the safe's tx."""
         response = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "target": "0x" + "aa" * 20, "value": "0x10"},
+            json={
+                "chain": "testchain",
+                "target": "0x" + "aa" * 20,
+                "value": "0x10",
+                "intent": pay("0x" + "aa" * 20, 16),
+            },
             headers=auth(),
         )
         assert response.status_code == 200

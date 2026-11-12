@@ -135,7 +135,17 @@ def router_swap(  # pylint: disable=too-many-arguments,too-many-positional-argum
     else:
         calls = approval_calls(chain_id, token_in, amount, deadline)
         label = PERMIT_SEPARATE
-    swap: evm.Call = {"to": spender, "data": calldata, "what": "swap"}
+    swap: evm.Call = {
+        "to": spender,
+        "data": calldata,
+        "what": "swap",
+        # the signer re-simulates the swap and refuses it if it spends more
+        # than `amount` or returns less than the slippage floor
+        "intent": {
+            "spend": {evm.intent_token(token_in): amount},
+            "receive_min": {evm.intent_token(token_out): minimum},
+        },
+    }
     if native:
         swap["value"] = amount
     calls.append(swap)

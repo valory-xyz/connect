@@ -31,6 +31,8 @@ import typing as t
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from connect.activity import ActivityLog
+
 # Names a session plausibly reaches for, and the parameter it meant: the safe
 # path's call target is `target`, not the EOA path's `to`, and vice versa.
 HINTS: dict[str, dict[str, str]] = {
@@ -66,12 +68,21 @@ def unknown_parameters_message(
     )
 
 
-def _check_known(cls: type[BaseModel], data: t.Any) -> t.Any:
+UNKNOWN_PARAMETER_RULE = "unknown-parameter"
+
+OnRefusal = t.Callable[[str], None]
+
+
+def _check_known(
+    cls: type[BaseModel], data: t.Any, on_refusal: OnRefusal | None = None
+) -> t.Any:
     """Before-validator body: refuse a mapping that carries unknown keys."""
     if isinstance(data, dict):
         expected = {field.alias or name for name, field in cls.model_fields.items()}
         message = unknown_parameters_message(data, expected)
         if message is not None:
+            if on_refusal is not None:
+                on_refusal(message)
             raise ValueError(message)
     return data
 
@@ -87,7 +98,9 @@ class StrictBody(BaseModel):
         return _check_known(cls, data)
 
 
-def strict_arg_model(model: type[BaseModel]) -> type[BaseModel]:
+def strict_arg_model(
+    model: type[BaseModel], on_refusal: OnRefusal | None = None
+) -> type[BaseModel]:
     """Return a subclass of an MCP tool's argument model that refuses unknown keys."""
 
     class Strict(model):  # type: ignore[valid-type, misc]
@@ -98,13 +111,34 @@ def strict_arg_model(model: type[BaseModel]) -> type[BaseModel]:
         @model_validator(mode="before")
         @classmethod
         def _refuse_unknown(cls, data: t.Any) -> t.Any:
-            return _check_known(cls, data)
+            return _check_known(cls, data, on_refusal)
 
     Strict.__name__ = Strict.__qualname__ = model.__name__
     return Strict
 
 
-def make_tools_strict(mcp: FastMCP) -> None:
-    """Make every registered tool refuse arguments it does not take."""
+def make_tools_strict(mcp: FastMCP, activity: ActivityLog) -> None:
+    """Make every registered tool refuse arguments it does not take, audited."""
     for tool in mcp._tool_manager.list_tools():  # pylint: disable=protected-access
-        tool.fn_metadata.arg_model = strict_arg_model(tool.fn_metadata.arg_model)
+
+        def audit(message: str, name: str = tool.name) -> None:
+            activity.record(
+                "refusal", rule=UNKNOWN_PARAMETER_RULE, tool=name, reason=message
+            )
+
+        tool.fn_metadata.arg_model = strict_arg_model(tool.fn_metadata.arg_model, audit)
+
+
+def audit_unknown_parameters(
+    activity: ActivityLog, path: str, errors: t.Iterable[t.Mapping[str, t.Any]]
+) -> None:
+    """Record an HTTP body's unknown-parameter refusal in the activity log."""
+    for error in errors:
+        message = str(error.get("msg", ""))
+        if "unknown parameter" in message:
+            activity.record(
+                "refusal",
+                rule=UNKNOWN_PARAMETER_RULE,
+                path=path,
+                reason=message.removeprefix("Value error, "),
+            )
