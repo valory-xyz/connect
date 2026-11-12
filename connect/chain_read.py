@@ -108,10 +108,6 @@ SKILL_SIGNATURES = (
 )
 
 
-# Contracts Connect ships an ABI for: the shared ones, and the ones its bundled
-# skills call (connect-polymarket's pm_common, the lib's uniswap DEPLOYMENTS,
-# connect-pons's pons.py), lower-case. tests/test_chain_read.py reads those
-# files to keep the two in step.
 class KnownContract(t.NamedTuple):
     """A contract Connect ships an ABI for, and the chains it is deployed on."""
 
@@ -120,6 +116,9 @@ class KnownContract(t.NamedTuple):
     chains: frozenset[int] | None  # None: the same address on every chain
 
 
+# The shared contracts, and the ones the bundled skills call (connect-polymarket's
+# pm_common, the lib's uniswap DEPLOYMENTS, connect-pons's pons.py), lower-case.
+# tests/test_chain_read.py reads those files to keep the two in step.
 KNOWN_CONTRACTS: dict[str, "KnownContract"] = {
     # the same address on every chain these are deployed to
     "0xca11bde05977b3631167028862be2a173976ca11": KnownContract(

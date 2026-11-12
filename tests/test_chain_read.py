@@ -221,7 +221,7 @@ def _addresses_in(relative: str, names: list[str]) -> dict[str, str]:
 
 
 @pytest.mark.parametrize(
-    ("relative", "names"),
+    ("relative", "names", "chain"),
     [
         (
             "skills/connect-polymarket/scripts/pm_common.py",
@@ -234,31 +234,35 @@ def _addresses_in(relative: str, names: list[str]) -> dict[str, str]:
                 "CTF_COLLATERAL_ADAPTER",
                 "NEG_RISK_CTF_COLLATERAL_ADAPTER",
             ],
+            137,  # Polygon
         ),
         (
             "skills/connect-pons/scripts/pons.py",
             ["WETH", "USDG", "MEME_HOOK", "FEE_ESCROW"],
+            4663,  # Robinhood Chain
         ),
     ],
 )
-def test_the_skills_contracts_are_shipped(relative: str, names: list[str]) -> None:
-    """get_abi knows every contract the bundled skills call, at their address."""
+def test_the_skills_contracts_are_shipped(
+    relative: str, names: list[str], chain: int
+) -> None:
+    """get_abi knows every contract the bundled skills call, on their chain."""
     for name, address in _addresses_in(relative, names).items():
         assert address in chain_read.KNOWN_CONTRACTS, name
+        assert chain_read.KNOWN_CONTRACTS[address].chains == frozenset({chain}), name
 
 
 def test_every_universal_router_is_shipped() -> None:
-    """Each chain's router in the lib's Uniswap deployments has its execute ABI."""
-    import re  # pylint: disable=import-outside-toplevel
-    from pathlib import Path  # pylint: disable=import-outside-toplevel
+    """Each chain's router in the lib's Uniswap deployments, on that chain only."""
+    import uniswap  # pylint: disable=import-outside-toplevel,import-error
 
-    source = (Path(chain_read.__file__).parent / "assets/lib/uniswap.py").read_text()
-    routers = re.findall(r'"universal_router": "(0x[0-9a-fA-F]{40})"', source)
-    assert routers
-    for router in routers:
-        name, signatures, _ = chain_read.KNOWN_CONTRACTS[router.lower()]
+    assert uniswap.DEPLOYMENTS
+    for chain_id, deployment in uniswap.DEPLOYMENTS.items():
+        router = deployment["universal_router"].lower()
+        name, signatures, chains = chain_read.KNOWN_CONTRACTS[router]
         assert name == "Uniswap Universal Router"
         assert "execute(bytes,bytes[],uint256)" in signatures
+        assert chains == frozenset({chain_id}), chain_id
 
 
 def test_a_skill_contract_is_verified_with_its_calls() -> None:
