@@ -42,8 +42,6 @@ from connect.signer import Signer
 
 from tests.conftest import FakeW3, audit_entries, pay
 
-import router  # noqa: E402  pylint: disable=wrong-import-position,wrong-import-order
-
 WORKSPACE = "workspace-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
 USDC = "0x" + "c0" * 20
@@ -240,13 +238,15 @@ def test_a_uniswap_swap_draws_its_amount_twice_not_three_times() -> None:
     the router, then the swap spends. Only the Permit2 grant and the spend
     draw on the session, so a swap of X fits a session cap of 2X.
     """
+    import router  # pylint: disable=import-outside-toplevel,import-error
+
     store = GrantStore(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 80}))
-    calls = router.approval_calls(4663, USDC, 40, 99)
-    assert calls[0]["intent"]["approvals"][0]["spender"] == intent_module.PERMIT2
-    calls.append({"intent": {"spend": {USDC: 40}}})  # the swap itself
-    for call in calls:
-        store.authorize(capped, "safe_transaction", {"intent": call["intent"]})
+    intents = [call["intent"] for call in router.approval_calls(4663, USDC, 40, 99)]
+    assert intents[0]["approvals"][0]["spender"] == intent_module.PERMIT2
+    intents.append({"spend": {USDC: 40}})  # the swap itself
+    for intent in intents:
+        store.authorize(capped, "safe_transaction", {"intent": intent})
     with pytest.raises(GrantRefused) as refused:  # and the budget is all used
         store.authorize(capped, "safe_transaction", {"intent": {"spend": {USDC: 1}}})
     assert refused.value.rule == "token-cap-per-session"
