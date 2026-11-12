@@ -324,9 +324,15 @@ class GrantStore:
                         f"{asset} per transaction (the call declares {amount})",
                     )
         # an approval is spend its spender may take later, outside any send this
-        # token makes: it draws on the session budget like the spend itself
+        # token makes: it draws on the session budget like the spend itself.
+        # Except an ERC-20 approval of Permit2: Permit2 moves the token only
+        # for a Permit2 grant, which the gate makes the intent declare and
+        # which draws here, or a signed permit, which a capped token cannot
+        # sign. Drawing both would charge one swap's funds twice.
         drawn = dict(declared)
         for approval in approvals:
+            if approval["spender"] == intent_module.PERMIT2:
+                continue
             key = intent_module.balance_key(approval["token"])
             drawn[key] = drawn.get(key, 0) + approval["amount"]
         with self._lock:

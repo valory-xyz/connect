@@ -214,7 +214,8 @@ no native transfer of it fails closed as `simulation-unavailable`: the RPC
 ignored `traceTransfers`. Permit2's own grants (its `Approval` from
 `approve()` and its `Permit` from a signed permit, from the canonical Permit2
 address) are approvals of the token to their spender, declared and capped like
-an ERC-20 approval. An RPC that cannot simulate refuses the send
+an ERC-20 approval, and always declared: the allowance exemption above reads
+the token's own `allowance()`, which says nothing about a Permit2 grant. An RPC that cannot simulate refuses the send
 as `simulation-unavailable`, so Pearl must give Connect, on every chain, an RPC
 that serves `eth_simulateV1` (Celo's `forno.celo.org` does not). The
 transactions the server builds itself — the mech flow (`MechSigner`) and the
@@ -393,7 +394,11 @@ budget is drawn down when a call is authorized, whether or not the send then
 succeeds, so it can be spent early but never exceeded; a child's spend is drawn
 on every capped token it was minted from as well, so minting more children
 never multiplies a budget. A declared approval draws on the session budget as
-its spend does, since its spender can take that much later. What a cap cannot bound, a value-capped token may not
+its spend does, since its spender can take that much later. An ERC-20 approval
+of the canonical Permit2 is the exception: Permit2 moves the token only for its
+own grant, which is declared and drawn, or for a signed permit, which a capped
+token cannot sign, so a Uniswap swap draws its amount twice (the Permit2 grant
+and the spend), not three times. What a cap cannot bound, a value-capped token may not
 do: approve more of a token than its caps allow (an approval is spend the
 spender takes later), sign a raw digest (`sign_message`: a digest can authorize
 any safe transaction), or move an ERC-721/1155 position out of the safe (the
