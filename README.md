@@ -40,8 +40,12 @@ other non-aea agent. It:
      opened, `requested` the one it aimed for. An optional `{"harness": …}`
      body overrides the saved preference for that launch alone, without
      rewriting what the operator chose
-   - a bearer-authed signing surface: `POST /safe-transaction`,
-     `POST /sign-and-send`, `POST /sign-message`, `GET /wallet`
+   - a bearer-authed signing surface: `POST /safe-transaction` (the safe's call:
+     `target`, `value`, `data`), `POST /sign-and-send` (the EOA's: `to`,
+     `value`, `data`), `POST /sign-message`, `GET /wallet`. Every body and
+     every MCP tool refuses a parameter it does not take, with an error naming
+     the ones it does (`to` on the safe path is pointed at `target`); read-only
+     tools carry `readOnlyHint`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `safe_transaction`, `send_transaction`, `preflight_transaction`,
      `transaction_status`,

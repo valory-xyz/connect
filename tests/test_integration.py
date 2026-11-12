@@ -397,7 +397,7 @@ def test_safe_transaction_mines_a_server_composed_call_on_fork(
             "/safe-transaction",
             json={
                 "chain": "gnosis",
-                "to": recipient,  # the call the *safe* makes
+                "target": recipient,  # the call the *safe* makes
                 "value": 10**17,
                 "request_id": f"it-{secrets.token_hex(8)}",
             },
@@ -531,7 +531,7 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
         safe_address = fork_config.chains["gnosis"].safe_address
         self_call = client.post(
             "/safe-transaction",
-            json={"chain": "gnosis", "to": safe_address, "data": "0x610b5925"},
+            json={"chain": "gnosis", "target": safe_address, "data": "0x610b5925"},
             headers=headers,
         )
         assert self_call.status_code == 400

@@ -30,6 +30,7 @@ import typing as t
 
 from hexbytes import HexBytes
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from connect import settings as settings_config
@@ -38,10 +39,14 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
+from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer
 
 RECEIPT_POLL_SECONDS = 2
+# tools that read and never sign, broadcast or pay: harnesses may run them
+# without asking the operator
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
 MAX_RECEIPT_TIMEOUT = 300
 
 
@@ -73,7 +78,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         streamable_http_path="/",
     )
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY)
     async def wallet_info() -> dict:
         """Agent EOA and per-chain safes and native token balances.
 
@@ -148,7 +153,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             timeout=timeout,
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY)
     async def preflight_transaction(
         chain: str,
         target: str,
@@ -177,7 +182,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             return {"allowed": True}
         return {"allowed": False, "reason": reason}
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY)
     async def transaction_status(chain: str, tx_hash: str) -> dict:
         """Settlement of a transaction: mined / reverted / pending.
 
@@ -271,7 +276,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             request_context=request_context,
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY)
     async def mech_result(
         request_id: str, timeout: float = DEFAULT_RESULT_TIMEOUT
     ) -> dict:
@@ -283,7 +288,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         """
         return await asyncio.to_thread(mech.result, request_id, timeout=timeout)
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY)
     async def mech_tools(
         chain: str | None = None,
         priority_mech: str | None = None,
@@ -311,7 +316,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
     if expose_mode:
 
-        @mcp.tool()
+        @mcp.tool(annotations=READ_ONLY)
         async def settings() -> dict:
             """Read the enforced settings in their canonical shape.
 
@@ -320,6 +325,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             """
             return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 
+    # a parameter a tool does not take is refused by name, never dropped
+    make_tools_strict(mcp)
     return mcp
 
 

@@ -164,7 +164,7 @@ def test_a_contract_send_reaches_the_signer_without_estimating_locally(
     assert "eth_getBlockByNumber" not in seen
     ((path, payload),) = sent
     assert path == "/safe-transaction"  # made by the safe, not the EOA
-    assert payload["to"] == ADDR_A
+    assert payload["target"] == ADDR_A
     assert payload["data"].startswith("0x095ea7b3")  # approve(address,uint256)
 
 
@@ -291,7 +291,7 @@ def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
     def send(chain="testchain", to="0x" + "aa" * 20, headers=None) -> None:
         response = client.post(
             "/safe-transaction",
-            json={"chain": chain, "to": to},
+            json={"chain": chain, "target": to},
             headers=good if headers is None else headers,
         )
         error = _as_client_error(response)
@@ -337,7 +337,7 @@ def test_send_outcome_treats_a_failed_broadcast_as_possibly_sent(
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         response = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "to": "0x" + "aa" * 20},
+            json={"chain": "testchain", "target": "0x" + "aa" * 20},
             headers={"Authorization": "Bearer tok"},
         )
     assert evm.send_outcome(_as_client_error(response)) == evm.MAY_HAVE_BROADCAST

@@ -122,7 +122,7 @@ class SignerClient:
         request_id = request_id or str(uuid.uuid4())
         payload = {
             "chain": self.chain,
-            "to": tx["to"],
+            "target": tx["to"],
             "value": _to_int(tx.get("value", 0)),
             "data": tx.get("data", "0x"),
             "request_id": request_id,

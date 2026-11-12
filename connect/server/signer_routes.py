@@ -27,10 +27,11 @@ import logging
 import typing as t
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import Field, field_validator
 
 from connect import settings as settings_config
 from connect import wallet
+from connect.server.strict import StrictBody
 from connect.signer import SignerError
 
 logger = logging.getLogger("agent")
@@ -38,11 +39,10 @@ logger = logging.getLogger("agent")
 router = APIRouter()
 
 
-class SignAndSendRequest(BaseModel):
-    """SignAndSendRequest."""
+class _SendBody(StrictBody):
+    """Fields both signing routes share; unknown ones are refused by name."""
 
     chain: str
-    to: str
     value: int = Field(default=0, ge=0)
     data: str = "0x"
     request_id: str | None = None
@@ -57,13 +57,29 @@ class SignAndSendRequest(BaseModel):
         return v
 
 
-class SignMessageRequest(BaseModel):
+class SignAndSendRequest(_SendBody):
+    """A transaction the agent EOA sends: `to` is its recipient."""
+
+    to: str
+
+
+class SafeTransactionRequest(_SendBody):
+    """A call the service safe makes: `target` is what the safe calls.
+
+    The same name as the safe_transaction MCP tool's, so the two surfaces
+    cannot be confused for one another (OPE-2035 T6).
+    """
+
+    target: str
+
+
+class SignMessageRequest(StrictBody):
     """SignMessageRequest."""
 
     digest: str = Field(description="0x-hex 32-byte digest, signed unprefixed")
 
 
-def _dispatch(method: t.Callable[..., str], body: SignAndSendRequest) -> dict:
+def _dispatch(method: t.Callable[..., str], body: _SendBody, address: str) -> dict:
     """Run one signer method and map its input errors to a 400.
 
     The address is passed positionally: `send` reads it as the EOA's outer
@@ -73,7 +89,7 @@ def _dispatch(method: t.Callable[..., str], body: SignAndSendRequest) -> dict:
     try:
         tx_hash = method(
             body.chain,
-            body.to,
+            address,
             value=body.value,
             data=body.data,
             request_id=body.request_id,
@@ -87,17 +103,17 @@ def _dispatch(method: t.Callable[..., str], body: SignAndSendRequest) -> dict:
 @router.post("/sign-and-send")
 def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
     """Sign and send one transaction from the agent EOA."""
-    return _dispatch(request.app.state.signer.send, body)
+    return _dispatch(request.app.state.signer.send, body, body.to)
 
 
 @router.post("/safe-transaction")
-def safe_transaction(body: SignAndSendRequest, request: Request) -> dict:
+def safe_transaction(body: SafeTransactionRequest, request: Request) -> dict:
     """Have the service safe make one call; the server composes the safe's tx.
 
-    The same body as /sign-and-send, read one level in: `to`, `value` and `data`
-    are the call the *safe* makes, and the value leaves the safe.
+    `target`, `value` and `data` are the call the *safe* makes, and the value
+    leaves the safe.
     """
-    return _dispatch(request.app.state.signer.send_via_safe, body)
+    return _dispatch(request.app.state.signer.send_via_safe, body, body.target)
 
 
 @router.post("/sign-message")

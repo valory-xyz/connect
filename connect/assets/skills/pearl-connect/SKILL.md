@@ -52,6 +52,12 @@ cannot tell you is which to reach for:
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
 
+**Use the exact parameter names.** The safe's call target is `target` on
+`safe_transaction` and `preflight_transaction` (and `POST /safe-transaction`);
+only `send_transaction` and `POST /sign-and-send` take `to`. A parameter a
+tool does not take is refused with an error naming the ones it does — never
+silently dropped — so read that error and resend with the named parameter.
+
 ## The guardrail
 
 Every signing request passes a guardrail. Two of its rules never move: the

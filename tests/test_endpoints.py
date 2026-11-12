@@ -528,7 +528,7 @@ class TestAuth:
         """The route names the inner call; the server composes the safe's tx."""
         response = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": "0x10"},
+            json={"chain": "testchain", "target": "0x" + "aa" * 20, "value": "0x10"},
             headers=auth(),
         )
         assert response.status_code == 200
@@ -541,7 +541,7 @@ class TestAuth:
         """A chain we cannot spend from is the caller's problem, not a 500."""
         response = client.post(
             "/safe-transaction",
-            json={"chain": "mystery", "to": "0x" + "aa" * 20},
+            json={"chain": "mystery", "target": "0x" + "aa" * 20},
             headers=auth(),
         )
         assert response.status_code == 400
@@ -557,13 +557,13 @@ class TestAuth:
         """
         bad_target = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "to": "0x1234"},
+            json={"chain": "testchain", "target": "0x1234"},
             headers=auth(),
         )
         assert bad_target.status_code == 400
         huge_value = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": 2**256},
+            json={"chain": "testchain", "target": "0x" + "aa" * 20, "value": 2**256},
             headers=auth(),
         )
         assert huge_value.status_code == 400
