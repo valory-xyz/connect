@@ -45,6 +45,7 @@ from tests.conftest import FakeW3, audit_entries, pay
 WORKSPACE = "workspace-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
 USDC = "0x" + "c0" * 20
+ROBINHOOD_ROUTER = "0x8876789976decbfcbbbe364623c63652db8c0904"
 
 
 def grant(**kwargs: t.Any) -> TokenGrant:
@@ -232,11 +233,11 @@ def test_approvals_draw_on_the_session_budget() -> None:
 
 
 def test_a_uniswap_swap_draws_its_amount_twice_not_three_times() -> None:
-    """The ERC-20 approval of Permit2 and Permit2's own grant are one grant.
+    """The router pulls only from its caller, so Permit2's grant to it is free.
 
     The skill lib's separate-approvals path: approve Permit2, Permit2 grants
-    the router, then the swap spends. Only the Permit2 grant and the spend
-    draw on the session, so a swap of X fits a session cap of 2X.
+    the router, then the swap spends. Only the approval of Permit2 and the
+    spend draw on the session, so a swap of X fits a session cap of 2X.
     """
     import router  # pylint: disable=import-outside-toplevel,import-error
 
@@ -246,9 +247,38 @@ def test_a_uniswap_swap_draws_its_amount_twice_not_three_times() -> None:
     assert intents[0]["approvals"][0]["spender"] == intent_module.PERMIT2
     intents.append({"spend": {USDC: 40}})  # the swap itself
     for intent in intents:
-        store.authorize(capped, "safe_transaction", {"intent": intent})
+        store.authorize(
+            capped, "safe_transaction", {"chain": "robinhood", "intent": intent}
+        )
     with pytest.raises(GrantRefused) as refused:  # and the budget is all used
         store.authorize(capped, "safe_transaction", {"intent": {"spend": {USDC: 1}}})
+    assert refused.value.rule == "token-cap-per-session"
+
+
+def test_re_approving_permit2_draws_on_the_session_each_time() -> None:
+    """Permit2 also honours grants made before this token, so each approval draws."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
+    approval = {"token": USDC, "spender": intent_module.PERMIT2, "amount": 100}
+    arguments = {"chain": "robinhood", "intent": {"approvals": [approval]}}
+    store.authorize(capped, "safe_transaction", arguments)
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(capped, "safe_transaction", arguments)
+    assert refused.value.rule == "token-cap-per-session"
+
+
+@pytest.mark.parametrize("chain", ["gnosis", "not-a-chain", None])
+def test_a_universal_router_draws_off_the_chain_it_is_deployed_on(
+    chain: str | None,
+) -> None:
+    """The Robinhood Chain router's address is not a known router elsewhere."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
+    approval = {"token": USDC, "spender": ROBINHOOD_ROUTER, "amount": 100}
+    arguments = {"chain": chain, "intent": {"approvals": [approval]}}
+    store.authorize(capped, "safe_transaction", arguments)
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(capped, "safe_transaction", arguments)
     assert refused.value.rule == "token-cap-per-session"
 
 

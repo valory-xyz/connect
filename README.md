@@ -394,11 +394,13 @@ budget is drawn down when a call is authorized, whether or not the send then
 succeeds, so it can be spent early but never exceeded; a child's spend is drawn
 on every capped token it was minted from as well, so minting more children
 never multiplies a budget. A declared approval draws on the session budget as
-its spend does, since its spender can take that much later. An ERC-20 approval
-of the canonical Permit2 is the exception: Permit2 moves the token only for its
-own grant, which is declared and drawn, or for a signed permit, which a capped
-token cannot sign, so a Uniswap swap draws its amount twice (the Permit2 grant
-and the spend), not three times. What a cap cannot bound, a value-capped token may not
+its spend does, since its spender can take that much later. That includes an
+ERC-20 approval of Permit2, which also honours Permit2 grants made before this
+token (by the workspace token, or outside Connect). An approval to a Uniswap
+Universal Router that Connect ships for the call's `chain` is the exception: the
+router pulls only from its own caller, so only the safe's own swaps can use it,
+and what they move is drawn as spend. A Uniswap swap therefore draws its amount
+twice (the approval of Permit2 and the spend), not three times. What a cap cannot bound, a value-capped token may not
 do: approve more of a token than its caps allow (an approval is spend the
 spender takes later), sign a raw digest (`sign_message`: a digest can authorize
 any safe transaction), or move an ERC-721/1155 position out of the safe (the

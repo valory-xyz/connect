@@ -49,6 +49,8 @@ from pydantic import field_validator
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
+from connect.chain_read import KNOWN_CONTRACTS, UNIVERSAL_ROUTER
+from connect.chains import chain_info
 from connect.server.strict import StrictBody
 
 Scope = t.Literal["read", "mech", "tx"]
@@ -196,6 +198,18 @@ def _declared(
     return declared, list((parsed or {}).get("approvals", []))
 
 
+def _is_universal_router(spender: str, chain: t.Any) -> bool:
+    """Whether `spender` is a Uniswap Universal Router Connect ships on `chain`."""
+    info = chain_info(chain) if isinstance(chain, str) else None
+    known = KNOWN_CONTRACTS.get(spender.lower())
+    return (
+        info is not None
+        and known is not None
+        and known.name == UNIVERSAL_ROUTER
+        and (known.chains is None or info["chain_id"] in known.chains)
+    )
+
+
 class GrantStore:
     """The bearer tokens this process honours, and what each may do."""
 
@@ -325,13 +339,12 @@ class GrantStore:
                     )
         # an approval is spend its spender may take later, outside any send this
         # token makes: it draws on the session budget like the spend itself.
-        # Except an ERC-20 approval of Permit2: Permit2 moves the token only
-        # for a Permit2 grant, which the gate makes the intent declare and
-        # which draws here, or a signed permit, which a capped token cannot
-        # sign. Drawing both would charge one swap's funds twice.
+        # Permit2 included, since it also honours grants made before this token.
+        # Except an approval of a Universal Router: it pulls only from its own
+        # caller, so only the safe's own swaps use it, and those draw as spend.
         drawn = dict(declared)
         for approval in approvals:
-            if approval["spender"] == intent_module.PERMIT2:
+            if _is_universal_router(approval["spender"], arguments.get("chain")):
                 continue
             key = intent_module.balance_key(approval["token"])
             drawn[key] = drawn.get(key, 0) + approval["amount"]

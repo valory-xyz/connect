@@ -108,6 +108,9 @@ SKILL_SIGNATURES = (
 )
 
 
+UNIVERSAL_ROUTER = "Uniswap Universal Router"
+
+
 class KnownContract(t.NamedTuple):
     """A contract Connect ships an ABI for, and the chains it is deployed on."""
 
@@ -129,13 +132,13 @@ KNOWN_CONTRACTS: dict[str, "KnownContract"] = {
     ),
     # Uniswap Universal Router: Robinhood Chain, Polygon, Gnosis
     "0x8876789976decbfcbbbe364623c63652db8c0904": KnownContract(
-        "Uniswap Universal Router", UNIVERSAL_ROUTER_SIGNATURES, frozenset({4663})
+        UNIVERSAL_ROUTER, UNIVERSAL_ROUTER_SIGNATURES, frozenset({4663})
     ),
     "0x1095692a6237d83c6a72f3f5efedb9a670c49223": KnownContract(
-        "Uniswap Universal Router", UNIVERSAL_ROUTER_SIGNATURES, frozenset({137})
+        UNIVERSAL_ROUTER, UNIVERSAL_ROUTER_SIGNATURES, frozenset({137})
     ),
     "0x75fc67473a91335b5b8f8821277262a13b38c9b3": KnownContract(
-        "Uniswap Universal Router", UNIVERSAL_ROUTER_SIGNATURES, frozenset({100})
+        UNIVERSAL_ROUTER, UNIVERSAL_ROUTER_SIGNATURES, frozenset({100})
     ),
     # Polymarket, Polygon
     "0x4d97dcd97ec945f40cf65f87097ace5ea0476045": KnownContract(
