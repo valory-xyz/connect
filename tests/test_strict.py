@@ -32,7 +32,10 @@ from connect.guard import Guard
 from connect.mech import MechService
 from connect.server.auth import GrantStore
 from connect.server.mcp_tools import build_mcp
-from connect.server.strict import unknown_parameters_message
+from connect.server.strict import (
+    audit_unknown_parameters,
+    unknown_parameters_message,
+)
 from connect.settings import SettingsStore
 from connect.signer import Signer
 
@@ -157,6 +160,20 @@ def test_http_safe_transaction_refuses_to(
     (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert entry["rule"] == "unknown-parameter"
     assert entry["path"] == "/safe-transaction"
+    # the typed error's own message, not a ValueError's "Value error, ..." text
+    assert entry["reason"].startswith("unknown parameter 'to' (did you mean 'target'?)")
+
+
+def test_the_audit_matches_the_error_type_not_its_text(
+    activity: ActivityLog, store_path: t.Any
+) -> None:
+    """Another validation error that mentions unknown parameters is not audited."""
+    audit_unknown_parameters(
+        activity,
+        "/safe-transaction",
+        [{"type": "value_error", "msg": "Value error, unknown parameter 'to'"}],
+    )
+    assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
 
 
 def test_http_sign_message_refuses_unknown_fields(client: TestClient) -> None:
