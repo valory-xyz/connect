@@ -50,6 +50,16 @@ config:
       chain_id: ${ROBINHOOD_CHAIN_ID:int:4663}
       poa_chain: ${IS_POA_CHAIN:bool:false}
       default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+    arbitrum_one:
+      address: ${ARBITRUM_ONE_LEDGER_RPC:str:https://arb1.arbitrum.io/rpc}
+      chain_id: ${ARBITRUM_ONE_CHAIN_ID:int:42161}
+      poa_chain: ${IS_POA_CHAIN:bool:false}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
+    celo:
+      address: ${CELO_LEDGER_RPC:str:https://celo-rpc.publicnode.com}
+      chain_id: ${CELO_CHAIN_ID:int:42220}
+      poa_chain: ${IS_POA_CHAIN:bool:false}
+      default_gas_price_strategy: ${DEFAULT_GAS_PRICE_STRATEGY:str:eip1559}
 ---
 public_id: valory/configs:0.1.0
 type: connection

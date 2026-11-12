@@ -20,6 +20,9 @@ private key — and never need to.
   single chain. The launcher configures an RPC for every chain it supports,
   so the rest are listed with no safe or no gas. That is the normal shape,
   not something to fix; `not_actionable_because` says which state each is in.
+  Each supported chain's entry also carries `chain_id`, `native_symbol` and
+  `marketplace`: with `marketplace: false` there is no mech marketplace on
+  that chain, so `mech_request` cannot be used there.
 
 Minutes per run (Auto-run turns): see "Minutes per run" in `CLAUDE.md`.
 

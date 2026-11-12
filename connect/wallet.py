@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 from web3 import Web3
 
+from connect.chains import chain_info
 from connect.config import AppConfig, FundRequirement, NATIVE_ASSET
 from connect.signer import Signer
 
@@ -218,6 +219,11 @@ def wallet_overview(config: AppConfig, signer: Signer) -> dict:
         }
         if reason is not None:
             entry["not_actionable_because"] = reason
+        info = chain_info(chain)
+        if info is not None:
+            # chain id, native symbol, and whether a mech marketplace (or the
+            # facilitator) is there, so "none here" is known before a request
+            entry.update(info)
         chains[chain] = entry
     actionable = [chain for chain, entry in chains.items() if entry["actionable"]]
     return {

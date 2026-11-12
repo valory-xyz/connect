@@ -145,6 +145,12 @@ Robinhood Chain also hosts **Pons**, a memecoin launchpad, via the
 - **Launch a token** — name, symbol, logo and an optional first buy, then
   claim the creator fees it earns.
 
+**`arbitrum_one`** and **`celo`** — no chain-specific recipe yet: report
+balances and put the safe's funds to work with `safe_transaction`. Each
+chain's `wallet_info` entry says whether a mech marketplace is there
+(`marketplace`); where it is `false`, say up front that mech requests are not
+available on that chain rather than trying one.
+
 Keep it short: a line of intro, two or three examples drawn from the chain
 they actually have, an invitation. The skills carry the details once they
 choose.
