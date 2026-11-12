@@ -11,7 +11,7 @@ dependencies = [
     "web3==7.16.0",
     "eth-account==0.13.7",
     "mcp==1.28.1",
-    "mech-client==0.24.1",
+    "mech-client @ git+https://github.com/valory-xyz/mech-client.git@6c4cd60a838d377847e4353a09f6f61811a8661d",
     "open-aea-ledger-ethereum==2.2.9",
     "tomli-w==1.2.0",
 ]
@@ -38,6 +38,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["connect"]
+
+# Needed only while mech-client is pinned to valory-xyz/mech-client#272's commit
+# (OPE-2035, D25); drop it with the bump to the first release containing #272.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.black]
 force-exclude = '''packages/(valory/(connections|protocols)|open_aea)/'''
