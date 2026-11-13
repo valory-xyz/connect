@@ -35,6 +35,7 @@ from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 
 from connect import __main__ as main_module
 from connect import signer as signer_module
@@ -1349,7 +1350,7 @@ class TestSignerExtras:
         """A gas-estimation revert surfaces as SignerError, not a raw exception."""
 
         def reverting_estimate(tx: dict) -> int:
-            raise RuntimeError("execution reverted: not enough funds")
+            raise ContractLogicError("execution reverted: not enough funds")
 
         fake_w3.eth.estimate_gas = reverting_estimate  # type: ignore[method-assign]
         with pytest.raises(SignerError, match="execution reverted"):
@@ -1546,9 +1547,9 @@ class TestWalletExtras:
         )
         overview = wallet.wallet_overview(app_config, test_signer)
         entry = overview["chains"]["testchain"]
-        assert entry["balances"] == {"error": "down"}
+        assert entry["balances"] == {"error": wallet.BALANCE_READ_FAILED}
         assert entry["actionable"] is False
-        assert "down" in entry["not_actionable_because"]
+        assert "balances unreadable" in entry["not_actionable_because"]
         assert overview["actionable_chains"] == []
 
     def test_overview_separates_undeployed_from_unfunded_chains(

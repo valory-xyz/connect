@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from web3.exceptions import ContractLogicError
 
 from connect import wallet as wallet_module
 from connect import workspace
@@ -600,41 +601,118 @@ class TestAuth:
         assert set(quick.json()) == {"tx_hash"}
 
     @pytest.mark.parametrize(
-        ("path", "to_key"), [("/safe-transaction", "target"), ("/sign-and-send", "to")]
+        ("tool", "path", "to_key"),
+        [
+            ("safe_transaction", "/safe-transaction", "target"),
+            ("send_transaction", "/sign-and-send", "to"),
+        ],
     )
-    @pytest.mark.parametrize("fails", ["broadcast", "receipt"])
-    def test_a_library_error_never_reaches_the_body(  # pylint: disable=too-many-arguments
+    @pytest.mark.parametrize("surface", ["http", "mcp"])
+    @pytest.mark.parametrize("fails", ["broadcast", "receipt", "simulation"])
+    @pytest.mark.parametrize(
+        "leak",
+        [
+            # urllib3's own form: no scheme, the key in the path
+            "HTTPSConnectionPool(host='rpc.example', port=443): Max retries "
+            "exceeded with url: /v2/SECRETKEY (Caused by NewConnectionError)",
+            "https://rpc.example/v3/SECRETKEY timed out",
+        ],
+    )
+    def test_a_library_error_never_reaches_the_answer(  # pylint: disable=too-many-arguments
         self,
         client: TestClient,
         fake_w3: FakeW3,
         monkeypatch: pytest.MonkeyPatch,
+        tool: str,
         path: str,
         to_key: str,
+        surface: str,
         fails: str,
+        leak: str,
     ) -> None:
         """An RPC's error text may name its URL, key and all: only the log sees it."""
-        leak = "HTTPSConnectionPool: https://rpc.example/v3/SECRETKEY timed out"
 
         def broken(*_args: t.Any, **_kwargs: t.Any) -> t.Any:
             raise ConnectionError(leak)
 
-        name = (
-            "send_raw_transaction"
-            if fails == "broadcast"
-            else "wait_for_transaction_receipt"
-        )
-        monkeypatch.setattr(fake_w3.eth, name, broken)
-        body = {
+        if fails == "simulation":
+            monkeypatch.setattr(fake_w3.provider, "make_request", broken)
+        else:
+            name = {
+                "broadcast": "send_raw_transaction",
+                "receipt": "wait_for_transaction_receipt",
+            }[fails]
+            monkeypatch.setattr(fake_w3.eth, name, broken)
+        arguments = {
             "chain": "testchain",
             to_key: "0x" + "aa" * 20,
             "value": 16,
             "intent": pay("0x" + "aa" * 20, 16),
             "wait_for_receipt": True,
         }
-        answer = client.post(path, json=body, headers=auth())
+        if surface == "http":
+            answer = client.post(path, json=arguments, headers=auth())
+        else:
+            call = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            }
+            answer = client.post(
+                "/mcp/",
+                json=call,
+                headers={"Accept": "application/json, text/event-stream", **auth()},
+            )
         assert "SECRETKEY" not in answer.text
         assert "rpc.example" not in answer.text
-        assert answer.status_code == (400 if fails == "broadcast" else 200)
+        expected = {
+            "broadcast": "the RPC could not take the transaction",
+            "receipt": "receipt could not be read",
+            "simulation": "cannot simulate this call",
+        }[fails]
+        assert expected in answer.text
+
+    def test_a_revert_keeps_the_contract_s_reason(
+        self, client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A revert is the contract's answer, not the RPC's: its reason stays."""
+
+        def reverting(_tx: t.Any) -> t.Any:
+            raise ContractLogicError("execution reverted: GS013", data="0x")
+
+        monkeypatch.setattr(fake_w3.eth, "estimate_gas", reverting)
+        answer = client.post(
+            "/sign-and-send",
+            json={"chain": "testchain", "to": "0x" + "aa" * 20, "data": "0x12"},
+            headers=auth(),
+        )
+        assert answer.json()["detail"] == "send failed: execution reverted: GS013"
+        bare = ContractLogicError("GS013", data="0x")  # no "execution reverted"
+        monkeypatch.setattr(
+            fake_w3.eth, "estimate_gas", lambda _tx: (_ for _ in ()).throw(bare)
+        )
+        again = client.post(
+            "/sign-and-send",
+            json={"chain": "testchain", "to": "0x" + "aa" * 20, "data": "0x12"},
+            headers=auth(),
+        )
+        assert again.json()["detail"] == "send failed: execution reverted: GS013"
+
+    def test_a_failed_balance_read_names_no_rpc(
+        self, client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """wallet_info's per-chain error is Connect's words, not the RPC library's."""
+
+        def broken(*_args: t.Any, **_kwargs: t.Any) -> t.Any:
+            raise ConnectionError("with url: /v2/SECRETKEY")
+
+        monkeypatch.setattr(fake_w3.eth, "get_balance", broken)
+        answer = client.get("/wallet", headers=auth())
+        assert "SECRETKEY" not in answer.text
+        assert answer.json()["chains"]["testchain"]["balances"] == {
+            "error": wallet_module.BALANCE_READ_FAILED
+        }
 
     def test_safe_transaction_without_a_safe_is_400(
         self, client: TestClient, fake_w3: FakeW3

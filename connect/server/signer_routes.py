@@ -24,7 +24,6 @@ EOA), /sign-message, /wallet.
 """
 
 import logging
-import re
 import typing as t
 
 from fastapi import APIRouter, HTTPException, Request
@@ -45,9 +44,6 @@ from connect.signer import SignerError
 
 logger = logging.getLogger("agent")
 
-# a URL in an error comes from an RPC or a library, and may carry an API key
-_URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>()]+")
-URL_REDACTED = "<url redacted>"
 
 router = APIRouter()
 
@@ -126,7 +122,7 @@ def _dispatch(  # pylint: disable=too-many-arguments
             replay_only=replay_only,
         )
     except (SignerError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=_public_detail(e)) from e
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return settled(
         request.app.state.signer,
         body.chain,
@@ -134,20 +130,6 @@ def _dispatch(  # pylint: disable=too-many-arguments
         body.wait_for_receipt,
         body.timeout,
     )
-
-
-def _public_detail(error: Exception) -> str:
-    """Return an error's text for the HTTP body, any URL in it redacted.
-
-    Connect's refusals name their rule and must reach the caller as they are;
-    what a library or RPC adds to them may name an RPC URL with its key, so
-    URLs are cut, and the full text goes to the log instead.
-    """
-    text = str(error)
-    public = _URL.sub(URL_REDACTED, text)
-    if public != text:
-        logger.warning("a send was refused: %s", text)
-    return public
 
 
 def _authorize(request: Request, action: str, body: _SendBody | None = None) -> bool:
@@ -190,7 +172,7 @@ def sign_message(body: SignMessageRequest, request: Request) -> dict:
         digest = bytes.fromhex(body.digest.removeprefix("0x"))
         signature = request.app.state.signer.sign_digest(digest)
     except (SignerError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=_public_detail(e)) from e
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return {"signature": signature}
 
 

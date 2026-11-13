@@ -1053,7 +1053,7 @@ def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(  # pylint:
         first.join(10)
         first_done.set()
         retry.join(10)
-    assert "nonce too low" in answers["first"].text
+    assert "the RPC could not take the transaction" in answers["first"].text
     assert "nothing was sent for this retry" in answers["retry"].text
     assert len(broadcasts) == 1  # the retry broadcast nothing
     assert "token-cap-per-session" in post().text  # not held now: drawn in full

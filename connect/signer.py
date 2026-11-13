@@ -38,6 +38,7 @@ from eth_abi.exceptions import EncodingError
 from eth_account.signers.local import LocalAccount
 from eth_typing import Hash32
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 from web3.types import TxParams
 
@@ -159,6 +160,34 @@ def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
     """Fingerprint the call a request id stands for."""
     raw = "\x1f".join((chain.lower(), to.lower(), str(value), (data or "0x").lower()))
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# What a caller is told of a failure that is not one of Connect's refusals:
+# Connect's own words, never the library's, which may name the RPC URL and its
+# key (urllib3 writes "with url: /v2/<key>"); the cause goes to the log.
+SEND_FAILED = (
+    "send failed: the RPC could not take the transaction (the cause is in "
+    "Connect's log)"
+)
+COMPOSE_FAILED = (
+    "cannot compose the safe call: the target must be an address, the value a "
+    "whole amount and the data hex"
+)
+
+
+def _send_failure(error: Exception) -> str:
+    """Return what a caller is told of a failed send.
+
+    A revert in gas estimation is the contract's own answer, so its reason
+    stays (the shipped client reads it as reverted before signing); anything
+    else is SEND_FAILED.
+    """
+    if isinstance(error, ContractLogicError):
+        reason = str(error.message or "execution reverted")
+        if "execution reverted" not in reason:
+            reason = f"execution reverted: {reason}"
+        return f"send failed: {reason}"
+    return SEND_FAILED
 
 
 def _safe_request_key(request_id: str) -> str:
@@ -454,7 +483,7 @@ class Signer:
         except (EncodingError, ValueError, TypeError, OverflowError) as e:
             # composition fails on the caller's input, not the chain — a 400, the
             # same answer send() gives for a malformed EOA transaction, not a 500
-            raise SignerError(f"cannot compose the safe call: {e}") from e
+            raise SignerError(COMPOSE_FAILED) from e
         return safe, calldata
 
     def send_via_safe(  # pylint: disable=too-many-arguments
@@ -608,7 +637,7 @@ class Signer:
             return None, None, problems
         try:
             diff = self._simulate(chain, call)
-        except intent_module.SimulationUnavailable as e:
+        except intent_module.SimulationUnavailable:
             # every agent send on this chain is refused until it can simulate:
             # log.txt must say why, including when the cause is our own code
             logger.error(
@@ -625,7 +654,7 @@ class Signer:
                     intent_module.Problem(
                         rule="simulation-unavailable",
                         detail=f"the RPC for '{chain}' cannot simulate this call, "
-                        f"so it is not signed unchecked ({e})",
+                        "so it is not signed unchecked (the cause is in Connect's log)",
                     )
                 ],
             )
@@ -809,7 +838,8 @@ class Signer:
                         value=str(value),
                         error=str(e),
                     )
-                raise SignerError(f"send failed: {e}") from e
+                logger.warning("send on %s to %s failed", chain, to, exc_info=True)
+                raise SignerError(_send_failure(e)) from e
             state.next_nonce = tx["nonce"] + 1
         if audit:
             self._activity.record(

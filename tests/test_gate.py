@@ -266,8 +266,9 @@ class TestSignerGate:
             raise ConnectionError("rpc down")
 
         monkeypatch.setattr(fake_w3.provider, "make_request", boom)
-        with pytest.raises(SignerError, match="rpc down"):
+        with pytest.raises(SignerError, match="'simulation-unavailable'") as refused:
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
+        assert "rpc down" not in str(refused.value)  # the RPC's text: log only
 
     def test_an_unreachable_rpc_is_simulation_unavailable(
         self, test_signer: Signer, monkeypatch: pytest.MonkeyPatch
@@ -545,10 +546,10 @@ class TestSignerGate:
             raise ConnectionError("getCode timed out")
 
         monkeypatch.setattr(fake_w3.eth, "get_code", no_code)
-        with pytest.raises(SignerError, match="'simulation-unavailable'.*getCode"):
+        with pytest.raises(SignerError, match="'simulation-unavailable'"):
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
         monkeypatch.setattr(fake_w3.provider, "make_request", lambda m, p: {})
-        with pytest.raises(SignerError, match="no result in the answer"):
+        with pytest.raises(SignerError, match="'simulation-unavailable'"):
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
 
     def test_a_garbled_answer_building_the_client_is_the_rpcs_fault(
