@@ -280,9 +280,10 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
 
 The agent can ask before it spends: `preflight_transaction` composes the same
 bytes the send would and runs them past the same gate, answering `{allowed}`
-plus the refusal the real call would have raised. Nothing is signed or
-broadcast, and no single-use allowance is spent — the reasoning for that is at
-the top of `connect/guard.py`.
+plus the refusal the real call would have raised — the calling token's caps
+included, checked first as the MCP mount checks the send, without drawing on its
+session budget. Nothing is signed or broadcast, and no single-use allowance is
+spent — the reasoning for that is at the top of `connect/guard.py`.
 
 Asking is not a new capability: a refused send never reached the chain either,
 because the gate runs before signing. What asking avoids is the audit entry, so

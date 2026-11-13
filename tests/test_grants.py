@@ -891,3 +891,49 @@ def test_mcp_a_replayed_request_id_draws_the_session_once(
     assert "token-cap-per-session" not in again.text
     assert "tx_hash" in again.text
     assert len(fake_w3.eth.sent) == 1
+
+
+def test_mcp_preflight_answers_with_the_token_s_cap_and_draws_nothing(
+    client: TestClient, fake_w3: FakeW3, store_path: t.Any
+) -> None:
+    """Preflight refuses as the send would, by cap, without spending the budget."""
+    capped = client.post(
+        "/tokens",
+        json={
+            "scopes": ["read", "tx"],
+            "max_value_per_tx": {"native": 5},
+            "max_value_per_session": {"native": 5},
+        },
+        headers=_bearer(WORKSPACE),
+    ).json()["token"]
+    headers = {"Accept": "application/json, text/event-stream", **_bearer(capped)}
+
+    def call(tool: str, value: int) -> str:
+        arguments = {
+            "chain": "testchain",
+            "target": RECIPIENT,
+            "value": value,
+            "intent": pay(RECIPIENT, value),
+        }
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        }
+        return client.post("/mcp/", json=body, headers=headers).text
+
+    over = call("preflight_transaction", 6)
+    assert '\\"allowed\\": false' in over
+    assert "token-cap-per-tx" in over
+    for _ in range(2):  # a dry run draws nothing on the session budget
+        assert '\\"allowed\\": true' in call("preflight_transaction", 5)
+    assert "tx_hash" in call("safe_transaction", 5)
+    spent = call("preflight_transaction", 1)
+    assert "token-cap-per-session" in spent
+    assert len(fake_w3.eth.sent) == 1
+    checked = [e for e in audit_entries(store_path) if e["kind"] == "checked"]
+    assert [e["allowed"] for e in checked] == [False, True, True, False]
+    assert "token-cap-per-tx" in checked[0]["reason"]
+    assert checked[0]["probed_value"] == "6"
+    assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]

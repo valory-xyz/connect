@@ -82,7 +82,7 @@ Server (`connect/server/`):
 - `pearl_routes.py` — Pearl SDK contracts (`/healthcheck`, `/funds-status`); `is_healthy` flips true only once the workspace is populated.
 - `signer_routes.py` / `settings_routes.py` — HTTP signing surface and settings. `/safe-transaction` takes `target` (the safe's call), `/sign-and-send` takes `to` (the EOA's).
 - `strict.py` — unknown parameters are refused by name on both surfaces: `StrictBody` for HTTP bodies, and `make_tools_strict` swaps each MCP tool's argument model (through FastMCP's private `_tool_manager`: it has no public hook) for one that forbids extras, so a mistyped name is an error naming the expected ones (with a `to`/`target` hint) instead of a silently dropped field.
-- `mcp_tools.py` — MCP (streamable HTTP) at `/mcp`; thin adapters over signer/wallet. The MCP SDK calls sync tools inline on the event loop, so blocking bodies are pushed to worker threads.
+- `mcp_tools.py` — MCP (streamable HTTP) at `/mcp`; thin adapters over signer/wallet. `preflight_transaction` first asks `GrantStore.authorize(..., draw=False)` for the send it stands for, so a token's cap refusal is answered (and audited as `checked`) without drawing on its budget. The MCP SDK calls sync tools inline on the event loop, so blocking bodies are pushed to worker threads.
 
 Other trees:
 

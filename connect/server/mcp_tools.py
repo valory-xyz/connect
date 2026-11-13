@@ -40,7 +40,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
-from connect.server.auth import GrantStore, request_token
+from connect.server.auth import GrantRefused, GrantStore, request_token
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer
@@ -184,10 +184,27 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         Takes what safe_transaction takes (or send_transaction's, with
         via_safe=false) and answers {allowed}, plus the same `reason` the real
         call would have refused with. Nothing is signed, broadcast or paid for.
-        `allowed` means the guardrail and the intent gate permit these bytes
-        at head — with the `intent` you give, as the real call would be
-        checked; any `problems` name the gate's rules.
+        `allowed` means your token, the guardrail and the intent gate permit
+        these bytes at head — with the `intent` you give, as the real call
+        would be checked; any `problems` name the gate's rules.
         """
+        refused = _token_refusal(
+            grants,
+            ctx,
+            "safe_transaction" if via_safe else "send_transaction",
+            {"chain": chain, "value": value, "intent": intent},
+        )
+        if refused is not None:  # audited as the gate's own dry runs are
+            activity.record(
+                "checked",
+                chain=chain,
+                allowed=False,
+                reason=refused,
+                probed_target=target,
+                probed_value=str(value),
+                via_safe=via_safe,
+            )
+            return {"allowed": False, "reason": refused}
         reason, problems = await asyncio.to_thread(
             signer.check,
             chain,
@@ -413,17 +430,41 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     return mcp
 
 
+def _ctx_token(ctx: Context | None) -> str | None:
+    """Return the bearer token the MCP mount stamped on this tool's request."""
+    try:
+        request = ctx.request_context.request if ctx is not None else None
+    except ValueError:  # no request: called in-process, not through the mount
+        request = None
+    return request_token(request)
+
+
 def _for_token(grants: GrantStore, ctx: Context | None, intent: dict | None) -> t.Any:
     """Return the intent the gate holds this call to, for the calling token.
 
     The MCP mount stamps the token on the request; `GrantStore.intent_for`
     decides, and treats a call that reached a tool without one as capped.
     """
+    return grants.intent_for(_ctx_token(ctx), intent)
+
+
+def _token_refusal(
+    grants: GrantStore, ctx: Context | None, action: str, arguments: dict
+) -> str | None:
+    """Return the refusal the token's grant gives `action`, drawing on nothing.
+
+    A dry run of the check the mount makes before the real call, so a
+    preflight answers with the cap the send would be refused under. A call
+    with no token never reached the mount, which authorizes every real call.
+    """
+    token = _ctx_token(ctx)
+    if token is None:
+        return None
     try:
-        request = ctx.request_context.request if ctx is not None else None
-    except ValueError:  # no request: called in-process, not through the mount
-        request = None
-    return grants.intent_for(request_token(request), intent)
+        grants.authorize(token, action, arguments, draw=False)
+    except GrantRefused as e:
+        return f"rule '{e.rule}': {e}"
+    return None
 
 
 async def _dispatch(  # pylint: disable=too-many-arguments

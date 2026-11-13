@@ -274,6 +274,8 @@ class GrantStore:
         token: str,
         action: str,
         arguments: t.Mapping[str, t.Any],
+        *,
+        draw: bool = True,
     ) -> None:
         """Raise unless `token` may perform `action` with `arguments`.
 
@@ -286,7 +288,7 @@ class GrantStore:
         authorized, whether or not the send then succeeds: it can be spent
         early, never exceeded. A call whose `request_id` the signer already
         sent draws nothing: the signer answers it with the sent hash, and
-        sends nothing new.
+        sends nothing new. `draw=False` answers without drawing, for a dry run.
         """
         grant = self._live(token)
         scope = ACTION_SCOPES.get(action)
@@ -305,7 +307,9 @@ class GrantStore:
                 "authorize a safe transaction that no cap or intent sees",
             )
         if scope == "tx" and action != "sign_message":
-            self._check_value(token, grant, action, arguments)
+            self._check_value(
+                token, grant, action=action, arguments=arguments, draw=draw
+            )
 
     def intent_for(self, token: str | None, intent: t.Any) -> t.Any:
         """Return the intent the gate holds a call to, for the calling token.
@@ -335,12 +339,14 @@ class GrantStore:
                 f"max_payment no higher than that (got {asked})",
             )
 
-    def _check_value(  # pylint: disable=too-many-locals
+    def _check_value(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         token: str,
         grant: TokenGrant,
+        *,
         action: str,
         arguments: t.Mapping[str, t.Any],
+        draw: bool,
     ) -> None:
         declared, approvals = _declared(arguments)  # refuses malformed first
         self._check_approvals(grant, approvals)
@@ -392,6 +398,8 @@ class GrantStore:
                             f"{spent.get(asset, 0)} is spent and this declares "
                             f"{amount} (spend and approvals)",
                         )
+            if not draw:
+                return
             for holder, _ in capped:
                 spent = self._spent.setdefault(holder, {})
                 for asset, amount in drawn.items():
