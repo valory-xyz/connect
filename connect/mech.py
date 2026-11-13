@@ -77,11 +77,11 @@ from connect.mech_types import (
     MechError,
     MechNotSent,
     MechUnknownRequest,
-    MetadataRead,
     PendingDelivery,
     PricedMech,
     SPEND_UNCERTAIN,
     offchain_blocker,
+    read_service_metadata,
 )
 from connect.signer import Signer, SignerError
 
@@ -196,35 +196,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             f"paid by the safe (configured chains: {sorted(self._config.chains)})"
         )
 
-    @staticmethod
-    def _service_metadata(service: MarketplaceService, service_id: int) -> MetadataRead:
-        """Read the mech's published service metadata, keeping any failure cause.
-
-        One fetch answers both questions a report asks of that document — the
-        tool names and the off-chain URL — where mech-client refetches it per
-        question, and every miss costs a full gateway timeout. The request
-        path still pays twice: the pre-flight reads it here, then
-        ``send_request`` resolves the URL from it again inside mech-client.
-
-        mech-client swallows the common transport failures itself and hands
-        back a bare ``None``, so a miss here usually arrives with no cause at
-        all. Log every miss rather than only the ones that reach the `except`,
-        otherwise the frequent case leaves no trace in this service's log.
-        """
-        try:
-            metadata = service.tool_manager.fetch_tools_metadata(service_id)
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.warning("metadata fetch failed for service %s: %s", service_id, e)
-            return MetadataRead(None, f"{type(e).__name__}: {e}")
-        if isinstance(metadata, dict):
-            return MetadataRead(metadata, None)
-        logger.warning(
-            "metadata for service %s is unusable: expected a document, got %s",
-            service_id,
-            type(metadata).__name__,
-        )
-        return MetadataRead(None, None)
-
     def _service(self, chain: str) -> MarketplaceService:
         """Lazily build the MarketplaceService for a configured chain."""
         chain = chain.lower()
@@ -293,7 +264,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             "service_id": service_id,
             "max_delivery_rate": str(max_delivery_rate),
         }
-        read = self._service_metadata(service, service_id)
+        read = read_service_metadata(service, service_id)
         # The document is published by the mech operator, so neither its shape
         # nor its contents are ours to assume. A `tools` that is not a list
         # must not be iterated (a bare string yields one "tool" per character),
@@ -584,7 +555,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # a message about metadata, which reads as a transient gateway
             # problem. Most listed mechs publish no endpoint at all, so decide
             # it here, before any payment, and name the flow that does work.
-            read = self._service_metadata(service, service_id)
+            read = read_service_metadata(service, service_id)
             blocker = offchain_blocker(read)
             if blocker is not None:
                 self._blocked(chain, tool, "offchain-unreachable", blocker)

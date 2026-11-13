@@ -19,7 +19,12 @@
 
 """Errors and shapes shared by connect/mech.py, mech_allowances.py and mech_nonces.py."""
 
+import logging
 import typing as t
+
+from mech_client.services.marketplace_service import MarketplaceService
+
+logger = logging.getLogger("agent")
 
 
 class MechError(Exception):
@@ -108,3 +113,32 @@ def offchain_blocker(read: MetadataRead) -> str | None:
     if not isinstance(url, str) or not url.strip():
         return "no 'url' in metadata; this mech serves on-chain requests only"
     return None
+
+
+def read_service_metadata(service: MarketplaceService, service_id: int) -> MetadataRead:
+    """Read the mech's published service metadata, keeping any failure cause.
+
+    One fetch answers both questions a report asks of that document — the
+    tool names and the off-chain URL — where mech-client refetches it per
+    question, and every miss costs a full gateway timeout. The request
+    path still pays twice: the pre-flight reads it here, then
+    ``send_request`` resolves the URL from it again inside mech-client.
+
+    mech-client swallows the common transport failures itself and hands
+    back a bare ``None``, so a miss here usually arrives with no cause at
+    all. Log every miss rather than only the ones that reach the `except`,
+    otherwise the frequent case leaves no trace in this service's log.
+    """
+    try:
+        metadata = service.tool_manager.fetch_tools_metadata(service_id)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.warning("metadata fetch failed for service %s: %s", service_id, e)
+        return MetadataRead(None, f"{type(e).__name__}: {e}")
+    if isinstance(metadata, dict):
+        return MetadataRead(metadata, None)
+    logger.warning(
+        "metadata for service %s is unusable: expected a document, got %s",
+        service_id,
+        type(metadata).__name__,
+    )
+    return MetadataRead(None, None)
