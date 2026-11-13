@@ -19,6 +19,7 @@
 
 """Scoped tokens."""
 
+import asyncio
 import json
 import threading
 import time
@@ -31,6 +32,8 @@ from connect import intent as intent_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server import auth as auth_module
+from connect.server import mcp_tools as mcp_tools_module
+from connect.server import signer_routes as signer_routes_module
 from connect.server.auth import (
     AuthFailureLimiter,
     AuthMiddleware,
@@ -944,6 +947,91 @@ def test_http_a_retry_while_the_send_is_in_flight_is_not_drawn_again(
     assert "in flight" in retry.json()["detail"]
     assert answers[0].status_code == 200
     assert len(fake_w3.eth.sent) == 1
+
+
+@pytest.mark.parametrize("surface", ["http", "mcp"])
+def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(
+    client: TestClient,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+) -> None:
+    """The draw was spared because the id was in flight; then the first send failed.
+
+    The retry must not broadcast on a draw it never paid: it is answered from
+    the id's result or refused, and a later retry is charged in full.
+    """
+    capped = _session_capped(client)
+    arguments = {
+        "chain": "testchain",
+        "target": RECIPIENT,
+        "value": 10,
+        "intent": pay(RECIPIENT, 10),
+        "request_id": "r1",
+    }
+    call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "safe_transaction", "arguments": arguments},
+    }
+    headers = {"Accept": "application/json, text/event-stream", **_bearer(capped)}
+
+    def post() -> t.Any:
+        if surface == "http":
+            return client.post("/safe-transaction", json=arguments, headers=headers)
+        return client.post("/mcp/", json=call, headers=headers)
+
+    broadcasting, release = threading.Event(), threading.Event()
+    retry_authorized, first_done = threading.Event(), threading.Event()
+    broadcasts: list = []
+    send_raw = fake_w3.eth.send_raw_transaction
+
+    def slow_broadcast(raw: bytes) -> t.Any:
+        broadcasts.append(raw)
+        broadcasting.set()
+        assert release.wait(10)
+        return send_raw(raw)  # fails: fail_broadcast is set by then
+
+    module = signer_routes_module if surface == "http" else mcp_tools_module
+    dispatch = module._dispatch  # pylint: disable=protected-access
+
+    def hold_retry(replay_only: bool) -> None:
+        if replay_only:  # the retry, authorized as a replay of the held id
+            retry_authorized.set()
+            assert first_done.wait(10)
+
+    def held_back(*args: t.Any, **kwargs: t.Any) -> t.Any:
+        hold_retry(kwargs["replay_only"])
+        return dispatch(*args, **kwargs)
+
+    async def held_back_async(*args: t.Any, **kwargs: t.Any) -> t.Any:
+        # the MCP tool runs on the event loop: wait off it, or the first stalls
+        await asyncio.to_thread(hold_retry, kwargs["replay_only"])
+        return await dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", slow_broadcast)
+    monkeypatch.setattr(
+        module, "_dispatch", held_back if surface == "http" else held_back_async
+    )
+    answers: dict = {}
+    first = threading.Thread(target=lambda: answers.update(first=post()))
+    retry = threading.Thread(target=lambda: answers.update(retry=post()))
+    first.start()
+    try:
+        assert broadcasting.wait(10)
+        retry.start()
+        assert retry_authorized.wait(10)
+        fake_w3.eth.fail_broadcast = True
+    finally:
+        release.set()
+        first.join(10)
+        first_done.set()
+        retry.join(10)
+    assert "nonce too low" in answers["first"].text
+    assert "nothing was sent for this retry" in answers["retry"].text
+    assert len(broadcasts) == 1  # the retry broadcast nothing
+    assert "token-cap-per-session" in post().text  # not held now: drawn in full
 
 
 def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:

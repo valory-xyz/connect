@@ -410,7 +410,10 @@ succeeds, so it can be spent early but never exceeded; a retry naming a
 `request_id` the same token already drew for is drawn only past that draw while
 the signer holds the id (sent, so the retry answers its hash, or still
 sending, so the retry is refused as in flight), since it sends nothing new —
-an id the signer no longer holds may really send, and is drawn in full; a child's spend is drawn
+an id the signer no longer holds may really send, and is drawn in full. A
+retry spared so is sent replay-only: if the first send fails before the retry
+reaches the signer, the retry is refused with nothing sent, never broadcast
+on the draw it was spared; a child's spend is drawn
 on every capped token it was minted from as well, so minting more children
 never multiplies a budget. A declared approval draws on the session budget as
 its spend does, since its spender can take that much later. That includes an

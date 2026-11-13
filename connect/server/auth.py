@@ -117,6 +117,8 @@ MAX_DRAWN_REQUEST_IDS = 1024
 
 # the request-state key the MCP mount sets: the bearer token that authorized it
 AUTH_TOKEN = "auth_token"  # nosec B105 - a state key, not a credential
+# and the (tool, request id) of each call it relieved as a retry: replay only
+REPLAYS = "replays"
 
 
 class GrantRefused(Exception):
@@ -289,7 +291,7 @@ class GrantStore:
         arguments: t.Mapping[str, t.Any],
         *,
         draw: bool = True,
-    ) -> None:
+    ) -> bool:
         """Raise unless `token` may perform `action` with `arguments`.
 
         Value caps are checked against the spend the call's intent declares,
@@ -304,6 +306,11 @@ class GrantStore:
         the id (sent, or still sending), since the signer then sends nothing
         new; once it does not, the call may really send, and is drawn in full.
         `draw=False` answers without drawing, for a dry run.
+
+        Returns whether the call was relieved so. That holds only while the
+        signer still holds the id when the call reaches it, so the caller must
+        send it `replay_only`: answered from the signer's result or refused,
+        never sent fresh on a draw it was spared.
         """
         grant = self._live(token)
         scope = ACTION_SCOPES.get(action)
@@ -322,9 +329,10 @@ class GrantStore:
                 "authorize a safe transaction that no cap or intent sees",
             )
         if scope == "tx" and action != "sign_message":
-            self._check_value(
+            return self._check_value(
                 token, grant, action=action, arguments=arguments, draw=draw
             )
+        return False
 
     def intent_for(self, token: str | None, intent: t.Any) -> t.Any:
         """Return the intent the gate holds a call to, for the calling token.
@@ -362,7 +370,8 @@ class GrantStore:
         action: str,
         arguments: t.Mapping[str, t.Any],
         draw: bool,
-    ) -> None:
+    ) -> bool:
+        """Hold a send to the caps; return whether a retry's draw was relieved."""
         declared, approvals = _declared(arguments)  # refuses malformed first
         self._check_approvals(grant, approvals)
         per_tx = grant.max_value_per_tx
@@ -420,13 +429,14 @@ class GrantStore:
                             f"{amount} (spend and approvals)",
                         )
             if not draw:
-                return
+                return bool(paid)
             for holder, _ in capped:
                 spent = self._spent.setdefault(holder, {})
                 for asset, amount in owed.items():
                     spent[asset] = spent.get(asset, 0) + amount
             if id_key is not None and capped:
                 self._remember(id_key, paid, drawn)
+        return bool(paid)
 
     def _remember(
         self, key: tuple[str, str, str], paid: dict[str, int], drawn: dict[str, int]
@@ -464,6 +474,12 @@ class GrantStore:
                         f"this token may approve at most {caps.get(token, 0)} of "
                         f"{token} (the intent approves {approval['amount']})",
                     )
+
+
+def is_replay(request: t.Any, action: str, request_id: str | None) -> bool:
+    """Whether the MCP mount relieved this call's draw as a retry of `request_id`."""
+    replays = getattr(getattr(request, "state", None), REPLAYS, None) or set()
+    return request_id is not None and (action, request_id) in replays
 
 
 def request_token(request: t.Any) -> str | None:
@@ -622,16 +638,22 @@ class AuthMiddleware:
             await _reject(send, 401, "invalid or missing bearer token")
             return
         body = await _read_body(receive)
-        refusal = self._refusal(token, body)
+        replays: set[tuple[str, str]] = set()
+        refusal = self._refusal(token, body, replays)
         if refusal is not None:
             await _send_json(send, 200, refusal)
             return
         # read back by the send tools through the MCP request context
-        scope.setdefault("state", {})[AUTH_TOKEN] = token
+        scope.setdefault("state", {}).update({AUTH_TOKEN: token, REPLAYS: replays})
         await self._app(scope, _replay(body, receive), send)
 
-    def _refusal(self, token: str, body: bytes) -> dict | None:
-        """Return a JSON-RPC error for the first tool call this token may not make."""
+    def _refusal(
+        self, token: str, body: bytes, replays: set[tuple[str, str]]
+    ) -> dict | None:
+        """Return a JSON-RPC error for the first tool call this token may not make.
+
+        Each call relieved as a retry is added to `replays` as (tool, request id).
+        """
         try:
             message = json.loads(body or b"null")
         except ValueError:
@@ -642,12 +664,10 @@ class AuthMiddleware:
             params = call.get("params")
             params = params if isinstance(params, dict) else {}
             arguments = params.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
             try:
-                self._grants.authorize(
-                    token,
-                    str(params.get("name")),
-                    arguments if isinstance(arguments, dict) else {},
-                )
+                if self._grants.authorize(token, str(params.get("name")), arguments):
+                    replays.add((str(params["name"]), str(arguments["request_id"])))
             except GrantRefused as e:
                 self._activity.record(
                     "refusal", rule=e.rule, tool=params.get("name"), reason=str(e)
@@ -716,14 +736,16 @@ def _replay(body: bytes, receive: t.Any) -> t.Callable[[], t.Awaitable[dict]]:
 
 def authorize_route(
     request: Request, activity: ActivityLog, action: str, arguments: dict
-) -> None:
+) -> bool:
     """Authorize an HTTP route's action against the request's token.
+
+    Returns whether it was relieved as a retry (`GrantStore.authorize`).
 
     :raises HTTPException: 403 (401 for an expired token) naming the rule.
     """
     grants: GrantStore = request.app.state.grants
     try:
-        grants.authorize(getattr(request.state, AUTH_TOKEN), action, arguments)
+        return grants.authorize(getattr(request.state, AUTH_TOKEN), action, arguments)
     except GrantRefused as e:
         raise refused_route(request, activity, e) from e
 

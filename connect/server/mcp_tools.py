@@ -40,7 +40,12 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
-from connect.server.auth import GrantRefused, GrantStore, request_token
+from connect.server.auth import (
+    GrantRefused,
+    GrantStore,
+    is_replay,
+    request_token,
+)
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer
@@ -132,6 +137,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             data=data,
             intent=_for_token(grants, ctx, intent),
             request_id=request_id,
+            replay_only=is_replay(_ctx_request(ctx), "safe_transaction", request_id),
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
         )
@@ -164,6 +170,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             data=data,
             intent=_for_token(grants, ctx, intent),
             request_id=request_id,
+            replay_only=is_replay(_ctx_request(ctx), "send_transaction", request_id),
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
         )
@@ -431,13 +438,17 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     return mcp
 
 
+def _ctx_request(ctx: Context | None) -> t.Any:
+    """Return the HTTP request behind this tool call, None when called in-process."""
+    try:
+        return ctx.request_context.request if ctx is not None else None
+    except ValueError:  # no request: called in-process, not through the mount
+        return None
+
+
 def _ctx_token(ctx: Context | None) -> str | None:
     """Return the bearer token the MCP mount stamped on this tool's request."""
-    try:
-        request = ctx.request_context.request if ctx is not None else None
-    except ValueError:  # no request: called in-process, not through the mount
-        request = None
-    return request_token(request)
+    return request_token(_ctx_request(ctx))
 
 
 def _for_token(grants: GrantStore, ctx: Context | None, intent: dict | None) -> t.Any:
@@ -478,6 +489,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     data: str,
     intent: t.Any,
     request_id: str | None,
+    replay_only: bool,
     wait_for_receipt: bool,
     timeout: int,
 ) -> dict:
@@ -498,6 +510,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
             data=data,
             request_id=request_id,
             intent=intent,
+            replay_only=replay_only,
         )
         return _settled(signer, chain, tx_hash, wait_for_receipt, timeout)
 

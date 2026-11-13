@@ -300,6 +300,7 @@ class Signer:
         gas: int | None = None,
         audit: bool = True,
         intent: t.Any = None,
+        replay_only: bool = False,
     ) -> str:
         """Fill, sign and broadcast one EOA transaction; returns the tx hash.
 
@@ -308,6 +309,8 @@ class Signer:
         a caller that audits the outcome itself, under its own kind. `intent`
         is what the transaction may do; a value-moving one without it is
         refused (`SERVER_BUILT` is for the server's own transactions).
+        `replay_only` answers only from the request id's completed send (see
+        `_send_guarded`).
         """
         return self._send_guarded(
             chain,
@@ -319,6 +322,7 @@ class Signer:
             audit=audit,
             gate=lambda: self._eoa_gate(chain, to, value, data),
             intent=intent,
+            replay_only=replay_only,
         )
 
     def _send_guarded(  # pylint: disable=too-many-arguments,too-many-locals
@@ -333,13 +337,16 @@ class Signer:
         audit: bool,
         gate: GateFactory,
         intent: t.Any,
+        replay_only: bool = False,
     ) -> str:
         """Replay, guard, intent gate, then broadcast: the one path to signing.
 
         `gate` builds the call the intent gate simulates, after the guard has
         answered, so a gate refusal and a guard refusal are audited alike.
         Only `SERVER_BUILT`, a private object no request body can produce,
-        skips the gate.
+        skips the gate. `replay_only` is a retry whose token draw was spared
+        because the id was held: it is answered from the id's completed send
+        or refused, never sent fresh, since the hold may have ended since.
         """
         stamp = _call_stamp(chain, to, value, data)
         if request_id is not None:
@@ -349,6 +356,8 @@ class Signer:
             cached = self._requests.cached(request_id, stamp)
             if cached is not None:
                 return cached
+            if replay_only:
+                self._refuse_lost_replay(request_id)
         self._check_transaction(chain=chain, to=to, value=value, data=data, audit=audit)
         if intent is not SERVER_BUILT:
             # after the guard, so the cheap static rules answer first and the
@@ -377,6 +386,19 @@ class Signer:
         if request_id is None:
             return broadcast()
         return self._requests.run(request_id, stamp, broadcast)
+
+    def _refuse_lost_replay(self, request_id: str) -> t.NoReturn:
+        """Refuse a spared retry that has no completed send to answer from."""
+        if self._requests.holds(request_id):
+            raise SignerError(
+                f"request '{request_id}' is already in flight; retry shortly"
+            )
+        raise SignerError(
+            f"request '{request_id}' was authorized as a retry of a send that has "
+            "since failed (or whose result was forgotten); nothing was sent for "
+            "this retry. Retry again to send "
+            "it, which is charged as a new send"
+        )
 
     def _refuse(  # pylint: disable=too-many-arguments
         self,
@@ -438,6 +460,7 @@ class Signer:
         gas: int | None = None,
         audit: bool = True,
         intent: t.Any = None,
+        replay_only: bool = False,
     ) -> str:
         """Act as the service safe: wrap one inner call and send it.
 
@@ -466,6 +489,7 @@ class Signer:
             # whose assets move, and what the intent describes
             gate=lambda: _GateCall(sender=safe, to=target, value=value, data=data),
             intent=intent,
+            replay_only=replay_only,
         )
 
     def _eoa_gate(self, chain: str, to: str, value: int, data: str) -> _GateCall:

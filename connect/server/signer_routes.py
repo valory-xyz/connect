@@ -88,8 +88,13 @@ class SignMessageRequest(StrictBody):
     digest: str = Field(description="0x-hex 32-byte digest, signed unprefixed")
 
 
-def _dispatch(
-    request: Request, method: t.Callable[..., str], body: _SendBody, address: str
+def _dispatch(  # pylint: disable=too-many-arguments
+    request: Request,
+    method: t.Callable[..., str],
+    body: _SendBody,
+    address: str,
+    *,
+    replay_only: bool,
 ) -> dict:
     """Run one signer method and map its input errors to a 400.
 
@@ -97,6 +102,7 @@ def _dispatch(
     recipient, `send_via_safe` as the safe's call target — the one field whose
     meaning the two endpoints deliberately keep distinct. A value-capped
     token's intent is `intent.Capped`: no position may leave under it.
+    `replay_only` is set for a retry whose draw was spared (`_authorize`).
     """
     intent = request.app.state.grants.intent_for(request_token(request), body.intent)
     try:
@@ -108,23 +114,26 @@ def _dispatch(
             request_id=body.request_id,
             gas=body.gas,
             intent=intent,
+            replay_only=replay_only,
         )
     except (SignerError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"tx_hash": tx_hash}
 
 
-def _authorize(request: Request, action: str, body: _SendBody | None = None) -> None:
-    """Hold this request's token to its grant: scope, caps, expiry."""
+def _authorize(request: Request, action: str, body: _SendBody | None = None) -> bool:
+    """Hold this request's token to its grant; return whether it is a spared retry."""
     arguments = {} if body is None else body.model_dump()
-    authorize_route(request, request.app.state.activity, action, arguments)
+    return authorize_route(request, request.app.state.activity, action, arguments)
 
 
 @router.post("/sign-and-send")
 def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
     """Sign and send one transaction from the agent EOA."""
-    _authorize(request, "send_transaction", body)
-    return _dispatch(request, request.app.state.signer.send, body, body.to)
+    replay_only = _authorize(request, "send_transaction", body)
+    return _dispatch(
+        request, request.app.state.signer.send, body, body.to, replay_only=replay_only
+    )
 
 
 @router.post("/safe-transaction")
@@ -134,8 +143,14 @@ def safe_transaction(body: SafeTransactionRequest, request: Request) -> dict:
     `target`, `value` and `data` are the call the *safe* makes, and the value
     leaves the safe.
     """
-    _authorize(request, "safe_transaction", body)
-    return _dispatch(request, request.app.state.signer.send_via_safe, body, body.target)
+    replay_only = _authorize(request, "safe_transaction", body)
+    return _dispatch(
+        request,
+        request.app.state.signer.send_via_safe,
+        body,
+        body.target,
+        replay_only=replay_only,
+    )
 
 
 @router.post("/sign-message")
