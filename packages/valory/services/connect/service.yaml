@@ -71,3 +71,4 @@ config:
   minutes_per_run: ${MINUTES_PER_RUN:int:15}
   mech_settle_timeout: ${MECH_SETTLE_TIMEOUT:int:1800}
   mech_gap_retries: ${MECH_GAP_RETRIES:int:3}
+  mech_hard_cancel_after: ${MECH_HARD_CANCEL_AFTER:int:21600}

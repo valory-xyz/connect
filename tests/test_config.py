@@ -29,6 +29,7 @@ from connect.config import (
     FUND_REQUIREMENTS_ENV,
     LOG_LEVEL_ENV,
     MECH_GAP_RETRIES_ENV,
+    MECH_HARD_CANCEL_AFTER_ENV,
     MECH_SETTLE_TIMEOUT_ENV,
     MINUTES_PER_RUN_ENV,
     SAFES_ENV,
@@ -219,3 +220,16 @@ def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:
     config = load_config(base_env(tmp_path))
     with pytest.raises(ValueError, match="unknown chain"):
         config.chain("solana")
+
+
+def test_the_hard_cancel_window_outlasts_the_settle_timeout(tmp_path: Path) -> None:
+    """Six hours by default; configurable, but never within the settle timeout."""
+    env = base_env(tmp_path)
+    assert load_config(env).mech_hard_cancel_after == 21600
+    config = load_config(env | {MECH_HARD_CANCEL_AFTER_ENV: "3600"})
+    assert config.mech_hard_cancel_after == 3600
+    for raw in ("1800", "60"):
+        with pytest.raises(ValueError, match="must be longer than"):
+            load_config(env | {MECH_HARD_CANCEL_AFTER_ENV: raw})
+    with pytest.raises(ValueError, match=MECH_HARD_CANCEL_AFTER_ENV):
+        load_config(env | {MECH_HARD_CANCEL_AFTER_ENV: "soon"})

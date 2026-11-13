@@ -50,6 +50,7 @@ LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 MECH_SETTLE_TIMEOUT_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_SETTLE_TIMEOUT"
 MECH_GAP_RETRIES_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_GAP_RETRIES"
+MECH_HARD_CANCEL_AFTER_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_HARD_CANCEL_AFTER"
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 DEFAULT_LOG_LEVEL = "info"
@@ -58,6 +59,10 @@ DEFAULT_MINUTES_PER_RUN = 15
 # before its safe's queue stalls; and how often a 503 gap resends a nonce
 DEFAULT_MECH_SETTLE_TIMEOUT = 1800
 DEFAULT_MECH_GAP_RETRIES = 3
+# seconds a safe's queue must have been stalled before the operator may hard
+# cancel it (one paid on-chain request); longer than the settle timeout, so a
+# queue gets the time to clear itself first
+DEFAULT_MECH_HARD_CANCEL_AFTER = 21600
 
 
 class FundRequirement(TypedDict):
@@ -91,6 +96,17 @@ class AppConfig:
     minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
     mech_settle_timeout: int = DEFAULT_MECH_SETTLE_TIMEOUT
     mech_gap_retries: int = DEFAULT_MECH_GAP_RETRIES
+    mech_hard_cancel_after: int = DEFAULT_MECH_HARD_CANCEL_AFTER
+
+    def __post_init__(self) -> None:
+        """Refuse a hard-cancel window no longer than the settle timeout."""
+        if self.mech_hard_cancel_after <= self.mech_settle_timeout:
+            raise ValueError(
+                f"{MECH_HARD_CANCEL_AFTER_ENV} ({self.mech_hard_cancel_after}s) "
+                "must be longer than "
+                f"{MECH_SETTLE_TIMEOUT_ENV} ({self.mech_settle_timeout}s): a "
+                "stalled queue gets the settle timeout to clear itself first"
+            )
 
     def chain(self, name: str) -> ChainConfig:
         """Chain."""
@@ -278,5 +294,8 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         ),
         mech_gap_retries=_parse_count(
             env, MECH_GAP_RETRIES_ENV, DEFAULT_MECH_GAP_RETRIES
+        ),
+        mech_hard_cancel_after=_parse_count(
+            env, MECH_HARD_CANCEL_AFTER_ENV, DEFAULT_MECH_HARD_CANCEL_AFTER
         ),
     )

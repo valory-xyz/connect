@@ -496,7 +496,10 @@ queue whose held slot `mapNonces` has not passed within the settle timeout
 (`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s) after its
 delivery, or after the request's own 300 s response timeout, stalls: only a
 probe at `mapNonces` is sent until one is accepted again, and refusals and
-`mech_result` say `mech_queue_stalled`. An on-chain request takes `mapNonces`
+`mech_result` say `mech_queue_stalled`. A queue stalled for
+`CONNECTION_CONFIGS_CONFIG_MECH_HARD_CANCEL_AFTER` (default 21600 s; it must
+be longer than the settle timeout, or Connect refuses to start) can be hard
+cancelled by the operator (below). An on-chain request takes `mapNonces`
 itself, so it waits until no off-chain slot is held. Held slots, their metadata
 salt and the stall are persisted in `mech_nonces.json` under STORE_PATH, written
 before the POST, so a restart never reissues a held nonce; an unreadable file
@@ -679,7 +682,7 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES}`)
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`)
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
   vendorable dependencies, synced on demand)
 
