@@ -275,10 +275,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def decode_calldata(chain: str, data: str) -> dict:
         """Decode calldata against the signatures Connect ships.
 
-        Returns {selector, signature, args}, or {selector, error} for a
-        selector Connect does not know or calldata too large to decode.
-        `chain` is accepted for symmetry with the other read tools; decoding
-        needs no RPC.
+        Returns {selector, signature, args}. A call it cannot decode carries
+        `error` instead of `args` (an unknown selector, calldata that is not
+        hex or is too large, arguments that do not fit or decode too large),
+        with `signature` when one matched the selector. `chain` is accepted
+        for symmetry with the other read tools; decoding needs no RPC.
         """
         return chain_read.decode_calldata(data)
 
