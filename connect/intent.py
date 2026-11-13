@@ -33,16 +33,19 @@ no fork and no trace,
 so "contracts touched" is the target plus every contract that emitted
 a log; a contract called without emitting one is not listed.
 
-The rules:
+The rules (`Rule` is the full list):
 `reverts`, `bad-intent`, `overspend`, `receive-min`, `undeclared-recipient`
-(EOAs only; burns to the zero address are skipped) and `undeclared-approval`
-(a 0 approval, a revoke, is not checked; `setApprovalForAll` counts as a
-maximum approval, even when revoking). The intent is required:
-`missing-intent` refuses a value-moving call that carries
-none, and `simulation-unavailable` refuses anything an RPC cannot simulate —
-nothing falls back to signing unchecked. Under a value-capped token (`Capped`)
-`token-cap-positions` refuses any ERC-721/1155 position leaving the sender,
-which no cap can bound.
+(EOAs only, an EIP-7702 delegated EOA counted as one; burns to the zero
+address are skipped) and `undeclared-approval` (a 0 approval, a revoke, is
+not checked; `setApprovalForAll` counts as a maximum approval, even when
+revoking). The intent is required: `missing-intent` refuses a value-moving
+call that carries none, and `simulation-unavailable` refuses anything an RPC
+cannot simulate — nothing falls back to signing unchecked. Under a
+value-capped token (`Capped`) `token-cap-positions` refuses any ERC-721/1155
+position leaving the sender, which no cap can bound. Three are raised by the
+signer before anything is simulated: `bad-calldata` (calldata that is not
+hex), and for an EOA's execTransaction to the safe `approve-hash` and
+`bad-exec-transaction` (see `Signer._eoa_gate`).
 """
 
 import typing as t
