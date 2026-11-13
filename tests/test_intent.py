@@ -314,6 +314,9 @@ def test_revert_reason_is_decoded() -> None:
         "out of gas"
     )
     assert simulate([], status="0x0")["revert"] == "reverted"
+    assert simulate([], status="0x0", error="execution reverted")["revert"] == (
+        "execution reverted"
+    )
     assert simulate([], status="0x0", error={"data": "0xdeadbeef"})["revert"] == (
         "0xdeadbeef"
     )

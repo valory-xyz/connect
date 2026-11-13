@@ -448,7 +448,7 @@ class FakeProvider:
         self.simulated: list[dict] = []
         self.logs: list[dict] = []
         self.status = "0x1"
-        self.error: dict | None = None
+        self.error: dict | str | None = None
         self.unavailable = False
         self.symbols: dict[str, str] = {}  # token -> symbol() answer, 0x-hex
 

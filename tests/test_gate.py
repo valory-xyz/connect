@@ -152,6 +152,18 @@ class TestSignerGate:
         with pytest.raises(SignerError, match="'reverts'"):
             test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
 
+    def test_a_revert_reported_as_a_bare_string_is_refused_and_audited(
+        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
+    ) -> None:
+        """Some RPCs answer the call's error as a string, not an object."""
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = "execution reverted"
+        with pytest.raises(SignerError, match="'reverts': .*execution reverted"):
+            test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
+        assert not fake_w3.eth.sent
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry["rule"] == "reverts"
+
     def test_no_simulation_means_no_signature(
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:

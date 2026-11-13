@@ -163,9 +163,15 @@ def _topic_address(topic: str) -> str:
     return "0x" + topic.removeprefix("0x")[-40:].lower()
 
 
-def _revert_reason(error: t.Mapping[str, t.Any] | None, return_data: str) -> str:
-    """Decode an `Error(string)` revert, else the RPC's message, else the raw data."""
-    data = str((error or {}).get("data") or return_data or "0x")
+def _revert_reason(error: t.Any, return_data: str) -> str:
+    """Decode an `Error(string)` revert, else the RPC's message, else the raw data.
+
+    `error` is the call's error object; some RPCs answer a bare string instead,
+    which is read as the message.
+    """
+    if not isinstance(error, t.Mapping):
+        error = {"message": error} if isinstance(error, str) else {}
+    data = str(error.get("data") or return_data or "0x")
     raw = data.removeprefix("0x")
     if raw.startswith("08c379a0") and len(raw) >= 8 + 128:
         try:
@@ -174,7 +180,7 @@ def _revert_reason(error: t.Mapping[str, t.Any] | None, return_data: str) -> str
             return text.decode("utf-8", errors="replace")
         except ValueError:
             pass
-    message = (error or {}).get("message")
+    message = error.get("message")
     return str(message) if message else ("reverted" if raw == "" else "0x" + raw)
 
 
