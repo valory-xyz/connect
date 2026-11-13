@@ -446,7 +446,7 @@ safe and chain (a request to another mech waits for the first one's slots to
 settle, and is refused as `mech-in-flight` when its wait runs out), the lock is
 held from reservation until the mech answers, and a slot is held until
 `mapNonces > n`. mech-client signs the nonce it is given (`send_request(...,
-nonces=[n], on_request_id=...)`, the pinned mech-client) and reports the
+nonces=[n], on_request_id=...)`, mech-client 0.25.0) and reports the
 request id just before signing. Connect still recomputes that id itself from
 what it assembled and the nonce it allocated: mech-client asks the contract
 for it over `eth_call`, and an id signed on faith would let a lying RPC
@@ -458,7 +458,10 @@ holds it; 503 (a gap) resends the same nonce and id up to
 `wire nonce below sender's next expected slot` means the nonce is taken
 (`mech-nonce-taken`: our own unknown slot is then accepted, otherwise the queue
 stalls); any other 4xx, a 402 after the top-up retry included, frees it
-(`mech-request-rejected`); any other 5xx or a transport error holds it, since
+(`mech-request-rejected`), as does mech-client's auto top-up failing on the
+safe's side (`OffchainTopUpFailed`: a cap, a balance, a reverted deposit). When
+that top-up landed and the mech still answered 402, the amount it deposited
+into the balance tracker is audited as `mech_deposit`; any other 5xx or a transport error holds it, since
 the mech may have stored the request. A failure before mech-client's pre-sign
 hook (an RPC or gateway error assembling the request) never reached the mech,
 so it frees the nonce too. A held slot's settle clock starts when its delivery

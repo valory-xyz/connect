@@ -45,7 +45,7 @@ import typing as t
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from mech_client import OffchainRequestRejected
+from mech_client import OffchainRequestRejected, OffchainTopUpFailed
 
 from connect.config import DEFAULT_MECH_GAP_RETRIES, DEFAULT_MECH_SETTLE_TIMEOUT
 from connect.mech_types import MechError, MechNotSent
@@ -75,13 +75,18 @@ UNKNOWN: Outcome = "unknown"
 
 
 class NonceRefused(Exception):
-    """The allocator will not hand out a nonce now; `rule` names why."""
+    """The allocator will not hand out a nonce now; `rule` names why.
 
-    def __init__(self, rule: str, detail: str) -> None:
+    `deposited` is what mech-client's auto top-up paid into the balance
+    tracker before the mech refused the request anyway, else 0.
+    """
+
+    def __init__(self, rule: str, detail: str, deposited: int = 0) -> None:
         """Initialize."""
-        super().__init__(rule, detail)
+        super().__init__(rule, detail, deposited)
         self.rule = rule
         self.detail = detail
+        self.deposited = deposited
 
     def __str__(self) -> str:
         """Return the refusal a caller reads."""
@@ -467,8 +472,15 @@ def _optional_time(raw: t.Any) -> float | None:
     return None if raw is None else float(raw)
 
 
-def outcome_of(rejection: OffchainRequestRejected) -> Outcome:
-    """Map the mech's HTTP answer to what it means for the nonce."""
+# what mech-client raises for one request of an off-chain call: the mech's HTTP
+# answer, or an auto top-up that failed on our side before the mech accepted it
+OFFCHAIN_FAILURES = (OffchainRequestRejected, OffchainTopUpFailed)
+
+
+def outcome_of(rejection: OffchainRequestRejected | OffchainTopUpFailed) -> Outcome:
+    """Map the mech's HTTP answer, or a failed top-up, to what it means for the nonce."""
+    if isinstance(rejection, OffchainTopUpFailed):
+        return "not_accepted"
     if rejection.status == 503:
         return "retry"
     if rejection.status == 401 and rejection.reason == NONCE_TAKEN_REASON:
@@ -485,6 +497,16 @@ REJECTION_RULES = {
     "not_accepted": "mech-request-rejected",
     "unknown": ANSWER_UNKNOWN_RULE,
 }
+
+
+def _answer(failure: OffchainRequestRejected | OffchainTopUpFailed) -> str:
+    """Say what came back for a nonce, for the refusal's detail."""
+    if isinstance(failure, OffchainTopUpFailed):
+        return f"the auto top-up for nonce {failure.nonce} failed: {failure}"
+    return (
+        f"the mech answered HTTP {failure.status} ({failure.reason}) to nonce "
+        f"{failure.nonce}"
+    )
 
 
 def not_sent_on_error(read: t.Callable[[], int]) -> t.Callable[[], int]:
@@ -519,7 +541,7 @@ def offchain_send(
         return send(on_request_id=hook)
     except (MechError, SignerError) as e:
         raise MechNotSent(str(e)) from e
-    except OffchainRequestRejected:
+    except OFFCHAIN_FAILURES:
         raise
     except Exception as e:
         if not hooked:
@@ -555,7 +577,7 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
         for attempt in range(allocator.gap_retries + 1):
             try:
                 result = send(slot.nonce)
-            except OffchainRequestRejected as e:
+            except OFFCHAIN_FAILURES as e:
                 outcome = outcome_of(e)
                 if outcome == "retry" and attempt < allocator.gap_retries:
                     sleep(GAP_RETRY_SECONDS)
@@ -567,8 +589,8 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
                 )
                 raise NonceRefused(
                     REJECTION_RULES[outcome],
-                    f"the mech answered HTTP {e.status} ({e.reason}) to nonce "
-                    f"{e.nonce}",
+                    _answer(e),
+                    getattr(e, "deposited", 0),
                 ) from e
             except not_sent:
                 slot.answered("not_accepted", mech=mech, salt=salt)

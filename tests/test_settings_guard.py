@@ -39,7 +39,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
-from mech_client import OffchainRequestRejected
+from mech_client import OffchainRequestRejected, OffchainTopUpFailed
 from mech_client.domain import identification
 from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
@@ -4583,6 +4583,52 @@ class TestMech:
             mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert refusal["rule"] == "mech-request-rejected"
+        assert "mech_deposit" not in audit_kinds(store_path)  # nothing was deposited
+
+    def test_a_deposit_before_a_second_402_is_audited(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """The top-up landed but the mech refused anyway: the deposit is on record."""
+        patched_mech.raises = OffchainRequestRejected(
+            "HTTP 402",
+            request_id="0x01",
+            nonce=5,
+            status=402,
+            reason="Payment Required",
+            unsent=[],
+            deposited=7,
+        )
+        with pytest.raises(MechNotSent, match="rule 'mech-request-rejected'"):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+            )
+        (deposit,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_deposit"
+        ]
+        assert deposit["amount"] == "7"
+        assert deposit["chain"] == "testchain"
+        assert deposit["request_id"] == "r1"
+
+    def test_a_failed_top_up_frees_the_nonce(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """mech-client's top-up failed on our side: not accepted, so nothing is held."""
+        patched_mech.raises = OffchainTopUpFailed(
+            "deposit reverted", request_id="0x01", nonce=5, unsent=[]
+        )
+        with pytest.raises(MechNotSent, match="auto top-up for nonce 5 failed"):
+            mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert refusal["rule"] == "mech-request-rejected"
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+            assert slot.nonce == 5  # freed, not held as unknown
 
     def test_a_lost_answer_is_possibly_paid_not_a_refusal(
         self,

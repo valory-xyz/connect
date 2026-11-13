@@ -653,7 +653,7 @@ requires-dist = [
     { name = "eth-account", specifier = "==0.13.7" },
     { name = "fastapi", specifier = "==0.139.2" },
     { name = "mcp", specifier = "==1.28.1" },
-    { name = "mech-client", git = "https://github.com/valory-xyz/mech-client.git?rev=6c4cd60a838d377847e4353a09f6f61811a8661d" },
+    { name = "mech-client", specifier = "==0.25.0" },
     { name = "open-aea-ledger-ethereum", specifier = "==2.2.9" },
     { name = "tomli-w", specifier = "==1.2.0" },
     { name = "uvicorn", specifier = "==0.54.0" },
@@ -1724,8 +1724,8 @@ wheels = [
 
 [[package]]
 name = "mech-client"
-version = "0.24.1"
-source = { git = "https://github.com/valory-xyz/mech-client.git?rev=6c4cd60a838d377847e4353a09f6f61811a8661d#6c4cd60a838d377847e4353a09f6f61811a8661d" }
+version = "0.25.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "gql" },
@@ -1738,6 +1738,10 @@ dependencies = [
     { name = "safe-eth-py" },
     { name = "setuptools" },
     { name = "tabulate" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/27/ea/b9e60b3bb1787cc4aea3d5ffd08df72ae696da48370db88d230250d71c83/mech_client-0.25.0.tar.gz", hash = "sha256:8d7ea7d6a39bc40c5984ff0a57aaa7516afc59170fb7a152dc2b0b7d061b3de4", size = 253776, upload-time = "2026-11-12T18:10:52.792Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/70/40/8acd0aea941324850a485d1cf16a6ea7675f10ef6fbd2dd595795b62c8c6/mech_client-0.25.0-py3-none-any.whl", hash = "sha256:32196b671852c6161011707043daaff6f5af26a3713cf0f15a2a371fb5870311", size = 334386, upload-time = "2026-11-12T18:10:51.603Z" },
 ]
 
 [[package]]

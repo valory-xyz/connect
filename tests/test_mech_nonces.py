@@ -24,7 +24,7 @@ import typing as t
 from pathlib import Path
 
 import pytest
-from mech_client import OffchainRequestRejected
+from mech_client import OffchainRequestRejected, OffchainTopUpFailed
 
 from connect import mech_nonces
 from connect.mech_nonces import NonceAllocator, NonceRefused, send_with_nonce
@@ -281,6 +281,8 @@ def test_outcomes_follow_the_mechs_answers() -> None:
     assert mech_nonces.outcome_of(reject(400)) == "not_accepted"  # the bound
     assert mech_nonces.outcome_of(reject(399)) == "unknown"
     assert mech_nonces.outcome_of(reject(500)) == "unknown"
+    top_up = OffchainTopUpFailed("cap", request_id="0x01", nonce=0, unsent=[])
+    assert mech_nonces.outcome_of(top_up) == "not_accepted"
 
 
 def _send(allocator: NonceAllocator, answers: list, clock: Clock) -> tuple[list, t.Any]:

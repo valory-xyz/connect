@@ -657,6 +657,13 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         except NonceRefused as e:
             safe = t.cast(str, self._config.chain(plan.chain).safe_address)
             note = self._nonces.stall_note(plan.chain, safe)
+            if e.deposited:  # the top-up landed before the mech refused anyway
+                self._activity.record(
+                    "mech_deposit",
+                    chain=plan.chain,
+                    request_id=request_id,
+                    amount=str(e.deposited),
+                )
             if e.rule == ANSWER_UNKNOWN_RULE:  # the mech may hold it: not a refusal
                 self._activity.record(
                     "mech_request_failed",
