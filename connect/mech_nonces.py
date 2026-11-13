@@ -604,9 +604,8 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
     transport error) leaves the slot held, since the mech may have stored it.
 
     :raises NonceRefused: naming the rule, when the mech did not accept it.
-    :raises NonceAnswerUnknown: when its answer was lost (what `outcome_of`
-        reads as unknown: a 5xx other than 503, whose retries end as
-        mech-nonce-gap): the request was signed, so the mech may hold it.
+    :raises NonceAnswerUnknown: when the mech's answer to the signed request
+        was lost (see the class).
     """
     with allocator.reserve(
         chain, safe, mech, read_map_nonces, timeout=timeout, salt=salt
