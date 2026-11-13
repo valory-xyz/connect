@@ -43,10 +43,11 @@ disabled: a digest is an opaque hash this gate cannot inspect, and the EOA
 owns the safe at threshold 1, so an attacker-chosen digest could be the hash
 of a safe transaction — one signature over it and the whitelist is bypassed.
 The exceptions are allowances the server registers for itself, and the agent
-session can register neither. For signing, the mech flow recomputes the
-off-chain request id from inputs it already validated, wraps it into the
-safe's ERC-1271 SafeMessage hash, and registers exactly that digest
-(allow_digest_once) before mech-client asks for the signature.
+session can register neither. For signing, the mech flow wraps the request
+id mech-client derived locally and checked against getRequestId (handed to
+its pre-sign hook) into the safe's ERC-1271 SafeMessage hash, and registers
+exactly that digest (allow_digest_once) before mech-client asks for the
+signature.
 For transactions, the same flow may pre-authorize the one deposit its 402
 top-up would send — the safe paying the mech balance tracker
 (allow_safe_deposit_once), shape-checked (a bare native transfer, or
