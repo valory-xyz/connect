@@ -35,8 +35,7 @@ A call that moves value needs an intent, which only signer.send_transaction
 carries: w3.eth.send_transaction and .transact() suit calls that move nothing.
 
 To run another script under a narrower token, mint one and hand it over in
-the environment; every .mcp.json reader here (connect(), load_mcp_config_dir)
-picks it up:
+the environment; every .mcp.json reader here picks it up (see _signing_token):
 
     token = signer.mint_token({"scopes": ["read", "tx"], ...})
     subprocess.run([sys.executable, "job.py"],
@@ -57,8 +56,7 @@ from web3 import HTTPProvider, Web3
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 
 MCP_SERVER_NAME = "pearl-connect"
-# a token every reader of .mcp.json here uses instead of the one in it, for a
-# script that was handed a narrower one
+# hands a script a narrower token than .mcp.json's; see _signing_token
 TOKEN_ENV_VAR = "PEARL_CONNECT_TOKEN"  # nosec B105 - a variable name
 SEND_ATTEMPTS = 3
 
@@ -263,14 +261,16 @@ def _signing_token(token: str | None, workspace_token: str) -> str:
     return token.strip()
 
 
-def load_mcp_config_dir(start: Path | None = None) -> tuple[str, str, Path]:
+def load_mcp_config_dir(
+    start: Path | None = None, token: str | None = None
+) -> tuple[str, str, Path]:
     """Find .mcp.json (cwd upwards); return (base_url, token, containing_dir).
 
-    The token is the one to sign with: $PEARL_CONNECT_TOKEN when it is set,
-    so every bundled script honours a narrower token it was handed, else the
-    workspace token in .mcp.json. The containing directory is the agent
-    workspace — sibling skills that keep their own state files there use it
-    to locate that root.
+    The token is the one to sign with, resolved here and only here by
+    `_signing_token` from `token` and .mcp.json's, so every bundled script
+    honours a narrower token it was handed. The containing directory is the
+    agent workspace — sibling skills that keep their own state files there
+    use it to locate that root.
     """
     directory = (start or Path.cwd()).resolve()
     for candidate in (directory, *directory.parents):
@@ -280,14 +280,16 @@ def load_mcp_config_dir(start: Path | None = None) -> tuple[str, str, Path]:
                 MCP_SERVER_NAME
             ]
             base_url = entry["url"].rstrip("/").removesuffix("/mcp")
-            token = entry["headers"]["Authorization"].removeprefix("Bearer ")
-            return base_url, _signing_token(None, token), candidate
+            workspace_token = entry["headers"]["Authorization"].removeprefix("Bearer ")
+            return base_url, _signing_token(token, workspace_token), candidate
     raise FileNotFoundError(".mcp.json not found in cwd or parents")
 
 
-def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
+def load_mcp_config(
+    start: Path | None = None, token: str | None = None
+) -> tuple[str, str]:
     """Find .mcp.json (cwd upwards) and return (server_base_url, token)."""
-    base_url, token, _ = load_mcp_config_dir(start)
+    base_url, token, _ = load_mcp_config_dir(start, token)
     return base_url, token
 
 
@@ -314,13 +316,10 @@ def _strip_unused_send_middleware(w3: Web3) -> None:
 def connect(chain: str, token: str | None = None) -> tuple[Web3, SignerClient]:
     """Web3 instance whose sends go through the signer, plus the raw client.
 
-    The token is `token`, else $PEARL_CONNECT_TOKEN, else the one in .mcp.json;
-    a blank `token` or variable is an error, never the workspace token.
+    `token` is the one to sign with, if given; see `_signing_token`.
     """
-    if token is not None:
-        token = _signing_token(token, "")
-    base_url, loaded = load_mcp_config()
-    signer = SignerClient(base_url, token or loaded, chain)
+    base_url, token = load_mcp_config(token=token)
+    signer = SignerClient(base_url, token, chain)
     entry = signer.chain_info(chain)
     w3 = Web3(provider=SignerProvider(entry["rpc"], signer))
     # PoA chains (Polygon above all) pad extraData past 32 bytes, which web3's

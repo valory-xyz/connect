@@ -684,6 +684,20 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
+@pytest.fixture(autouse=True)
+def _no_handed_token() -> t.Iterator[None]:
+    """Keep a developer's $PEARL_CONNECT_TOKEN out of every test.
+
+    The bundled clients read it wherever they load .mcp.json, and tox passes
+    the whole environment through. Its own MonkeyPatch, not the shared
+    fixture: requesting that from an autouse fixture here would make every
+    test's monkeypatch undo last, after the modules' own autouse teardowns.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("PEARL_CONNECT_TOKEN", raising=False)
+        yield
+
+
 def grant_store(token: str) -> GrantStore:
     """Return a GrantStore over a signer that holds no request id."""
     return GrantStore(token, held=lambda request_id, via_safe: False)

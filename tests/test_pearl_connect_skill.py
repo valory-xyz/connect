@@ -90,7 +90,9 @@ ERC20_APPROVE_ABI = [
 def _connected(monkeypatch, chain_entry: dict):
     """Build the client's web3 without touching .mcp.json or the network."""
     monkeypatch.setattr(
-        signer_client, "load_mcp_config", lambda: ("http://127.0.0.1:8716", "t0ken")
+        signer_client,
+        "load_mcp_config",
+        lambda token=None: ("http://127.0.0.1:8716", token or "t0ken"),
     )
     monkeypatch.setattr(
         signer_client.SignerClient, "chain_info", lambda self, c=None: chain_entry
@@ -213,7 +215,12 @@ def test_connect_says_so_when_there_is_no_safe_to_read_as(monkeypatch, capsys) -
 
 @pytest.mark.parametrize(
     ("argument", "env", "expected"),
-    [(None, None, "t0ken"), (None, "child", "child"), ("given", "child", "given")],
+    [
+        (None, None, "t0ken"),
+        (None, "child", "child"),
+        ("given", "child", "given"),
+        ("given", "", "given"),  # an explicit token wins over a blank variable
+    ],
 )
 def test_connect_takes_a_narrower_token(
     monkeypatch, tmp_path, argument, env, expected
