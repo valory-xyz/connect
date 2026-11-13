@@ -200,8 +200,9 @@ def test_a_capped_token_approves_no_more_than_its_caps(
         store.authorize(capped, "safe_transaction", arguments)
     assert refused.value.rule == "token-cap-per-tx"
     session_only = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 5}))
-    with pytest.raises(GrantRefused, match="may approve at most"):
+    with pytest.raises(GrantRefused, match="may approve at most") as by_session:
         store.authorize(session_only, "safe_transaction", arguments)
+    assert by_session.value.rule == "token-cap-per-session"  # the cap it has
     store.authorize(WORKSPACE, "safe_transaction", arguments)  # uncapped
 
 

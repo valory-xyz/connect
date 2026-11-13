@@ -383,14 +383,17 @@ class GrantStore:
         transaction this token sends, so it is held to the per-transaction and
         the per-session cap alike; a token with no cap may not be approved.
         """
-        for caps in (grant.max_value_per_tx, grant.max_value_per_session):
+        for rule, caps in (
+            ("token-cap-per-tx", grant.max_value_per_tx),
+            ("token-cap-per-session", grant.max_value_per_session),
+        ):
             if caps is None:
                 continue
             for approval in approvals:
                 token = intent_module.balance_key(approval["token"])
                 if approval["amount"] > caps.get(token, 0):
                     raise GrantRefused(
-                        "token-cap-per-tx",
+                        rule,
                         f"this token may approve at most {caps.get(token, 0)} of "
                         f"{token} (the intent approves {approval['amount']})",
                     )

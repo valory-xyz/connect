@@ -405,7 +405,7 @@ router pulls only from its own caller, so only the safe's own swaps can use it,
 and what they move is drawn as spend. A Uniswap swap therefore draws its amount
 twice (the approval of Permit2 and the spend), not three times. What a cap cannot bound, a value-capped token may not
 do: approve more of a token than its caps allow (an approval is spend the
-spender takes later), sign a raw digest (`sign_message`: a digest can authorize
+spender takes later; refused under the rule of the cap it exceeds), sign a raw digest (`sign_message`: a digest can authorize
 any safe transaction), or move an ERC-721/1155 position out of the safe (the
 gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
 `token-expired`, `token-cap-per-tx`, `token-cap-per-session`,
