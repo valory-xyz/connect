@@ -215,15 +215,16 @@ def test_connect_says_so_when_there_is_no_safe_to_read_as(monkeypatch, capsys) -
     ("argument", "env", "expected"),
     [(None, None, "t0ken"), (None, "child", "child"), ("given", "child", "given")],
 )
-def test_connect_takes_a_narrower_token(monkeypatch, argument, env, expected) -> None:
+def test_connect_takes_a_narrower_token(
+    monkeypatch, tmp_path, argument, env, expected
+) -> None:
     """connect() uses token=, else the env var, else the token in .mcp.json."""
+    _write_mcp_config(tmp_path, "http://127.0.0.1:8716/mcp/")
+    monkeypatch.chdir(tmp_path)
     if env is None:
         monkeypatch.delenv(signer_client.TOKEN_ENV_VAR, raising=False)
     else:
         monkeypatch.setenv(signer_client.TOKEN_ENV_VAR, env)
-    monkeypatch.setattr(
-        signer_client, "load_mcp_config", lambda: ("http://127.0.0.1:8716", "t0ken")
-    )
     seen: list = []
 
     def chain_info(self, c=None):
@@ -233,6 +234,52 @@ def test_connect_takes_a_narrower_token(monkeypatch, argument, env, expected) ->
     monkeypatch.setattr(signer_client.SignerClient, "chain_info", chain_info)
     signer_client.connect("polygon", token=argument)
     assert seen == [expected]
+
+
+@pytest.mark.parametrize(("argument", "env"), [(None, ""), (None, "  "), ("", None)])
+def test_a_blank_handover_is_an_error_not_the_root_token(
+    monkeypatch, tmp_path, argument, env
+) -> None:
+    """A mint that printed nothing must not leave the script on the root token."""
+    _write_mcp_config(tmp_path, "http://127.0.0.1:8716/mcp/")
+    monkeypatch.chdir(tmp_path)
+    if env is None:
+        monkeypatch.delenv(signer_client.TOKEN_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(signer_client.TOKEN_ENV_VAR, env)
+    with pytest.raises(signer_client.SignerRequestError, match="set but empty"):
+        signer_client.connect("polygon", token=argument)
+    if env is not None:
+        with pytest.raises(signer_client.SignerRequestError, match="PEARL_CONNECT"):
+            signer_client.load_mcp_config_dir(tmp_path)
+
+
+def test_a_bundled_script_signs_with_the_handed_token(monkeypatch, tmp_path) -> None:
+    """connect-polymarket's from_workspace reads .mcp.json too: it honours the handover."""
+    monkeypatch.syspath_prepend(
+        str(_SCRIPTS.parent.parent / "connect-polymarket" / "scripts")
+    )
+    import pm_common  # noqa: E402  pylint: disable=import-outside-toplevel
+
+    _write_mcp_config(tmp_path, "http://127.0.0.1:8716/mcp/")
+    monkeypatch.setenv(signer_client.TOKEN_ENV_VAR, "child")
+    sent: list = []
+
+    class _Answer(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(request, timeout):  # noqa: ARG001
+        sent.append(request.get_header("Authorization"))
+        return _Answer(json.dumps({"tx_hash": "0x01"}).encode())
+
+    monkeypatch.setattr(signer_client.urllib.request, "urlopen", urlopen)
+    signer = pm_common.ConnectSigner.from_workspace(tmp_path)
+    signer.send_transaction({"to": ADDR_A, "data": "0x"})
+    assert sent == ["Bearer child"]
 
 
 def test_mint_token_mints_a_narrower_token_the_server_honours(

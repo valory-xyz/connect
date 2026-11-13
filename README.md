@@ -384,10 +384,13 @@ token, `"native"` or an address in any case, in base units; Celo's CELO face
 counts as `"native"`), a mech payment cap, an expiry. A grant wider than the
 presenting token's is refused (`token-scope`), and unknown fields are refused by
 name like every other body. The bundled `signer_client` mints one with
-`SignerClient.mint_token(grant)`, and its `connect(chain, token=None)` signs with
-`token`, else `$PEARL_CONNECT_TOKEN`, else the workspace token, so a launcher
-can hand a script a narrower token without the session ever reading
-`.mcp.json`.
+`SignerClient.mint_token(grant)`, and every bundled reader of `.mcp.json`
+(`signer_client.load_mcp_config_dir`, so `connect(chain, token=None)` and
+connect-polymarket's `ConnectSigner.from_workspace` alike) signs with
+`$PEARL_CONNECT_TOKEN` when it is set, so a launcher can hand a script a
+narrower token without the session ever reading `.mcp.json`. A blank value is
+an error, never a fall-back to the workspace token. The cap bounds a script's
+mistakes, not a hostile script, which can still read `.mcp.json` itself.
 
 | Scope | Allows |
 |---|---|

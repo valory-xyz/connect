@@ -35,7 +35,8 @@ A call that moves value needs an intent, which only signer.send_transaction
 carries: w3.eth.send_transaction and .transact() suit calls that move nothing.
 
 To run another script under a narrower token, mint one and hand it over in
-the environment; that script's connect() picks it up:
+the environment; every .mcp.json reader here (connect(), load_mcp_config_dir)
+picks it up:
 
     token = signer.mint_token({"scopes": ["read", "tx"], ...})
     subprocess.run([sys.executable, "job.py"],
@@ -56,8 +57,8 @@ from web3 import HTTPProvider, Web3
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 
 MCP_SERVER_NAME = "pearl-connect"
-# a token connect() uses instead of the one in .mcp.json, for a script that
-# was handed a narrower one
+# a token every reader of .mcp.json here uses instead of the one in it, for a
+# script that was handed a narrower one
 TOKEN_ENV_VAR = "PEARL_CONNECT_TOKEN"  # nosec B105 - a variable name
 SEND_ATTEMPTS = 3
 
@@ -242,11 +243,34 @@ class SignerProvider(HTTPProvider):
         return super().make_request(method, params)
 
 
+def _signing_token(token: str | None, workspace_token: str) -> str:
+    """Pick the signing token: `token`, else $PEARL_CONNECT_TOKEN, else the root.
+
+    Only an absent value falls back. A blank one is a handover that failed (a
+    launcher whose mint printed nothing), and falling back would sign with the
+    widest token there is, so it is an error naming where it came from.
+    """
+    source = "token"
+    if token is None:
+        token, source = os.environ.get(TOKEN_ENV_VAR), f"${TOKEN_ENV_VAR}"
+    if token is None:
+        return workspace_token
+    if not token.strip():
+        raise SignerRequestError(
+            f"{source} is set but empty; refusing to fall back to the workspace "
+            "token — mint the narrower token again, or unset it"
+        )
+    return token.strip()
+
+
 def load_mcp_config_dir(start: Path | None = None) -> tuple[str, str, Path]:
     """Find .mcp.json (cwd upwards); return (base_url, token, containing_dir).
 
-    The containing directory is the agent workspace — sibling skills that
-    keep their own state files there use it to locate that root.
+    The token is the one to sign with: $PEARL_CONNECT_TOKEN when it is set,
+    so every bundled script honours a narrower token it was handed, else the
+    workspace token in .mcp.json. The containing directory is the agent
+    workspace — sibling skills that keep their own state files there use it
+    to locate that root.
     """
     directory = (start or Path.cwd()).resolve()
     for candidate in (directory, *directory.parents):
@@ -257,7 +281,7 @@ def load_mcp_config_dir(start: Path | None = None) -> tuple[str, str, Path]:
             ]
             base_url = entry["url"].rstrip("/").removesuffix("/mcp")
             token = entry["headers"]["Authorization"].removeprefix("Bearer ")
-            return base_url, token, candidate
+            return base_url, _signing_token(None, token), candidate
     raise FileNotFoundError(".mcp.json not found in cwd or parents")
 
 
@@ -290,11 +314,13 @@ def _strip_unused_send_middleware(w3: Web3) -> None:
 def connect(chain: str, token: str | None = None) -> tuple[Web3, SignerClient]:
     """Web3 instance whose sends go through the signer, plus the raw client.
 
-    The token is `token`, else $PEARL_CONNECT_TOKEN, else the one in .mcp.json.
+    The token is `token`, else $PEARL_CONNECT_TOKEN, else the one in .mcp.json;
+    a blank `token` or variable is an error, never the workspace token.
     """
-    base_url, workspace_token = load_mcp_config()
-    token = token or os.environ.get(TOKEN_ENV_VAR) or workspace_token
-    signer = SignerClient(base_url, token, chain)
+    if token is not None:
+        token = _signing_token(token, "")
+    base_url, loaded = load_mcp_config()
+    signer = SignerClient(base_url, token or loaded, chain)
     entry = signer.chain_info(chain)
     w3 = Web3(provider=SignerProvider(entry["rpc"], signer))
     # PoA chains (Polygon above all) pad extraData past 32 bytes, which web3's

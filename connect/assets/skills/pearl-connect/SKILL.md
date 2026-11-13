@@ -88,10 +88,10 @@ The bundled skills attach the intents of the calls they build.
 
 ## Narrower tokens for scripts
 
-`signer_client.connect()` reads the workspace token, which can do anything
-this session can. When a script should be able to do less, mint it a
-narrower token from a launcher and hand that over in the environment — the
-token never passes through you, and `.mcp.json` stays unread:
+`signer_client.connect()` signs with the workspace token, which can do
+anything this session can. When a script should be able to do less, mint it a
+narrower token from a launcher and hand that over in the environment, so the
+token never passes through you:
 
 ```python
 import os, subprocess, sys, time
@@ -108,9 +108,12 @@ subprocess.run([sys.executable, "job.py"],
                env={**os.environ, TOKEN_ENV_VAR: token}, check=True)
 ```
 
-`connect()` in `job.py` then signs with that token (`connect(chain,
-token=...)` takes one directly). `mint_token` is `POST /tokens`; the grant
-is its body.
+Every bundled script in `job.py`'s environment — `connect()` and the
+connect-polymarket scripts alike — then signs with that token (`connect(chain,
+token=...)` takes one directly); a blank `PEARL_CONNECT_TOKEN` is an error,
+never the workspace token. `mint_token` is `POST /tokens`; the grant is its
+body. The cap bounds the script's mistakes, not a hostile script: it still
+reads `.mcp.json` for the server's address, and the workspace token sits there.
 
 Scopes are `read`, `mech` and `tx`; caps are per token (`"native"` or a
 token address) in base units, checked against the spend and the approvals the
