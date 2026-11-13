@@ -50,6 +50,12 @@ LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 MECH_SETTLE_TIMEOUT_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_SETTLE_TIMEOUT"
 MECH_GAP_RETRIES_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_GAP_RETRIES"
+MECH_INDEXER_ENV_VARS = (
+    "MECHX_MARKETPLACE_BASE_SQUID_URL",
+    "MECHX_MARKETPLACE_POLYGON_SQUID_URL",
+    "MECHX_REGISTRY_BASE_SQUID_URL",
+    "MECHX_REGISTRY_POLYGON_SQUID_URL",
+)
 MECH_HARD_CANCEL_AFTER_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_HARD_CANCEL_AFTER"
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
@@ -246,6 +252,21 @@ def _parse_count(env: dict[str, str], name: str, default: int) -> int:
     if value < 0:
         raise ValueError(f"{name} is not a whole number >= 0: {raw!r}")
     return value
+
+
+def configure_mech_indexers() -> None:
+    """Forward Pearl squid settings and log their sources; see README."""
+    for name in MECH_INDEXER_ENV_VARS:
+        value = os.environ.get(CUSTOM_ENV_VARS_PREFIX + name, "").strip()
+        direct = bool(os.environ.get(name, "").strip())
+        if value and value.lower() != "null":
+            os.environ[name] = value
+            source = "template (overrides direct)" if direct else "template"
+        elif direct:
+            source = "direct"
+        else:
+            continue
+        logger.info("mech indexer %s source=%s", name, source)
 
 
 def load_config(env: dict[str, str] | None = None) -> AppConfig:

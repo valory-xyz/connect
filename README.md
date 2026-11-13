@@ -471,6 +471,26 @@ endpoint in its on-chain metadata — few have, so `mech_tools` reports
 refused before any payment. The on-chain path sends through the
 MechMarketplace via the service safe and works for any listed mech.
 
+### Base and Polygon indexers
+
+Mech discovery and registry reads on Base and Polygon require mech-client
+0.26.0 or later and four operator-supplied squid GraphQL endpoints:
+
+- `MECHX_MARKETPLACE_BASE_SQUID_URL`
+- `MECHX_MARKETPLACE_POLYGON_SQUID_URL`
+- `MECHX_REGISTRY_BASE_SQUID_URL`
+- `MECHX_REGISTRY_POLYGON_SQUID_URL`
+
+For standalone runs, export these variables before starting Connect; `.env`
+is not loaded automatically. For Pearl, add the four values to the Connect
+service template's `valory/configs` fields (`mechx_marketplace_base_squid_url`,
+etc.). Middleware injects them as `CONNECTION_CONFIGS_CONFIG_MECHX_...`;
+Connect forwards them to mech-client at startup. Non-empty template values
+take precedence over direct variables; blank or `null` defaults leave direct
+variables unchanged. Startup logs record variable names and their source,
+including template overrides, without logging URLs. Endpoint values stay in
+deployment configuration. Other chains keep their existing indexers.
+
 ### One payer per safe: nonces
 
 Off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
@@ -702,7 +722,9 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`)
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`, plus
+  `CONNECTION_CONFIGS_CONFIG_MECHX_{MARKETPLACE,REGISTRY}_{BASE,POLYGON}_SQUID_URL`;
+  see [Base and Polygon indexers](#base-and-polygon-indexers))
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
   vendorable dependencies, synced on demand)
 
