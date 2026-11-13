@@ -62,6 +62,7 @@ from connect.mech_allowances import (
 )
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
 from connect.mech_chat import chat_report, is_chat_prompt
+from connect.mech_metadata import offchain_blocker, read_service_metadata
 from connect.mech_nonces import (
     ANSWER_UNKNOWN_RULE,
     NonceAllocator,
@@ -82,8 +83,6 @@ from connect.mech_types import (
     PendingDelivery,
     PricedMech,
     SPEND_UNCERTAIN,
-    offchain_blocker,
-    read_service_metadata,
 )
 from connect.signer import Signer, SignerError
 
