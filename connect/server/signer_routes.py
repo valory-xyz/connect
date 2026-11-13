@@ -38,7 +38,7 @@ from connect.server.auth import (
     refused_route,
     request_token,
 )
-from connect.server.mcp_tools import settled
+from connect.server.receipts import settled
 from connect.server.strict import StrictBody
 from connect.signer import SignerError
 

@@ -47,11 +47,8 @@ from connect.server.auth import (
     RequireAuth,
     require_local_origin,
 )
-from connect.server.mcp_tools import (
-    MAX_RECEIPT_TIMEOUT,
-    RECEIPT_POLL_SECONDS,
-    build_mcp,
-)
+from connect.server.mcp_tools import build_mcp
+from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
 from connect.settings import MODE_RESTRICTED, SettingsStore
 from connect.signer import SERVER_BUILT, Signer
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
