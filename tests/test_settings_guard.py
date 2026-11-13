@@ -823,6 +823,28 @@ class TestGuard:
             guard.check_sign_digest(b"\xab" * 32)
         assert "expired unconsumed" in caplog.text
 
+    def test_a_revoked_allowance_is_gone_and_only_its_own(
+        self, store: SettingsStore
+    ) -> None:
+        """Revoking withdraws exactly the grant armed, leaving any other shape."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_digest_once(b"\xab" * 32)
+        guard.allow_digest_once(b"\xac" * 32)
+        guard.revoke_digest(b"\xab" * 32)
+        with pytest.raises(GuardError, match="digest signing is disabled"):
+            guard.check_sign_digest(b"\xab" * 32)
+        guard.check_sign_digest(b"\xac" * 32)  # the other one stands
+        shape: dict[str, t.Any] = dict(
+            chain="testchain", tracker=TRACKER, amount_cap=10, is_token=False
+        )
+        guard.allow_safe_deposit_once(**shape)
+        guard.revoke_safe_deposit(**{**shape, "amount_cap": 11})  # not its shape
+        deposit = exec_transaction_calldata(TRACKER, value=10)
+        guard.check_transaction("testchain", SAFE, 0, deposit, consume=False)
+        guard.revoke_safe_deposit(**shape)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+
     def test_deposit_allowance_native(self, store: SettingsStore) -> None:
         """A pre-authorized bare transfer to the tracker passes — once, capped.
 
@@ -3334,6 +3356,34 @@ class TestMech:
         assert armed[0]["amount_cap"] == str(_MAX_AUTO_DEPOSIT_RATIO * 10**16)
         deposit = exec_transaction_calldata(TRACKER, value=10**16)
         guard.check_transaction("testchain", SAFE, 0, deposit)  # the one top-up
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    def test_a_request_refused_before_sending_leaves_no_allowance(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mech-client's price cap refuses after the top-up was armed: it is withdrawn.
+
+        Nothing was sent, so nothing the request armed may outlive it.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        service, guard = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        patched_mech.info = native_mech_info(10**18)  # above the default budget
+        with pytest.raises(MechNotSent, match="max_payment"):
+            service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        deposit = exec_transaction_calldata(TRACKER, value=10**16)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
 

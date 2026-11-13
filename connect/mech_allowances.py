@@ -19,6 +19,7 @@
 
 """The single-use grants the mech flow registers with the guard."""
 
+import functools
 import logging
 import typing as t
 
@@ -35,6 +36,9 @@ from connect.safe import safe_message_hash
 from connect.settings import MODE_RESTRICTED
 
 logger = logging.getLogger("agent")
+
+# what one request armed, each entry withdrawing one grant (MechAllowances.revoke)
+Armed = list[t.Callable[[], None]]
 
 
 def deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
@@ -83,6 +87,7 @@ class MechAllowances:
         mech: str,
         request_id: bytes,
         nonce: int,
+        armed: Armed,
     ) -> None:
         """Pre-authorize, once, the safe's signature on a request id.
 
@@ -96,6 +101,7 @@ class MechAllowances:
         digest = safe_message_hash(safe, chain_id, bytes(request_id))
         if self._guard.mode() == MODE_RESTRICTED:
             self._guard.allow_digest_once(digest)
+            armed.append(functools.partial(self._guard.revoke_digest, digest))
         self._activity.record(
             "mech_offchain_digest",
             chain=chain,
@@ -105,7 +111,7 @@ class MechAllowances:
             nonce=nonce,
         )
 
-    def arm_auto_deposit(self, chain: str, priced: PricedMech) -> bool:
+    def arm_auto_deposit(self, chain: str, priced: PricedMech, armed: Armed) -> bool:
         """Pre-authorize the one 402 top-up this request may send, and say so.
 
         Returns whether auto_deposit should stay on. The deposit pays the
@@ -133,9 +139,14 @@ class MechAllowances:
             return True
         amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate
         if restricted:
-            self._guard.allow_safe_deposit_once(
-                chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
-            )
+            shape: dict[str, t.Any] = {
+                "chain": chain,
+                "tracker": tracker,
+                "amount_cap": amount_cap,
+                "is_token": is_token,
+            }
+            self._guard.allow_safe_deposit_once(**shape)
+            armed.append(functools.partial(self._guard.revoke_safe_deposit, **shape))
         self._activity.record(
             "mech_deposit_allowance",
             chain=chain,
@@ -144,3 +155,13 @@ class MechAllowances:
             is_token=is_token,
         )
         return True
+
+    @staticmethod
+    def revoke(armed: Armed) -> None:
+        """Withdraw every grant a request armed: it ended with nothing sent.
+
+        A refusal before the POST (mech-client's price cap or id check, the
+        signer, the queue) must spend nothing, so no grant outlives it.
+        """
+        while armed:
+            armed.pop()()

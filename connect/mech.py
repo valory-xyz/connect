@@ -63,7 +63,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
-from connect.mech_allowances import MechAllowances, read_map_nonces
+from connect.mech_allowances import Armed, MechAllowances, read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
 from connect.mech_queue import MechQueue
 from connect.mech_signer import MechSigner
@@ -116,6 +116,7 @@ class _RequestPlan(t.NamedTuple):
     tool: str
     max_payment: int
     terms: dict  # mech-client's mech report, merged into the request's report
+    armed: Armed  # the guard grants this request armed, revoked if nothing is sent
 
     @property
     def legacy_on_chain(self) -> bool:
@@ -531,6 +532,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     "default budget for; pass max_payment to set one"
                 )
         extra_attributes: dict | None
+        armed: Armed = []
         if not legacy_on_chain:
             # mech-client discovers the endpoint mid-flow and fails there with
             # a message about metadata, which reads as a transient gateway
@@ -553,7 +555,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             extra_attributes = metadata_extras(request_context)
             offchain = True
             if auto_deposit:
-                auto_deposit = self._allowances.arm_auto_deposit(chain, priced)
+                auto_deposit = self._allowances.arm_auto_deposit(chain, priced, armed)
         else:
             # nothing reads the document on-chain, so no operator link here
             terms = service.tool_manager.terms_report(priority_mech, None)
@@ -573,9 +575,10 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             tool=tool,
             max_payment=max_payment,
             terms=terms,
+            armed=armed,
         )
 
-    def _dispatch(  # pylint: disable=too-many-locals
+    def _dispatch(  # pylint: disable=too-many-locals,too-many-statements
         self,
         plan: _RequestPlan,
         prompt: str,
@@ -610,6 +613,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             )
             raise
         except MechPriceExceeded as e:  # mech-client's cap: nothing was paid
+            self._allowances.revoke(plan.armed)
             self._blocked(plan.chain, plan.tool, "over-max-payment", str(e))
             raise MechNotSent(
                 f"mech {plan.priced.mech} charges {e.price} per request (in its "
@@ -617,6 +621,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 "pass a higher max_payment to accept that price"
             ) from e
         except NonceRefused as e:
+            self._allowances.revoke(plan.armed)
             note = self._queue.note(plan.chain)
             self._record_deposit(plan, request_id, getattr(e.__cause__, "deposited", 0))
             self._activity.record(
@@ -629,6 +634,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             )
             raise MechNotSent(f"rule '{e.rule}': {e}{note}") from e
         except MechNotSent as e:  # failed before reaching the mech: nothing paid
+            self._allowances.revoke(plan.armed)
             self._activity.record(
                 "mech_request_not_sent",
                 chain=plan.chain,
@@ -770,6 +776,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 mech=plan.priced.mech,
                 request_id=request_id,
                 nonce=nonce,
+                armed=plan.armed,
             )
             armed[nonce] = bytes(request_id)
 
