@@ -22,6 +22,7 @@
 import asyncio
 import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -61,7 +62,6 @@ from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
 from connect import mech_nonces as mech_nonces_module
-from connect import mech_rpc
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -1857,8 +1857,6 @@ class FakeMarketplaceService:
         }
         self.report_fallback: str | None = None
         self.report_calls: list[tuple] = []
-        # whether each report ran with mech-client's RPC mismatch warning muted
-        self.report_muted: list[bool] = []
         self.tool_manager = SimpleNamespace(
             read_tools_metadata=lambda service_id: metadata_read(self.metadata),
             terms_report=self._terms_report,
@@ -1867,6 +1865,7 @@ class FakeMarketplaceService:
         self.contract = FakeMarketplaceContract()
         self.signer: t.Any = None  # the MechSigner mech-client would sign with
         self.safe_address: str | None = None  # agent-mode requester of record
+        self.rpc_url: str | None = None  # the rpc_url it was built with
         # mirrors BaseTransactionService.mech_config, whose chain id the flow
         # threads into sign_safe_message
         self.mech_config = SimpleNamespace(
@@ -1881,7 +1880,6 @@ class FakeMarketplaceService:
     def _mech_report_or_terms(self, mech_address: str, metadata: t.Any) -> dict:
         """Record the call; return the canned report, or the terms and a note."""
         self.report_calls.append((mech_address, metadata))
-        self.report_muted.append(getattr(mech_rpc._LISTING, "active", False))
         if self.report_fallback is not None:
             return {**self.terms, "report_note": self.report_fallback}
         return {**self.terms, **self.report}
@@ -2101,6 +2099,7 @@ class TestMech:
             """Capture the MechSigner and safe the service would sign with."""
             fake.signer = kwargs.get("signer")
             fake.safe_address = t.cast(str, kwargs.get("safe_address"))
+            fake.rpc_url = t.cast(str, kwargs.get("rpc_url"))
             return fake
 
         monkeypatch.setattr(mech_module, "MarketplaceService", _construct)
@@ -2133,8 +2132,6 @@ class TestMech:
         assert order == ["report", "send"]
         # the default off-chain flow reuses the document its pre-flight read
         assert patched_mech.report_calls == [(OTHER, patched_mech.metadata)]
-        # its indexer reads must not warn that MECHX_CHAIN_RPC is for another chain
-        assert patched_mech.report_muted == [True]
         assert not patched_mech.terms_calls
         assert out["valory_operated"] is True
         assert out["terms"] == VALORY_TERMS_NOTICE
@@ -3789,7 +3786,6 @@ class TestMech:
         }
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert patched_mech.report_calls == [(OTHER, patched_mech.metadata)]
-        assert patched_mech.report_muted == [True]
         assert not patched_mech.terms_calls
         assert info["valory_operated"] is True
         assert info["terms"] == VALORY_TERMS_NOTICE
@@ -4274,62 +4270,6 @@ class TestMech:
         unknown_chain = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert unknown_chain["payment_token"] is None
 
-    @pytest.mark.parametrize("before", [None, "http://another-chain"])
-    def test_listing_never_touches_the_rpc_variable(
-        self,
-        before: t.Optional[str],
-        mech_service: MechService,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Only a request's own flow may move it; a listing merely reads it."""
-        if before is None:
-            monkeypatch.delenv("MECHX_CHAIN_RPC", raising=False)
-        else:
-            monkeypatch.setenv("MECHX_CHAIN_RPC", before)
-        seen: list[t.Optional[str]] = []
-
-        def _query(chain: str) -> list:
-            """Record what mech-client would read."""
-            seen.append(mech_module.os.environ.get("MECHX_CHAIN_RPC"))
-            return []
-
-        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
-        mech_service.tools(chain="testchain")
-        assert seen == [before]
-        assert mech_module.os.environ.get("MECHX_CHAIN_RPC") == before
-
-    def test_the_mismatch_warning_is_dropped_only_while_listing(
-        self,
-        mech_service: MechService,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A stale RPC during a listing is noise; during construction it is a fault."""
-        warner = logging.getLogger(
-            "mech_client.mech_client.infrastructure.config.chain_config"
-        )
-        # mech-client turns propagation off on its root logger at import, so
-        # the records reach caplog only if an earlier test ran main(). Hand
-        # them to caplog here, once, whatever ran before.
-        monkeypatch.setattr(warner, "handlers", [caplog.handler])
-        monkeypatch.setattr(warner, "propagate", False)
-
-        def _query(chain: str) -> list:
-            """Warn the way mech-client does when the variable names another chain."""
-            warner.warning("MECHX_CHAIN_RPC mismatch detected!\n  during listing")
-            warner.warning("an unrelated warning during listing")
-            return []
-
-        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
-        with caplog.at_level(logging.WARNING, logger=warner.name):
-            mech_service.tools(chain="testchain")
-            warner.warning("MECHX_CHAIN_RPC mismatch detected!\n  outside listing")
-        messages = [r.getMessage() for r in caplog.records if r.name == warner.name]
-        assert messages == [
-            "an unrelated warning during listing",
-            "MECHX_CHAIN_RPC mismatch detected!\n  outside listing",
-        ]
-
     def test_a_slow_listing_holds_up_no_other_mech_work(
         self,
         mech_service: MechService,
@@ -4397,29 +4337,20 @@ class TestMech:
             release.set()
             listing.join(10)
 
-    def test_a_request_points_mech_client_at_its_own_chain(
+    def test_each_chain_s_service_talks_to_its_own_rpc(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """An auto-deposit rebuilds a mech-client service mid-send and rereads it."""
-        seen: list[str] = []
-        original = patched_mech.send_request
-
-        async def _send(**kwargs: object) -> dict:
-            """Record the RPC visible while the request is in flight."""
-            seen.append(mech_module.os.environ["MECHX_CHAIN_RPC"])
-            return await original(**kwargs)
-
-        monkeypatch.setattr(patched_mech, "send_request", _send)
-        mech_service._service("testchain")  # pylint: disable=protected-access
-        monkeypatch.setenv("MECHX_CHAIN_RPC", "http://a-chain-listed-since")
+        """rpc_url per service; the process-global MECHX_CHAIN_RPC is never set."""
+        monkeypatch.delenv("MECHX_CHAIN_RPC", raising=False)
         mech_service.request(
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
         # pylint: disable=protected-access
-        assert seen == [mech_service._config.chain("testchain").rpc_url]
+        assert patched_mech.rpc_url == mech_service._config.chain("testchain").rpc_url
+        assert "MECHX_CHAIN_RPC" not in os.environ
 
     def test_request_wraps_pricing_failures(
         self,

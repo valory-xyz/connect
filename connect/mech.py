@@ -34,7 +34,6 @@ points a request needs them; the reasoning for each lives there.
 
 import asyncio
 import logging
-import os
 import threading
 import time
 import typing as t
@@ -71,7 +70,6 @@ from connect.mech_nonces import (
     offchain_send,
     send_with_nonce,
 )
-from connect.mech_rpc import RPC_LOCK, listing_mechs
 from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
 from connect.mech_types import (
@@ -151,6 +149,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         self._activity = activity
         self._allowances = MechAllowances(config, guard, activity)
         self._lock = threading.Lock()
+        self._services_lock = threading.Lock()
         self._services: dict[str, MarketplaceService] = {}
         # requests that returned without a delivery, keyed by request id, so
         # mech_result can resume the watch a paid-for request deserves
@@ -210,23 +209,18 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 f"no service safe is configured for chain '{chain}'; mech "
                 "requests are paid by the safe"
             )
-        with RPC_LOCK:
+        with self._services_lock:
             service = self._services.get(chain)
             if service is None:
-                # mech-client reads the RPC from this process-global env var at
-                # service construction (highest priority, keeps it away from
-                # ~/.operate) — hence the construction lock, which must span
-                # the constructor itself: built outside it, two chains could
-                # race the env var and construct against each other's RPC.
-                # First use of one chain therefore stalls the others; the fix
-                # is a constructor arg upstream (valory-xyz/mech-client#247).
-                os.environ["MECHX_CHAIN_RPC"] = chain_config.rpc_url
+                # rpc_url, not the process-global MECHX_CHAIN_RPC: each chain's
+                # service talks to its own RPC, whatever the others do
                 service = MarketplaceService(
                     chain_config=chain,
                     agent_mode=True,
                     safe_address=safe,
                     ethereum_client=EthereumClient(URI(chain_config.rpc_url)),
                     signer=MechSigner(self._signer, chain),
+                    rpc_url=chain_config.rpc_url,
                 )
                 self._services[chain] = service
             return service
@@ -290,10 +284,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         info["offchain_capable"] = blocker is None
         if blocker is not None:
             info["offchain_note"] = blocker
-        with listing_mechs():
-            info |= service.tool_manager.mech_report_or_terms(
-                priority_mech, read.document
-            )
+        info |= service.tool_manager.mech_report_or_terms(priority_mech, read.document)
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:
@@ -306,8 +297,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         limit = max(1, min(limit, MAX_MECH_PAGE_SIZE))
         offset = max(0, offset)
         try:
-            with listing_mechs():
-                mechs = query_mm_mechs_info(chain) or []
+            mechs = query_mm_mechs_info(chain) or []
             # inside the try: a malformed subgraph entry must surface as the
             # structured MechError this method promises, not a raw KeyError
             page = [
@@ -567,10 +557,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     f"off-chain requests: {blocker}"
                 )
             # before any allowance is armed, so a failure here spends nothing
-            with listing_mechs():
-                terms = service.tool_manager.mech_report_or_terms(
-                    priority_mech, read.document
-                )
+            terms = service.tool_manager.mech_report_or_terms(
+                priority_mech, read.document
+            )
             # Pin the metadata salt so the CID, and with it the request id
             # mech-client will sign, is known here first; the pre-sign hook
             # checks that id in every mode and arms its allowance (restricted
@@ -620,10 +609,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         Everything here is past the point of no return: mech-client pays
         before it watches, so a failure below may still have spent funds.
         """
-        with RPC_LOCK:
-            # an auto-deposit builds a fresh mech-client service mid-send, and
-            # it reads this variable again; see _service
-            os.environ["MECHX_CHAIN_RPC"] = self._config.chain(plan.chain).rpc_url
         deadline = time.monotonic() + timeout
         try:
             result = self._send(plan, prompt, timeout)
