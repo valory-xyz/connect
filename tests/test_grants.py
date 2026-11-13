@@ -1060,6 +1060,30 @@ def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
         store.authorize(capped, "safe_transaction", {"value": 6, "request_id": "r1"})
 
 
+def test_a_retry_s_record_keeps_the_most_drawn_per_asset() -> None:
+    """A retry declaring less, or leaving an asset out, lowers nothing on record."""
+    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 20, USDC: 5}))
+
+    def send(request_id: str, value: int, usdc: int = 0) -> None:
+        spend = {USDC: usdc} if usdc else {}
+        arguments = {"value": value, "intent": {"spend": spend}}
+        store.authorize(
+            capped, "safe_transaction", {**arguments, "request_id": request_id}
+        )
+
+    for value in (9, 6, 9):  # decreasing, then back: 9 is drawn once
+        send("r1", value)
+    send("r2", 1, usdc=5)
+    send("r2", 1)  # USDC left out of this retry
+    send("r2", 1, usdc=5)  # and declared again: still drawn once
+    send("r3", 10)  # 9 + 1 + 10 is all 20 of native
+    with pytest.raises(GrantRefused):
+        send("r4", 1)
+    with pytest.raises(GrantRefused):
+        send("r4", 0, usdc=1)
+
+
 def test_a_forgotten_request_id_is_drawn_in_full(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

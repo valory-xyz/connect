@@ -210,6 +210,32 @@ class TestSignerGate:
         (record,) = [r for r in caplog.records if "cannot simulate" in r.message]
         assert record.exc_info is not None
 
+    def test_holds_request_keeps_the_two_paths_apart(
+        self, test_signer: Signer, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A safe send's id is not the EOA's, and an in-flight one is held too.
+
+        A wrong namespace would let a fresh EOA send ride on a completed
+        safe send's id, uncharged.
+        """
+        assert not test_signer.holds_request("r1", True)
+        test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL, request_id="r1")
+        assert test_signer.holds_request("r1", True)
+        assert not test_signer.holds_request("r1", False)
+        test_signer.send("testchain", TOKEN, data=TOKEN_CALL, request_id="r2")
+        assert test_signer.holds_request("r2", False)
+        assert not test_signer.holds_request("r2", True)
+        seen: list = []
+        send_raw = fake_w3.eth.send_raw_transaction
+
+        def mid_broadcast(raw: bytes) -> t.Any:
+            seen.append(test_signer.holds_request("r3", False))
+            return send_raw(raw)
+
+        monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", mid_broadcast)
+        test_signer.send("testchain", TOKEN, data=TOKEN_CALL, request_id="r3")
+        assert seen == [True]  # in flight counts as held
+
     def test_no_simulation_means_no_signature(
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
