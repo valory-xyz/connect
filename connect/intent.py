@@ -378,24 +378,24 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
         if dst == holder:
             native += amount
 
-    for log in logs:
+    for address, src, dst, data in _erc20_transfers(logs):
+        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES:
+            continue  # native moves, counted above
+        amount = _word(data, 0)
+        if src == holder:
+            tokens[address] = tokens.get(address, 0) - amount
+            _sent_to(dst)
+        if dst == holder:
+            tokens[address] = tokens.get(address, 0) + amount
+
+    for log in logs:  # every other log; a 3-topic Transfer matches no branch
         address = str(log.get("address", "")).lower()
         topics = [str(x).lower() for x in log.get("topics") or []]
         if address == NATIVE_LOG_ADDRESS or not topics:
             continue
         data = str(log.get("data", "0x"))
         kind = topics[0]
-        if address in NATIVE_ERC20_FACES and kind == TRANSFER and len(topics) == 3:
-            continue  # counted as native above; the face's other logs are not
-        if kind == TRANSFER and len(topics) == 3:  # ERC-20
-            src, dst = _topic_address(topics[1]), _topic_address(topics[2])
-            amount = _word(data, 0)
-            if src == holder:
-                tokens[address] = tokens.get(address, 0) - amount
-                _sent_to(dst)
-            if dst == holder:
-                tokens[address] = tokens.get(address, 0) + amount
-        elif kind == TRANSFER and len(topics) == 4:  # ERC-721
+        if kind == TRANSFER and len(topics) == 4:  # ERC-721
             src, dst = _topic_address(topics[1]), _topic_address(topics[2])
             key = (address, str(int(topics[3], 16)))
             if src == holder:
