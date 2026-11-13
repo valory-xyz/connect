@@ -303,6 +303,58 @@ def test_weth_and_nft_moves_and_approvals() -> None:
     assert diff["recipients"] == [{"address": EOA, "contract": False}]
 
 
+ZERO = "0x" + "00" * 20
+
+
+def _wrap_log(kind: str, holder: str, amount: int) -> dict:
+    """Return a WETH Deposit or Withdrawal log."""
+    return {
+        "address": TOKEN,
+        "topics": [kind, _topic(holder)],
+        "data": "0x" + _word(amount),
+    }
+
+
+@pytest.mark.parametrize(
+    ("logs", "delta"),
+    [
+        ([transfer(TOKEN, ZERO, SAFE, 9), _wrap_log(intent.DEPOSIT, SAFE, 9)], "9"),
+        ([_wrap_log(intent.DEPOSIT, SAFE, 9), transfer(TOKEN, ZERO, SAFE, 9)], "9"),
+        ([transfer(TOKEN, SAFE, ZERO, 4), _wrap_log(intent.WITHDRAWAL, SAFE, 4)], "-4"),
+    ],
+)
+def test_a_wrap_logging_transfer_and_deposit_counts_once(
+    logs: list[dict], delta: str
+) -> None:
+    """Solmate/OpenZeppelin WETH log a mint or burn Transfer beside Deposit/Withdrawal."""
+    assert simulate(logs)["tokens"] == {TOKEN: {"symbol": "USDC", "delta": delta}}
+
+
+@pytest.mark.parametrize(
+    ("code", "contract"),
+    [
+        (intent.EIP7702_DELEGATION_PREFIX + b"\x11" * 20, False),
+        (intent.EIP7702_DELEGATION_PREFIX + b"\x11" * 21, True),
+        (b"\xef\x01\x01" + b"\x11" * 20, True),
+    ],
+)
+def test_an_eip7702_delegated_eoa_is_not_a_contract(
+    code: bytes, contract: bool
+) -> None:
+    """A delegated EOA's key still moves what it holds: its recipient is declared."""
+    diff = intent.simulate(
+        rpc_with([transfer(TOKEN, SAFE, EOA, 5)]),
+        sender=SAFE,
+        to=TOKEN,
+        value=0,
+        data="0x",
+        get_code=lambda a: code,
+    )
+    assert diff["recipients"] == [{"address": EOA, "contract": contract}]
+    rules = [p["rule"] for p in intent.check_intent(diff, {"recipients": []})]
+    assert ("undeclared-recipient" in rules) is not contract
+
+
 def test_revert_reason_is_decoded() -> None:
     """An Error(string) revert is read out; otherwise the RPC message or the raw data."""
     text = b"too little received"

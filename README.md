@@ -186,10 +186,13 @@ comes from the synthetic `0xeeee…eeee` logs plus, on Celo, the `0x471E…` CEL
 face's `Transfer` logs, summed: a native send logs only the synthetic one and a
 `transfer` on the face logs only its own, so neither is counted twice
 (`chains.NATIVE_ERC20_FACES`). Polygon's own `LogTransfer` is a different event
-and never counted. The rules, each named in
+and never counted. A WETH `Deposit`/`Withdrawal` is counted only when the same
+token logged no `Transfer` mint to (or burn from) the sender, since
+Solmate- and OpenZeppelin-style wrappers log both for one wrap. The rules, each named in
 the refusal and recorded as an activity `refusal` entry: `reverts`,
 `bad-intent`, `missing-intent`, `overspend`, `receive-min`,
-`undeclared-recipient` (EOAs only; burns to the zero address skipped) and
+`undeclared-recipient` (EOAs only, an EIP-7702 delegated EOA counted as one;
+burns to the zero address skipped) and
 `undeclared-approval` (a 0 approval is not checked; `setApprovalForAll` counts
 as a maximum, even when revoking). Only the CELO face's `Transfer` is native:
 its `Approval` is an approval like any other, and an intent naming the face in

@@ -70,6 +70,9 @@ TRANSFER_SINGLE = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2
 TRANSFER_BATCH = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
 DEPOSIT = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c"
 WITHDRAWAL = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"
+# an EIP-7702 delegated EOA's code: this prefix and the 20-byte delegate
+EIP7702_DELEGATION_PREFIX = bytes.fromhex("ef0100")
+EIP7702_DELEGATION_LENGTH = 23
 
 # native ERC-20 faces (Celo's CELO): their Transfer logs are native moves
 NATIVE_ERC20_FACES = frozenset(_FACES.values())
@@ -355,6 +358,7 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
     positions: dict[tuple[str, str], int] = {}
     approvals: list[dict[str, t.Any]] = []
     receivers: list[str] = []
+    minted, burned = _wrapped_by_transfer(holder, logs)
 
     def _sent_to(receiver: str) -> None:
         if receiver not in (holder, ZERO_ADDRESS) and receiver not in receivers:
@@ -402,10 +406,10 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
                 if dst == holder:
                     positions[key] = positions.get(key, 0) + amount
         elif kind == DEPOSIT and len(topics) == 2:  # WETH minted to dst
-            if _topic_address(topics[1]) == holder:
+            if _topic_address(topics[1]) == holder and address not in minted:
                 tokens[address] = tokens.get(address, 0) + _word(data, 0)
         elif kind == WITHDRAWAL and len(topics) == 2:  # WETH burned from src
-            if _topic_address(topics[1]) == holder:
+            if _topic_address(topics[1]) == holder and address not in burned:
                 tokens[address] = tokens.get(address, 0) - _word(data, 0)
         elif (
             address == PERMIT2
@@ -461,7 +465,7 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
                 )
 
     recipients = [
-        {"address": receiver, "contract": bool(get_code(receiver))}
+        {"address": receiver, "contract": _is_contract(get_code(receiver))}
         for receiver in receivers
     ]
     return {
@@ -475,6 +479,39 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
             if delta
         ],
     }
+
+
+def _is_contract(code: bytes) -> bool:
+    """Whether code is a contract's, not an EOA's — an EIP-7702 delegation is not.
+
+    A delegated EOA carries only a pointer to its delegate's code, and its
+    key still moves what it holds: a transfer there leaves for an EOA.
+    """
+    delegated = len(code) == EIP7702_DELEGATION_LENGTH and code.startswith(
+        EIP7702_DELEGATION_PREFIX
+    )
+    return bool(code) and not delegated
+
+
+def _wrapped_by_transfer(holder: str, logs: list[dict]) -> tuple[set, set]:
+    """Return the tokens that logged a Transfer mint to, and a burn from, `holder`.
+
+    Solmate- and OpenZeppelin-style WETH log both Transfer and Deposit (or
+    Withdrawal) for one wrap; the Transfer is counted, so that Deposit is not.
+    """
+    minted: set[str] = set()
+    burned: set[str] = set()
+    for log in logs:
+        topics = [str(x).lower() for x in log.get("topics") or []]
+        if len(topics) != 3 or topics[0] != TRANSFER:
+            continue
+        address = str(log.get("address", "")).lower()
+        src, dst = _topic_address(topics[1]), _topic_address(topics[2])
+        if src == ZERO_ADDRESS and dst == holder:
+            minted.add(address)
+        if src == holder and dst == ZERO_ADDRESS:
+            burned.add(address)
+    return minted, burned
 
 
 def _erc1155_items(kind: str, data: str) -> list[tuple[int, int]]:
