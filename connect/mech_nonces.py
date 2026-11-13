@@ -205,11 +205,15 @@ class NonceAllocator:  # pylint: disable=too-many-instance-attributes
         key = self.key(chain, safe)
         queue = self._queue(key)
         now = self._clock()
+        marked = False
         with self._lock:
-            marked = [n for n in nonces if n in queue.slots]
-            for nonce in marked:
-                if queue.slots[nonce].delivered_at is None:
-                    queue.slots[nonce].delivered_at = now
+            for nonce in nonces:
+                # _sync frees slots under the queue's lock, not this one: a
+                # slot settled meanwhile is simply gone, with nothing to mark
+                slot = queue.slots.get(nonce)
+                if slot is not None and slot.delivered_at is None:
+                    slot.delivered_at = now
+                    marked = True
         if marked:
             self._save()
 

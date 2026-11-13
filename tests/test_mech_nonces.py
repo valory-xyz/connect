@@ -225,6 +225,35 @@ def test_a_delivery_starts_the_settle_clock(
     assert queue.slots[5].delivered_at == 1010.0
 
 
+class _SettledMidLookup(dict):
+    """Slots whose membership check races _sync, which frees the slot."""
+
+    def __contains__(self, nonce: object) -> bool:
+        """Answer as the slot stood, then settle it, as _sync would."""
+        present = super().__contains__(nonce)
+        self.pop(nonce, None)
+        return present
+
+    def get(self, nonce: t.Any, default: t.Any = None) -> t.Any:
+        """Settle the slot before the lookup, as _sync would between them."""
+        self.pop(nonce, None)
+        return default
+
+
+def test_a_delivery_of_a_slot_settled_meanwhile_is_ignored(
+    allocator: NonceAllocator,
+) -> None:
+    """_sync frees slots under the queue lock alone: delivered() must not raise."""
+    with take(allocator, 5) as slot:
+        slot.answered("accepted", mech=MECH_A, salt="")
+    queue = allocator._queue(  # pylint: disable=protected-access
+        allocator.key("gnosis", SAFE)
+    )
+    queue.slots = _SettledMidLookup(queue.slots)
+    allocator.delivered("gnosis", SAFE, [5])
+    assert 5 not in dict(queue.slots)
+
+
 def test_queues_survive_a_restart(tmp_path: Path, clock: Clock) -> None:
     """Held slots, salts and the stall are read back, so nothing is reissued."""
     first = NonceAllocator(tmp_path, clock=clock, sleep=clock.sleep)
