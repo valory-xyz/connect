@@ -27,7 +27,12 @@ import pytest
 from mech_client import OffchainRequestRejected, OffchainTopUpFailed
 
 from connect import mech_nonces
-from connect.mech_nonces import NonceAllocator, NonceRefused, send_with_nonce
+from connect.mech_nonces import (
+    NonceAllocator,
+    NonceAnswerUnknown,
+    NonceRefused,
+    send_with_nonce,
+)
 from connect.mech_types import MechError, MechNotSent
 from connect.signer import SignerError
 
@@ -386,6 +391,10 @@ def test_send_with_nonce_names_each_rejection(  # pylint: disable=too-many-argum
     assert isinstance(error, NonceRefused)
     assert error.rule == rule
     assert (salt_of(allocator, 5) is not None) is held
+    # a lost answer is its own type, carrying the nonce its id was signed with
+    assert isinstance(error, NonceAnswerUnknown) is held
+    if held:
+        assert t.cast(NonceAnswerUnknown, error).nonce == 5
 
 
 def test_send_with_nonce_frees_a_nonce_never_sent_and_holds_a_lost_one(
@@ -541,7 +550,7 @@ def test_offchain_send_tells_a_failure_before_the_post_apart() -> None:
 
     with pytest.raises(MechNotSent, match="not sent: rpc"):
         mech_nonces.offchain_send(failing(True, ConnectionError("rpc")), seen.append)
-    with pytest.raises(NonceRefused, match="lost after it was signed") as lost:
+    with pytest.raises(NonceAnswerUnknown, match="lost after it was signed") as lost:
         mech_nonces.offchain_send(  # the POST may have reached the mech
             failing(False, ConnectionError("rpc")), lambda *a: seen.append(a)
         )

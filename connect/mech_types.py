@@ -42,14 +42,18 @@ class MechAnswerUnknown(MechError):
     """The mech's answer to a signed request was lost: it may be paid for.
 
     `pending_request_ids` are registered for mech_result to collect, since
-    the mech may still store and deliver the request.
+    the mech may still store and deliver the request; `deposited` is what an
+    auto top-up paid into the balance tracker on the way, else 0.
     """
 
-    def __init__(self, message: str, pending_request_ids: list[str]) -> None:
+    def __init__(
+        self, message: str, pending_request_ids: list[str], deposited: int = 0
+    ) -> None:
         """Initialize."""
-        super().__init__(message, pending_request_ids)
+        super().__init__(message, pending_request_ids, deposited)
         self.message = message
         self.pending_request_ids = pending_request_ids
+        self.deposited = deposited
 
     def __str__(self) -> str:
         """Return the error a caller reads."""

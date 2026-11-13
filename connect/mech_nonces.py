@@ -72,29 +72,42 @@ NONCE_TAKEN_REASON = "wire nonce below sender's next expected slot"
 Outcome = t.Literal["accepted", "retry", "not_accepted", "taken", "unknown"]
 ACCEPTED: Outcome = "accepted"
 UNKNOWN: Outcome = "unknown"
+ANSWER_UNKNOWN_RULE = "mech-answer-unknown"
 
 
 class NonceRefused(Exception):
-    """The allocator will not hand out a nonce now; `rule` names why.
+    """No request went out on a nonce, or none was accepted; `rule` names why.
 
-    `deposited` is what mech-client's auto top-up paid into the balance
-    tracker before the mech refused the request anyway, else 0. `nonce` is
-    the one the mech answered for, when a request was sent with one.
+    The allocator would not hand one out, or the mech answered that it did
+    not accept the request. `deposited` is what mech-client's auto top-up
+    paid into the balance tracker before the mech refused it anyway, else 0.
     """
 
-    def __init__(
-        self, rule: str, detail: str, deposited: int = 0, nonce: int | None = None
-    ) -> None:
+    def __init__(self, rule: str, detail: str, deposited: int = 0) -> None:
         """Initialize."""
-        super().__init__(rule, detail, deposited, nonce)
+        super().__init__(rule, detail, deposited)
         self.rule = rule
         self.detail = detail
         self.deposited = deposited
-        self.nonce = nonce
 
     def __str__(self) -> str:
         """Return the refusal a caller reads."""
         return self.detail
+
+
+class NonceAnswerUnknown(NonceRefused):
+    """The answer to a signed request was lost (a 5xx, a dropped connection).
+
+    Not a refusal: the mech may hold the request and charge for it, so the
+    nonce stays held, and `nonce` — the one it was signed with — lets the
+    caller keep its request id pending. The rule is always mech-answer-unknown.
+    """
+
+    def __init__(self, detail: str, nonce: int, deposited: int = 0) -> None:
+        """Initialize."""
+        super().__init__(ANSWER_UNKNOWN_RULE, detail, deposited)
+        self.args = (detail, nonce, deposited)
+        self.nonce = nonce
 
 
 @dataclass
@@ -498,12 +511,10 @@ def outcome_of(rejection: OffchainRequestRejected | OffchainTopUpFailed) -> Outc
     return UNKNOWN
 
 
-ANSWER_UNKNOWN_RULE = "mech-answer-unknown"
 REJECTION_RULES = {
     "retry": "mech-nonce-gap",
     "taken": "mech-nonce-taken",
     "not_accepted": "mech-request-rejected",
-    "unknown": ANSWER_UNKNOWN_RULE,
 }
 
 
@@ -539,7 +550,7 @@ def offchain_send(
     hook's id check, the signer) come before the POST too. Those raise
     MechNotSent, and leave the nonce free. Anything else may have reached it:
     after the hook, the request was signed, so a failure there (a transport
-    error) is the mech's answer lost, raised as ANSWER_UNKNOWN_RULE with the
+    error) is the mech's answer lost, raised as NonceAnswerUnknown with the
     nonce the hook was handed, for the caller to keep its id pending.
     """
     hooked: list[int] = []
@@ -557,11 +568,10 @@ def offchain_send(
     except Exception as e:
         if not hooked:
             raise MechNotSent(f"mech request not sent: {e}") from e
-        raise NonceRefused(
-            ANSWER_UNKNOWN_RULE,
+        raise NonceAnswerUnknown(
             f"the mech's answer to nonce {hooked[-1]} was lost after it was "
             f"signed: {e}",
-            nonce=hooked[-1],
+            hooked[-1],
         ) from e
 
 
@@ -586,6 +596,8 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
     transport error) leaves the slot held, since the mech may have stored it.
 
     :raises NonceRefused: naming the rule, when the mech did not accept it.
+    :raises NonceAnswerUnknown: when its answer was lost (a 5xx): the request
+        was signed, so the mech may hold it.
     """
     with allocator.reserve(
         chain, safe, mech, read_map_nonces, timeout=timeout, salt=salt
@@ -603,11 +615,12 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
                     mech=mech,
                     salt=salt,
                 )
+                if outcome == UNKNOWN:
+                    raise NonceAnswerUnknown(
+                        _answer(e), slot.nonce, getattr(e, "deposited", 0)
+                    ) from e
                 raise NonceRefused(
-                    REJECTION_RULES[outcome],
-                    _answer(e),
-                    getattr(e, "deposited", 0),
-                    slot.nonce,
+                    REJECTION_RULES[outcome], _answer(e), getattr(e, "deposited", 0)
                 ) from e
             except not_sent:
                 slot.answered("not_accepted", mech=mech, salt=salt)

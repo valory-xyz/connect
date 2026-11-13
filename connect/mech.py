@@ -65,6 +65,7 @@ from connect.mech_chat import chat_report, is_chat_prompt
 from connect.mech_nonces import (
     ANSWER_UNKNOWN_RULE,
     NonceAllocator,
+    NonceAnswerUnknown,
     NonceRefused,
     not_sent_on_error,
     offchain_send,
@@ -626,31 +627,28 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         deadline = time.monotonic() + timeout
         try:
             result = self._send(plan, prompt, timeout)
+        except MechAnswerUnknown as e:  # the mech may hold it: keep its id pending
+            self._with_pending(
+                {"request_ids": e.pending_request_ids},
+                chain=plan.chain,
+                mech=plan.priced.mech,
+                service_id=plan.priced.service_id,
+                offchain=True,
+            )
+            self._record_deposit(plan, request_id, e.deposited)
+            self._activity.record(
+                "mech_request_failed",
+                chain=plan.chain,
+                tool=plan.tool,
+                request_id=request_id,
+                error=str(e),
+                pending_request_ids=e.pending_request_ids,
+            )
+            raise
         except NonceRefused as e:
             safe = t.cast(str, self._config.chain(plan.chain).safe_address)
             note = self._nonces.stall_note(plan.chain, safe)
-            if e.deposited:  # the top-up landed before the mech refused anyway
-                self._activity.record(
-                    "mech_deposit",
-                    chain=plan.chain,
-                    request_id=request_id,
-                    amount=str(e.deposited),
-                )
-            if e.rule == ANSWER_UNKNOWN_RULE:  # the mech may hold it: not a refusal
-                held = self._held_unanswered(plan, t.cast(int, e.nonce))
-                self._activity.record(
-                    "mech_request_failed",
-                    chain=plan.chain,
-                    tool=plan.tool,
-                    request_id=request_id,
-                    error=str(e),
-                    pending_request_ids=held,
-                )
-                raise MechAnswerUnknown(
-                    f"rule '{e.rule}': {e}{note}; pending_request_ids: {held} "
-                    "(mech_result collects it if the mech delivers it)",
-                    held,
-                ) from e
+            self._record_deposit(plan, request_id, e.deposited)
             self._activity.record(
                 "refusal",
                 rule=e.rule,
@@ -787,33 +785,37 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             ):
                 return send(wait)
         offchain, salt = plan.offchain, (plan.extra_attributes or {})["nonce"]
-        return send_with_nonce(
-            self._nonces,
-            chain=plan.chain,
-            safe=safe,
-            mech=plan.priced.mech,
-            salt=str(salt),
-            read_map_nonces=not_sent_on_error(offchain.map_nonces),
-            send=lambda nonce: offchain_send(
-                lambda **kw: send(wait, nonces=[nonce], **kw), offchain.on_request_id
-            ),
-            not_sent=(MechNotSent,),
-            timeout=timeout,
-        )
+        try:
+            return send_with_nonce(
+                self._nonces,
+                chain=plan.chain,
+                safe=safe,
+                mech=plan.priced.mech,
+                salt=str(salt),
+                read_map_nonces=not_sent_on_error(offchain.map_nonces),
+                send=lambda nonce: offchain_send(
+                    lambda **kw: send(wait, nonces=[nonce], **kw),
+                    offchain.on_request_id,
+                ),
+                not_sent=(MechNotSent,),
+                timeout=timeout,
+            )
+        except NonceAnswerUnknown as e:  # its id, derived as the pre-sign hook did
+            held = [offchain.request_id(e.nonce).hex()]
+            note = self._nonces.stall_note(plan.chain, safe)
+            raise MechAnswerUnknown(
+                f"rule '{ANSWER_UNKNOWN_RULE}': {e}{note}; pending_request_ids: "
+                f"{held} (mech_result collects it if the mech delivers it)",
+                held,
+                e.deposited,
+            ) from e
 
-    def _held_unanswered(self, plan: _RequestPlan, nonce: int) -> list[str]:
-        """Register a request whose answer was lost, for mech_result; return its id.
-
-        Derived from the nonce, as the pre-sign hook checked it: no RPC is trusted.
-        """
-        request_id = t.cast(OffchainDigests, plan.offchain).request_id(nonce)
-        return self._with_pending(
-            {"request_ids": ["0x" + request_id.hex()]},
-            chain=plan.chain,
-            mech=plan.priced.mech,
-            service_id=plan.priced.service_id,
-            offchain=True,
-        )["pending_request_ids"]
+    def _record_deposit(self, plan: _RequestPlan, rid: str | None, amount: int) -> None:
+        """Audit what a top-up deposited before the mech refused or lost it."""
+        if amount:
+            self._activity.record(
+                "mech_deposit", chain=plan.chain, request_id=rid, amount=str(amount)
+            )
 
     def _with_pending(  # pylint: disable=too-many-locals
         self,
