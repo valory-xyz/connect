@@ -259,8 +259,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         """Decode calldata against the signatures Connect ships.
 
         Returns {selector, signature, args}, or {selector, error} for a
-        selector Connect does not know. `chain` is accepted for symmetry with
-        the other read tools; decoding needs no RPC.
+        selector Connect does not know or calldata too large to decode.
+        `chain` is accepted for symmetry with the other read tools; decoding
+        needs no RPC.
         """
         return chain_read.decode_calldata(data)
 

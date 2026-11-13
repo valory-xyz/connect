@@ -248,6 +248,11 @@ def chain_call(w3: Web3, to: str, data: str, block: str = "latest") -> dict:
 
 
 BLOCK_TAGS = ("latest", "pending", "earliest", "safe", "finalized")
+# decode_calldata's bounds. ABI offsets may all point at one blob, so a small
+# input can decode to N copies of it: the input is capped before decoding, and
+# the decoded tree is measured before it is hex-encoded a second time.
+MAX_CALLDATA_BYTES = 64 * 1024
+MAX_DECODED_BYTES = 2 * MAX_CALLDATA_BYTES
 
 
 def _block(block: str) -> t.Any:
@@ -347,6 +352,11 @@ def decode_calldata(data: str) -> dict:
     selector = "0x" + raw[:8]
     if len(raw) < 8:
         return {"selector": selector, "error": "calldata shorter than a selector"}
+    if len(raw) > 2 * MAX_CALLDATA_BYTES:
+        return {
+            "selector": selector,
+            "error": f"calldata longer than {MAX_CALLDATA_BYTES} bytes",
+        }
     candidates = SELECTORS.get(selector)
     if not candidates:
         return {"selector": selector, "error": "unknown selector"}
@@ -355,9 +365,14 @@ def decode_calldata(data: str) -> dict:
     except ValueError:
         return {"selector": selector, "error": "calldata is not hex"}
     for signature in candidates:
-        args = _decode_args(signature, args_raw)
-        if args is not None:
-            return {"selector": selector, "signature": signature, "args": args}
+        decoded = _decode_args(signature, args_raw)
+        if decoded is not None:
+            outcome = (
+                {"error": "decoded arguments too large"}
+                if _decoded_size(decoded) > MAX_DECODED_BYTES
+                else {"args": _jsonable(decoded)}
+            )
+            return {"selector": selector, "signature": signature, **outcome}
     return {
         "selector": selector,
         "signature": candidates[0],
@@ -365,14 +380,22 @@ def decode_calldata(data: str) -> dict:
     }
 
 
-def _decode_args(signature: str, args_raw: bytes) -> list | None:
+def _decode_args(signature: str, args_raw: bytes) -> tuple | None:
     """Decode arguments as `signature` takes them, or None if they do not fit."""
     types = _split_types(signature.partition("(")[2][:-1])
     try:
-        decoded = abi_decode(types, args_raw)
+        return tuple(abi_decode(types, args_raw))
     except DecodingError:  # the bytes do not fit; a bad signature still raises
         return None
-    return _jsonable(decoded)
+
+
+def _decoded_size(value: t.Any) -> int:
+    """Return the bytes a decoded ABI value holds; a scalar counts as one word."""
+    if isinstance(value, (list, tuple)):
+        return sum(_decoded_size(v) for v in value)
+    if isinstance(value, (bytes, str)):
+        return len(value)
+    return 32
 
 
 def _jsonable(value: t.Any) -> t.Any:

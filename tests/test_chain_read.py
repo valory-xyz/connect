@@ -177,6 +177,29 @@ def test_get_abi_follows_the_eip1967_slot_and_says_when_it_knows_nothing() -> No
     assert "no ABI Connect ships" in unknown["note"]
 
 
+def test_decode_calldata_refuses_an_oversized_input() -> None:
+    """Calldata past the cap is refused by name, before anything is decoded."""
+    raw = "ac9650d8" + "00" * chain_read.MAX_CALLDATA_BYTES
+    assert chain_read.decode_calldata("0x" + raw) == {
+        "selector": "0xac9650d8",
+        "error": f"calldata longer than {chain_read.MAX_CALLDATA_BYTES} bytes",
+    }
+
+
+def test_decode_calldata_bounds_what_one_blob_expands_to() -> None:
+    """Offsets that all point at one blob decode to N copies: that is refused."""
+    count = 64
+    blob = 4 * 1024
+    words = [32, count] + [32 * count] * count + [blob]
+    args = b"".join(w.to_bytes(32, "big") for w in words) + b"\x01" * blob
+    assert len(args) < chain_read.MAX_CALLDATA_BYTES < count * blob
+    assert chain_read.decode_calldata("0xac9650d8" + args.hex()) == {
+        "selector": "0xac9650d8",
+        "signature": "multicall(bytes[])",
+        "error": "decoded arguments too large",
+    }
+
+
 def test_decode_calldata() -> None:
     """Known selectors decode; short, unknown or undecodable data says why."""
     decoded = chain_read.decode_calldata(
