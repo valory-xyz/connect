@@ -93,3 +93,18 @@ class PendingDelivery(t.NamedTuple):
     service_id: int
     offchain: bool
     from_block: int | None
+
+
+def published_tools(document: t.Any) -> list[str]:
+    """Return the tool names a mech's metadata document publishes.
+
+    The document is published by the mech operator, so neither its shape nor
+    its contents are ours to assume. A `tools` that is not a list must not be
+    iterated (a bare string yields one "tool" per character), and an entry that
+    is not a name must not be stringified into one: both invent
+    plausible-looking tools that no mech serves.
+    """
+    raw = (document if isinstance(document, dict) else {}).get("tools")
+    if not isinstance(raw, list):
+        return []
+    return [name for name in raw if isinstance(name, str) and name.strip()]

@@ -76,6 +76,7 @@ from connect.mech_types import (
     PendingDelivery,
     PricedMech,
     SPEND_UNCERTAIN,
+    published_tools,
 )
 from connect.signer import Signer, SignerError
 
@@ -264,17 +265,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             "max_delivery_rate": str(max_delivery_rate),
         }
         read = service.tool_manager.read_tools_metadata(service_id)
-        # The document is published by the mech operator, so neither its shape
-        # nor its contents are ours to assume. A `tools` that is not a list
-        # must not be iterated (a bare string yields one "tool" per character),
-        # and an entry that is not a name must not be stringified into one:
-        # both invent plausible-looking tools that no mech serves.
-        raw_tools = (read.document or {}).get("tools")
-        tool_names = (
-            [n for n in raw_tools if isinstance(n, str) and n.strip()]
-            if isinstance(raw_tools, list)
-            else []
-        )
+        tool_names = published_tools(read.document)
         if tool_names:
             info["tools"] = tool_names
         elif read.document is None:

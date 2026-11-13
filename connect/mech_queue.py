@@ -26,18 +26,23 @@ marketplace request from the safe that consumes the stuck mapNonces.
 """
 
 import asyncio
+import logging
 import time
 import typing as t
 
-from mech_client import NonceAllocator
+from mech_client import MechPriceExceeded, NonceAllocator
 from mech_client.services.marketplace_service import MarketplaceService
 from web3 import Web3
 
 from connect.activity import ActivityLog
 from connect.config import AppConfig
+from connect.guard import GuardError
 from connect.mech_allowances import read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT
-from connect.mech_types import MechError
+from connect.mech_types import MechError, published_tools
+from connect.signer import SignerError
+
+logger = logging.getLogger("agent")
 
 STALL_NOTE = (
     "; mech_queue_stalled: the mech is not settling this safe's requests in "
@@ -51,6 +56,24 @@ HARD_CANCEL_AVAILABLE = (
 HARD_CANCEL_PROMPT = "Connect hard cancel: consumes this safe's stuck marketplace nonce"
 # the hard cancel only needs its transaction mined, not the mech's answer
 HARD_CANCEL_WAIT_SECONDS = 1.0
+
+
+class HardCancelRefused(MechError):
+    """The hard cancel will not send, for a reason Connect names (`rule`)."""
+
+    def __init__(self, rule: str, detail: str) -> None:
+        """Initialize."""
+        super().__init__(rule, detail)
+        self.rule = rule
+        self.detail = detail
+
+    def __str__(self) -> str:
+        """Return the refusal a caller reads."""
+        return self.detail
+
+
+class HardCancelFailed(Exception):
+    """The hard cancel's request failed after it was sent for; it is audited."""
 
 
 class MechQueue:
@@ -115,43 +138,54 @@ class MechQueue:
         """Consume the stuck mapNonces with one on-chain request, and audit it.
 
         mech-client's `allocator.hard_cancel` refuses (`mech-queue-not-stalled`)
-        unless the queue has been stalled for MECH_HARD_CANCEL_AFTER, and holds
-        the queue meanwhile. The request goes to the mech of the stuck slot,
-        capped by that mech's default max_payment, and is signed like any
-        on-chain mech request: through the guard, server-built.
+        unless the queue has been stalled for MECH_HARD_CANCEL_AFTER, holds the
+        queue meanwhile, and restarts the stall clock when it exits, whatever
+        happened inside. So everything that can refuse before the broadcast
+        (the stuck mech, its price against its default budget, a tool to send)
+        is settled first, outside it: such a refusal costs the operator no
+        window. The request goes to the mech of the stuck slot, capped by that
+        mech's default max_payment, and is signed like any on-chain mech
+        request: through the guard, server-built.
 
         :raises NonceRefused: the allocator's refusal, naming its rule.
-        :raises MechError: no stuck mech, or nothing to send it with.
+        :raises HardCancelRefused: nothing to cancel, or nothing to send it with.
+        :raises SignerError: the guard refused the request.
+        :raises HardCancelFailed: the request failed (audited, logged).
         """
         # the service was built for this chain, so it has a safe
         safe = t.cast(str, self._config.chain(chain).safe_address)
         contract = service.marketplace_contract()
+
+        def read_map() -> int:
+            return read_map_nonces(contract, safe)
+
+        mech = self._stuck_mech(chain, safe, read_map())
+        info = service.mech_info(mech)
+        cap = DEFAULT_MAX_PAYMENT.get(info.payment_type)
+        if cap is None or info.max_delivery_rate > cap:
+            raise HardCancelRefused(
+                "over-max-payment",
+                f"mech {mech} charges {info.max_delivery_rate} per request, above "
+                f"its default max_payment {cap}",
+            )
+        read = service.tool_manager.read_tools_metadata(info.service_id)
+        tools = published_tools(read.document)
+        if not tools:
+            cause = (
+                f" (metadata unreadable: {read.error})" if read.document is None else ""
+            )
+            raise HardCancelRefused(
+                "hard-cancel-no-tool", f"mech {mech} publishes no tool to send{cause}"
+            )
         with self.allocator.hard_cancel(
-            chain,
-            safe,
-            lambda: read_map_nonces(contract, safe),
-            stalled_for=self._config.mech_hard_cancel_after,
+            chain, safe, read_map, stalled_for=self._config.mech_hard_cancel_after
         ) as nonce:
-            mech = self._stuck_mech(chain, safe, nonce)
-            info = service.mech_info(mech)
-            cap = DEFAULT_MAX_PAYMENT.get(info.payment_type)
-            tools = (
-                service.tool_manager.read_tools_metadata(info.service_id).document or {}
-            ).get("tools")
-            if cap is None or not isinstance(tools, list) or not tools:
-                raise MechError(
-                    f"cannot hard cancel through mech {mech}: it has no default "
-                    "budget or publishes no tool to send"
+            if self._stuck_mech(chain, safe, nonce) != mech:  # it moved meanwhile
+                raise HardCancelRefused(
+                    "hard-cancel-moved", "the stuck slot changed; try again"
                 )
-            result = asyncio.run(
-                service.send_request(
-                    prompts=(HARD_CANCEL_PROMPT,),
-                    tools=(str(tools[0]),),
-                    priority_mech=mech,
-                    use_offchain=False,
-                    max_price=cap,
-                    timeout=HARD_CANCEL_WAIT_SECONDS,
-                )
+            result = self._send(
+                service, chain, nonce=nonce, mech=mech, tool=tools[0], cap=cap
             )
         report = {
             "tx_hash": str(result.get("tx_hash")),
@@ -161,6 +195,58 @@ class MechQueue:
         }
         self._activity.record("mech_hard_cancel", chain=chain, **report)
         return report
+
+    def _send(  # pylint: disable=too-many-arguments
+        self,
+        service: MarketplaceService,
+        chain: str,
+        *,
+        nonce: int,
+        mech: str,
+        tool: str,
+        cap: int,
+    ) -> dict:
+        """Send the hard cancel's on-chain request; audit a failure in full.
+
+        A failure may have paid already, so its record names the nonce and the
+        mech to check the safe against.
+        """
+        try:
+            return dict(
+                asyncio.run(
+                    service.send_request(
+                        prompts=(HARD_CANCEL_PROMPT,),
+                        tools=(tool,),
+                        priority_mech=mech,
+                        use_offchain=False,
+                        max_price=cap,
+                        timeout=HARD_CANCEL_WAIT_SECONDS,
+                    )
+                )
+            )
+        except MechPriceExceeded:  # mech-client's cap: refused before paying
+            raise
+        except SignerError as e:
+            if isinstance(e.__cause__, GuardError):  # refused before signing
+                raise
+            failure: Exception = e
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            failure = e
+        logger.error(
+            "the hard cancel on %s (nonce %s, mech %s) failed",
+            chain,
+            nonce,
+            mech,
+            exc_info=failure,
+        )
+        self._activity.record(
+            "mech_hard_cancel_failed",
+            chain=chain,
+            nonce=nonce,
+            mech=mech,
+            error=type(failure).__name__,
+        )
+        raise HardCancelFailed(chain) from failure
 
     def _stuck_mech(self, chain: str, safe: str, nonce: int) -> str:
         """Return the mech of the safe's slot at `nonce`, else its lowest held one.
@@ -174,8 +260,9 @@ class MechQueue:
         slots = dict(queue.slots)
         slot = slots.get(nonce) or (slots[min(slots)] if slots else None)
         if slot is None:
-            raise MechError(
+            raise HardCancelRefused(
+                "hard-cancel-no-slot",
                 f"this safe holds no off-chain slot on {chain}, so there is no "
-                "stuck request's mech to send the hard cancel to"
+                "stuck request's mech to send the hard cancel to",
             )
         return Web3.to_checksum_address(slot.mech)

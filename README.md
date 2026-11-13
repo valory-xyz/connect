@@ -517,7 +517,15 @@ of the stuck slot, capped by that mech's default `max_payment` and signed
 through the guard like any on-chain mech request, which consumes the stuck
 `mapNonces` (mech-client's `allocator.hard_cancel`). It answers
 `{tx_hash, nonce, mech, paid}`, is audited as `mech_hard_cancel`, and restarts
-the stall clock, so a second one needs its own window. `GET /mech-queue`
+the stall clock, so a second one needs its own window. What can refuse it
+before anything is sent — no slot of the safe's to name the mech, a price
+above that mech's default budget, no tool it publishes (with why its metadata
+could not be read) — is settled before the queue is held, so it costs no
+window. Every refusal names its rule (`unknown-chain`, `hard-cancel-no-slot`,
+`over-max-payment`, `hard-cancel-no-tool`, `guardrail`,
+`mech-queue-not-stalled`) and is audited as a `refusal`; a request that fails
+once sent answers a fixed 502 and is audited as `mech_hard_cancel_failed` with
+its nonce, mech and error class, since it may have paid. `GET /mech-queue`
 (origin-gated) reports each safe's queue per chain — `stalled`,
 `stalled_since`, `hard_cancel_available` — for the operator's UI. An on-chain request takes `mapNonces`
 itself, so it waits until no off-chain slot is held. Held slots, their metadata
