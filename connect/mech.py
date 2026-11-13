@@ -74,6 +74,7 @@ from connect.mech_rpc import RPC_LOCK, listing_mechs
 from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
 from connect.mech_types import (
+    MechAnswerUnknown,
     MechError,
     MechNotSent,
     MechUnknownRequest,
@@ -605,7 +606,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             terms=terms,
         )
 
-    def _dispatch(
+    def _dispatch(  # pylint: disable=too-many-locals
         self,
         plan: _RequestPlan,
         prompt: str,
@@ -636,14 +637,20 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     amount=str(e.deposited),
                 )
             if e.rule == ANSWER_UNKNOWN_RULE:  # the mech may hold it: not a refusal
+                held = self._held_unanswered(plan, t.cast(int, e.nonce))
                 self._activity.record(
                     "mech_request_failed",
                     chain=plan.chain,
                     tool=plan.tool,
                     request_id=request_id,
                     error=str(e),
+                    pending_request_ids=held,
                 )
-                raise MechError(f"rule '{e.rule}': {e}{note}") from e
+                raise MechAnswerUnknown(
+                    f"rule '{e.rule}': {e}{note}; pending_request_ids: {held} "
+                    "(mech_result collects it if the mech delivers it)",
+                    held,
+                ) from e
             self._activity.record(
                 "refusal",
                 rule=e.rule,
@@ -793,6 +800,20 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             not_sent=(MechNotSent,),
             timeout=timeout,
         )
+
+    def _held_unanswered(self, plan: _RequestPlan, nonce: int) -> list[str]:
+        """Register a request whose answer was lost, for mech_result; return its id.
+
+        Derived from the nonce, as the pre-sign hook checked it: no RPC is trusted.
+        """
+        request_id = t.cast(OffchainDigests, plan.offchain).request_id(nonce)
+        return self._with_pending(
+            {"request_ids": ["0x" + request_id.hex()]},
+            chain=plan.chain,
+            mech=plan.priced.mech,
+            service_id=plan.priced.service_id,
+            offchain=True,
+        )["pending_request_ids"]
 
     def _with_pending(  # pylint: disable=too-many-locals
         self,

@@ -80,6 +80,7 @@ from connect.mech_allowances import (
     deposit_tracker,
     request_digest,
 )
+from connect.mech_types import MechAnswerUnknown
 from connect.safe import (
     APPROVE_SELECTOR,
     DEPOSIT_SELECTOR,
@@ -4635,6 +4636,7 @@ class TestMech:
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A 5xx: the mech may have stored it, so the id is not freed."""
         patched_mech.raises = OffchainRequestRejected(
@@ -4653,11 +4655,29 @@ class TestMech:
         kinds = audit_kinds(store_path)
         assert "mech_request_failed" in kinds
         assert "refusal" not in kinds
+        # the id the pre-sign hook would have checked, so mech_result can
+        # collect a delivery the safe may have paid for
+        (held,) = t.cast(MechAnswerUnknown, raised.value).pending_request_ids
+        assert held in str(raised.value)
+        (failed,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request_failed"
+        ]
+        assert failed["pending_request_ids"] == [held]
         patched_mech.raises = None
-        with pytest.raises(MechError, match="cannot tell whether it was paid"):
+        with pytest.raises(MechError, match=f"{held}.*cannot tell whether it was paid"):
             mech_service.request(
                 "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r9"
             )
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            assert pending.offchain
+            assert pending.mech == OTHER
+            return {key: DeliveryResult(key, {"answer": "42"}, None)}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        assert mech_service.result(held, timeout=1)["result"] == {"answer": "42"}
 
     def test_a_stalled_queue_is_reported(
         self,

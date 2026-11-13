@@ -78,15 +78,19 @@ class NonceRefused(Exception):
     """The allocator will not hand out a nonce now; `rule` names why.
 
     `deposited` is what mech-client's auto top-up paid into the balance
-    tracker before the mech refused the request anyway, else 0.
+    tracker before the mech refused the request anyway, else 0. `nonce` is
+    the one the mech answered for, when a request was sent with one.
     """
 
-    def __init__(self, rule: str, detail: str, deposited: int = 0) -> None:
+    def __init__(
+        self, rule: str, detail: str, deposited: int = 0, nonce: int | None = None
+    ) -> None:
         """Initialize."""
-        super().__init__(rule, detail, deposited)
+        super().__init__(rule, detail, deposited, nonce)
         self.rule = rule
         self.detail = detail
         self.deposited = deposited
+        self.nonce = nonce
 
     def __str__(self) -> str:
         """Return the refusal a caller reads."""
@@ -595,6 +599,7 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
                     REJECTION_RULES[outcome],
                     _answer(e),
                     getattr(e, "deposited", 0),
+                    slot.nonce,
                 ) from e
             except not_sent:
                 slot.answered("not_accepted", mech=mech, salt=salt)

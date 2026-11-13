@@ -38,6 +38,24 @@ class MechNotSent(MechError):
     """
 
 
+class MechAnswerUnknown(MechError):
+    """The mech's answer to a signed request was lost: it may be paid for.
+
+    `pending_request_ids` are registered for mech_result to collect, since
+    the mech may still store and deliver the request.
+    """
+
+    def __init__(self, message: str, pending_request_ids: list[str]) -> None:
+        """Initialize."""
+        super().__init__(message, pending_request_ids)
+        self.message = message
+        self.pending_request_ids = pending_request_ids
+
+    def __str__(self) -> str:
+        """Return the error a caller reads."""
+        return self.message
+
+
 class MechUnknownRequest(MechError):
     """No delivery is being awaited for this request id.
 
