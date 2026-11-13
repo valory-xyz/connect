@@ -671,9 +671,10 @@ class AuthMiddleware:
             params = params if isinstance(params, dict) else {}
             arguments = params.get("arguments")
             arguments = arguments if isinstance(arguments, dict) else {}
+            name = str(params.get("name"))
             try:
-                if self._grants.authorize(token, str(params.get("name")), arguments):
-                    replays.add((str(params["name"]), str(arguments["request_id"])))
+                if self._grants.authorize(token, name, arguments):
+                    replays.add((name, str(arguments["request_id"])))
             except GrantRefused as e:
                 self._activity.record(
                     "refusal", rule=e.rule, tool=params.get("name"), reason=str(e)
