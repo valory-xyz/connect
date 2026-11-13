@@ -4484,7 +4484,10 @@ class TestMech:
                 timeout=asked,
                 priority_mech=OTHER,
             )
-            assert patched_mech.calls[-1]["timeout"] <= bound
+            # the send waits only ACK_WAIT_SECONDS of the clamped timeout
+            assert patched_mech.calls[-1]["timeout"] == min(
+                bound, mech_module.ACK_WAIT_SECONDS
+            )
             assert all(wait <= bound for wait in waits)
             if bound > 1:  # with 1 s, a coarse clock may or may not leave a wait
                 assert waits
