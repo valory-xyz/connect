@@ -115,6 +115,13 @@ never the workspace token. `mint_token` is `POST /tokens`; the grant is its
 body. The cap bounds the script's mistakes, not a hostile script: it still
 reads `.mcp.json` for the server's address, and the workspace token sits there.
 
+A value cap also takes away what no cap can bound, so it suits only some
+scripts. Under a value-capped token connect-polymarket can read
+(`positions.py`) but not trade: orders, CLOB auth and the deposit wallet's
+batches are raw-digest signatures (`token-cap-sign`), and redeeming moves
+outcome-token positions out of the safe (`token-cap-positions`). For those,
+mint a token with fewer scopes or an expiry, but no value caps.
+
 Scopes are `read`, `mech` and `tx`; caps are per token (`"native"` or a
 token address) in base units, checked against the spend and the approvals the
 call's intent declares; `max_mech_payment` caps `mech_request`'s
