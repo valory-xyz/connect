@@ -424,7 +424,8 @@ do: approve more of a token than its caps allow (an approval is spend the
 spender takes later; refused under the rule of the cap it exceeds), sign a raw digest (`sign_message`: a digest can authorize
 any safe transaction), or move an ERC-721/1155 position out of the safe (the
 gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
-`token-expired`, `token-cap-per-tx`, `token-cap-per-session`,
+`token-expired`, `token-cap-per-tx`, `token-cap-per-session`, `token-cap-sign`
+(a raw digest refused to a value-capped token),
 `token-mech-payment-cap`, and `bad-intent` or `bad-value` for an amount that is
 not a whole number >= 0), come back as the HTTP 403/401 detail or the MCP tool
 error, and are recorded as activity `refusal` entries. MCP calls are authorized

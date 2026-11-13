@@ -183,7 +183,7 @@ def test_a_token_with_either_value_cap_may_not_sign_a_digest(cap: str) -> None:
     capped = store.mint(WORKSPACE, grant(**{cap: {"native": 10}}))
     with pytest.raises(GrantRefused, match="may not sign raw digests") as digest:
         store.authorize(capped, "sign_message", {})
-    assert digest.value.rule == "token-cap-per-tx"
+    assert digest.value.rule == "token-cap-sign"  # neither cap: the power itself
 
 
 @pytest.mark.parametrize(

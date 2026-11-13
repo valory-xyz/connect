@@ -309,7 +309,7 @@ class GrantStore:
             self._check_mech_payment(grant, arguments)
         if action == "sign_message" and grant.value_capped():
             raise GrantRefused(
-                "token-cap-per-tx",
+                "token-cap-sign",
                 "a value-capped token may not sign raw digests: a digest can "
                 "authorize a safe transaction that no cap or intent sees",
             )
