@@ -35,6 +35,7 @@ from connect.server.auth import (
     GrantRefused,
     TokenGrant,
     authorize_route,
+    refused_route,
     request_token,
 )
 from connect.server.strict import StrictBody
@@ -171,9 +172,6 @@ def mint_token(grant: TokenGrant, request: Request) -> dict:
     try:
         token = request.app.state.grants.mint(request_token(request), grant)
     except GrantRefused as e:
-        request.app.state.activity.record(
-            "refusal", rule=e.rule, path=request.url.path, reason=str(e)
-        )
-        raise HTTPException(status_code=e.status, detail=f"rule '{e.rule}': {e}") from e
+        raise refused_route(request, request.app.state.activity, e) from e
     request.app.state.activity.record("token_minted", scopes=grant.scopes)
     return {"token": token, "grant": grant.model_dump()}

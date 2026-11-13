@@ -133,6 +133,14 @@ class GrantRefused(Exception):
         """Return the refusal a caller reads."""
         return self.detail
 
+    @property
+    def message(self) -> str:
+        """Return the refusal as every surface words it, its rule first.
+
+        One wording, since the shipped client reads a refusal by that prefix.
+        """
+        return f"rule '{self.rule}': {self.detail}"
+
 
 def _within(child: dict[str, int] | None, parent: dict[str, int] | None) -> bool:
     """Whether a child's caps are no wider than its parent's (None is no cap)."""
@@ -647,7 +655,7 @@ class AuthMiddleware:
                 return {
                     "jsonrpc": "2.0",
                     "id": call.get("id"),
-                    "error": {"code": -32001, "message": f"rule '{e.rule}': {e}"},
+                    "error": {"code": -32001, "message": e.message},
                 }
         return None
 
@@ -717,5 +725,14 @@ def authorize_route(
     try:
         grants.authorize(getattr(request.state, AUTH_TOKEN), action, arguments)
     except GrantRefused as e:
-        activity.record("refusal", rule=e.rule, path=request.url.path, reason=str(e))
-        raise HTTPException(status_code=e.status, detail=f"rule '{e.rule}': {e}") from e
+        raise refused_route(request, activity, e) from e
+
+
+def refused_route(
+    request: Request, activity: ActivityLog, refused: GrantRefused
+) -> HTTPException:
+    """Audit an HTTP route's grant refusal and return the error that answers it."""
+    activity.record(
+        "refusal", rule=refused.rule, path=request.url.path, reason=str(refused)
+    )
+    return HTTPException(status_code=refused.status, detail=refused.message)

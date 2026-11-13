@@ -463,7 +463,7 @@ def _token_refusal(
     try:
         grants.authorize(token, action, arguments, draw=False)
     except GrantRefused as e:
-        return f"rule '{e.rule}': {e}"
+        return e.message
     return None
 
 
