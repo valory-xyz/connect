@@ -632,7 +632,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 chain=plan.chain,
                 mech=plan.priced.mech,
                 service_id=plan.priced.service_id,
-                offchain=True,
+                offchain=not plan.legacy_on_chain,
             )
             self._record_deposit(plan, request_id, e.deposited)
             self._activity.record(
