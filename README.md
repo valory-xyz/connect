@@ -204,8 +204,8 @@ safe's inner call (to any other address the EOA's own call is what runs, and
 what is simulated), and refused before simulating as `bad-exec-transaction` if
 it also carries value from the EOA, is not a CALL, or pays a gas refund (any of
 `gasPrice`, `gasToken`, `refundReceiver` set), which the inner call's
-simulation would not show. The safe's `approveHash` is refused outright
-(`approve-hash`): it pre-approves a safe transaction by hash, which anyone may
+simulation would not show. The safe's `approveHash` is refused outright, on
+any EOA send whatever its target (`approve-hash`): it pre-approves a safe transaction by hash, which anyone may
 then execute, so no intent could hold it. These refusals are audited like the
 rest, after the guard has answered. Calldata that is not strictly hex of whole
 bytes (a space or a newline included) is refused before anything reaches the

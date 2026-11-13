@@ -44,8 +44,9 @@ cannot simulate — nothing falls back to signing unchecked. Under a
 value-capped token (`Capped`) `token-cap-positions` refuses any ERC-721/1155
 position leaving the sender, which no cap can bound. Three are raised by the
 signer before anything is simulated: `bad-calldata` (calldata that is not
-hex), and for an EOA's execTransaction to the safe `approve-hash` and
-`bad-exec-transaction` (see `Signer._eoa_gate`).
+strictly hex), `approve-hash` (any EOA send of the safe's approveHash,
+whatever its target) and `bad-exec-transaction` (an EOA's execTransaction
+to the safe); see `connect/signer.py`.
 """
 
 import typing as t
