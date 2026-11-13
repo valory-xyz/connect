@@ -210,6 +210,11 @@ def test_decode_calldata() -> None:
         "signature": "transfer(address,uint256)",
         "args": ["0x" + "aa" * 20, "5"],
     }
+    # the signer reads 0X and upper-case hex as the same bytes: so does this
+    shouted = (
+        "0XA9059CBB" + ("00" * 12 + "aa" * 20).upper() + (5).to_bytes(32, "big").hex()
+    )
+    assert chain_read.decode_calldata(shouted) == decoded
     assert chain_read.decode_calldata("0x12")["error"].startswith("calldata shorter")
     assert chain_read.decode_calldata("0x12345678")["error"] == "unknown selector"
     truncated = chain_read.decode_calldata("0xa9059cbb" + "00" * 4)

@@ -19,16 +19,22 @@
 
 """Scoped tokens."""
 
+import asyncio
 import json
+import threading
 import time
 import typing as t
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
+from connect.server import auth as auth_module
+from connect.server import mcp_tools as mcp_tools_module
+from connect.server import signer_routes as signer_routes_module
 from connect.server.auth import (
     AuthFailureLimiter,
     AuthMiddleware,
@@ -40,7 +46,7 @@ from connect.server.auth import (
 )
 from connect.signer import Signer
 
-from tests.conftest import FakeW3, audit_entries, pay
+from tests.conftest import FakeW3, audit_entries, grant_store, pay
 
 WORKSPACE = "workspace-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
@@ -55,7 +61,7 @@ def grant(**kwargs: t.Any) -> TokenGrant:
 
 def test_the_workspace_token_can_do_what_a_session_always_could() -> None:
     """Check read + mech + tx with no caps: the workspace token loses nothing."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     assert store.lookup(f"Bearer {WORKSPACE}") == WORKSPACE
     assert store.grant(WORKSPACE) == WORKSPACE_GRANT
     for action in ("wallet_info", "mech_request", "safe_transaction"):
@@ -64,7 +70,7 @@ def test_the_workspace_token_can_do_what_a_session_always_could() -> None:
 
 def test_unknown_or_malformed_tokens_are_not_found() -> None:
     """Only a Bearer header carrying a token we issued resolves."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     assert store.lookup(None) is None
     assert store.lookup(WORKSPACE) is None  # no Bearer prefix
     assert store.lookup("Bearer nope") is None
@@ -109,9 +115,23 @@ def _capped(per_tx: int, session: int, mech: int, expiry: int) -> dict:
     }
 
 
+def test_a_live_grant_cannot_be_widened_in_place() -> None:
+    """Neither the minting caller's object nor a handed-out grant is the stored one."""
+    store = grant_store(WORKSPACE)
+    asked = grant(max_value_per_tx={"native": 1})
+    capped = store.mint(WORKSPACE, asked)
+    with pytest.raises(ValidationError):
+        store.grant(capped).max_value_per_tx = None  # type: ignore[misc]
+    t.cast(dict, asked.max_value_per_tx)["native"] = 10**30
+    t.cast(dict, store.grant(capped).max_value_per_tx)["native"] = 10**30
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(capped, "safe_transaction", {"value": 2})
+    assert refused.value.rule == "token-cap-per-tx"
+
+
 def test_mint_only_narrows() -> None:
     """A minted token works; a wider grant is refused as token-scope."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     child = store.mint(WORKSPACE, grant(scopes=["read"]))
     assert store.lookup(f"Bearer {child}") == child
     with pytest.raises(GrantRefused, match="narrower") as refused:
@@ -121,7 +141,7 @@ def test_mint_only_narrows() -> None:
 
 def test_a_read_token_reads_and_does_nothing_else() -> None:
     """wallet_info, mech_tools and the status calls; no mech, no tx."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     reader = store.mint(WORKSPACE, grant(scopes=["read"]))
     for action in ("wallet_info", "mech_tools", "mech_result", "transaction_status"):
         store.authorize(reader, action, {})
@@ -133,7 +153,7 @@ def test_a_read_token_reads_and_does_nothing_else() -> None:
 
 def test_an_expired_token_is_refused() -> None:
     """Past expires_at the token answers nothing, and mints nothing."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     old = store.mint(WORKSPACE, grant(expires_at=int(time.time()) - 1))
     with pytest.raises(GrantRefused) as refused:
         store.authorize(old, "wallet_info", {})
@@ -142,7 +162,7 @@ def test_an_expired_token_is_refused() -> None:
 
 def test_mech_payment_cap() -> None:
     """A capped token must name a max_payment within its cap."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_mech_payment=100))
     store.authorize(capped, "mech_request", {"max_payment": 100})
     for asked in (None, 101, True):
@@ -153,7 +173,7 @@ def test_mech_payment_cap() -> None:
 
 def test_value_caps_per_tx_and_per_session() -> None:
     """Caps hold the declared spend (and the native value) per call and in all."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(
         WORKSPACE,
         grant(
@@ -177,11 +197,11 @@ def test_value_caps_per_tx_and_per_session() -> None:
 @pytest.mark.parametrize("cap", ["max_value_per_tx", "max_value_per_session"])
 def test_a_token_with_either_value_cap_may_not_sign_a_digest(cap: str) -> None:
     """A digest can authorize any safe transaction, which no cap would see."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(**{cap: {"native": 10}}))
     with pytest.raises(GrantRefused, match="may not sign raw digests") as digest:
         store.authorize(capped, "sign_message", {})
-    assert digest.value.rule == "token-cap-per-tx"
+    assert digest.value.rule == "token-cap-sign"  # neither cap: the power itself
 
 
 @pytest.mark.parametrize(
@@ -197,7 +217,7 @@ def test_a_capped_token_approves_no_more_than_its_caps(
     approval: dict, allowed: bool
 ) -> None:
     """An approval is spend the spender takes later: the caps bound it too."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(
         WORKSPACE,
         grant(max_value_per_tx={USDC: 5}, max_value_per_session={USDC: 100}),
@@ -218,7 +238,7 @@ def test_a_capped_token_approves_no_more_than_its_caps(
 
 def test_approvals_draw_on_the_session_budget() -> None:
     """Two approvals each under the cap may not add up past it."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
     other = "0x" + "5f" * 20
     store.authorize(
@@ -252,7 +272,7 @@ def test_a_uniswap_swap_draws_its_amount_twice_not_three_times() -> None:
     """
     import router  # pylint: disable=import-outside-toplevel,import-error
 
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 80}))
     intents = [call["intent"] for call in router.approval_calls(4663, USDC, 40, 99)]
     assert intents[0]["approvals"][0]["spender"] == intent_module.PERMIT2
@@ -268,7 +288,7 @@ def test_a_uniswap_swap_draws_its_amount_twice_not_three_times() -> None:
 
 def test_re_approving_permit2_draws_on_the_session_each_time() -> None:
     """Permit2 also honours grants made before this token, so each approval draws."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
     approval = {"token": USDC, "spender": intent_module.PERMIT2, "amount": 100}
     arguments = {"chain": "robinhood", "intent": {"approvals": [approval]}}
@@ -280,7 +300,7 @@ def test_re_approving_permit2_draws_on_the_session_each_time() -> None:
 
 def test_a_universal_router_approval_on_its_chain_draws_nothing() -> None:
     """The router pulls only from its caller: its grant funds only the safe's swaps."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
     approval = {"token": USDC, "spender": ROBINHOOD_ROUTER, "amount": 100}
     arguments = {"chain": "robinhood", "intent": {"approvals": [approval]}}
@@ -291,7 +311,7 @@ def test_a_universal_router_approval_on_its_chain_draws_nothing() -> None:
 
 def test_an_unknown_spender_on_a_listed_chain_draws_on_the_session() -> None:
     """Only a router Connect ships is exempt; any other spender draws."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
     approval = {"token": USDC, "spender": RECIPIENT, "amount": 100}
     arguments = {"chain": "robinhood", "intent": {"approvals": [approval]}}
@@ -306,7 +326,7 @@ def test_a_universal_router_draws_off_the_chain_it_is_deployed_on(
     chain: str | None,
 ) -> None:
     """The Robinhood Chain router's address is not a known router elsewhere."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
     approval = {"token": USDC, "spender": ROBINHOOD_ROUTER, "amount": 100}
     arguments = {"chain": chain, "intent": {"approvals": [approval]}}
@@ -318,7 +338,7 @@ def test_a_universal_router_draws_off_the_chain_it_is_deployed_on(
 
 def test_an_approval_of_permit2_is_still_held_to_the_caps() -> None:
     """An approval of Permit2 may not exceed a cap."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 80}))
     approval = {"token": USDC, "spender": intent_module.PERMIT2, "amount": 81}
     with pytest.raises(GrantRefused, match="may approve at most"):
@@ -330,7 +350,7 @@ def test_an_approval_of_permit2_is_still_held_to_the_caps() -> None:
 @pytest.mark.parametrize("cap", ["max_value_per_tx", "max_value_per_session"])
 def test_an_asset_a_cap_does_not_name_may_not_be_spent(cap: str) -> None:
     """A token capped on native only spends no USDC at all."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(**{cap: {"native": 10}}))
     with pytest.raises(GrantRefused) as refused:
         store.authorize(capped, "safe_transaction", {"intent": {"spend": {USDC: 1}}})
@@ -341,7 +361,7 @@ def test_an_asset_a_cap_does_not_name_may_not_be_spent(cap: str) -> None:
 
 def test_an_integral_float_value_is_taken_and_a_fraction_refused() -> None:
     """5.0 is what the tool's int field takes too; 0.5 and inf are not amounts."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_tx={"native": 5}))
     store.authorize(capped, "safe_transaction", {"value": 5.0})
     for value in (0.5, float("inf")):
@@ -352,7 +372,7 @@ def test_an_integral_float_value_is_taken_and_a_fraction_refused() -> None:
 
 def test_a_call_with_no_known_token_is_held_as_capped() -> None:
     """The one capped rule fails closed: no token, or an unknown one, is capped."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     raw = {"spend": {"native": 1}}
     for token in (None, "not-a-token"):
         assert store.intent_for(token, raw) == intent_module.Capped(raw)
@@ -363,7 +383,7 @@ def test_a_call_with_no_known_token_is_held_as_capped() -> None:
 
 def test_cap_keys_are_normalised_when_minted() -> None:
     """A checksummed address, NATIVE or the CELO face caps what the gate books."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     checksummed = "0x" + "C0" * 20
     capped = store.mint(
         WORKSPACE,
@@ -382,7 +402,7 @@ def test_cap_keys_are_normalised_when_minted() -> None:
 
 def test_a_json_string_intent_is_capped_like_the_tool_reads_it() -> None:
     """Decode a string intent before capping it, as FastMCP does before the tool."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_tx={USDC: 10}))
     with pytest.raises(GrantRefused) as refused:
         store.authorize(
@@ -408,7 +428,7 @@ def test_malformed_amounts_are_refused_before_any_budget_moves(
     arguments: dict, rule: str
 ) -> None:
     """A negative or malformed amount can never refill a session budget."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={USDC: 100}))
     with pytest.raises(GrantRefused) as refused:
         store.authorize(capped, "safe_transaction", arguments)
@@ -420,7 +440,7 @@ def test_malformed_amounts_are_refused_before_any_budget_moves(
 
 def test_children_draw_on_their_parents_session_budget() -> None:
     """Minting more children does not multiply a parent's session cap."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     parent = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     children = [
         store.mint(parent, grant(max_value_per_session={"native": 10}))
@@ -434,7 +454,7 @@ def test_children_draw_on_their_parents_session_budget() -> None:
 
 def test_per_tx_only_caps_do_not_track_a_session() -> None:
     """A per-transaction cap alone has no running total."""
-    store = GrantStore(WORKSPACE)
+    store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_tx={"native": 10}))
     for _ in range(3):
         store.authorize(capped, "safe_transaction", {"value": 10})
@@ -591,7 +611,7 @@ class TestMcpMiddleware:
     @pytest.fixture
     def setup(self, activity: ActivityLog) -> tuple[AuthMiddleware, str]:
         """Return a middleware over a store with a read-only token minted."""
-        store = GrantStore(WORKSPACE)
+        store = grant_store(WORKSPACE)
         reader = store.mint(WORKSPACE, grant(scopes=["read"]))
         middleware = AuthMiddleware(
             lambda *a: None, store, activity, AuthFailureLimiter()
@@ -661,7 +681,9 @@ async def test_a_disconnect_before_any_body_is_passed_on(activity: ActivityLog) 
         seen.append(await receive())
         seen.append(await receive())
 
-    middleware = AuthMiddleware(inner, WORKSPACE, activity, AuthFailureLimiter())
+    middleware = AuthMiddleware(
+        inner, grant_store(WORKSPACE), activity, AuthFailureLimiter()
+    )
     messages = [{"type": "http.disconnect"}, {"type": "http.disconnect"}]
 
     async def receive() -> dict:
@@ -898,6 +920,209 @@ def test_http_a_replayed_request_id_draws_the_session_once(
     assert fresh.status_code == 403
 
 
+def test_http_a_retry_while_the_send_is_in_flight_is_not_drawn_again(
+    client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """signer_client retries the moment its timeout fires, often mid-broadcast.
+
+    That retry is refused by the signer as in flight, and sends nothing: it
+    must get that answer, not a cap refusal for a draw it already made.
+    """
+    capped = _session_capped(client)
+    body = {
+        "chain": "testchain",
+        "target": RECIPIENT,
+        "value": 10,
+        "intent": pay(RECIPIENT, 10),
+        "request_id": "r1",
+    }
+    broadcasting, release = threading.Event(), threading.Event()
+    send_raw = fake_w3.eth.send_raw_transaction
+
+    def slow_broadcast(raw: bytes) -> t.Any:
+        broadcasting.set()
+        assert release.wait(10)
+        return send_raw(raw)
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", slow_broadcast)
+    answers: list = []
+    first = threading.Thread(
+        target=lambda: answers.append(
+            client.post("/safe-transaction", json=body, headers=_bearer(capped))
+        )
+    )
+    first.start()
+    try:
+        assert broadcasting.wait(10)
+        retry = client.post("/safe-transaction", json=body, headers=_bearer(capped))
+    finally:
+        release.set()
+        first.join(10)
+    assert retry.status_code == 400
+    assert "in flight" in retry.json()["detail"]
+    assert answers[0].status_code == 200
+    assert len(fake_w3.eth.sent) == 1
+
+
+@pytest.mark.parametrize("surface", ["http", "mcp"])
+@pytest.mark.parametrize(
+    ("tool", "path", "to_key"),
+    [
+        ("safe_transaction", "/safe-transaction", "target"),
+        ("send_transaction", "/sign-and-send", "to"),
+    ],
+)
+def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(  # pylint: disable=too-many-arguments,too-many-locals
+    client: TestClient,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    tool: str,
+    path: str,
+    to_key: str,
+) -> None:
+    """The draw was spared because the id was in flight; then the first send failed.
+
+    The retry must not broadcast on a draw it never paid: it is answered from
+    the id's result or refused, and a later retry is charged in full.
+    """
+    capped = _session_capped(client)
+    arguments = {
+        "chain": "testchain",
+        to_key: RECIPIENT,
+        "value": 10,
+        "intent": pay(RECIPIENT, 10),
+        "request_id": "r1",
+    }
+    call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    }
+    headers = {"Accept": "application/json, text/event-stream", **_bearer(capped)}
+
+    def post() -> t.Any:
+        if surface == "http":
+            return client.post(path, json=arguments, headers=headers)
+        return client.post("/mcp/", json=call, headers=headers)
+
+    broadcasting, release = threading.Event(), threading.Event()
+    retry_authorized, first_done = threading.Event(), threading.Event()
+    broadcasts: list = []
+    send_raw = fake_w3.eth.send_raw_transaction
+
+    def slow_broadcast(raw: bytes) -> t.Any:
+        broadcasts.append(raw)
+        broadcasting.set()
+        assert release.wait(10)
+        return send_raw(raw)  # fails: fail_broadcast is set by then
+
+    module = signer_routes_module if surface == "http" else mcp_tools_module
+    dispatch = module._dispatch  # pylint: disable=protected-access
+
+    def hold_retry(replay_only: bool) -> None:
+        if replay_only:  # the retry, authorized as a replay of the held id
+            retry_authorized.set()
+            assert first_done.wait(10)
+
+    def held_back(*args: t.Any, **kwargs: t.Any) -> t.Any:
+        hold_retry(kwargs["replay_only"])
+        return dispatch(*args, **kwargs)
+
+    async def held_back_async(*args: t.Any, **kwargs: t.Any) -> t.Any:
+        # the MCP tool runs on the event loop: wait off it, or the first stalls
+        await asyncio.to_thread(hold_retry, kwargs["replay_only"])
+        return await dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", slow_broadcast)
+    monkeypatch.setattr(
+        module, "_dispatch", held_back if surface == "http" else held_back_async
+    )
+    answers: dict = {}
+    first = threading.Thread(target=lambda: answers.update(first=post()))
+    retry = threading.Thread(target=lambda: answers.update(retry=post()))
+    first.start()
+    try:
+        assert broadcasting.wait(10)
+        retry.start()
+        assert retry_authorized.wait(10)
+        fake_w3.eth.fail_broadcast = True
+    finally:
+        release.set()
+        first.join(10)
+        first_done.set()
+        retry.join(10)
+    assert "nonce too low" in answers["first"].text
+    assert "nothing was sent for this retry" in answers["retry"].text
+    assert len(broadcasts) == 1  # the retry broadcast nothing
+    assert "token-cap-per-session" in post().text  # not held now: drawn in full
+
+
+def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
+    """The exemption covers what this token drew for the id, and nothing more."""
+    held: set = set()
+    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: (rid, via_safe) in held)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
+    other = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
+    store.authorize(capped, "safe_transaction", {"value": 6, "request_id": "r1"})
+    held.add(("r1", True))  # the signer is sending it
+    store.authorize(capped, "safe_transaction", {"value": 6, "request_id": "r1"})
+    store.authorize(capped, "safe_transaction", {"value": 9, "request_id": "r1"})
+    with pytest.raises(GrantRefused) as past:  # 9 drawn; 11 is 2 more of 1 left
+        store.authorize(capped, "safe_transaction", {"value": 11, "request_id": "r1"})
+    assert past.value.rule == "token-cap-per-session"
+    # another token never drew for r1: it is drawn in full
+    store.authorize(other, "safe_transaction", {"value": 10, "request_id": "r1"})
+    with pytest.raises(GrantRefused):  # all 10 of its budget went to r1
+        store.authorize(other, "safe_transaction", {"value": 1, "request_id": "r2"})
+    # the EOA namespace is another id; and one the signer no longer holds
+    # (the first attempt failed, so a retry really sends) is drawn in full
+    with pytest.raises(GrantRefused):
+        store.authorize(capped, "send_transaction", {"value": 6, "request_id": "r1"})
+    held.clear()
+    with pytest.raises(GrantRefused):
+        store.authorize(capped, "safe_transaction", {"value": 6, "request_id": "r1"})
+
+
+def test_a_retry_s_record_keeps_the_most_drawn_per_asset() -> None:
+    """A retry declaring less, or leaving an asset out, lowers nothing on record."""
+    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 20, USDC: 5}))
+
+    def send(request_id: str, value: int, usdc: int = 0) -> None:
+        spend = {USDC: usdc} if usdc else {}
+        arguments = {"value": value, "intent": {"spend": spend}}
+        store.authorize(
+            capped, "safe_transaction", {**arguments, "request_id": request_id}
+        )
+
+    for value in (9, 6, 9):  # decreasing, then back: 9 is drawn once
+        send("r1", value)
+    send("r2", 1, usdc=5)
+    send("r2", 1)  # USDC left out of this retry
+    send("r2", 1, usdc=5)  # and declared again: still drawn once
+    send("r3", 10)  # 9 + 1 + 10 is all 20 of native
+    with pytest.raises(GrantRefused):
+        send("r4", 1)
+    with pytest.raises(GrantRefused):
+        send("r4", 0, usdc=1)
+
+
+def test_a_forgotten_request_id_is_drawn_in_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the bound a draw is forgotten, which only ever draws again."""
+    monkeypatch.setattr(auth_module, "MAX_DRAWN_REQUEST_IDS", 1)
+    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True)
+    capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
+    store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r1"})
+    store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r2"})
+    store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r2"})
+    with pytest.raises(GrantRefused):  # r1 forgotten: 4 more of the 2 left
+        store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r1"})
+
+
 def test_mcp_a_replayed_request_id_draws_the_session_once(
     client: TestClient, fake_w3: FakeW3
 ) -> None:
@@ -971,3 +1196,29 @@ def test_mcp_preflight_answers_with_the_token_s_cap_and_draws_nothing(
     assert "token-cap-per-tx" in checked[0]["reason"]
     assert checked[0]["probed_value"] == "6"
     assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+
+
+def test_mcp_preflight_answers_a_read_only_token_as_its_send_would(
+    client: TestClient, fake_w3: FakeW3, store_path: t.Any
+) -> None:
+    """A read token may preflight, and is told its send would be refused by scope."""
+    reader = client.post(
+        "/tokens", json={"scopes": ["read"]}, headers=_bearer(WORKSPACE)
+    ).json()["token"]
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "preflight_transaction",
+            "arguments": {"chain": "testchain", "target": RECIPIENT},
+        },
+    }
+    headers = {"Accept": "application/json, text/event-stream", **_bearer(reader)}
+    answer = client.post("/mcp/", json=body, headers=headers).text
+    assert '\\"allowed\\": false' in answer
+    assert "token-scope" in answer
+    (checked,) = [e for e in audit_entries(store_path) if e["kind"] == "checked"]
+    assert "token-scope" in checked["reason"]
+    assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert fake_w3.provider.simulated == []

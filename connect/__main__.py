@@ -180,12 +180,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config()
-        configure_mech_indexers()
     except ValueError as e:
         setup_logging().error("configuration error: %s", e)
         return 1
 
     logger = setup_logging(config.log_level)
+    configure_mech_indexers()
     logger.info("connect starting")
 
     try:

@@ -75,3 +75,4 @@ config:
   mechx_marketplace_polygon_squid_url: ${MECHX_MARKETPLACE_POLYGON_SQUID_URL:str:null}
   mechx_registry_base_squid_url: ${MECHX_REGISTRY_BASE_SQUID_URL:str:null}
   mechx_registry_polygon_squid_url: ${MECHX_REGISTRY_POLYGON_SQUID_URL:str:null}
+  mech_hard_cancel_after: ${MECH_HARD_CANCEL_AFTER:int:21600}

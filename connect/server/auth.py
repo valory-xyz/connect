@@ -41,17 +41,18 @@ import secrets
 import threading
 import time
 import typing as t
-from collections import deque
+from collections import OrderedDict, deque
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
 from connect.chain_read import UNIVERSAL_ROUTER_NAME, known_contract
 from connect.chains import chain_info
 from connect.server.strict import StrictBody
+from connect.signer import MAX_CACHED_RESULTS
 
 Scope = t.Literal["read", "mech", "tx"]
 SCOPES: tuple[Scope, ...] = ("read", "mech", "tx")
@@ -78,8 +79,12 @@ ACTION_SCOPES: dict[str, Scope] = {
 class TokenGrant(StrictBody):
     """What a bearer token may do; a token can only mint a narrower one.
 
-    Unknown fields are refused by name, like every other HTTP body.
+    Unknown fields are refused by name, like every other HTTP body. Frozen,
+    and stored and handed out as copies, so nothing widens a live grant
+    without passing its validation again.
     """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     scopes: list[Scope]
     max_value_per_tx: dict[str, int] | None = None
@@ -111,9 +116,13 @@ class TokenGrant(StrictBody):
 
 
 WORKSPACE_GRANT = TokenGrant(scopes=list(SCOPES))
+# as many request ids' draws as the signer keeps results; one forgotten is drawn again
+MAX_DRAWN_REQUEST_IDS = MAX_CACHED_RESULTS
 
 # the request-state key the MCP mount sets: the bearer token that authorized it
 AUTH_TOKEN = "auth_token"  # nosec B105 - a state key, not a credential
+# and the (tool, request id) of each call it relieved as a retry: replay only
+REPLAYS = "replays"
 
 
 class GrantRefused(Exception):
@@ -129,6 +138,14 @@ class GrantRefused(Exception):
     def __str__(self) -> str:
         """Return the refusal a caller reads."""
         return self.detail
+
+    @property
+    def message(self) -> str:
+        """Return the refusal as every surface words it, its rule first.
+
+        One wording, since the shipped client reads a refusal by that prefix.
+        """
+        return f"rule '{self.rule}': {self.detail}"
 
 
 def _within(child: dict[str, int] | None, parent: dict[str, int] | None) -> bool:
@@ -211,17 +228,19 @@ class GrantStore:
     """The bearer tokens this process honours, and what each may do."""
 
     def __init__(
-        self,
-        workspace_token: str,
-        *,
-        sent: t.Callable[[str, bool], bool] = lambda request_id, via_safe: False,
+        self, workspace_token: str, *, held: t.Callable[[str, bool], bool]
     ) -> None:
         """Hold the workspace token, the root every other token is minted from.
 
-        `sent(request_id, via_safe)` says whether the signer already sent that
-        request id, so its replay is not drawn on a session budget twice.
+        `held(request_id, via_safe)` says whether the signer holds that request
+        id, completed or still sending (`Signer.holds_request`): a call
+        repeating it then sends nothing new.
         """
-        self._sent = sent
+        self._held = held
+        # what each (token, action, request_id) has drawn, so a retry of a
+        # request this token already paid for is not drawn again; forgotten
+        # past the bound, which only draws again
+        self._drawn: OrderedDict[tuple[str, str, str], dict[str, int]] = OrderedDict()
         self._lock = threading.Lock()
         self._grants: dict[str, TokenGrant] = {workspace_token: WORKSPACE_GRANT}
         self._spent: dict[str, dict[str, int]] = {}
@@ -242,9 +261,9 @@ class GrantStore:
         return found
 
     def grant(self, token: str) -> TokenGrant:
-        """Return a known token's grant."""
+        """Return a copy of a known token's grant."""
         with self._lock:
-            return self._grants[token]
+            return self._grants[token].model_copy(deep=True)
 
     def mint(self, parent: str, grant: TokenGrant) -> str:
         """Mint a token for `grant`, which must be no wider than `parent`'s.
@@ -259,7 +278,7 @@ class GrantStore:
             )
         token = secrets.token_urlsafe(32)
         with self._lock:
-            self._grants[token] = grant
+            self._grants[token] = grant.model_copy(deep=True)
             self._parents[token] = parent
         return token
 
@@ -276,7 +295,7 @@ class GrantStore:
         arguments: t.Mapping[str, t.Any],
         *,
         draw: bool = True,
-    ) -> None:
+    ) -> bool:
         """Raise unless `token` may perform `action` with `arguments`.
 
         Value caps are checked against the spend the call's intent declares,
@@ -286,9 +305,16 @@ class GrantStore:
         move a position (`intent.Capped`, which the send surfaces apply).
         A capped token's per-session budget is drawn down when a call is
         authorized, whether or not the send then succeeds: it can be spent
-        early, never exceeded. A call whose `request_id` the signer already
-        sent draws nothing: the signer answers it with the sent hash, and
-        sends nothing new. `draw=False` answers without drawing, for a dry run.
+        early, never exceeded. A call repeating a `request_id` this token
+        already drew for is drawn only past that draw while the signer holds
+        the id (sent, or still sending), since the signer then sends nothing
+        new; once it does not, the call may really send, and is drawn in full.
+        `draw=False` answers without drawing, for a dry run.
+
+        Returns whether the call was relieved so. That holds only while the
+        signer still holds the id when the call reaches it, so the caller must
+        send it `replay_only`: answered from the signer's result or refused,
+        never sent fresh on a draw it was spared.
         """
         grant = self._live(token)
         scope = ACTION_SCOPES.get(action)
@@ -302,16 +328,19 @@ class GrantStore:
             self._check_mech_payment(grant, arguments)
         if action == "sign_message" and grant.value_capped():
             raise GrantRefused(
-                "token-cap-per-tx",
+                "token-cap-sign",
                 "a value-capped token may not sign raw digests: a digest can "
                 "authorize a safe transaction that no cap or intent sees",
             )
         if scope == "tx" and action != "sign_message":
-            self._check_value(
+            return self._check_value(
                 token, grant, action=action, arguments=arguments, draw=draw
             )
+        return False
 
-    def intent_for(self, token: str | None, intent: t.Any) -> t.Any:
+    def intent_for(
+        self, token: str | None, intent: dict | None
+    ) -> intent_module.AgentIntent:
         """Return the intent the gate holds a call to, for the calling token.
 
         A value-capped token's intent is `intent.Capped`, so the gate refuses
@@ -347,7 +376,8 @@ class GrantStore:
         action: str,
         arguments: t.Mapping[str, t.Any],
         draw: bool,
-    ) -> None:
+    ) -> bool:
+        """Hold a send to the caps; return whether a retry's draw was relieved."""
         declared, approvals = _declared(arguments)  # refuses malformed first
         self._check_approvals(grant, approvals)
         per_tx = grant.max_value_per_tx
@@ -370,11 +400,17 @@ class GrantStore:
                 continue
             key = intent_module.balance_key(approval["token"])
             drawn[key] = drawn.get(key, 0) + approval["amount"]
+        # a retry of a request id this token drew for, which the signer still
+        # holds, sends nothing new: only what it declares past that draw is owed
         request_id = arguments.get("request_id")
-        if isinstance(request_id, str) and self._sent(
-            request_id, action == "safe_transaction"
-        ):
-            drawn = {}  # a replay: the signer sends nothing new for it
+        id_key = None
+        paid: dict[str, int] = {}
+        if isinstance(request_id, str):
+            id_key = (token, action, request_id)
+            if self._held(request_id, action == "safe_transaction"):
+                with self._lock:
+                    paid = self._drawn.get(id_key, {})
+        owed = {asset: max(0, n - paid.get(asset, 0)) for asset, n in drawn.items()}
         with self._lock:
             # this token and every ancestor it was minted from: minting more
             # children must not multiply a parent's session budget
@@ -388,7 +424,7 @@ class GrantStore:
             ]
             for holder, per_session in capped:
                 spent = self._spent.get(holder, {})
-                for asset, amount in drawn.items():
+                for asset, amount in owed.items():
                     cap = t.cast(dict, per_session).get(asset, 0)
                     if spent.get(asset, 0) + amount > cap:
                         raise GrantRefused(
@@ -399,11 +435,26 @@ class GrantStore:
                             f"{amount} (spend and approvals)",
                         )
             if not draw:
-                return
+                return bool(paid)
             for holder, _ in capped:
                 spent = self._spent.setdefault(holder, {})
-                for asset, amount in drawn.items():
+                for asset, amount in owed.items():
                     spent[asset] = spent.get(asset, 0) + amount
+            if id_key is not None and capped:
+                self._remember(id_key, paid, drawn)
+        return bool(paid)
+
+    def _remember(
+        self, key: tuple[str, str, str], paid: dict[str, int], drawn: dict[str, int]
+    ) -> None:
+        """Record what a request id has drawn, keeping the most per asset."""
+        merged = {**paid}
+        for asset, amount in drawn.items():
+            merged[asset] = max(amount, merged.get(asset, 0))
+        self._drawn[key] = merged
+        self._drawn.move_to_end(key)
+        while len(self._drawn) > MAX_DRAWN_REQUEST_IDS:
+            self._drawn.popitem(last=False)
 
     @staticmethod
     def _check_approvals(
@@ -431,6 +482,12 @@ class GrantStore:
                     )
 
 
+def is_replay(request: t.Any, action: str, request_id: str | None) -> bool:
+    """Whether the MCP mount relieved this call's draw as a retry of `request_id`."""
+    replays = getattr(getattr(request, "state", None), REPLAYS, None) or set()
+    return request_id is not None and (action, request_id) in replays
+
+
 def request_token(request: t.Any) -> str | None:
     """Return the bearer token the auth layer stamped on a request, if any.
 
@@ -438,11 +495,6 @@ def request_token(request: t.Any) -> str | None:
     request, the MCP mount's middleware on the scope the tool's request reads.
     """
     return getattr(getattr(request, "state", None), AUTH_TOKEN, None)
-
-
-def as_store(grants: "GrantStore | str") -> GrantStore:
-    """Accept a GrantStore, or a bare workspace token for a store of one."""
-    return GrantStore(grants) if isinstance(grants, str) else grants
 
 
 LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
@@ -514,12 +566,12 @@ class RequireAuth:
 
     def __init__(
         self,
-        grants: "GrantStore | str",
+        grants: GrantStore,
         activity: ActivityLog,
         limiter: AuthFailureLimiter,
     ) -> None:
         """Initialize."""
-        self._grants = as_store(grants)
+        self._grants = grants
         self._activity = activity
         self._limiter = limiter
 
@@ -557,13 +609,13 @@ class AuthMiddleware:
     def __init__(
         self,
         app: t.Callable,
-        grants: "GrantStore | str",
+        grants: GrantStore,
         activity: ActivityLog,
         limiter: AuthFailureLimiter,
     ) -> None:
         """Initialize."""
         self._app = app
-        self._grants = as_store(grants)
+        self._grants = grants
         self._activity = activity
         self._limiter = limiter
 
@@ -592,16 +644,22 @@ class AuthMiddleware:
             await _reject(send, 401, "invalid or missing bearer token")
             return
         body = await _read_body(receive)
-        refusal = self._refusal(token, body)
+        replays: set[tuple[str, str]] = set()
+        refusal = self._refusal(token, body, replays)
         if refusal is not None:
             await _send_json(send, 200, refusal)
             return
         # read back by the send tools through the MCP request context
-        scope.setdefault("state", {})[AUTH_TOKEN] = token
+        scope.setdefault("state", {}).update({AUTH_TOKEN: token, REPLAYS: replays})
         await self._app(scope, _replay(body, receive), send)
 
-    def _refusal(self, token: str, body: bytes) -> dict | None:
-        """Return a JSON-RPC error for the first tool call this token may not make."""
+    def _refusal(
+        self, token: str, body: bytes, replays: set[tuple[str, str]]
+    ) -> dict | None:
+        """Return a JSON-RPC error for the first tool call this token may not make.
+
+        Each call relieved as a retry is added to `replays` as (tool, request id).
+        """
         try:
             message = json.loads(body or b"null")
         except ValueError:
@@ -612,12 +670,11 @@ class AuthMiddleware:
             params = call.get("params")
             params = params if isinstance(params, dict) else {}
             arguments = params.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            name = str(params.get("name"))
             try:
-                self._grants.authorize(
-                    token,
-                    str(params.get("name")),
-                    arguments if isinstance(arguments, dict) else {},
-                )
+                if self._grants.authorize(token, name, arguments):
+                    replays.add((name, str(arguments["request_id"])))
             except GrantRefused as e:
                 self._activity.record(
                     "refusal", rule=e.rule, tool=params.get("name"), reason=str(e)
@@ -625,7 +682,7 @@ class AuthMiddleware:
                 return {
                     "jsonrpc": "2.0",
                     "id": call.get("id"),
-                    "error": {"code": -32001, "message": f"rule '{e.rule}': {e}"},
+                    "error": {"code": -32001, "message": e.message},
                 }
         return None
 
@@ -686,14 +743,25 @@ def _replay(body: bytes, receive: t.Any) -> t.Callable[[], t.Awaitable[dict]]:
 
 def authorize_route(
     request: Request, activity: ActivityLog, action: str, arguments: dict
-) -> None:
+) -> bool:
     """Authorize an HTTP route's action against the request's token.
+
+    Returns whether it was relieved as a retry (`GrantStore.authorize`).
 
     :raises HTTPException: 403 (401 for an expired token) naming the rule.
     """
     grants: GrantStore = request.app.state.grants
     try:
-        grants.authorize(getattr(request.state, AUTH_TOKEN), action, arguments)
+        return grants.authorize(getattr(request.state, AUTH_TOKEN), action, arguments)
     except GrantRefused as e:
-        activity.record("refusal", rule=e.rule, path=request.url.path, reason=str(e))
-        raise HTTPException(status_code=e.status, detail=f"rule '{e.rule}': {e}") from e
+        raise refused_route(request, activity, e) from e
+
+
+def refused_route(
+    request: Request, activity: ActivityLog, refused: GrantRefused
+) -> HTTPException:
+    """Audit an HTTP route's grant refusal and return the error that answers it."""
+    activity.record(
+        "refusal", rule=refused.rule, path=request.url.path, reason=str(refused)
+    )
+    return HTTPException(status_code=refused.status, detail=refused.message)

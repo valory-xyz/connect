@@ -27,6 +27,8 @@ other non-aea agent. It:
      read into memory at boot and served from there. It ships a stand-in page
      (settings, harness, open a session — everything it shows comes from
      `GET /settings`); see [docs/agent-ui.md](docs/agent-ui.md)
+   - Mech queue: `GET /mech-queue` and the operator's
+     `POST /mech-queue/hard-cancel` (password-gated; "One payer per safe")
    - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its
@@ -42,7 +44,13 @@ other non-aea agent. It:
      rewriting what the operator chose
    - a bearer-authed signing surface: `POST /safe-transaction` (the safe's call:
      `target`, `value`, `data`), `POST /sign-and-send` (the EOA's: `to`,
-     `value`, `data`), `POST /sign-message`, `GET /wallet`. Every body and
+     `value`, `data`; both also take `request_id`, `intent`, and
+     `wait_for_receipt`/`timeout`, answering `status` and the receipt as the
+     MCP send tools do), `POST /sign-message`, `GET /wallet`. An error body
+     carries Connect's own message with any URL in it redacted, and a receipt
+     that cannot be read is `pending` with Connect's `receipt_error`: what an
+     RPC library says, which may name the RPC URL and its key, goes only to
+     `log.txt`. Every body and
      every MCP tool refuses a parameter it does not take, with an error naming
      the ones it does (`to` on the safe path is pointed at `target`); read-only
      tools carry `readOnlyHint`
@@ -204,10 +212,15 @@ safe's inner call (to any other address the EOA's own call is what runs, and
 what is simulated), and refused before simulating as `bad-exec-transaction` if
 it also carries value from the EOA, is not a CALL, or pays a gas refund (any of
 `gasPrice`, `gasToken`, `refundReceiver` set), which the inner call's
-simulation would not show. The safe's `approveHash` is refused outright
-(`approve-hash`): it pre-approves a safe transaction by hash, which anyone may
+simulation would not show. The safe's `approveHash` is refused outright, on
+any EOA send whatever its target (`approve-hash`): it pre-approves a safe transaction by hash, which anyone may
 then execute, so no intent could hold it. These refusals are audited like the
-rest, after the guard has answered. An amount in an intent is a whole number
+rest, after the guard has answered. Calldata that is not strictly hex of whole
+bytes (a space or a newline included) is refused before anything reaches the
+RPC (`bad-calldata`), on a send, `preflight_transaction`
+and `simulate_transaction` alike, rather than reading as an RPC that cannot
+simulate. An RPC that cannot simulate is also logged to `log.txt` with the
+cause, since every agent send on that chain is refused until it can. An amount in an intent is a whole number
 of base units: a float or a bool is `bad-intent`, never truncated. An ERC-20
 `Approval` whose amount is no higher than the spender's allowance before the
 call (read at head; OpenZeppelin 4.x tokens emit one from `transferFrom` as
@@ -253,13 +266,15 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
 
 - **unrestricted** (default) — any other well-formed request is signed;
 - **restricted** (operator opt-in) — raw digest signing is off, with one
-  carve-out: the mech flow recomputes the off-chain request id *locally* from
-  inputs it already validated, wraps it into the safe's ERC-1271 SafeMessage
-  hash (the safe is the off-chain requester of record), and registers exactly
-  that digest with the guard as a single-use, short-lived allowance before
-  mech-client asks for the signature (nothing the agent session names can
-  register one, and a digest the server did not derive — say, from a lying
-  RPC answering `getRequestId` — mismatches and is refused). The only allowed
+  carve-out: in mech-client's pre-sign hook, the mech flow wraps the
+  off-chain request id mech-client hands it into the safe's ERC-1271
+  SafeMessage hash (the safe is the off-chain requester of record) and
+  registers exactly that digest with the guard as a single-use, short-lived
+  allowance before mech-client asks for the signature (nothing the agent
+  session names can register one). mech-client derives the id locally from
+  the marketplace's `domainSeparator()` and refuses one the RPC's
+  `getRequestId` disagrees with (`RequestIdMismatch`) before the hook runs, so
+  a lying RPC can only cause a refusal. The only allowed
   transaction is a safe `execTransaction` CALL to a whitelisted address with
   the gas-refund fields zeroed (a non-zero SafeTx `gasPrice` would pay a refund
   out of the safe past the whitelist) — plus one analogous carve-out: before
@@ -359,7 +374,8 @@ Binding to `127.0.0.1` does **not** make the server unreachable from the web:
 any page the user's browser visits can fire requests at localhost, and DNS
 rebinding defeats some browser-side protections. Hence: every route that moves
 funds or changes the guardrail requires the bearer token (or the keystore
-password for the `protected` settings), Origin headers are validated, only
+password for the `protected` settings and the mech queue's hard cancel, which
+no bearer token can authorize), Origin headers are validated, only
 loopback Host headers are accepted, and no CORS is enabled. Two state-changing
 routes are gated on **origin locality alone**, because the FE that calls them
 holds no token: `POST /session` (spawns an agent session on the operator's
@@ -384,10 +400,13 @@ token, `"native"` or an address in any case, in base units; Celo's CELO face
 counts as `"native"`), a mech payment cap, an expiry. A grant wider than the
 presenting token's is refused (`token-scope`), and unknown fields are refused by
 name like every other body. The bundled `signer_client` mints one with
-`SignerClient.mint_token(grant)`, and its `connect(chain, token=None)` signs with
-`token`, else `$PEARL_CONNECT_TOKEN`, else the workspace token, so a launcher
-can hand a script a narrower token without the session ever reading
-`.mcp.json`.
+`SignerClient.mint_token(grant)`, and every bundled reader of `.mcp.json`
+(`signer_client.load_mcp_config_dir`, so `connect(chain, token=None)` and
+connect-polymarket's `ConnectSigner.from_workspace` alike) signs with
+`$PEARL_CONNECT_TOKEN` when it is set, so a launcher can hand a script a
+narrower token without the session ever reading `.mcp.json`. A blank value is
+an error, never a fall-back to the workspace token. The cap bounds a script's
+mistakes, not a hostile script, which can still read `.mcp.json` itself.
 
 | Scope | Allows |
 |---|---|
@@ -400,8 +419,13 @@ native `value`), which the intent gate then holds the transaction to; a capped
 `mech` token must pass a `max_payment` within `max_mech_payment`. A per-session
 budget is drawn down when a call is authorized, whether or not the send then
 succeeds, so it can be spent early but never exceeded; a retry naming a
-`request_id` the signer already sent is not drawn again, since it is answered
-with the sent transaction's hash and sends nothing; a child's spend is drawn
+`request_id` the same token already drew for is drawn only past that draw while
+the signer holds the id (sent, so the retry answers its hash, or still
+sending, so the retry is refused as in flight), since it sends nothing new —
+an id the signer no longer holds may really send, and is drawn in full. A
+retry spared so is sent replay-only: if the first send fails before the retry
+reaches the signer, the retry is refused with nothing sent, never broadcast
+on the draw it was spared; a child's spend is drawn
 on every capped token it was minted from as well, so minting more children
 never multiplies a budget. A declared approval draws on the session budget as
 its spend does, since its spender can take that much later. That includes an
@@ -415,7 +439,8 @@ do: approve more of a token than its caps allow (an approval is spend the
 spender takes later; refused under the rule of the cap it exceeds), sign a raw digest (`sign_message`: a digest can authorize
 any safe transaction), or move an ERC-721/1155 position out of the safe (the
 gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
-`token-expired`, `token-cap-per-tx`, `token-cap-per-session`,
+`token-expired`, `token-cap-per-tx`, `token-cap-per-session`, `token-cap-sign`
+(a raw digest refused to a value-capped token),
 `token-mech-payment-cap`, and `bad-intent` or `bad-value` for an amount that is
 not a whole number >= 0), come back as the HTTP 403/401 detail or the MCP tool
 error, and are recorded as activity `refusal` entries. MCP calls are authorized
@@ -433,6 +458,19 @@ that survives those.
 
 ## Mech requests
 
+The `mech_request` MCP tool drives [mech](https://olas.network/services/ai-mechs)
+requests through mech-client's `Signer` protocol, so every transaction and
+digest passes the guarded choke point. The default off-chain prepaid flow
+works in both modes: it signs the request-id digest, which restricted mode
+allows through the server-derived single-use allowance described above, and
+its `auto_deposit` top-up (paying the balance tracker from the safe on HTTP
+402) is pre-authorized the same way — capped, single-use, armed only for the
+request being sent. The flow also needs a mech whose operator published an
+endpoint in its on-chain metadata — few have, so `mech_tools` reports
+`offchain_capable` per mech and a request to one that cannot serve it is
+refused before any payment. The on-chain path sends through the
+MechMarketplace via the service safe and works for any listed mech.
+
 ### Base and Polygon indexers
 
 Mech discovery and registry reads on Base and Polygon require mech-client
@@ -449,79 +487,67 @@ service template's `valory/configs` fields (`mechx_marketplace_base_squid_url`,
 etc.). Middleware injects them as `CONNECTION_CONFIGS_CONFIG_MECHX_...`;
 Connect forwards them to mech-client at startup. Non-empty template values
 take precedence over direct variables; blank or `null` defaults leave direct
-variables unchanged. Endpoint values stay in deployment configuration.
-
-Release order: publish mech-client with #271 and #274, complete #107's
-dependency update, then release Connect and update the Pearl template and
-middleware pins with the squid settings. Before rollout, verify Base/Polygon
-mech discovery, operator/service metadata and one request/result flow per chain.
-Other chains keep their existing indexers.
-
-
-The `mech_request` MCP tool drives [mech](https://olas.network/services/ai-mechs)
-requests through mech-client's `Signer` protocol, so every transaction and
-digest passes the guarded choke point. The default off-chain prepaid flow
-works in both modes: it signs the request-id digest, which restricted mode
-allows through the server-derived single-use allowance described above, and
-its `auto_deposit` top-up (paying the balance tracker from the safe on HTTP
-402) is pre-authorized the same way — capped, single-use, armed only for the
-request being sent. The flow also needs a mech whose operator published an
-endpoint in its on-chain metadata — few have, so `mech_tools` reports
-`offchain_capable` per mech and a request to one that cannot serve it is
-refused before any payment. The on-chain path sends through the
-MechMarketplace via the service safe and works for any listed mech.
+variables unchanged. Startup logs record variable names and their source,
+including template overrides, without logging URLs. Endpoint values stay in
+deployment configuration. Other chains keep their existing indexers.
 
 ### One payer per safe: nonces
 
-Connect, not mech-client, allocates off-chain marketplace nonces
-(`connect/mech_nonces.py`), so concurrent requests from one safe never share
-one. It follows the deployed sequential marketplace: the mech admits only
-`mapNonces + accepted + settling` for a sender, so one mech is in flight per
-safe and chain (a request to another mech waits for the first one's slots to
-settle, and is refused as `mech-in-flight` when its wait runs out), the lock is
-held from reservation until the mech answers, and a slot is held until
-`mapNonces > n`. mech-client signs the nonce it is given (`send_request(...,
-nonces=[n], on_request_id=...)`, mech-client 0.25.0) and reports the
-request id just before signing. Connect still recomputes that id itself from
-what it assembled and the nonce it allocated: mech-client asks the contract
-for it over `eth_call`, and an id signed on faith would let a lying RPC
-collect the safe's ERC-1271 signature on any 32 bytes, so a mismatch is
-refused before anything is signed. The mech's answer decides the slot: 200
-holds it; 503 (a gap) resends the same nonce and id up to
+Off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
+process, through its `send_with_nonce`, so concurrent requests from one safe
+never share one. It follows the deployed sequential marketplace: the mech
+admits only `mapNonces + accepted + settling` for a sender, so one mech is in
+flight per safe and chain (a request to another mech waits for the first one's
+slots to settle, and is refused as `mech-in-flight` when its wait runs out),
+the lock is held from reservation until the mech answers, and a slot is held
+until `mapNonces > n`. Every rule below is mech-client's (its README, "Allocating
+offchain nonces"); Connect supplies the `mapNonces` read, its own pre-sign hook
+and the queue's settings. The mech's answer decides the slot: 200 holds it;
+503 (a gap) resends the same nonce and id up to
 `CONNECTION_CONFIGS_CONFIG_MECH_GAP_RETRIES` times (default 3), then refuses as
 `mech-nonce-gap`; a 401 whose reason is exactly
 `wire nonce below sender's next expected slot` means the nonce is taken
-(`mech-nonce-taken`: our own unknown slot is then accepted, otherwise the queue
-stalls); any other 4xx, a 402 after the top-up retry included, frees it
-(`mech-request-rejected`), as does mech-client's auto top-up failing on the
-safe's side (`OffchainTopUpFailed`: a cap, a balance, a reverted deposit). When
-that top-up landed and the mech still answered 402, the amount it deposited
-into the balance tracker is audited as `mech_deposit`; any other 5xx or a transport error holds it, since
-the mech may have stored the request. A failure before mech-client's pre-sign
-hook (an RPC or gateway error assembling the request) never reached the mech,
-so it frees the nonce too. A held slot's settle clock starts when its delivery
-arrives, or when the request's own response timeout (300 s, which mech-client
-writes into every request) runs out if no delivery was seen first; a queue
-with a slot that `mapNonces` has not passed within the settle timeout after
-that (`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s), or
-whose nonce another signer took, stalls: only a probe at `mapNonces` is sent
-until one is accepted again, and refusals and `mech_result` say
-`mech_queue_stalled`. A slot whose answer was lost (unknown) is resolved
-through that stall and probe; it is not resent by its salt. An on-chain request takes
-`mapNonces` itself, so it waits until no off-chain slot is held. Held slots,
-their metadata salt and the stall are persisted in `mech_nonces.json` under
-STORE_PATH, and a slot is written there as unknown before its request is
-POSTed, so a restart or a crash mid-send never reissues a held nonce. An
-unreadable file refuses every request (`mech-queue-unreadable`) rather than
-guess, and a file that cannot be written refuses new ones
-(`mech-queue-unwritable`), the request whose own slot could not be written
-included. Every refusal above is recorded as an activity `refusal` with its
-`rule`, and leaves a caller's `request_id` free to send again, since nothing
-reached the mech; only `mech-answer-unknown` is recorded as possibly paid for —
-a 5xx, or a transport error after the pre-sign hook, when the request was
-already signed. Its request id, derived from the nonce as the pre-sign hook checked it, is
-named in the error and the `mech_request_failed` entry as `pending_request_ids`
-and registered for `mech_result`, since the mech may still deliver it.
+(`mech-nonce-taken`); any other 4xx, a 402 after the top-up retry included,
+frees it (`mech-request-rejected`), as does mech-client's auto top-up failing
+on the safe's side (`OffchainTopUpFailed`). When that top-up landed and the mech
+still answered 402, the amount it deposited into the balance tracker is
+audited as `mech_deposit`; any other 5xx or a transport error after the request
+was posted holds the nonce, since the mech may have stored the request. A
+failure before the POST (an RPC or gateway error assembling the request, a
+signer or guard refusal) never reached the mech, so it frees the nonce too. A
+queue whose held slot `mapNonces` has not passed within the settle timeout
+(`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s) after its
+delivery, or after the request's own 300 s response timeout, stalls: only a
+probe at `mapNonces` is sent until one is accepted again, and refusals and
+`mech_result` say `mech_queue_stalled`. A queue stalled for
+`CONNECTION_CONFIGS_CONFIG_MECH_HARD_CANCEL_AFTER` (default 21600 s; it must
+be longer than the settle timeout, or Connect refuses to start) can be hard
+cancelled by the operator, and from then on `mech_request` and `mech_result`
+report `"hard_cancel": "available: the operator can confirm one on-chain
+request in Connect's UI"`; the session can only be told, never run it. The
+hard cancel is `POST /mech-queue/hard-cancel` with `{chain, password}`
+(origin-gated; the keystore password, checked as `PATCH /settings` checks it —
+re-decrypted, rate-limited, audited — authorizes it, never a bearer token). It
+is refused (409, `mech-queue-not-stalled`) until the stall is that old;
+otherwise it sends one on-chain marketplace request from the safe, to the mech
+of the stuck slot, capped by that mech's default `max_payment` and signed
+through the guard like any on-chain mech request, which consumes the stuck
+`mapNonces` (mech-client's `allocator.hard_cancel`). It answers
+`{tx_hash, nonce, mech, paid}`, is audited as `mech_hard_cancel`, and restarts
+the stall clock, so a second one needs its own window. `GET /mech-queue`
+(origin-gated) reports each safe's queue per chain — `stalled`,
+`stalled_since`, `hard_cancel_available` — for the operator's UI. An on-chain request takes `mapNonces`
+itself, so it waits until no off-chain slot is held. Held slots, their metadata
+salt and the stall are persisted in `mech_nonces.json` under STORE_PATH, written
+before the POST, so a restart never reissues a held nonce; an unreadable file
+refuses every request (`mech-queue-unreadable`) and an unwritable one new ones
+(`mech-queue-unwritable`). Every refusal above is recorded as an activity
+`refusal` with its `rule`, and leaves a caller's `request_id` free to send
+again, since nothing reached the mech; only `mech-answer-unknown` is recorded
+as possibly paid for — a 5xx, or a transport error after the request was
+posted. Its request id, the one Connect's pre-sign hook was handed, is named in
+the error and the `mech_request_failed` entry as `pending_request_ids` and
+registered for `mech_result`, since the mech may still deliver it.
 On both paths the lock is held only `ACK_WAIT_SECONDS` (1 s) of the delivery
 wait: the rest runs after it is released, up to the request's `timeout`, so
 other requests from the safe are not held behind a delivery. A read that fails
@@ -540,14 +566,19 @@ the shared chat contract: the report adds `completion` (text) and `usage`
 `MechModel` order (the delivery, then `response`/`result`, then
 `content`/`text`/`completion`, or `choices[0].message`); a native tool call the
 model returned unrequested comes back as a fenced bash block in `completion`
-(`connect/mech_chat.py`). Until the mechs team's chat mechs and the
+(mech-client's `chat_report` and `is_chat_prompt`). Until the mechs team's chat mechs and the
 facilitator's standard request path exist, do not use the facilitator's
 `/mech/chat` route and `mech_request` from one safe at once: the facilitator
 signs its own marketplace nonces for the safe, and two payers on one safe
 collide.
 
-Each request carries a spending budget, `max_payment`, checked against the
-mech's price before anything is paid. It is denominated in the mech's payment
+Each request carries a spending budget, `max_payment`, which goes to
+mech-client as `send_request(max_price=...)`: a mech pricing above it is
+refused (`MechPriceExceeded`, reported as `over-max-payment`) before any
+deposit, signature or POST. A request that ends with nothing sent — that
+refusal, mech-client's request-id check, a queue refusal or a signer error —
+withdraws every guard allowance it armed (the ERC-1271 digest, the capped
+top-up), so none outlives it. It is denominated in the mech's payment
 asset, so its default is 0.1 of that asset — 10^17 base units for native and
 OLAS mechs, 10^5 for USDC ones, including Robinhood Chain, where that payment
 type is USDG. `mech_tools` reports the asset as `payment_token`.
@@ -691,7 +722,9 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES}`)
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`, plus
+  `CONNECTION_CONFIGS_CONFIG_MECHX_{MARKETPLACE,REGISTRY}_{BASE,POLYGON}_SQUID_URL`;
+  see [Base and Polygon indexers](#base-and-polygon-indexers))
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
   vendorable dependencies, synced on demand)
 

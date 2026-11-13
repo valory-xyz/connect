@@ -35,6 +35,7 @@ from connect import workspace
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server import app as app_module
+from connect.server import receipts
 from connect.settings import HARNESSES
 from connect.signer import Signer
 
@@ -544,6 +545,96 @@ class TestAuth:
         assert response.status_code == 200
         assert response.json()["tx_hash"].startswith("0x")
         assert len(fake_w3.eth.sent) == 1
+
+    @pytest.mark.parametrize(
+        ("path", "to_key"), [("/safe-transaction", "target"), ("/sign-and-send", "to")]
+    )
+    def test_a_route_waits_for_the_receipt_as_the_tool_does(
+        self, client: TestClient, fake_w3: FakeW3, path: str, to_key: str
+    ) -> None:
+        """wait_for_receipt and timeout: the same fields, the same status."""
+        fake_w3.eth.receipt = {
+            "status": 1,
+            "blockNumber": 7,
+            "gasUsed": 21000,
+            "logs": [],
+        }
+        body = {
+            "chain": "testchain",
+            to_key: "0x" + "aa" * 20,
+            "value": 16,
+            "intent": pay("0x" + "aa" * 20, 16),
+            "wait_for_receipt": True,
+            "timeout": 5,
+        }
+        mined = client.post(path, json=body, headers=auth())
+        assert mined.status_code == 200
+        assert mined.json()["status"] == "mined"
+        assert mined.json()["receipt"]["status"] == 1
+        assert fake_w3.eth.receipt_waits == [5]  # the body's timeout, forwarded
+        huge = {
+            **body,
+            "timeout": 10**9,
+            "value": 19,
+            "intent": pay("0x" + "aa" * 20, 19),
+        }
+        client.post(path, json=huge, headers=auth())
+        assert fake_w3.eth.receipt_waits[-1] == receipts.MAX_RECEIPT_TIMEOUT
+        fake_w3.eth.receipt = None
+        pending = client.post(
+            path,
+            json={**body, "value": 17, "intent": pay("0x" + "aa" * 20, 17)},
+            headers=auth(),
+        )
+        assert pending.json()["status"] == "pending"
+        quick = client.post(
+            path,
+            json={
+                **body,
+                "wait_for_receipt": False,
+                "value": 18,
+                "intent": pay("0x" + "aa" * 20, 18),
+            },
+            headers=auth(),
+        )
+        assert set(quick.json()) == {"tx_hash"}
+
+    @pytest.mark.parametrize(
+        ("path", "to_key"), [("/safe-transaction", "target"), ("/sign-and-send", "to")]
+    )
+    @pytest.mark.parametrize("fails", ["broadcast", "receipt"])
+    def test_a_library_error_never_reaches_the_body(  # pylint: disable=too-many-arguments
+        self,
+        client: TestClient,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        to_key: str,
+        fails: str,
+    ) -> None:
+        """An RPC's error text may name its URL, key and all: only the log sees it."""
+        leak = "HTTPSConnectionPool: https://rpc.example/v3/SECRETKEY timed out"
+
+        def broken(*_args: t.Any, **_kwargs: t.Any) -> t.Any:
+            raise ConnectionError(leak)
+
+        name = (
+            "send_raw_transaction"
+            if fails == "broadcast"
+            else "wait_for_transaction_receipt"
+        )
+        monkeypatch.setattr(fake_w3.eth, name, broken)
+        body = {
+            "chain": "testchain",
+            to_key: "0x" + "aa" * 20,
+            "value": 16,
+            "intent": pay("0x" + "aa" * 20, 16),
+            "wait_for_receipt": True,
+        }
+        answer = client.post(path, json=body, headers=auth())
+        assert "SECRETKEY" not in answer.text
+        assert "rpc.example" not in answer.text
+        assert answer.status_code == (400 if fails == "broadcast" else 200)
 
     def test_safe_transaction_without_a_safe_is_400(
         self, client: TestClient, fake_w3: FakeW3

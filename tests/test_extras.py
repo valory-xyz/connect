@@ -54,12 +54,20 @@ from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
 from connect.run_goal import RunGoal
-from connect.server.auth import AuthFailureLimiter, AuthMiddleware, GrantStore
+from connect.server import receipts
+from connect.server.auth import AuthFailureLimiter, AuthMiddleware
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError, _IdempotencyCache
 
-from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds, pay
+from tests.conftest import (
+    FakeW3,
+    TEST_PASSWORD,
+    audit_entries,
+    audit_kinds,
+    grant_store,
+    pay,
+)
 
 
 class StubServer:
@@ -444,6 +452,7 @@ class TestMain:
         boot_env: Path,
         served: list[StubServer],
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A clean boot provisions the workspace and reports itself healthy.
 
@@ -465,6 +474,11 @@ class TestMain:
 
         monkeypatch.setattr(main_module, "MechService", make_mech)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert (
+            "agent",
+            logging.INFO,
+            f"mech indexer {name} source=template (overrides direct)",
+        ) in caplog.record_tuples
         assert (boot_env / ".mcp.json").exists()
         app = served[0].config.app
         assert app.state.workspace.reason is None
@@ -952,7 +966,7 @@ class TestAuthMiddlewareASGI:
     async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
         """Lifespan scopes bypass auth."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         _, passed = await self._run(middleware, {"type": "lifespan"})
         assert passed == ["lifespan"]
@@ -960,7 +974,7 @@ class TestAuthMiddlewareASGI:
     async def test_bad_origin_rejected(self, activity: ActivityLog) -> None:
         """Cross-origin requests get 403."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         scope = {
             "type": "http",
@@ -973,7 +987,7 @@ class TestAuthMiddlewareASGI:
     async def test_bad_token_rejected(self, activity: ActivityLog) -> None:
         """Missing token gets 401."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         sent, passed = await self._run(middleware, {"type": "http", "headers": []})
         assert sent[0]["status"] == 401
@@ -982,7 +996,7 @@ class TestAuthMiddlewareASGI:
     async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
         """Websocket scopes never reach the inner app; the handshake is closed."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
         assert not passed
@@ -991,7 +1005,7 @@ class TestAuthMiddlewareASGI:
     async def test_valid_request_passes(self, activity: ActivityLog) -> None:
         """Correct token reaches the inner app."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         scope = {"type": "http", "headers": [(b"authorization", b"Bearer tok")]}
         _, passed = await self._run(middleware, scope)
@@ -1019,7 +1033,7 @@ class TestMcpTools:
             guard=guard,
             mech=mech_service,
             settings_store=settings_store,
-            grants=GrantStore("workspace-token"),
+            grants=grant_store("workspace-token"),
         )
         manager = mcp._tool_manager  # pylint: disable=protected-access
         return {tool.name: tool.fn for tool in manager.list_tools()}
@@ -1129,7 +1143,7 @@ class TestMcpTools:
         assert fake_w3.eth.sent  # the premise: it really was broadcast first
         assert result["status"] == "pending"
         assert result["tx_hash"].startswith("0x")
-        assert "rpc dropped" in result["receipt_error"]
+        assert result["receipt_error"] == receipts.RECEIPT_ERROR  # not the RPC's text
 
     async def test_safe_transaction_rejects_a_negative_value(
         self, tools: dict[str, t.Callable]

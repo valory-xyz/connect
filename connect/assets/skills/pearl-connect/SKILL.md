@@ -88,10 +88,10 @@ The bundled skills attach the intents of the calls they build.
 
 ## Narrower tokens for scripts
 
-`signer_client.connect()` reads the workspace token, which can do anything
-this session can. When a script should be able to do less, mint it a
-narrower token from a launcher and hand that over in the environment — the
-token never passes through you, and `.mcp.json` stays unread:
+`signer_client.connect()` signs with the workspace token, which can do
+anything this session can. When a script should be able to do less, mint it a
+narrower token from a launcher and hand that over in the environment, so the
+token never passes through you:
 
 ```python
 import os, subprocess, sys, time
@@ -108,9 +108,19 @@ subprocess.run([sys.executable, "job.py"],
                env={**os.environ, TOKEN_ENV_VAR: token}, check=True)
 ```
 
-`connect()` in `job.py` then signs with that token (`connect(chain,
-token=...)` takes one directly). `mint_token` is `POST /tokens`; the grant
-is its body.
+Every bundled script in `job.py`'s environment — `connect()` and the
+connect-polymarket scripts alike — then signs with that token (`connect(chain,
+token=...)` takes one directly); a blank `PEARL_CONNECT_TOKEN` is an error,
+never the workspace token. `mint_token` is `POST /tokens`; the grant is its
+body. The cap bounds the script's mistakes, not a hostile script: it still
+reads `.mcp.json` for the server's address, and the workspace token sits there.
+
+A value cap also takes away what no cap can bound, so it suits only some
+scripts. Under a value-capped token connect-polymarket can read
+(`positions.py`) but not trade: orders, CLOB auth and the deposit wallet's
+batches are raw-digest signatures (`token-cap-sign`), and redeeming moves
+outcome-token positions out of the safe (`token-cap-positions`). For those,
+mint a token with fewer scopes or an expiry, but no value caps.
 
 Scopes are `read`, `mech` and `tx`; caps are per token (`"native"` or a
 token address) in base units, checked against the spend and the approvals the
@@ -143,7 +153,9 @@ to see the tools it serves and whether it can be reached off-chain.
   route and `mech_request` from the same safe at once: both sign marketplace
   nonces for it, and they collide, pausing the safe's settlement. Connect
   orders its own requests, one mech at a time per safe; on
-  `mech_queue_stalled`, wait, then retry.
+  `mech_queue_stalled`, wait, then retry. A report carrying `hard_cancel`
+  means only the user can unstick it, by confirming one paid on-chain request
+  in Connect's UI: tell them, and do not try to work around it.
 - **Chat tools.** Send `prompt` as a JSON `messages` list (`[{"role": "user",
   "content": "..."}]`) to a chat tool; the report adds `completion` and
   `usage`. A tool call the model made comes back as a fenced bash block in

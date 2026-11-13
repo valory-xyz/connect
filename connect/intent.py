@@ -33,16 +33,20 @@ no fork and no trace,
 so "contracts touched" is the target plus every contract that emitted
 a log; a contract called without emitting one is not listed.
 
-The rules:
+The rules (`Rule` is the full list):
 `reverts`, `bad-intent`, `overspend`, `receive-min`, `undeclared-recipient`
-(EOAs only; burns to the zero address are skipped) and `undeclared-approval`
-(a 0 approval, a revoke, is not checked; `setApprovalForAll` counts as a
-maximum approval, even when revoking). The intent is required:
-`missing-intent` refuses a value-moving call that carries
-none, and `simulation-unavailable` refuses anything an RPC cannot simulate —
-nothing falls back to signing unchecked. Under a value-capped token (`Capped`)
-`token-cap-positions` refuses any ERC-721/1155 position leaving the sender,
-which no cap can bound.
+(EOAs only, an EIP-7702 delegated EOA counted as one; burns to the zero
+address are skipped) and `undeclared-approval` (a 0 approval, a revoke, is
+not checked; `setApprovalForAll` counts as a maximum approval, even when
+revoking). The intent is required: `missing-intent` refuses a value-moving
+call that carries none, and `simulation-unavailable` refuses anything an RPC
+cannot simulate — nothing falls back to signing unchecked. Under a
+value-capped token (`Capped`) `token-cap-positions` refuses any ERC-721/1155
+position leaving the sender, which no cap can bound. Three are raised by the
+signer before anything is simulated: `bad-calldata` (calldata that is not
+strictly hex), `approve-hash` (any EOA send of the safe's approveHash,
+whatever its target) and `bad-exec-transaction` (an EOA's execTransaction
+to the safe); see `connect/signer.py`.
 """
 
 import typing as t
@@ -89,6 +93,7 @@ Rule = t.Literal[
     "token-cap-positions",
     "approve-hash",
     "bad-exec-transaction",
+    "bad-calldata",
 ]
 RULES: tuple[str, ...] = t.get_args(Rule)
 
@@ -121,6 +126,12 @@ class Capped(t.NamedTuple):
     """
 
     raw: t.Any
+
+
+# what an agent surface may hand the gate: an intent as sent, or one Capped.
+# Never the signer's SERVER_BUILT, the one gate bypass, so mypy keeps that
+# sentinel off every agent path.
+AgentIntent = dict | Capped | None
 
 
 class Problem(t.TypedDict):
@@ -332,21 +343,24 @@ def _native_moves(logs: list[dict]) -> list[tuple[str, str, int]]:
     ERC-20 face (a CELO.transfer emits only the face's). Checked against Celo's
     RPC: a plain send logs only the synthetic one, a face transfer only its own.
     """
-    moves = []
+    return [
+        (src, dst, _word(data, 0))
+        for address, src, dst, data in _erc20_transfers(logs)
+        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES
+    ]
+
+
+def _erc20_transfers(logs: list[dict]) -> t.Iterator[tuple[str, str, str, str]]:
+    """Yield (token, from, to, data) of every 3-topic `Transfer` log, lowercased."""
     for log in logs:
         topics = [str(x).lower() for x in log.get("topics") or []]
-        if len(topics) != 3 or topics[0] != TRANSFER:
-            continue
-        address = str(log.get("address", "")).lower()
-        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES:
-            moves.append(
-                (
-                    _topic_address(topics[1]),
-                    _topic_address(topics[2]),
-                    _word(str(log.get("data", "0x")), 0),
-                )
+        if len(topics) == 3 and topics[0] == TRANSFER:
+            yield (
+                str(log.get("address", "")).lower(),
+                _topic_address(topics[1]),
+                _topic_address(topics[2]),
+                str(log.get("data", "0x")),
             )
-    return moves
 
 
 def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
@@ -371,24 +385,24 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
         if dst == holder:
             native += amount
 
-    for log in logs:
+    for address, src, dst, data in _erc20_transfers(logs):
+        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES:
+            continue  # native moves, counted above
+        amount = _word(data, 0)
+        if src == holder:
+            tokens[address] = tokens.get(address, 0) - amount
+            _sent_to(dst)
+        if dst == holder:
+            tokens[address] = tokens.get(address, 0) + amount
+
+    for log in logs:  # every other log; a 3-topic Transfer matches no branch
         address = str(log.get("address", "")).lower()
         topics = [str(x).lower() for x in log.get("topics") or []]
         if address == NATIVE_LOG_ADDRESS or not topics:
             continue
         data = str(log.get("data", "0x"))
         kind = topics[0]
-        if address in NATIVE_ERC20_FACES and kind == TRANSFER and len(topics) == 3:
-            continue  # counted as native above; the face's other logs are not
-        if kind == TRANSFER and len(topics) == 3:  # ERC-20
-            src, dst = _topic_address(topics[1]), _topic_address(topics[2])
-            amount = _word(data, 0)
-            if src == holder:
-                tokens[address] = tokens.get(address, 0) - amount
-                _sent_to(dst)
-            if dst == holder:
-                tokens[address] = tokens.get(address, 0) + amount
-        elif kind == TRANSFER and len(topics) == 4:  # ERC-721
+        if kind == TRANSFER and len(topics) == 4:  # ERC-721
             src, dst = _topic_address(topics[1]), _topic_address(topics[2])
             key = (address, str(int(topics[3], 16)))
             if src == holder:
@@ -501,12 +515,7 @@ def _wrapped_by_transfer(holder: str, logs: list[dict]) -> tuple[set, set]:
     """
     minted: set[str] = set()
     burned: set[str] = set()
-    for log in logs:
-        topics = [str(x).lower() for x in log.get("topics") or []]
-        if len(topics) != 3 or topics[0] != TRANSFER:
-            continue
-        address = str(log.get("address", "")).lower()
-        src, dst = _topic_address(topics[1]), _topic_address(topics[2])
+    for address, src, dst, _ in _erc20_transfers(logs):
         if src == ZERO_ADDRESS and dst == holder:
             minted.add(address)
         if src == holder and dst == ZERO_ADDRESS:

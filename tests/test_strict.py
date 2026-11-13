@@ -30,7 +30,6 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
-from connect.server.auth import GrantStore
 from connect.server.mcp_tools import build_mcp
 from connect.server.strict import (
     audit_unknown_parameters,
@@ -39,7 +38,7 @@ from connect.server.strict import (
 from connect.settings import SettingsStore
 from connect.signer import Signer
 
-from tests.conftest import FakeW3, audit_entries
+from tests.conftest import FakeW3, audit_entries, grant_store
 
 TOKEN = "strict-test-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
@@ -62,7 +61,7 @@ def mcp(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech_service,
         settings_store=settings_store,
-        grants=GrantStore("workspace-token"),
+        grants=grant_store("workspace-token"),
     )
 
 

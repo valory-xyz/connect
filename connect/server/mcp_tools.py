@@ -31,7 +31,7 @@ import typing as t
 from hexbytes import HexBytes
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
-from web3.exceptions import TimeExhausted, TransactionNotFound
+from web3.exceptions import TransactionNotFound
 
 from connect import chain_read
 from connect import settings as settings_config
@@ -39,17 +39,22 @@ from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
+from connect.intent import AgentIntent
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
-from connect.server.auth import GrantRefused, GrantStore, request_token
+from connect.server.auth import (
+    GrantRefused,
+    GrantStore,
+    is_replay,
+    request_token,
+)
+from connect.server.receipts import mined_result, settled
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer
 
-RECEIPT_POLL_SECONDS = 2
 # tools that read and never sign, broadcast or pay: harnesses may run them
 # without asking the operator
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
-MAX_RECEIPT_TIMEOUT = 300
 
 
 def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-locals
@@ -132,6 +137,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             data=data,
             intent=_for_token(grants, ctx, intent),
             request_id=request_id,
+            replay_only=is_replay(_ctx_request(ctx), "safe_transaction", request_id),
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
         )
@@ -164,6 +170,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             data=data,
             intent=_for_token(grants, ctx, intent),
             request_id=request_id,
+            replay_only=is_replay(_ctx_request(ctx), "send_transaction", request_id),
             wait_for_receipt=wait_for_receipt,
             timeout=timeout,
         )
@@ -275,10 +282,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def decode_calldata(chain: str, data: str) -> dict:
         """Decode calldata against the signatures Connect ships.
 
-        Returns {selector, signature, args}, or {selector, error} for a
-        selector Connect does not know or calldata too large to decode.
-        `chain` is accepted for symmetry with the other read tools; decoding
-        needs no RPC.
+        Returns {selector, signature, args}. A call it cannot decode carries
+        `error` instead of `args` (an unknown selector, calldata that is not
+        hex or is too large, arguments that do not fit or decode too large),
+        with `signature` when one matched the selector. `chain` is accepted
+        for symmetry with the other read tools; decoding needs no RPC.
         """
         return chain_read.decode_calldata(data)
 
@@ -302,7 +310,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
                 receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
             except TransactionNotFound:
                 return {"tx_hash": tx_hash, "status": "pending"}
-            return _mined_result(tx_hash, receipt)
+            return mined_result(tx_hash, receipt)
 
         return await asyncio.to_thread(_run)
 
@@ -430,16 +438,22 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     return mcp
 
 
+def _ctx_request(ctx: Context | None) -> t.Any:
+    """Return the HTTP request behind this tool call, None when called in-process."""
+    try:
+        return ctx.request_context.request if ctx is not None else None
+    except ValueError:  # no request: called in-process, not through the mount
+        return None
+
+
 def _ctx_token(ctx: Context | None) -> str | None:
     """Return the bearer token the MCP mount stamped on this tool's request."""
-    try:
-        request = ctx.request_context.request if ctx is not None else None
-    except ValueError:  # no request: called in-process, not through the mount
-        request = None
-    return request_token(request)
+    return request_token(_ctx_request(ctx))
 
 
-def _for_token(grants: GrantStore, ctx: Context | None, intent: dict | None) -> t.Any:
+def _for_token(
+    grants: GrantStore, ctx: Context | None, intent: dict | None
+) -> AgentIntent:
     """Return the intent the gate holds this call to, for the calling token.
 
     The MCP mount stamps the token on the request; `GrantStore.intent_for`
@@ -463,7 +477,7 @@ def _token_refusal(
     try:
         grants.authorize(token, action, arguments, draw=False)
     except GrantRefused as e:
-        return f"rule '{e.rule}': {e}"
+        return e.message
     return None
 
 
@@ -475,8 +489,9 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     address: str,
     value: int,
     data: str,
-    intent: t.Any,
+    intent: AgentIntent,
     request_id: str | None,
+    replay_only: bool,
     wait_for_receipt: bool,
     timeout: int,
 ) -> dict:
@@ -497,64 +512,8 @@ async def _dispatch(  # pylint: disable=too-many-arguments
             data=data,
             request_id=request_id,
             intent=intent,
+            replay_only=replay_only,
         )
-        return _settled(signer, chain, tx_hash, wait_for_receipt, timeout)
+        return settled(signer, chain, tx_hash, wait_for_receipt, timeout)
 
     return await asyncio.to_thread(_run)
-
-
-def _settled(
-    signer: Signer,
-    chain: str,
-    tx_hash: str,
-    wait_for_receipt: bool,
-    timeout: int,
-) -> dict:
-    """Return the hash, and how it settled if the caller waited.
-
-    When the caller waits, a top-level `status` says which of pending / mined /
-    reverted it is, so a reverted execTransaction is not read as success from a
-    receipt whose 0/1 is buried a level down. And once the transaction is
-    broadcast the hash is never dropped: a post-send RPC error is reported as
-    still-pending, not as a failure that would invite a double-spending resend.
-    """
-    if not wait_for_receipt:
-        return {"tx_hash": tx_hash}
-    try:
-        receipt = signer.w3(chain).eth.wait_for_transaction_receipt(
-            HexBytes(tx_hash),
-            timeout=min(timeout, MAX_RECEIPT_TIMEOUT),
-            poll_latency=RECEIPT_POLL_SECONDS,
-        )
-        # inside the try on purpose: reading the receipt must not drop the hash
-        # either, so a malformed one is reported pending, not raised
-        return _mined_result(tx_hash, receipt)
-    except TimeExhausted:
-        return {"tx_hash": tx_hash, "status": "pending"}
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        # the send already happened; a receipt-read hiccup must not lose the hash
-        return {"tx_hash": tx_hash, "status": "pending", "receipt_error": str(e)}
-
-
-def _mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
-    """Return a settled receipt with `mined`/`reverted` lifted to a top-level status.
-
-    Every tool that hands back a mined receipt goes through here, so a caller
-    reads one field to tell success from a revert — the 0/1 is never left buried
-    in the receipt for one tool while another surfaces it.
-    """
-    info = _receipt_to_dict(receipt)
-    return {
-        "tx_hash": tx_hash,
-        "status": "mined" if info["status"] == 1 else "reverted",
-        "receipt": info,
-    }
-
-
-def _receipt_to_dict(receipt: t.Mapping[str, t.Any]) -> dict:
-    return {
-        "status": receipt["status"],
-        "block_number": receipt["blockNumber"],
-        "gas_used": receipt["gasUsed"],
-        "logs": len(receipt["logs"]),
-    }

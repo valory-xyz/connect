@@ -42,6 +42,7 @@ from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechService
 from connect.server.app import create_app
+from connect.server.auth import GrantStore
 from connect.settings import (
     MODE_UNRESTRICTED,
     Protected,
@@ -346,6 +347,7 @@ class FakeEth:
         self.base_fee: int | None = 10**9
         self.priority_fee_raises = False
         self.contracts: set[str] = set()
+        self.receipt_waits: list[float] = []  # the timeout of each receipt wait
         self._lock = threading.Lock()
 
     def get_balance(self, address: str) -> int:
@@ -365,7 +367,8 @@ class FakeEth:
     def wait_for_transaction_receipt(
         self, tx_hash: object, timeout: float = 120, poll_latency: float = 0.1
     ) -> dict:
-        """Return the configured receipt or raise TimeExhausted."""
+        """Record the timeout; return the configured receipt or raise TimeExhausted."""
+        self.receipt_waits.append(timeout)
         if self.receipt is None:
             raise TimeExhausted(f"tx not mined within {timeout}s")
         return self.receipt
@@ -681,6 +684,25 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """End a run that stopped on a failed collection with exit 1, not 2."""
     if exitstatus == pytest.ExitCode.INTERRUPTED and session.testsfailed:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+@pytest.fixture(autouse=True)
+def _no_handed_token() -> t.Iterator[None]:
+    """Keep a developer's $PEARL_CONNECT_TOKEN out of every test.
+
+    The bundled clients read it wherever they load .mcp.json, and tox passes
+    the whole environment through. Its own MonkeyPatch, not the shared
+    fixture: requesting that from an autouse fixture here would make every
+    test's monkeypatch undo last, after the modules' own autouse teardowns.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("PEARL_CONNECT_TOKEN", raising=False)
+        yield
+
+
+def grant_store(token: str) -> GrantStore:
+    """Return a GrantStore over a signer that holds no request id."""
+    return GrantStore(token, held=lambda request_id, via_safe: False)
 
 
 def pay(to: str, value: int) -> dict:

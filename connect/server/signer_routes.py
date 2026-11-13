@@ -24,6 +24,7 @@ EOA), /sign-message, /wallet.
 """
 
 import logging
+import re
 import typing as t
 
 from fastapi import APIRouter, HTTPException, Request
@@ -35,12 +36,18 @@ from connect.server.auth import (
     GrantRefused,
     TokenGrant,
     authorize_route,
+    refused_route,
     request_token,
 )
+from connect.server.receipts import settled
 from connect.server.strict import StrictBody
 from connect.signer import SignerError
 
 logger = logging.getLogger("agent")
+
+# a URL in an error comes from an RPC or a library, and may carry an API key
+_URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>()]+")
+URL_REDACTED = "<url redacted>"
 
 router = APIRouter()
 
@@ -55,6 +62,9 @@ class _SendBody(StrictBody):
     gas: int | None = Field(default=None, ge=0)
     # what the call may do; required when it moves value
     intent: dict | None = None
+    # as the MCP send tools take them: wait up to `timeout` s for the receipt
+    wait_for_receipt: bool = False
+    timeout: int = Field(default=60, ge=0)
 
     @field_validator("value", "gas", mode="before")
     @classmethod
@@ -87,8 +97,13 @@ class SignMessageRequest(StrictBody):
     digest: str = Field(description="0x-hex 32-byte digest, signed unprefixed")
 
 
-def _dispatch(
-    request: Request, method: t.Callable[..., str], body: _SendBody, address: str
+def _dispatch(  # pylint: disable=too-many-arguments
+    request: Request,
+    method: t.Callable[..., str],
+    body: _SendBody,
+    address: str,
+    *,
+    replay_only: bool,
 ) -> dict:
     """Run one signer method and map its input errors to a 400.
 
@@ -96,6 +111,7 @@ def _dispatch(
     recipient, `send_via_safe` as the safe's call target — the one field whose
     meaning the two endpoints deliberately keep distinct. A value-capped
     token's intent is `intent.Capped`: no position may leave under it.
+    `replay_only` is set for a retry whose draw was spared (`_authorize`).
     """
     intent = request.app.state.grants.intent_for(request_token(request), body.intent)
     try:
@@ -107,23 +123,46 @@ def _dispatch(
             request_id=body.request_id,
             gas=body.gas,
             intent=intent,
+            replay_only=replay_only,
         )
     except (SignerError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"tx_hash": tx_hash}
+        raise HTTPException(status_code=400, detail=_public_detail(e)) from e
+    return settled(
+        request.app.state.signer,
+        body.chain,
+        tx_hash,
+        body.wait_for_receipt,
+        body.timeout,
+    )
 
 
-def _authorize(request: Request, action: str, body: _SendBody | None = None) -> None:
-    """Hold this request's token to its grant: scope, caps, expiry."""
+def _public_detail(error: Exception) -> str:
+    """Return an error's text for the HTTP body, any URL in it redacted.
+
+    Connect's refusals name their rule and must reach the caller as they are;
+    what a library or RPC adds to them may name an RPC URL with its key, so
+    URLs are cut, and the full text goes to the log instead.
+    """
+    text = str(error)
+    public = _URL.sub(URL_REDACTED, text)
+    if public != text:
+        logger.warning("a send was refused: %s", text)
+    return public
+
+
+def _authorize(request: Request, action: str, body: _SendBody | None = None) -> bool:
+    """Hold this request's token to its grant; return whether it is a spared retry."""
     arguments = {} if body is None else body.model_dump()
-    authorize_route(request, request.app.state.activity, action, arguments)
+    return authorize_route(request, request.app.state.activity, action, arguments)
 
 
 @router.post("/sign-and-send")
 def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
     """Sign and send one transaction from the agent EOA."""
-    _authorize(request, "send_transaction", body)
-    return _dispatch(request, request.app.state.signer.send, body, body.to)
+    replay_only = _authorize(request, "send_transaction", body)
+    return _dispatch(
+        request, request.app.state.signer.send, body, body.to, replay_only=replay_only
+    )
 
 
 @router.post("/safe-transaction")
@@ -133,8 +172,14 @@ def safe_transaction(body: SafeTransactionRequest, request: Request) -> dict:
     `target`, `value` and `data` are the call the *safe* makes, and the value
     leaves the safe.
     """
-    _authorize(request, "safe_transaction", body)
-    return _dispatch(request, request.app.state.signer.send_via_safe, body, body.target)
+    replay_only = _authorize(request, "safe_transaction", body)
+    return _dispatch(
+        request,
+        request.app.state.signer.send_via_safe,
+        body,
+        body.target,
+        replay_only=replay_only,
+    )
 
 
 @router.post("/sign-message")
@@ -145,7 +190,7 @@ def sign_message(body: SignMessageRequest, request: Request) -> dict:
         digest = bytes.fromhex(body.digest.removeprefix("0x"))
         signature = request.app.state.signer.sign_digest(digest)
     except (SignerError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        raise HTTPException(status_code=400, detail=_public_detail(e)) from e
     return {"signature": signature}
 
 
@@ -171,9 +216,6 @@ def mint_token(grant: TokenGrant, request: Request) -> dict:
     try:
         token = request.app.state.grants.mint(request_token(request), grant)
     except GrantRefused as e:
-        request.app.state.activity.record(
-            "refusal", rule=e.rule, path=request.url.path, reason=str(e)
-        )
-        raise HTTPException(status_code=e.status, detail=f"rule '{e.rule}': {e}") from e
+        raise refused_route(request, request.app.state.activity, e) from e
     request.app.state.activity.record("token_minted", scopes=grant.scopes)
     return {"token": token, "grant": grant.model_dump()}

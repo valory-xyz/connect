@@ -30,12 +30,11 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
-from connect.server.auth import GrantStore
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import SERVER_BUILT, Signer, SignerError
 
-from tests.conftest import FakeW3, audit_entries, pay
+from tests.conftest import FakeW3, audit_entries, grant_store, pay
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -75,7 +74,7 @@ def tools(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech_service,
         settings_store=settings_store,
-        grants=GrantStore("workspace-token"),
+        grants=grant_store("workspace-token"),
     )
     manager = mcp._tool_manager  # pylint: disable=protected-access
     return {tool.name: tool.fn for tool in manager.list_tools()}
@@ -163,6 +162,88 @@ class TestSignerGate:
         assert not fake_w3.eth.sent
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert entry["rule"] == "reverts"
+
+    @pytest.mark.parametrize("via_safe", [True, False])
+    @pytest.mark.parametrize(
+        "data", ["0xzz", "0xa9059cbb 00", "0xa9059cbb\n00", "0xabc", " 0x00"]
+    )
+    def test_calldata_that_is_not_hex_is_refused_before_the_rpc(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        store_path: t.Any,
+        via_safe: bool,
+        data: str,
+    ) -> None:
+        """A caller's typo is refused as one, not as an RPC that cannot simulate."""
+        send = test_signer.send_via_safe if via_safe else test_signer.send
+        with pytest.raises(SignerError, match="'bad-calldata': cannot decode"):
+            send("testchain", TOKEN, data=data)
+        assert fake_w3.provider.simulated == []
+        assert not fake_w3.eth.sent
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry["rule"] == "bad-calldata"
+        reason, problems = test_signer.check(
+            "testchain", TOKEN, data=data, via_safe=via_safe
+        )
+        assert "'bad-calldata'" in str(reason)
+        assert problems[0]["rule"] == "bad-calldata"
+        simulated = test_signer.simulate(
+            "testchain", TOKEN, data=data, via_safe=via_safe
+        )
+        assert simulated["problems"][0]["rule"] == "bad-calldata"
+        assert fake_w3.provider.simulated == []
+
+    def test_an_unavailable_simulation_is_logged(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Every send on the chain is refused, so log.txt must say why."""
+        fake_w3.provider.unavailable = True
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
+            test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
+        (record,) = [r for r in caplog.records if "cannot simulate" in r.message]
+        assert record.exc_info is not None
+        assert record.levelname == "ERROR"
+        assert EOA in record.message  # which call it could not simulate
+
+    @pytest.mark.parametrize("via_safe", [True, False])
+    def test_a_replay_only_send_without_an_id_is_refused(
+        self, test_signer: Signer, fake_w3: FakeW3, via_safe: bool
+    ) -> None:
+        """There is nothing it could replay, and it must never send fresh."""
+        send = test_signer.send_via_safe if via_safe else test_signer.send
+        with pytest.raises(SignerError, match="needs the request id"):
+            send("testchain", TOKEN, data=TOKEN_CALL, replay_only=True)
+        assert not fake_w3.eth.sent
+
+    def test_holds_request_keeps_the_two_paths_apart(
+        self, test_signer: Signer, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A safe send's id is not the EOA's, and an in-flight one is held too.
+
+        A wrong namespace would let a fresh EOA send ride on a completed
+        safe send's id, uncharged.
+        """
+        assert not test_signer.holds_request("r1", True)
+        test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL, request_id="r1")
+        assert test_signer.holds_request("r1", True)
+        assert not test_signer.holds_request("r1", False)
+        test_signer.send("testchain", TOKEN, data=TOKEN_CALL, request_id="r2")
+        assert test_signer.holds_request("r2", False)
+        assert not test_signer.holds_request("r2", True)
+        seen: list = []
+        send_raw = fake_w3.eth.send_raw_transaction
+
+        def mid_broadcast(raw: bytes) -> t.Any:
+            seen.append(test_signer.holds_request("r3", False))
+            return send_raw(raw)
+
+        monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", mid_broadcast)
+        test_signer.send("testchain", TOKEN, data=TOKEN_CALL, request_id="r3")
+        assert seen == [True]  # in flight counts as held
 
     def test_no_simulation_means_no_signature(
         self, test_signer: Signer, fake_w3: FakeW3

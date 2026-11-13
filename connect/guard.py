@@ -195,6 +195,31 @@ class Guard:
             is_token=False,
         )
 
+    def revoke_digest(self, digest: bytes) -> None:
+        """Withdraw a digest allowance before use; a no-op once used or expired.
+
+        For a server-side flow that armed one and then ended without sending:
+        left in place, it would outlive the request for its TTL.
+        """
+        with self._allowance_lock:
+            self._allowed_digests.pop(bytes(digest), None)
+
+    def revoke_safe_deposit(
+        self, *, chain: str, tracker: str, amount_cap: int, is_token: bool
+    ) -> None:
+        """Withdraw the unused safe payment allowance armed with exactly this shape.
+
+        A no-op once it was used or expired, and it never touches an allowance
+        of another shape.
+        """
+        shape = (chain.lower(), tracker.lower(), is_token, amount_cap)
+        with self._allowance_lock:
+            self._deposit_allowances = [
+                a
+                for a in self._deposit_allowances
+                if (a.chain, a.tracker, a.is_token, a.amount_cap) != shape
+            ]
+
     def _purge_expired(self) -> None:
         """Drop expired allowances — loudly; the caller holds the allowance lock.
 
