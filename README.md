@@ -264,13 +264,15 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
 
 - **unrestricted** (default) — any other well-formed request is signed;
 - **restricted** (operator opt-in) — raw digest signing is off, with one
-  carve-out: the mech flow recomputes the off-chain request id *locally* from
-  inputs it already validated, wraps it into the safe's ERC-1271 SafeMessage
-  hash (the safe is the off-chain requester of record), and registers exactly
-  that digest with the guard as a single-use, short-lived allowance before
-  mech-client asks for the signature (nothing the agent session names can
-  register one, and a digest the server did not derive — say, from a lying
-  RPC answering `getRequestId` — mismatches and is refused). The only allowed
+  carve-out: in mech-client's pre-sign hook, the mech flow wraps the
+  off-chain request id mech-client hands it into the safe's ERC-1271
+  SafeMessage hash (the safe is the off-chain requester of record) and
+  registers exactly that digest with the guard as a single-use, short-lived
+  allowance before mech-client asks for the signature (nothing the agent
+  session names can register one). mech-client derives the id locally from
+  the marketplace's `domainSeparator()` and refuses one the RPC's
+  `getRequestId` disagrees with (`RequestIdMismatch`) before the hook runs, so
+  a lying RPC can only cause a refusal. The only allowed
   transaction is a safe `execTransaction` CALL to a whitelisted address with
   the gas-refund fields zeroed (a non-zero SafeTx `gasPrice` would pay a refund
   out of the safe past the whitelist) — plus one analogous carve-out: before
@@ -468,55 +470,44 @@ MechMarketplace via the service safe and works for any listed mech.
 
 ### One payer per safe: nonces
 
-Connect, not mech-client, allocates off-chain marketplace nonces
-(`connect/mech_nonces.py`), so concurrent requests from one safe never share
-one. It follows the deployed sequential marketplace: the mech admits only
-`mapNonces + accepted + settling` for a sender, so one mech is in flight per
-safe and chain (a request to another mech waits for the first one's slots to
-settle, and is refused as `mech-in-flight` when its wait runs out), the lock is
-held from reservation until the mech answers, and a slot is held until
-`mapNonces > n`. mech-client signs the nonce it is given (`send_request(...,
-nonces=[n], on_request_id=...)`, mech-client 0.25.0) and reports the
-request id just before signing. Connect still recomputes that id itself from
-what it assembled and the nonce it allocated: mech-client asks the contract
-for it over `eth_call`, and an id signed on faith would let a lying RPC
-collect the safe's ERC-1271 signature on any 32 bytes, so a mismatch is
-refused before anything is signed. The mech's answer decides the slot: 200
-holds it; 503 (a gap) resends the same nonce and id up to
+Off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
+process, through its `send_with_nonce`, so concurrent requests from one safe
+never share one. It follows the deployed sequential marketplace: the mech
+admits only `mapNonces + accepted + settling` for a sender, so one mech is in
+flight per safe and chain (a request to another mech waits for the first one's
+slots to settle, and is refused as `mech-in-flight` when its wait runs out),
+the lock is held from reservation until the mech answers, and a slot is held
+until `mapNonces > n`. Every rule below is mech-client's (its README, "Allocating
+offchain nonces"); Connect supplies the `mapNonces` read, its own pre-sign hook
+and the queue's settings. The mech's answer decides the slot: 200 holds it;
+503 (a gap) resends the same nonce and id up to
 `CONNECTION_CONFIGS_CONFIG_MECH_GAP_RETRIES` times (default 3), then refuses as
 `mech-nonce-gap`; a 401 whose reason is exactly
 `wire nonce below sender's next expected slot` means the nonce is taken
-(`mech-nonce-taken`: our own unknown slot is then accepted, otherwise the queue
-stalls); any other 4xx, a 402 after the top-up retry included, frees it
-(`mech-request-rejected`), as does mech-client's auto top-up failing on the
-safe's side (`OffchainTopUpFailed`: a cap, a balance, a reverted deposit). When
-that top-up landed and the mech still answered 402, the amount it deposited
-into the balance tracker is audited as `mech_deposit`; any other 5xx or a transport error holds it, since
-the mech may have stored the request. A failure before mech-client's pre-sign
-hook (an RPC or gateway error assembling the request) never reached the mech,
-so it frees the nonce too. A held slot's settle clock starts when its delivery
-arrives, or when the request's own response timeout (300 s, which mech-client
-writes into every request) runs out if no delivery was seen first; a queue
-with a slot that `mapNonces` has not passed within the settle timeout after
-that (`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s), or
-whose nonce another signer took, stalls: only a probe at `mapNonces` is sent
-until one is accepted again, and refusals and `mech_result` say
-`mech_queue_stalled`. A slot whose answer was lost (unknown) is resolved
-through that stall and probe; it is not resent by its salt. An on-chain request takes
-`mapNonces` itself, so it waits until no off-chain slot is held. Held slots,
-their metadata salt and the stall are persisted in `mech_nonces.json` under
-STORE_PATH, and a slot is written there as unknown before its request is
-POSTed, so a restart or a crash mid-send never reissues a held nonce. An
-unreadable file refuses every request (`mech-queue-unreadable`) rather than
-guess, and a file that cannot be written refuses new ones
-(`mech-queue-unwritable`), the request whose own slot could not be written
-included. Every refusal above is recorded as an activity `refusal` with its
-`rule`, and leaves a caller's `request_id` free to send again, since nothing
-reached the mech; only `mech-answer-unknown` is recorded as possibly paid for —
-a 5xx, or a transport error after the pre-sign hook, when the request was
-already signed. Its request id, derived from the nonce as the pre-sign hook checked it, is
-named in the error and the `mech_request_failed` entry as `pending_request_ids`
-and registered for `mech_result`, since the mech may still deliver it.
+(`mech-nonce-taken`); any other 4xx, a 402 after the top-up retry included,
+frees it (`mech-request-rejected`), as does mech-client's auto top-up failing
+on the safe's side (`OffchainTopUpFailed`). When that top-up landed and the mech
+still answered 402, the amount it deposited into the balance tracker is
+audited as `mech_deposit`; any other 5xx or a transport error after the request
+was posted holds the nonce, since the mech may have stored the request. A
+failure before the POST (an RPC or gateway error assembling the request, a
+signer or guard refusal) never reached the mech, so it frees the nonce too. A
+queue whose held slot `mapNonces` has not passed within the settle timeout
+(`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s) after its
+delivery, or after the request's own 300 s response timeout, stalls: only a
+probe at `mapNonces` is sent until one is accepted again, and refusals and
+`mech_result` say `mech_queue_stalled`. An on-chain request takes `mapNonces`
+itself, so it waits until no off-chain slot is held. Held slots, their metadata
+salt and the stall are persisted in `mech_nonces.json` under STORE_PATH, written
+before the POST, so a restart never reissues a held nonce; an unreadable file
+refuses every request (`mech-queue-unreadable`) and an unwritable one new ones
+(`mech-queue-unwritable`). Every refusal above is recorded as an activity
+`refusal` with its `rule`, and leaves a caller's `request_id` free to send
+again, since nothing reached the mech; only `mech-answer-unknown` is recorded
+as possibly paid for — a 5xx, or a transport error after the request was
+posted. Its request id, the one Connect's pre-sign hook was handed, is named in
+the error and the `mech_request_failed` entry as `pending_request_ids` and
+registered for `mech_result`, since the mech may still deliver it.
 On both paths the lock is held only `ACK_WAIT_SECONDS` (1 s) of the delivery
 wait: the rest runs after it is released, up to the request's `timeout`, so
 other requests from the safe are not held behind a delivery. A read that fails
@@ -541,8 +532,10 @@ facilitator's standard request path exist, do not use the facilitator's
 signs its own marketplace nonces for the safe, and two payers on one safe
 collide.
 
-Each request carries a spending budget, `max_payment`, checked against the
-mech's price before anything is paid. It is denominated in the mech's payment
+Each request carries a spending budget, `max_payment`, which goes to
+mech-client as `send_request(max_price=...)`: a mech pricing above it is
+refused (`MechPriceExceeded`, reported as `over-max-payment`) before any
+deposit, signature or POST. It is denominated in the mech's payment
 asset, so its default is 0.1 of that asset — 10^17 base units for native and
 OLAS mechs, 10^5 for USDC ones, including Robinhood Chain, where that payment
 type is USDG. `mech_tools` reports the asset as `payment_token`.

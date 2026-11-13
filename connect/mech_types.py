@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Errors and shapes shared by connect/mech.py, mech_allowances.py and mech_nonces.py."""
+"""Errors and shapes shared by connect/mech.py and mech_allowances.py."""
 
 import typing as t
 

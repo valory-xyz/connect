@@ -42,14 +42,19 @@ from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from mech_client import (
     MechInfo,
+    MechPriceExceeded,
     MetadataRead,
     OffchainRequestRejected,
     OffchainTopUpFailed,
+    PreSignHook,
+    RequestIdMismatch,
 )
+from mech_client import nonces as mech_nonces_module
 from mech_client.domain import identification
 from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
 from mech_client.domain.identification import VALORY_TERMS_NOTICE
+from mech_client.domain.request_id import request_digest
 from mech_client.domain.tools import manager as manager_module
 from mech_client.domain.tools.manager import ToolManager
 from mech_client.infrastructure.config import PaymentType
@@ -61,7 +66,6 @@ from web3.datastructures import AttributeDict
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
-from connect import mech_nonces as mech_nonces_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -78,13 +82,8 @@ from connect.mech import (
     MechService,
     MechSigner,
     PendingDelivery,
-    PricedMech,
 )
-from connect.mech_allowances import (
-    _MAX_AUTO_DEPOSIT_RATIO,
-    deposit_tracker,
-    request_digest,
-)
+from connect.mech_allowances import _MAX_AUTO_DEPOSIT_RATIO, deposit_tracker
 from connect.mech_types import MechAnswerUnknown
 from connect.safe import (
     APPROVE_SELECTOR,
@@ -1824,6 +1823,7 @@ class FakeMarketplaceService:
     def __init__(self) -> None:
         """Initialize."""
         self.calls: list[dict] = []
+        self.priced_out: list[dict] = []  # refused by max_price, before any work
         # the healthy case: the mech answered before the wait ran out, so
         # nothing is left pending (tests for the timeout path drop the
         # delivery_results entry to leave that id unanswered)
@@ -1889,8 +1889,8 @@ class FakeMarketplaceService:
         payment_type, service_id, rate = self.info
         return MechInfo(mech, service_id, payment_type, rate)
 
-    def _get_marketplace_contract(self) -> FakeMarketplaceContract:
-        """Return the contract stand-in (the private helper the code pins)."""
+    def marketplace_contract(self) -> FakeMarketplaceContract:
+        """Return the contract stand-in."""
         return self.contract
 
     async def send_request(self, **kwargs: object) -> dict:
@@ -1905,8 +1905,23 @@ class FakeMarketplaceService:
         exercise end to end.
         """
         self.calls.append(kwargs)
-        if self.raises is not None:
+        hook = kwargs.get("on_request_id")
+        if isinstance(hook, PreSignHook):
+            hook.received = True  # on entry, as mech-client marks it
+        # the mech's own answer to a POST comes after signing, as it does live
+        answered = isinstance(
+            self.raises, (OffchainRequestRejected, OffchainTopUpFailed)
+        )
+        if self.raises is not None and not (answered and kwargs.get("use_offchain")):
             raise self.raises
+        max_price = kwargs.get("max_price")
+        if isinstance(max_price, int) and self.info[2] > max_price:
+            # mech-client's cap: refused before any deposit, signature or POST
+            self.calls.pop()
+            self.priced_out.append(kwargs)
+            raise MechPriceExceeded(
+                "over the cap", price=self.info[2], max_price=max_price
+            )
         if kwargs.get("use_offchain") and self.signer is not None:
             prompts = t.cast(tuple, kwargs["prompts"])
             tools = t.cast(tuple, kwargs["tools"])
@@ -1922,14 +1937,34 @@ class FakeMarketplaceService:
                 bytes.fromhex(self.info[0].value),
                 nonces[0],
             ).call()
-            hook = kwargs.get("on_request_id")
+            local = request_digest(
+                domain_separator=self.contract.domain_separator,
+                marketplace=self.contract.address,
+                mech=t.cast(str, kwargs["priority_mech"]),
+                requester=t.cast(str, self.safe_address),
+                data_hash=bytes.fromhex(data_hash.removeprefix("0x")),
+                delivery_rate=self.info[2],
+                payment_type=bytes.fromhex(self.info[0].value),
+                nonce=nonces[0],
+            )
+            if bytes(request_id) != local:  # mech-client's own check, pre-hook
+                raise RequestIdMismatch(
+                    "mismatch",
+                    expected=local.hex(),
+                    reported=bytes(request_id).hex(),
+                    nonce=nonces[0],
+                )
             if callable(hook):
-                hook(request_id, nonces[0])  # just before signing, as #272 does
+                hook(local, nonces[0])  # just before signing, as #274 does
             self.signer.sign_safe_message(
                 self.safe_address,
                 self.mech_config.ledger_config.chain_id,
-                request_id,
+                local,
             )
+            if isinstance(hook, PreSignHook):
+                hook.posting = True  # signed: the POST is next
+            if answered:
+                raise t.cast(Exception, self.raises)
             if self.raises_after_signing is not None:
                 raise self.raises_after_signing
         return self.result
@@ -2076,7 +2111,7 @@ class TestMech:
         strings, field order, or the keccak(digest) shortcut breaks every
         restricted-mode off-chain signature; without this, only the
         RPC-gated fork test would catch it. Companion to
-        test_request_digest_matches_deployed_marketplace.
+        mech-client's own request_digest tests.
         """
         safe = "0x" + "ab" * 20
         assert (
@@ -2181,11 +2216,6 @@ class TestMech:
         """The check runs before any allowance is armed, so its failure spends nothing."""
         armed: list[str] = []
         allowances = mech_service._allowances  # pylint: disable=protected-access
-        monkeypatch.setattr(
-            allowances,
-            "offchain_digests",
-            lambda *a, **k: armed.append("digest"),
-        )
 
         def arm_deposit(*_args: t.Any, **_kwargs: t.Any) -> bool:
             armed.append("deposit")
@@ -2218,16 +2248,6 @@ class TestMech:
         assert out["valory_operated"] is False
         assert "terms" not in out
         assert out["identification_note"].startswith("Could not check")
-
-    def test_a_refused_request_never_checks_the_terms(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
-    ) -> None:
-        """A request refused on price spends no DNS lookups either."""
-        patched_mech.info = native_mech_info(10**18)
-        with pytest.raises(MechError, match="max_payment"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
-        assert not patched_mech.terms_calls
-        assert not patched_mech.report_calls
 
     def test_request_maps_arguments(
         self,
@@ -2294,7 +2314,7 @@ class TestMech:
         """
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             # AttributeDict, not a dict literal: that is what web3 really
             # hands back, and it is NOT a dict subclass — stubbing a plain
@@ -2304,8 +2324,6 @@ class TestMech:
         result = mech_service.request(
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
-        # normalized: the two flows disagree about the 0x prefix, and the id
-        # the caller is handed has to be the one mech_result accepts
         assert result["pending_request_ids"] == ["ab"]
 
         watched: dict = {}
@@ -2366,7 +2384,7 @@ class TestMech:
         """Picking up the answer the first call gave up on is the point."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -2404,7 +2422,7 @@ class TestMech:
         """A replayed id is exactly the case that needs the answer locatable."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -2429,7 +2447,7 @@ class TestMech:
         """An id cannot be both delivered and reported as a failed read."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -2463,8 +2481,8 @@ class TestMech:
         """mech-client says delivered-but-unreadable; that is not a null answer."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
-            "deliveries": {"0xAB": DeliveryResult("0xAB", None, "ipfs://later")},
+            "request_ids": ["ab"],
+            "deliveries": {"ab": DeliveryResult("ab", None, "ipfs://later")},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
         first = self._job(mech_service, "job-unreadable")
@@ -2491,7 +2509,7 @@ class TestMech:
         """Popping it here would strand a request its payment already bought."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -2766,7 +2784,7 @@ class TestMech:
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """A refusal reached before any payment must not burn the id."""
-        with pytest.raises(MechError, match="above max_payment"):
+        with pytest.raises(MechNotSent, match="above max_payment"):
             mech_service.request(
                 "q",
                 "t",
@@ -2776,6 +2794,7 @@ class TestMech:
                 request_id="job-6",
                 max_payment=0,
             )
+        assert patched_mech.priced_out[-1]["max_price"] == 0  # mech-client's cap
         assert not patched_mech.calls
         assert self._job(mech_service, "job-6")["delivery_results"] == {
             "ab": {"answer": "42"}
@@ -2947,10 +2966,10 @@ class TestMech:
         """
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {
-                "0xAB": DeliveryResult(
-                    request_id="0xAB",
+                "ab": DeliveryResult(
+                    request_id="ab",
                     data={"result": '{"p_yes": 0.38}'},
                     url="https://gateway.example/ipfs/f0170122ab/42",
                 )
@@ -2965,36 +2984,6 @@ class TestMech:
         }
         assert "deliveries" not in report
         assert "pending_request_ids" not in report
-
-    def test_every_id_in_one_response_is_spelled_the_same_way(
-        self,
-        store_path: Path,
-        mech_service: MechService,
-        patched_mech: FakeMarketplaceService,
-    ) -> None:
-        """One id must not appear 0x-prefixed in one key and bare in another.
-
-        mech-client 0x-prefixes on-chain request_ids but not the
-        delivery_results keys, so a caller handed both raw cannot tell that
-        they name the same request. The audit record carries them too: if the
-        harness abandons the call, the log is the only place naming what was
-        paid for.
-        """
-        patched_mech.result = {
-            "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB", "0xCD"],
-            "deliveries": {
-                "ab": DeliveryResult(request_id="ab", data={"answer": "42"}, url=None)
-            },
-        }
-        result = mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
-        )
-        assert result["request_ids"] == ["ab", "cd"]
-        assert list(result["delivery_results"]) == ["ab"]
-        assert result["pending_request_ids"] == ["cd"]
-        recorded = [e for e in audit_entries(store_path) if e["kind"] == "mech_request"]
-        assert recorded[-1]["request_ids"] == ["ab", "cd"]
 
     def test_poll_reports_a_delivery_that_has_not_arrived(
         self,
@@ -3072,7 +3061,7 @@ class TestMech:
                 get_offchain_url=lambda service_id: "https://mech.example/offchain"
             ),
             ledger_api=object(),
-            _get_marketplace_contract=lambda: "contract",
+            marketplace_contract=lambda: "contract",
         )
         pending = PendingDelivery("testchain", OTHER, 42, offchain, 99)
         out = asyncio.run(MechService._watch(service, pending, "ab", 5.0))
@@ -3279,14 +3268,11 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
         restricted: bool,
     ) -> None:
-        """A request id the server did not derive is not signed.
+        """A lying RPC's request id is refused, and nothing is signed.
 
-        This is the lying-RPC case: mech-client asks the contract for the id
-        over eth_call, so a hostile RPC can hand back any 32 bytes — a safe
-        transaction hash included. The local derivation turns that into a
-        mismatch, and the mismatch into a refusal. Since mech-client#272 the id
-        is checked in its pre-sign hook, so the refusal comes before anything
-        is signed, in every mode.
+        mech-client derives the id locally and raises RequestIdMismatch before
+        the pre-sign hook when getRequestId disagrees; Connect reports that as
+        not sent, in every mode, with no digest armed.
         """
         patched_mech.contract.request_id_override = b"\xee" * 32
         service, _ = self._restricted_mech_service(
@@ -3307,9 +3293,9 @@ class TestMech:
             "sign_digest",
             sign_digest,
         )
-        with pytest.raises(MechError, match="not the one this server derives"):
+        with pytest.raises(MechNotSent, match="not sent: mismatch"):
             service.request("q", "tool", chain="testchain", priority_mech=OTHER)
-        assert "mech_offchain_digest_mismatch" in audit_kinds(store_path)
+        assert "mech_offchain_digest" not in audit_kinds(store_path)
         assert signed == []
 
     def test_restricted_auto_deposit_is_armed_via_allowance(  # pylint: disable=too-many-arguments
@@ -3359,9 +3345,7 @@ class TestMech:
         """
         assert _MAX_AUTO_DEPOSIT_RATIO == 10
 
-    def test_deposit_tracker_reads_mech_client_constants(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_deposit_tracker_reads_mech_client_constants(self) -> None:
         """(tracker, is_token) resolves per payment type and fails closed."""
         native, is_token = deposit_tracker("gnosis", PaymentType.NATIVE.value)
         assert native is not None
@@ -3374,11 +3358,8 @@ class TestMech:
         assert deposit_tracker("gnosis", PaymentType.USDC_TOKEN.value) == (None, False)
         # NVM subscription types are deliberately unsupported, like mech-client
         assert deposit_tracker("gnosis", PaymentType.NATIVE_NVM.value) == (None, False)
+        # a chain mech-client does not know fails closed
         assert deposit_tracker("testchain", PaymentType.NATIVE.value) == (None, False)
-        # broken constants fail closed; patched on connect.mech, the binding
-        # the function actually reads since the imports were hoisted
-        monkeypatch.setattr("connect.mech_allowances.CHAIN_NAME_TO_ID", None)
-        assert deposit_tracker("gnosis", PaymentType.NATIVE.value) == (None, False)
 
     def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
         self,
@@ -3417,73 +3398,21 @@ class TestMech:
         assert "mech_deposit_allowance" in audit_kinds(store_path)
         assert not guard._deposit_allowances  # pylint: disable=protected-access
 
-    def test_register_offchain_digest_needs_a_safe(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
-    ) -> None:
-        """The requester of record is the safe; without one there is no digest.
-
-        Unreachable through request() — _service refuses safe-less chains
-        first — but the invariant must fail loudly, not silently, if the
-        call order ever changes.
-        """
-        # pylint: disable-next=protected-access
-        mech_service._config.chains["testchain"].safe_address = None
-        with pytest.raises(MechError, match="no service safe"):
-            # pylint: disable-next=protected-access
-            mech_service._allowances.offchain_digests(
-                t.cast(t.Any, patched_mech),
-                chain="testchain",
-                priced=PricedMech(
-                    mech=OTHER,
-                    service_id=42,
-                    rate=10**16,
-                    payment_type=NATIVE_PAYMENT_TYPE,
-                ),
-                prompt="q",
-                tool="t",
-                extra_attributes={"nonce": "s"},
-            )
-
-    def test_offchain_context_failure_is_a_mech_error(
+    def test_a_marketplace_contract_failure_is_not_sent(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A failing domain/nonce read refuses before any request is sent."""
+        """No marketplace contract, no mapNonces: refused before anything is sent."""
 
         def _boom() -> None:
             raise RuntimeError("rpc down")
 
-        monkeypatch.setattr(patched_mech, "_get_marketplace_contract", _boom)
-        with pytest.raises(MechError, match="could not derive the off-chain"):
+        monkeypatch.setattr(patched_mech, "marketplace_contract", _boom)
+        with pytest.raises(MechNotSent, match="could not read the marketplace"):
             mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         assert not patched_mech.calls
-
-    def test_request_digest_matches_deployed_marketplace(self) -> None:
-        """Golden vector recorded from the deployed gnosis marketplace.
-
-        domainSeparator() and getRequestId(...) were called on
-        0x735FAAb1c4Ec41128c367AFb5c3baC73509f70bB (2026-07-23) with these
-        synthetic inputs; the local derivation must reproduce the contract's
-        answer byte for byte, or restricted-mode off-chain requests break.
-        """
-        digest = request_digest(
-            domain_separator=bytes.fromhex(
-                "58fbb2508b962bcf6e2708fdfc23222115504128df851ae75ef8c66f2e0bdade"
-            ),
-            marketplace=GNOSIS_MARKETPLACE,
-            mech="0x" + "11" * 20,
-            requester="0x" + "22" * 20,
-            data_hash=bytes.fromhex("33" * 32),
-            delivery_rate=7,
-            payment_type=bytes.fromhex("44" * 32),
-            nonce=9,
-        )
-        assert (
-            digest.hex()
-            == "512e9b1dd2d2d253ba226f6d47af046720b1d97a09ae71e4ecc3f640f33bf36b"
-        )
 
     def test_request_refuses_an_unreachable_offchain_mech(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3650,22 +3579,29 @@ class TestMech:
         assert not patched_mech.calls  # nothing was ever sent
 
     def test_price_cap_binds_the_offchain_flow_too(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+        self,
+        store_path: Path,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
     ) -> None:
-        """The cap is checked for the default flow, before any metadata read.
+        """max_payment goes to mech-client as max_price on the default flow too.
 
-        Ordering matters: an over-priced mech is disqualified on price alone,
-        so the pre-flight's network fetch is never reached.
+        Its cap refuses before any deposit, signature or POST, so the nonce is
+        free again and no digest was ever armed.
         """
         patched_mech.info = native_mech_info(10**18)
-        patched_mech.tool_manager = SimpleNamespace(
-            read_tools_metadata=lambda service_id: pytest.fail(
-                "priced out already; the metadata fetch should not be reached"
-            )
-        )
-        with pytest.raises(MechError, match="max_payment"):
+        with pytest.raises(MechNotSent, match="max_payment"):
             mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        (priced_out,) = patched_mech.priced_out
+        assert priced_out["use_offchain"] is True
+        assert priced_out["max_price"] == 10**17
         assert not patched_mech.calls
+        assert "mech_offchain_digest" not in audit_kinds(store_path)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
+        ) as slot:
+            assert slot.nonce == patched_mech.contract.nonce  # freed
 
     def test_request_passes_signer_errors_through(
         self,
@@ -4283,7 +4219,7 @@ class TestMech:
         """
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -4441,6 +4377,15 @@ class TestMech:
             assert all(wait <= bound for wait in waits)
             if bound > 1:  # with 1 s, a coarse clock may or may not leave a wait
                 assert waits
+
+    def test_an_on_chain_report_claims_no_off_chain_validity(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Only an off-chain request is reported as carrying no deadline."""
+        report = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, legacy_on_chain=True
+        )
+        assert "expires" not in report
 
     def test_offchain_request_signs_the_nonce_connect_allocated(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -4711,12 +4656,13 @@ class TestMech:
             slot.answered("taken", mech=OTHER, salt="")  # another signer took it
         assert nonces.stalled("testchain", SAFE)
         assert mech_service.result("ab", timeout=1)["mech_queue_stalled"] is True
+        # the probe at mapNonces is refused outright, so the stall stands
         patched_mech.raises = OffchainRequestRejected(
-            "HTTP 401",
+            "HTTP 402",
             request_id="0x01",
             nonce=5,
-            status=401,
-            reason=mech_nonces_module.NONCE_TAKEN_REASON,
+            status=402,
+            reason="Payment Required",
             unsent=[],
         )
         with pytest.raises(MechError, match="mech_queue_stalled"):
@@ -4768,7 +4714,7 @@ class TestMech:
         ("request_ids", "deliveries", "delivered"),
         [
             (["ab"], {}, False),  # still pending: its clock waits for the timeout
-            (["0xAB"], {"ab": {"a": 1}}, True),  # one id, spelled two ways
+            (["ab"], {"ab": {"a": 1}}, True),
         ],
     )
     def test_only_a_delivered_request_starts_its_settle_clock(  # pylint: disable=too-many-arguments
@@ -4939,15 +4885,16 @@ class TestMech:
             raise ConnectionError("no RPC")
 
         monkeypatch.setattr(mech_module, "read_map_nonces", down)
-        with pytest.raises(MechNotSent, match="marketplace nonce"):
-            mech_service.request(
-                "q",
-                "tool",
-                chain="testchain",
-                priority_mech=OTHER,
-                legacy_on_chain=True,
-            )
-        monkeypatch.setattr(patched_mech, "_get_marketplace_contract", down)
+        for legacy_on_chain in (True, False):
+            with pytest.raises(MechNotSent, match="marketplace nonce: no RPC"):
+                mech_service.request(
+                    "q",
+                    "tool",
+                    chain="testchain",
+                    priority_mech=OTHER,
+                    legacy_on_chain=legacy_on_chain,
+                )
+        monkeypatch.setattr(patched_mech, "marketplace_contract", down)
         with pytest.raises(MechNotSent, match="could not read the marketplace"):
             mech_service.request(
                 "q",
