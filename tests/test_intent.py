@@ -229,7 +229,10 @@ def test_a_malformed_batch_is_simulation_unavailable() -> None:
     # the ids fit; only the amounts array runs past the data
     short = "0x" + _word(64) + _word(160) + _word(2) + _word(1) + _word(2)
     amounts_overrun = dict(huge, data=short + _word(2) + _word(5))
-    for malformed in (one_word, amounts_overrun):
+    # the amounts fit; only the ids array runs past the data
+    ids_at_end = "0x" + _word(160) + _word(64) + _word(2) + _word(5) + _word(6)
+    ids_overrun = dict(huge, data=ids_at_end + _word(2) + _word(1))
+    for malformed in (one_word, amounts_overrun, ids_overrun):
         with pytest.raises(intent.SimulationUnavailable, match="TransferBatch"):
             simulate([malformed])
     with pytest.raises(intent.SimulationUnavailable, match="unreadable"):
@@ -329,6 +332,9 @@ def _wrap_log(kind: str, holder: str, amount: int) -> dict:
         ([transfer(TOKEN, ZERO, SAFE, 9), _wrap_log(intent.DEPOSIT, SAFE, 9)], "9"),
         ([_wrap_log(intent.DEPOSIT, SAFE, 9), transfer(TOKEN, ZERO, SAFE, 9)], "9"),
         ([transfer(TOKEN, SAFE, ZERO, 4), _wrap_log(intent.WITHDRAWAL, SAFE, 4)], "-4"),
+        # a mint to, or a burn from, another address says nothing of the safe's
+        ([transfer(TOKEN, ZERO, EOA, 9), _wrap_log(intent.DEPOSIT, SAFE, 9)], "9"),
+        ([transfer(TOKEN, EOA, ZERO, 4), _wrap_log(intent.WITHDRAWAL, SAFE, 4)], "-4"),
     ],
 )
 def test_a_wrap_logging_transfer_and_deposit_counts_once(
