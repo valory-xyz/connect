@@ -175,10 +175,7 @@ class TestSignerGate:
         via_safe: bool,
         data: str,
     ) -> None:
-        """A caller's typo is refused as one, not as an RPC that cannot simulate.
-
-        Strictly: bytes.fromhex skips whitespace, and the raw string goes on.
-        """
+        """A caller's typo is refused as one, not as an RPC that cannot simulate."""
         send = test_signer.send_via_safe if via_safe else test_signer.send
         with pytest.raises(SignerError, match="'bad-calldata': cannot decode"):
             send("testchain", TOKEN, data=data)
