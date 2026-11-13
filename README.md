@@ -492,8 +492,9 @@ guess, and a file that cannot be written refuses new ones
 (`mech-queue-unwritable`), the request whose own slot could not be written
 included. Every refusal above is recorded as an activity `refusal` with its
 `rule`, and leaves a caller's `request_id` free to send again, since nothing
-reached the mech; only `mech-answer-unknown` is recorded as possibly paid for.
-Its request id, derived from the nonce as the pre-sign hook checked it, is
+reached the mech; only `mech-answer-unknown` is recorded as possibly paid for —
+a 5xx, or a transport error after the pre-sign hook, when the request was
+already signed. Its request id, derived from the nonce as the pre-sign hook checked it, is
 named in the error and the `mech_request_failed` entry as `pending_request_ids`
 and registered for `mech_result`, since the mech may still deliver it.
 On both paths the lock is held only `ACK_WAIT_SECONDS` (1 s) of the delivery

@@ -537,13 +537,16 @@ def offchain_send(
     mech-client calls `on_request_id` just before it signs, so whatever fails
     before that call has not reached the mech; Connect's own refusals (the
     hook's id check, the signer) come before the POST too. Those raise
-    MechNotSent, and leave the nonce free. Anything else may have reached it.
+    MechNotSent, and leave the nonce free. Anything else may have reached it:
+    after the hook, the request was signed, so a failure there (a transport
+    error) is the mech's answer lost, raised as ANSWER_UNKNOWN_RULE with the
+    nonce the hook was handed, for the caller to keep its id pending.
     """
-    hooked: list[bool] = []
+    hooked: list[int] = []
 
-    def hook(*args: t.Any) -> None:
-        hooked.append(True)
-        on_request_id(*args)
+    def hook(request_id: t.Any, nonce: int) -> None:
+        hooked.append(nonce)
+        on_request_id(request_id, nonce)
 
     try:
         return send(on_request_id=hook)
@@ -554,7 +557,12 @@ def offchain_send(
     except Exception as e:
         if not hooked:
             raise MechNotSent(f"mech request not sent: {e}") from e
-        raise
+        raise NonceRefused(
+            ANSWER_UNKNOWN_RULE,
+            f"the mech's answer to nonce {hooked[-1]} was lost after it was "
+            f"signed: {e}",
+            nonce=hooked[-1],
+        ) from e
 
 
 def send_with_nonce(  # pylint: disable=too-many-arguments

@@ -1818,6 +1818,8 @@ class FakeMarketplaceService:
             },
         }
         self.raises: Exception | None = None
+        # raised once the request is signed: the POST may have reached the mech
+        self.raises_after_signing: Exception | None = None
         self.mech_info = native_mech_info(10**16)
         # A mech that publishes both a tool list and an off-chain endpoint —
         # the rare healthy case; tests that need a blocker override `metadata`.
@@ -1912,6 +1914,8 @@ class FakeMarketplaceService:
                 self.mech_config.ledger_config.chain_id,
                 request_id,
             )
+            if self.raises_after_signing is not None:
+                raise self.raises_after_signing
         return self.result
 
 
@@ -4677,6 +4681,38 @@ class TestMech:
         ) -> dict:
             assert pending.offchain
             assert pending.mech == OTHER
+            return {key: DeliveryResult(key, {"answer": "42"}, None)}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        assert mech_service.result(held, timeout=1)["result"] == {"answer": "42"}
+
+    def test_a_transport_error_after_signing_keeps_the_id_pending(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Signed, then the connection dropped: the mech may hold it, so its id waits."""
+        patched_mech.raises_after_signing = ConnectionError("connection reset")
+        with pytest.raises(MechAnswerUnknown, match="connection reset") as raised:
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r7"
+            )
+        (held,) = raised.value.pending_request_ids
+        (failed,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request_failed"
+        ]
+        assert failed["pending_request_ids"] == [held]
+        assert "refusal" not in audit_kinds(store_path)
+        signed = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_offchain_digest"
+        ]
+        assert signed[-1]["request_id"].removeprefix("0x") == held  # the armed id
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
             return {key: DeliveryResult(key, {"answer": "42"}, None)}
 
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))

@@ -541,10 +541,11 @@ def test_offchain_send_tells_a_failure_before_the_post_apart() -> None:
 
     with pytest.raises(MechNotSent, match="not sent: rpc"):
         mech_nonces.offchain_send(failing(True, ConnectionError("rpc")), seen.append)
-    with pytest.raises(ConnectionError):  # the POST may have reached the mech
-        mech_nonces.offchain_send(
+    with pytest.raises(NonceRefused, match="lost after it was signed") as lost:
+        mech_nonces.offchain_send(  # the POST may have reached the mech
             failing(False, ConnectionError("rpc")), lambda *a: seen.append(a)
         )
+    assert (lost.value.rule, lost.value.nonce) == ("mech-answer-unknown", 5)
     assert seen == [(b"id", 5)]
     for refused in (MechError("id mismatch"), SignerError("guard")):
         with pytest.raises(MechNotSent):  # Connect's own refusals precede the POST
