@@ -965,11 +965,21 @@ def test_http_a_retry_while_the_send_is_in_flight_is_not_drawn_again(
 
 
 @pytest.mark.parametrize("surface", ["http", "mcp"])
-def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(
+@pytest.mark.parametrize(
+    ("tool", "path", "to_key"),
+    [
+        ("safe_transaction", "/safe-transaction", "target"),
+        ("send_transaction", "/sign-and-send", "to"),
+    ],
+)
+def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(  # pylint: disable=too-many-arguments,too-many-locals
     client: TestClient,
     fake_w3: FakeW3,
     monkeypatch: pytest.MonkeyPatch,
     surface: str,
+    tool: str,
+    path: str,
+    to_key: str,
 ) -> None:
     """The draw was spared because the id was in flight; then the first send failed.
 
@@ -979,7 +989,7 @@ def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(
     capped = _session_capped(client)
     arguments = {
         "chain": "testchain",
-        "target": RECIPIENT,
+        to_key: RECIPIENT,
         "value": 10,
         "intent": pay(RECIPIENT, 10),
         "request_id": "r1",
@@ -988,13 +998,13 @@ def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {"name": "safe_transaction", "arguments": arguments},
+        "params": {"name": tool, "arguments": arguments},
     }
     headers = {"Accept": "application/json, text/event-stream", **_bearer(capped)}
 
     def post() -> t.Any:
         if surface == "http":
-            return client.post("/safe-transaction", json=arguments, headers=headers)
+            return client.post(path, json=arguments, headers=headers)
         return client.post("/mcp/", json=call, headers=headers)
 
     broadcasting, release = threading.Event(), threading.Event()
