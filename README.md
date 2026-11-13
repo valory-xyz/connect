@@ -535,7 +535,7 @@ the shared chat contract: the report adds `completion` (text) and `usage`
 `MechModel` order (the delivery, then `response`/`result`, then
 `content`/`text`/`completion`, or `choices[0].message`); a native tool call the
 model returned unrequested comes back as a fenced bash block in `completion`
-(`connect/mech_chat.py`). Until the mechs team's chat mechs and the
+(mech-client's `chat_report` and `is_chat_prompt`). Until the mechs team's chat mechs and the
 facilitator's standard request path exist, do not use the facilitator's
 `/mech/chat` route and `mech_request` from one safe at once: the facilitator
 signs its own marketplace nonces for the safe, and two payers on one safe

@@ -41,6 +41,7 @@ import typing as t
 from collections.abc import Mapping
 
 from eth_typing import URI
+from mech_client import chat_report, is_chat_prompt
 from mech_client.domain.delivery import (
     OffchainDeliveryWatcher,
     OnchainDeliveryWatcher,
@@ -61,7 +62,6 @@ from connect.mech_allowances import (
     read_map_nonces,
 )
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
-from connect.mech_chat import chat_report, is_chat_prompt
 from connect.mech_metadata import offchain_blocker, read_service_metadata
 from connect.mech_nonces import (
     ANSWER_UNKNOWN_RULE,
