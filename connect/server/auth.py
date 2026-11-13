@@ -52,6 +52,7 @@ from connect.activity import ActivityLog
 from connect.chain_read import UNIVERSAL_ROUTER_NAME, known_contract
 from connect.chains import chain_info
 from connect.server.strict import StrictBody
+from connect.signer import MAX_CACHED_RESULTS
 
 Scope = t.Literal["read", "mech", "tx"]
 SCOPES: tuple[Scope, ...] = ("read", "mech", "tx")
@@ -111,9 +112,8 @@ class TokenGrant(StrictBody):
 
 
 WORKSPACE_GRANT = TokenGrant(scopes=list(SCOPES))
-# request ids whose draws GrantStore remembers, as many as the signer keeps
-# results for (MAX_CACHED_RESULTS); one forgotten is only drawn again
-MAX_DRAWN_REQUEST_IDS = 1024
+# as many request ids' draws as the signer keeps results; one forgotten is drawn again
+MAX_DRAWN_REQUEST_IDS = MAX_CACHED_RESULTS
 
 # the request-state key the MCP mount sets: the bearer token that authorized it
 AUTH_TOKEN = "auth_token"  # nosec B105 - a state key, not a credential
