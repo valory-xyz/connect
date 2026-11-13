@@ -433,6 +433,31 @@ that survives those.
 
 ## Mech requests
 
+### Base and Polygon indexers
+
+Mech discovery and registry reads on Base and Polygon require mech-client
+0.26.0 or later and four operator-supplied squid GraphQL endpoints:
+
+- `MECHX_MARKETPLACE_BASE_SQUID_URL`
+- `MECHX_MARKETPLACE_POLYGON_SQUID_URL`
+- `MECHX_REGISTRY_BASE_SQUID_URL`
+- `MECHX_REGISTRY_POLYGON_SQUID_URL`
+
+For standalone runs, export these variables before starting Connect; `.env`
+is not loaded automatically. For Pearl, add the four values to the Connect
+service template's `valory/configs` fields (`mechx_marketplace_base_squid_url`,
+etc.). Middleware injects them as `CONNECTION_CONFIGS_CONFIG_MECHX_...`;
+Connect forwards them to mech-client at startup. Non-empty template values
+take precedence over direct variables; blank or `null` defaults leave direct
+variables unchanged. Endpoint values stay in deployment configuration.
+
+Release order: publish mech-client with #271 and #274, complete #107's
+dependency update, then release Connect and update the Pearl template and
+middleware pins with the squid settings. Before rollout, verify Base/Polygon
+mech discovery, operator/service metadata and one request/result flow per chain.
+Other chains keep their existing indexers.
+
+
 The `mech_request` MCP tool drives [mech](https://olas.network/services/ai-mechs)
 requests through mech-client's `Signer` protocol, so every transaction and
 digest passes the guarded choke point. The default off-chain prepaid flow

@@ -21,18 +21,22 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
 from connect.config import (
+    CUSTOM_ENV_VARS_PREFIX,
     FUND_REQUIREMENTS_ENV,
     LOG_LEVEL_ENV,
     MECH_GAP_RETRIES_ENV,
+    MECH_INDEXER_ENV_VARS,
     MECH_SETTLE_TIMEOUT_ENV,
     MINUTES_PER_RUN_ENV,
     SAFES_ENV,
     STORE_PATH_ENV,
+    configure_mech_indexers,
     load_config,
 )
 
@@ -219,3 +223,35 @@ def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:
     config = load_config(base_env(tmp_path))
     with pytest.raises(ValueError, match="unknown chain"):
         config.chain("solana")
+
+
+@pytest.mark.parametrize("name", MECH_INDEXER_ENV_VARS)
+def test_pearl_indexers_override_direct_values(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Pearl values reach mech-client without mixing chains or reader types."""
+    for key in MECH_INDEXER_ENV_VARS:
+        monkeypatch.delenv(CUSTOM_ENV_VARS_PREFIX + key, raising=False)
+        monkeypatch.setenv(key, "https://old.example/graphql")
+    monkeypatch.setenv(CUSTOM_ENV_VARS_PREFIX + name, " https://squid.example/graphql ")
+    configure_mech_indexers()
+    assert os.environ[name] == "https://squid.example/graphql"
+    for key in set(MECH_INDEXER_ENV_VARS) - {name}:
+        assert os.environ[key] == "https://old.example/graphql"
+
+
+@pytest.mark.parametrize("raw", [None, "", "  ", "null", " NULL "])
+def test_unset_pearl_indexers_preserve_standalone(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None
+) -> None:
+    """Template defaults neither erase direct URLs nor invent endpoints."""
+    for index, name in enumerate(MECH_INDEXER_ENV_VARS):
+        monkeypatch.delenv(CUSTOM_ENV_VARS_PREFIX + name, raising=False)
+        if raw is not None:
+            monkeypatch.setenv(CUSTOM_ENV_VARS_PREFIX + name, raw)
+        monkeypatch.delenv(name, raising=False)
+        if index == 0:
+            monkeypatch.setenv(name, "https://direct.example/graphql")
+    configure_mech_indexers()
+    assert os.environ[MECH_INDEXER_ENV_VARS[0]] == "https://direct.example/graphql"
+    assert all(name not in os.environ for name in MECH_INDEXER_ENV_VARS[1:])

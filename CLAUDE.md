@@ -96,3 +96,14 @@ Other trees:
 - `mech-client` is pinned to `0.25.0`, the first release with valory-xyz/mech-client#272, which adds caller-owned off-chain nonces (`send_request(..., nonces=, on_request_id=)`), the result's `nonces` and `OffchainRequestRejected`, which the nonce allocator relies on (README, "Mech requests"). Before it, `0.24.0` was the first release with `ToolManager.mech_report` and `mech_report_or_terms` (operator domain verification, benchmark links, delivery record, payment method, and the fallback to the terms). `0.23.3` was the first with `ToolManager.terms_report` and DNS identification of Valory mechs. `0.23.0` was the first that lists Robinhood Chain's mechs (its marketplace indexer is a squid, which 0.22.x could not query). `0.22.0` was the first carrying the `deliveries`/`DeliveryResult` shape `connect/mech.py` reads. `mech_request`'s default `max_payment` is 0.1 of the mech's payment asset, keyed by mech-client's `PaymentType` (`DEFAULT_MAX_PAYMENT` in `connect/mech_budget.py`), so a payment type added upstream is refused until it gets a default.
 - `[tool.uv] override-dependencies` pins fastapi past mech-client's transitive `fastapi<0.118` pin (operate paths in mech-client never run here). This is why the pylint/test tox envs use `uv sync` in `commands_pre` instead of a normal package install — pip can't honor the override.
 - pytest runs with `-p no:anchorpy` (a transitive plugin whose own deps aren't installed).
+
+## Base/Polygon squid configuration
+
+The four `MECHX_{MARKETPLACE,REGISTRY}_{BASE,POLYGON}_SQUID_URL` variables
+configure mech-client's independent Marketplace and registry readers (requires
+mech-client >= 0.26.0). `configure_mech_indexers()` runs at startup before
+services are created and forwards non-empty, non-`null`
+`CONNECTION_CONFIGS_CONFIG_MECHX_...` values from Pearl's service template.
+Standalone runs can export the direct variables. Keep endpoints in deployment
+configuration; other chains retain their current readers. #107 owns the
+dependency bump after mech-client #274 is published.

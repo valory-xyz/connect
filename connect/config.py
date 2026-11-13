@@ -50,6 +50,12 @@ LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 MECH_SETTLE_TIMEOUT_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_SETTLE_TIMEOUT"
 MECH_GAP_RETRIES_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_GAP_RETRIES"
+MECH_INDEXER_ENV_VARS = (
+    "MECHX_MARKETPLACE_BASE_SQUID_URL",
+    "MECHX_MARKETPLACE_POLYGON_SQUID_URL",
+    "MECHX_REGISTRY_BASE_SQUID_URL",
+    "MECHX_REGISTRY_POLYGON_SQUID_URL",
+)
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 DEFAULT_LOG_LEVEL = "info"
@@ -230,6 +236,18 @@ def _parse_count(env: dict[str, str], name: str, default: int) -> int:
     if value < 0:
         raise ValueError(f"{name} is not a whole number >= 0: {raw!r}")
     return value
+
+
+def configure_mech_indexers() -> None:
+    """Forward Pearl's squid settings to mech-client before creating services.
+
+    Standalone deployments can set the MECHX variables directly. Empty or
+    null template defaults leave those values untouched.
+    """
+    for name in MECH_INDEXER_ENV_VARS:
+        value = os.environ.get(CUSTOM_ENV_VARS_PREFIX + name, "").strip()
+        if value and value.lower() != "null":
+            os.environ[name] = value
 
 
 def load_config(env: dict[str, str] | None = None) -> AppConfig:

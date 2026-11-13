@@ -22,6 +22,7 @@
 import io
 import json
 import logging
+import os
 import threading
 import time as time_module
 import typing as t
@@ -442,6 +443,7 @@ class TestMain:
         self,
         boot_env: Path,
         served: list[StubServer],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A clean boot provisions the workspace and reports itself healthy.
 
@@ -449,6 +451,19 @@ class TestMain:
         once is_healthy turns true, so a regression that left a good boot
         unhealthy would quietly mean no session ever opens.
         """
+        name = "MECHX_MARKETPLACE_BASE_SQUID_URL"
+        monkeypatch.setenv(name, "https://old.example/graphql")
+        monkeypatch.setenv(
+            "CONNECTION_CONFIGS_CONFIG_" + name, "https://squid.example/graphql"
+        )
+        original = main_module.MechService
+
+        def make_mech(*args: t.Any, **kwargs: t.Any) -> MechService:
+            """Check the endpoint before constructing the first service."""
+            assert os.environ[name] == "https://squid.example/graphql"
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(main_module, "MechService", make_mech)
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         assert (boot_env / ".mcp.json").exists()
         app = served[0].config.app

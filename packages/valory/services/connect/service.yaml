@@ -71,3 +71,7 @@ config:
   minutes_per_run: ${MINUTES_PER_RUN:int:15}
   mech_settle_timeout: ${MECH_SETTLE_TIMEOUT:int:1800}
   mech_gap_retries: ${MECH_GAP_RETRIES:int:3}
+  mechx_marketplace_base_squid_url: ${MECHX_MARKETPLACE_BASE_SQUID_URL:str:null}
+  mechx_marketplace_polygon_squid_url: ${MECHX_MARKETPLACE_POLYGON_SQUID_URL:str:null}
+  mechx_registry_base_squid_url: ${MECHX_REGISTRY_BASE_SQUID_URL:str:null}
+  mechx_registry_polygon_squid_url: ${MECHX_REGISTRY_POLYGON_SQUID_URL:str:null}
