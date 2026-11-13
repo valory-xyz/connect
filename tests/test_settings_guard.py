@@ -3372,6 +3372,7 @@ class TestMech:
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
 
+    @pytest.mark.parametrize("case", ["price", "id-mismatch", "map-nonces", "rejected"])
     def test_a_request_refused_before_sending_leaves_no_allowance(  # pylint: disable=too-many-arguments
         self,
         account: LocalAccount,
@@ -3380,10 +3381,13 @@ class TestMech:
         settings_store: SettingsStore,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
+        case: str,
     ) -> None:
-        """mech-client's price cap refuses after the top-up was armed: it is withdrawn.
+        """Every exit that sent nothing withdraws the top-up armed for it.
 
-        Nothing was sent, so nothing the request armed may outlive it.
+        mech-client's price cap (MechPriceExceeded), its id check
+        (RequestIdMismatch) and a failed mapNonces read (MechNotSent), and the
+        mech's refusal (NonceRefused): none may leave an allowance behind.
         """
         monkeypatch.setattr(
             allowances_module,
@@ -3393,8 +3397,26 @@ class TestMech:
         service, guard = self._restricted_mech_service(
             account, app_config, activity, settings_store
         )
-        patched_mech.info = native_mech_info(10**18)  # above the default budget
-        with pytest.raises(MechNotSent, match="max_payment"):
+        if case == "price":
+            patched_mech.info = native_mech_info(10**18)  # above the default budget
+        if case == "id-mismatch":
+            patched_mech.contract.request_id_override = b"\xee" * 32
+        if case == "map-nonces":
+
+            def down(*_args: t.Any) -> int:
+                raise ConnectionError("no RPC")
+
+            monkeypatch.setattr(mech_module, "read_map_nonces", down)
+        if case == "rejected":
+            patched_mech.raises = OffchainRequestRejected(
+                "HTTP 402",
+                request_id="0x01",
+                nonce=5,
+                status=402,
+                reason="Payment Required",
+                unsent=[],
+            )
+        with pytest.raises(MechNotSent):
             service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         deposit = exec_transaction_calldata(TRACKER, value=10**16)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
