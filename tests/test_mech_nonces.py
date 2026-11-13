@@ -388,13 +388,15 @@ def test_send_with_nonce_names_each_rejection(  # pylint: disable=too-many-argum
 ) -> None:
     """Each answer names its rule, and holds the slot only when it may be stored."""
     _, error = _send(allocator, [reject(status, reason)], clock)
-    assert isinstance(error, NonceRefused)
-    assert error.rule == rule
     assert (salt_of(allocator, 5) is not None) is held
-    # a lost answer is its own type, carrying the nonce its id was signed with
+    # a lost answer is not a refusal: its own type, with the nonce it was signed with
+    assert isinstance(error, NonceRefused) is not held
     assert isinstance(error, NonceAnswerUnknown) is held
     if held:
         assert t.cast(NonceAnswerUnknown, error).nonce == 5
+        assert rule == mech_nonces.ANSWER_UNKNOWN_RULE
+    else:
+        assert t.cast(NonceRefused, error).rule == rule
 
 
 def test_send_with_nonce_frees_a_nonce_never_sent_and_holds_a_lost_one(
@@ -554,7 +556,7 @@ def test_offchain_send_tells_a_failure_before_the_post_apart() -> None:
         mech_nonces.offchain_send(  # the POST may have reached the mech
             failing(False, ConnectionError("rpc")), lambda *a: seen.append(a)
         )
-    assert (lost.value.rule, lost.value.nonce) == ("mech-answer-unknown", 5)
+    assert lost.value.nonce == 5
     assert seen == [(b"id", 5)]
     for refused in (MechError("id mismatch"), SignerError("guard")):
         with pytest.raises(MechNotSent):  # Connect's own refusals precede the POST

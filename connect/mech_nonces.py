@@ -95,19 +95,27 @@ class NonceRefused(Exception):
         return self.detail
 
 
-class NonceAnswerUnknown(NonceRefused):
-    """The answer to a signed request was lost (a 5xx, a dropped connection).
+class NonceAnswerUnknown(Exception):
+    """The answer to a signed request was lost: the mech may hold it, and charge.
 
-    Not a refusal: the mech may hold the request and charge for it, so the
-    nonce stays held, and `nonce` — the one it was signed with — lets the
-    caller keep its request id pending. The rule is always mech-answer-unknown.
+    Not a refusal, so not a NonceRefused: the nonce stays held, and `nonce` —
+    the one the request was signed with — lets the caller keep its id pending
+    (rule mech-answer-unknown). Raised for what `outcome_of` reads as unknown
+    (a 5xx other than 503, which is a gap to retry) and for a transport error
+    after mech-client's pre-sign hook. `deposited` is what an auto top-up
+    paid into the balance tracker on the way, else 0.
     """
 
     def __init__(self, detail: str, nonce: int, deposited: int = 0) -> None:
         """Initialize."""
-        super().__init__(ANSWER_UNKNOWN_RULE, detail, deposited)
-        self.args = (detail, nonce, deposited)
+        super().__init__(detail, nonce, deposited)
+        self.detail = detail
         self.nonce = nonce
+        self.deposited = deposited
+
+    def __str__(self) -> str:
+        """Return what a caller reads."""
+        return self.detail
 
 
 @dataclass
@@ -596,8 +604,9 @@ def send_with_nonce(  # pylint: disable=too-many-arguments
     transport error) leaves the slot held, since the mech may have stored it.
 
     :raises NonceRefused: naming the rule, when the mech did not accept it.
-    :raises NonceAnswerUnknown: when its answer was lost (a 5xx): the request
-        was signed, so the mech may hold it.
+    :raises NonceAnswerUnknown: when its answer was lost (what `outcome_of`
+        reads as unknown: a 5xx other than 503, whose retries end as
+        mech-nonce-gap): the request was signed, so the mech may hold it.
     """
     with allocator.reserve(
         chain, safe, mech, read_map_nonces, timeout=timeout, salt=salt
