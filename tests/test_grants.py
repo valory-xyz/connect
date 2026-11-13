@@ -1059,3 +1059,29 @@ def test_mcp_preflight_answers_with_the_token_s_cap_and_draws_nothing(
     assert "token-cap-per-tx" in checked[0]["reason"]
     assert checked[0]["probed_value"] == "6"
     assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+
+
+def test_mcp_preflight_answers_a_read_only_token_as_its_send_would(
+    client: TestClient, fake_w3: FakeW3, store_path: t.Any
+) -> None:
+    """A read token may preflight, and is told its send would be refused by scope."""
+    reader = client.post(
+        "/tokens", json={"scopes": ["read"]}, headers=_bearer(WORKSPACE)
+    ).json()["token"]
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "preflight_transaction",
+            "arguments": {"chain": "testchain", "target": RECIPIENT},
+        },
+    }
+    headers = {"Accept": "application/json, text/event-stream", **_bearer(reader)}
+    answer = client.post("/mcp/", json=body, headers=headers).text
+    assert '\\"allowed\\": false' in answer
+    assert "token-scope" in answer
+    (checked,) = [e for e in audit_entries(store_path) if e["kind"] == "checked"]
+    assert "token-scope" in checked["reason"]
+    assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert fake_w3.provider.simulated == []
