@@ -77,6 +77,7 @@ from connect.mech_types import (
     PricedMech,
     SPEND_UNCERTAIN,
     published_tools,
+    said,
 )
 from connect.signer import Signer, SignerError
 
@@ -303,7 +304,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 for m in mechs[offset : offset + limit]
             ]
         except Exception as e:
-            raise MechError(f"could not list mechs for '{chain}': {e}") from e
+            raise MechError(f"could not list mechs for '{chain}': {said(e)}") from e
         return {
             "chain": chain,
             "mechs": page,
@@ -644,7 +645,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 request_id=request_id,
                 error=str(e),
             )
-            raise MechError(f"mech request failed: {e}") from e
+            raise MechError(f"mech request failed: {said(e)}") from e
         self._activity.record(
             "mech_request",
             chain=plan.chain,
@@ -744,13 +745,15 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         try:
             contract = plan.service.marketplace_contract()
         except Exception as e:
-            raise MechNotSent(f"could not read the marketplace: {e}") from e
+            raise MechNotSent(f"could not read the marketplace: {said(e)}") from e
 
         def read_map() -> int:
             try:
                 return read_map_nonces(contract, safe)
             except Exception as e:
-                raise MechNotSent(f"could not read the marketplace nonce: {e}") from e
+                raise MechNotSent(
+                    f"could not read the marketplace nonce: {said(e)}"
+                ) from e
 
         if not plan.offchain:  # on-chain takes mapNonces itself: none held
             with self._nonces.exclusive(plan.chain, safe, read_map, timeout=timeout):
@@ -795,13 +798,13 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 raise
             raise self._lost(plan, sent, armed, e) from e
         except Exception as e:
-            if sent and sent[-1][1].posting:  # signed and POSTed: maybe stored
-                raise self._lost(plan, sent, armed, e) from e
+            # mech-client frees the nonce of what not_sent names, posting or not
+            # (a SignerError after the POST is the 402 top-up's): so does Connect
             if isinstance(e, MechNotSent):  # the mapNonces read: nothing sent
                 raise
-            # Connect's own refusals (the guard, the signer) keep their words
-            detail = str(e) if isinstance(e, (MechError, SignerError)) else e
-            raise MechNotSent(f"mech request not sent: {detail}") from e
+            if sent and sent[-1][1].posting and not isinstance(e, SignerError):
+                raise self._lost(plan, sent, armed, e) from e
+            raise MechNotSent(f"mech request not sent: {said(e)}") from e
 
     def _lost(
         self,
@@ -813,7 +816,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         """Describe a signed request whose answer was lost, its armed id pending."""
         held = [armed[sent[-1][0]].hex()]
         return MechAnswerUnknown(
-            f"rule '{REJECTION_RULES[UNKNOWN]}': {error}{self._queue.note(plan.chain)}; "
+            f"rule '{REJECTION_RULES[UNKNOWN]}': {said(error)}"
+            f"{self._queue.note(plan.chain)}; "
             f"pending_request_ids: {held} (mech_result collects it if the mech "
             "delivers it)",
             held,
@@ -892,7 +896,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         try:
             delivered = asyncio.run(self._watch(service, pending, key, timeout))
         except Exception as e:
-            raise MechError(f"could not read delivery for request {key}: {e}") from e
+            raise MechError(
+                f"could not read delivery for request {key}: {said(e)}"
+            ) from e
         split = {_request_key(k): v for k, v in (delivered or {}).items()}
         data = {k: d.data for k, d in split.items() if d.data is not None}
         report = {
@@ -982,7 +988,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         try:
             info = service.mech_info(priority_mech)
         except Exception as e:
-            raise MechError(f"could not price mech {priority_mech}: {e}") from e
+            raise MechError(f"could not price mech {priority_mech}: {said(e)}") from e
         return PricedMech(
             mech=priority_mech,
             service_id=int(info.service_id),

@@ -19,7 +19,14 @@
 
 """Errors and shapes shared by connect/mech.py and mech_allowances.py."""
 
+import logging
 import typing as t
+
+from mech_client import NonceRefused, RequestIdMismatch
+
+from connect.signer import SignerError
+
+logger = logging.getLogger("agent")
 
 
 class MechError(Exception):
@@ -108,3 +115,21 @@ def published_tools(document: t.Any) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [name for name in raw if isinstance(name, str) and name.strip()]
+
+
+# what a caller is told of a failure whose words are a library's, which may
+# name an RPC URL and its key; the cause goes to the log
+UNSAID = "mech-client failed (the cause is in Connect's log)"
+
+
+def said(error: Exception) -> str:
+    """Return what a caller is told of a failure on the mech path.
+
+    Connect's own errors and refusals (MechError and the signer's, rule-named),
+    mech-client's NonceRefused and its id check keep their words; anything
+    else is a library's, so it is UNSAID and logged.
+    """
+    if isinstance(error, (MechError, SignerError, NonceRefused, RequestIdMismatch)):
+        return str(error)
+    logger.warning("mech request failed", exc_info=error)
+    return UNSAID

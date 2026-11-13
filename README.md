@@ -51,9 +51,11 @@ other non-aea agent. It:
      own words: a refusal names its rule; a revert in gas estimation keeps the
      contract's reason; an RPC that cannot take the transaction or simulate it
      is a fixed message, as are a receipt that cannot be read (`pending` with
-     `receipt_error`) and a failed balance read. What the RPC library said,
-     which may name the RPC URL and its key (`with url: /v2/<key>`), goes only
-     to `log.txt`. Every body and
+     `receipt_error`) and a failed balance read. The mech tools
+     likewise: a refusal names its rule, and a library's failure reads
+     `mech-client failed (the cause is in Connect's log)`. What the RPC library
+     said, which may name the RPC URL and its key (`with url: /v2/<key>`), goes
+     only to `log.txt`. Every body and
      every MCP tool refuses a parameter it does not take, with an error naming
      the ones it does (`to` on the safe path is pointed at `target`); read-only
      tools carry `readOnlyHint`

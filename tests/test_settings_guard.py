@@ -85,7 +85,7 @@ from connect.mech import (
     PendingDelivery,
 )
 from connect.mech_allowances import _MAX_AUTO_DEPOSIT_RATIO, deposit_tracker
-from connect.mech_types import MechAnswerUnknown
+from connect.mech_types import MechAnswerUnknown, UNSAID
 from connect.safe import (
     APPROVE_SELECTOR,
     DEPOSIT_SELECTOR,
@@ -2813,7 +2813,7 @@ class TestMech:
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         again = self._job(mech_service, "job-5")
         assert again["pending_request_ids"] == ["ab"]
-        assert "gateway timed out" in again["replay_errors"]["ab"]
+        assert UNSAID in again["replay_errors"]["ab"]  # the gateway's text: log only
         assert "unrecoverable_request_ids" not in again
 
     def test_a_failure_before_the_paying_call_frees_its_id(
@@ -2849,7 +2849,7 @@ class TestMech:
         agent is told to make, and buy a second answer.
         """
         patched_mech.raises = RuntimeError("gateway fell over")
-        with pytest.raises(MechError, match="gateway fell over"):
+        with pytest.raises(MechError, match="cause is in Connect's log"):
             self._job(mech_service, "job-7")
         patched_mech.raises = None
         with pytest.raises(MechError, match="cannot tell whether it was paid"):
@@ -2863,7 +2863,7 @@ class TestMech:
         assert [(e["request_id"], e["reason"]) for e in refusals] == [
             ("job-7", "spend-uncertain")
         ]
-        assert "gateway fell over" in refusals[0]["detail"]
+        assert UNSAID in refusals[0]["detail"]
 
     def test_reusing_an_id_for_a_different_question_is_refused(
         self,
@@ -3400,6 +3400,46 @@ class TestMech:
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
 
+    def test_a_refused_top_up_after_the_402_is_not_sent(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The mech answered 402 and the signer refused the top-up: nothing stands.
+
+        mech-client frees the nonce of a SignerError (Connect names it in
+        not_sent) though the POST went out; Connect reports it not sent too,
+        keeps no id pending, and withdraws what it armed.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        service, guard = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        patched_mech.raises_after_signing = SignerError(
+            "the operator's guardrail settings do not allow it"
+        )
+        with pytest.raises(MechNotSent, match="guardrail"):
+            service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert not service._pending  # pylint: disable=protected-access
+        deposit = exec_transaction_calldata(TRACKER, value=10**16)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+        nonces = service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
+        ) as slot:
+            assert (
+                slot.nonce == patched_mech.contract.nonce
+            )  # freed, as mech-client did
+
     def test_auto_deposit_cap_matches_mech_client(self) -> None:
         """The armed cap multiplies by the exact bound mech-client enforces.
 
@@ -3594,7 +3634,7 @@ class TestMech:
     ) -> None:
         """mech-client exceptions surface as structured MechError + audit entry."""
         patched_mech.raises = RuntimeError("subgraph down")
-        with pytest.raises(MechError, match="subgraph down"):
+        with pytest.raises(MechError, match="cause is in Connect's log"):
             mech_service.request(
                 "q",
                 "tool",
@@ -3757,7 +3797,7 @@ class TestMech:
             "query_mm_mechs_info",
             lambda chain: (_ for _ in ()).throw(RuntimeError("subgraph down")),
         )
-        with pytest.raises(MechError, match="subgraph down"):
+        with pytest.raises(MechError, match="cause is in Connect's log"):
             mech_service.tools(chain="testchain")
 
     def test_tools_for_one_mech(
@@ -4676,7 +4716,9 @@ class TestMech:
     ) -> None:
         """Signed, then the connection dropped: the mech may hold it, so its id waits."""
         patched_mech.raises_after_signing = ConnectionError("connection reset")
-        with pytest.raises(MechAnswerUnknown, match="connection reset") as raised:
+        with pytest.raises(
+            MechAnswerUnknown, match="cause is in Connect's log"
+        ) as raised:
             mech_service.request(
                 "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r7"
             )
@@ -5258,7 +5300,7 @@ class TestMech:
     ) -> None:
         """An RPC error before mech-client's pre-sign hook: n was never sent."""
         patched_mech.raises = ConnectionError("the RPC is down")
-        with pytest.raises(MechNotSent, match="RPC is down"):
+        with pytest.raises(MechNotSent, match="cause is in Connect's log"):
             mech_service.request(
                 "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r2"
             )
@@ -5283,7 +5325,9 @@ class TestMech:
 
         monkeypatch.setattr(mech_module, "read_map_nonces", down)
         for legacy_on_chain in (True, False):
-            with pytest.raises(MechNotSent, match="marketplace nonce: no RPC"):
+            with pytest.raises(
+                MechNotSent, match="marketplace nonce: mech-client failed"
+            ):
                 mech_service.request(
                     "q",
                     "tool",
