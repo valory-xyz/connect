@@ -35,6 +35,7 @@ from connect import workspace
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server import app as app_module
+from connect.server import receipts
 from connect.settings import HARNESSES
 from connect.signer import Signer
 
@@ -570,6 +571,15 @@ class TestAuth:
         assert mined.status_code == 200
         assert mined.json()["status"] == "mined"
         assert mined.json()["receipt"]["status"] == 1
+        assert fake_w3.eth.receipt_waits == [5]  # the body's timeout, forwarded
+        huge = {
+            **body,
+            "timeout": 10**9,
+            "value": 19,
+            "intent": pay("0x" + "aa" * 20, 19),
+        }
+        client.post(path, json=huge, headers=auth())
+        assert fake_w3.eth.receipt_waits[-1] == receipts.MAX_RECEIPT_TIMEOUT
         fake_w3.eth.receipt = None
         pending = client.post(
             path,

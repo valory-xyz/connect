@@ -347,6 +347,7 @@ class FakeEth:
         self.base_fee: int | None = 10**9
         self.priority_fee_raises = False
         self.contracts: set[str] = set()
+        self.receipt_waits: list[float] = []  # the timeout of each receipt wait
         self._lock = threading.Lock()
 
     def get_balance(self, address: str) -> int:
@@ -366,7 +367,8 @@ class FakeEth:
     def wait_for_transaction_receipt(
         self, tx_hash: object, timeout: float = 120, poll_latency: float = 0.1
     ) -> dict:
-        """Return the configured receipt or raise TimeExhausted."""
+        """Record the timeout; return the configured receipt or raise TimeExhausted."""
+        self.receipt_waits.append(timeout)
         if self.receipt is None:
             raise TimeExhausted(f"tx not mined within {timeout}s")
         return self.receipt
