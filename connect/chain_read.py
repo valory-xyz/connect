@@ -35,6 +35,8 @@ from eth_utils import keccak, to_checksum_address
 from web3 import Web3
 from web3.exceptions import ContractLogicError
 
+from connect.safe import calldata_hex
+
 # EIP-1967: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
 IMPLEMENTATION_SLOT = int(
     "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc", 16
@@ -348,7 +350,7 @@ def get_abi(w3: Web3, address: str) -> dict:
 
 def decode_calldata(data: str) -> dict:
     """Decode calldata against the signatures Connect ships."""
-    raw = (data or "0x").removeprefix("0x")
+    raw = calldata_hex(data)  # the signer reads 0X... as these same bytes
     selector = "0x" + raw[:8]
     if len(raw) < 8:
         return {"selector": selector, "error": "calldata shorter than a selector"}
