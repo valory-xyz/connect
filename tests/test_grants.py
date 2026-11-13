@@ -86,6 +86,10 @@ def test_narrower_is_a_partial_order_on_every_field() -> None:
     assert not narrower(grant(scopes=["read"], **_capped(10, 50, 6, 1000)), parent)
     assert not narrower(grant(scopes=["read"], **_capped(10, 50, 5, 1001)), parent)
     assert not narrower(grant(scopes=["read"]), parent)  # uncapped is wider
+    # each limit on its own: a child without it would outlive or outspend
+    for field in ("expires_at", "max_mech_payment"):
+        unlimited = {**_capped(10, 50, 5, 1000), field: None}
+        assert not narrower(grant(scopes=["read"], **unlimited), parent)
     assert not narrower(
         grant(
             scopes=["read"],
@@ -167,11 +171,17 @@ def test_value_caps_per_tx_and_per_session() -> None:
     store.authorize(capped, "safe_transaction", {"value": 5})  # 10 + 5 of 15
     with pytest.raises(GrantRefused):
         store.authorize(capped, "safe_transaction", {"value": 1})
-    # a digest can authorize any safe transaction, which no cap would see
+    store.authorize(WORKSPACE, "sign_message", {})  # an uncapped token still may
+
+
+@pytest.mark.parametrize("cap", ["max_value_per_tx", "max_value_per_session"])
+def test_a_token_with_either_value_cap_may_not_sign_a_digest(cap: str) -> None:
+    """A digest can authorize any safe transaction, which no cap would see."""
+    store = GrantStore(WORKSPACE)
+    capped = store.mint(WORKSPACE, grant(**{cap: {"native": 10}}))
     with pytest.raises(GrantRefused, match="may not sign raw digests") as digest:
         store.authorize(capped, "sign_message", {})
     assert digest.value.rule == "token-cap-per-tx"
-    store.authorize(WORKSPACE, "sign_message", {})  # an uncapped token still may
 
 
 @pytest.mark.parametrize(
@@ -482,6 +492,30 @@ def test_http_mint_and_use_a_read_token(
     assert wider.status_code == 403
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert rules == ["token-scope"] * 4
+
+
+@pytest.mark.parametrize(
+    ("grant_body", "status", "rule"),
+    [
+        ({"scopes": ["tx"]}, 403, "token-scope"),
+        ({"scopes": ["read"], "expires_at": 1}, 401, "token-expired"),
+    ],
+)
+def test_http_wallet_needs_a_live_read_token(
+    client: TestClient,
+    store_path: t.Any,
+    grant_body: dict,
+    status: int,
+    rule: str,
+) -> None:
+    """GET /wallet is held to the token's grant, and its refusal audited."""
+    token = client.post("/tokens", json=grant_body, headers=_bearer(WORKSPACE))
+    assert token.status_code == 200
+    refused = client.get("/wallet", headers=_bearer(token.json()["token"]))
+    assert refused.status_code == status
+    assert rule in refused.json()["detail"]
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert (entry["rule"], entry["path"]) == (rule, "/wallet")
 
 
 def test_http_capped_token_is_refused_above_its_cap(
