@@ -45,7 +45,7 @@ from collections import OrderedDict, deque
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
@@ -79,8 +79,12 @@ ACTION_SCOPES: dict[str, Scope] = {
 class TokenGrant(StrictBody):
     """What a bearer token may do; a token can only mint a narrower one.
 
-    Unknown fields are refused by name, like every other HTTP body.
+    Unknown fields are refused by name, like every other HTTP body. Frozen,
+    and stored and handed out as copies, so nothing widens a live grant
+    without passing its validation again.
     """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     scopes: list[Scope]
     max_value_per_tx: dict[str, int] | None = None
@@ -257,9 +261,9 @@ class GrantStore:
         return found
 
     def grant(self, token: str) -> TokenGrant:
-        """Return a known token's grant."""
+        """Return a copy of a known token's grant."""
         with self._lock:
-            return self._grants[token]
+            return self._grants[token].model_copy(deep=True)
 
     def mint(self, parent: str, grant: TokenGrant) -> str:
         """Mint a token for `grant`, which must be no wider than `parent`'s.
@@ -274,7 +278,7 @@ class GrantStore:
             )
         token = secrets.token_urlsafe(32)
         with self._lock:
-            self._grants[token] = grant
+            self._grants[token] = grant.model_copy(deep=True)
             self._parents[token] = parent
         return token
 

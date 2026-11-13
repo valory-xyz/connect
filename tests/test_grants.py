@@ -27,6 +27,7 @@ import typing as t
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
@@ -112,6 +113,20 @@ def _capped(per_tx: int, session: int, mech: int, expiry: int) -> dict:
         "max_mech_payment": mech,
         "expires_at": expiry,
     }
+
+
+def test_a_live_grant_cannot_be_widened_in_place() -> None:
+    """Neither the minting caller's object nor a handed-out grant is the stored one."""
+    store = grant_store(WORKSPACE)
+    asked = grant(max_value_per_tx={"native": 1})
+    capped = store.mint(WORKSPACE, asked)
+    with pytest.raises(ValidationError):
+        store.grant(capped).max_value_per_tx = None  # type: ignore[misc]
+    t.cast(dict, asked.max_value_per_tx)["native"] = 10**30
+    t.cast(dict, store.grant(capped).max_value_per_tx)["native"] = 10**30
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(capped, "safe_transaction", {"value": 2})
+    assert refused.value.rule == "token-cap-per-tx"
 
 
 def test_mint_only_narrows() -> None:
