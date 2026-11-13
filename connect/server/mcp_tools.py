@@ -515,19 +515,19 @@ async def _dispatch(  # pylint: disable=too-many-arguments
             intent=intent,
             replay_only=replay_only,
         )
-        return _settled(signer, chain, tx_hash, wait_for_receipt, timeout)
+        return settled(signer, chain, tx_hash, wait_for_receipt, timeout)
 
     return await asyncio.to_thread(_run)
 
 
-def _settled(
+def settled(
     signer: Signer,
     chain: str,
     tx_hash: str,
     wait_for_receipt: bool,
     timeout: int,
 ) -> dict:
-    """Return the hash, and how it settled if the caller waited.
+    """Return the hash, and how it settled if the caller waited (both surfaces).
 
     When the caller waits, a top-level `status` says which of pending / mined /
     reverted it is, so a reverted execTransaction is not read as success from a

@@ -42,7 +42,9 @@ other non-aea agent. It:
      rewriting what the operator chose
    - a bearer-authed signing surface: `POST /safe-transaction` (the safe's call:
      `target`, `value`, `data`), `POST /sign-and-send` (the EOA's: `to`,
-     `value`, `data`), `POST /sign-message`, `GET /wallet`. Every body and
+     `value`, `data`; both also take `request_id`, `intent`, and
+     `wait_for_receipt`/`timeout`, answering `status` and the receipt as the
+     MCP send tools do), `POST /sign-message`, `GET /wallet`. Every body and
      every MCP tool refuses a parameter it does not take, with an error naming
      the ones it does (`to` on the safe path is pointed at `target`); read-only
      tools carry `readOnlyHint`

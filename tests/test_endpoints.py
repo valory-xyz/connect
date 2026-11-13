@@ -545,6 +545,50 @@ class TestAuth:
         assert response.json()["tx_hash"].startswith("0x")
         assert len(fake_w3.eth.sent) == 1
 
+    @pytest.mark.parametrize(
+        ("path", "to_key"), [("/safe-transaction", "target"), ("/sign-and-send", "to")]
+    )
+    def test_a_route_waits_for_the_receipt_as_the_tool_does(
+        self, client: TestClient, fake_w3: FakeW3, path: str, to_key: str
+    ) -> None:
+        """wait_for_receipt and timeout: the same fields, the same status."""
+        fake_w3.eth.receipt = {
+            "status": 1,
+            "blockNumber": 7,
+            "gasUsed": 21000,
+            "logs": [],
+        }
+        body = {
+            "chain": "testchain",
+            to_key: "0x" + "aa" * 20,
+            "value": 16,
+            "intent": pay("0x" + "aa" * 20, 16),
+            "wait_for_receipt": True,
+            "timeout": 5,
+        }
+        mined = client.post(path, json=body, headers=auth())
+        assert mined.status_code == 200
+        assert mined.json()["status"] == "mined"
+        assert mined.json()["receipt"]["status"] == 1
+        fake_w3.eth.receipt = None
+        pending = client.post(
+            path,
+            json={**body, "value": 17, "intent": pay("0x" + "aa" * 20, 17)},
+            headers=auth(),
+        )
+        assert pending.json()["status"] == "pending"
+        quick = client.post(
+            path,
+            json={
+                **body,
+                "wait_for_receipt": False,
+                "value": 18,
+                "intent": pay("0x" + "aa" * 20, 18),
+            },
+            headers=auth(),
+        )
+        assert set(quick.json()) == {"tx_hash"}
+
     def test_safe_transaction_without_a_safe_is_400(
         self, client: TestClient, fake_w3: FakeW3
     ) -> None:

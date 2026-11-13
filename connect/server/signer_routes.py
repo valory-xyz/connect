@@ -38,6 +38,7 @@ from connect.server.auth import (
     refused_route,
     request_token,
 )
+from connect.server.mcp_tools import settled
 from connect.server.strict import StrictBody
 from connect.signer import SignerError
 
@@ -56,6 +57,9 @@ class _SendBody(StrictBody):
     gas: int | None = Field(default=None, ge=0)
     # what the call may do; required when it moves value
     intent: dict | None = None
+    # as the MCP send tools take them: wait up to `timeout` s for the receipt
+    wait_for_receipt: bool = False
+    timeout: int = Field(default=60, ge=0)
 
     @field_validator("value", "gas", mode="before")
     @classmethod
@@ -118,7 +122,13 @@ def _dispatch(  # pylint: disable=too-many-arguments
         )
     except (SignerError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"tx_hash": tx_hash}
+    return settled(
+        request.app.state.signer,
+        body.chain,
+        tx_hash,
+        body.wait_for_receipt,
+        body.timeout,
+    )
 
 
 def _authorize(request: Request, action: str, body: _SendBody | None = None) -> bool:
