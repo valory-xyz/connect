@@ -88,20 +88,34 @@ The bundled skills attach the intents of the calls they build.
 
 ## Narrower tokens for scripts
 
-The token in `.mcp.json` can do anything this session can. When you hand a
-script or another tool a token, mint a narrower one first:
+`signer_client.connect()` reads the workspace token, which can do anything
+this session can. When a script should be able to do less, mint it a
+narrower token from a launcher and hand that over in the environment — the
+token never passes through you, and `.mcp.json` stays unread:
 
-```
-POST /tokens  (Authorization: Bearer <your token>)
-{"scopes": ["read"]}                                    # balances and reads only
-{"scopes": ["tx"], "max_value_per_tx": {"native": 1000000000000000},
- "max_value_per_session": {"native": 5000000000000000}, "expires_at": <unix seconds, e.g. now + 3600>}
+```python
+import os, subprocess, sys, time
+from signer_client import TOKEN_ENV_VAR, connect
+
+_, signer = connect("gnosis")
+token = signer.mint_token({
+    "scopes": ["read", "tx"],  # connect() reads /wallet, so keep "read"
+    "max_value_per_tx": {"native": 1000000000000000},
+    "max_value_per_session": {"native": 5000000000000000},
+    "expires_at": int(time.time()) + 3600,
+})
+subprocess.run([sys.executable, "job.py"],
+               env={**os.environ, TOKEN_ENV_VAR: token}, check=True)
 ```
 
-It answers `{token, grant}`. Scopes are `read`, `mech` and `tx`; caps are per
-token (`"native"` or a token address) in base units, checked against the
-spend and the approvals the call's intent declares; `max_mech_payment` caps
-`mech_request`'s `max_payment`. A token with a value cap cannot do what a cap
+`connect()` in `job.py` then signs with that token (`connect(chain,
+token=...)` takes one directly). `mint_token` is `POST /tokens`; the grant
+is its body.
+
+Scopes are `read`, `mech` and `tx`; caps are per token (`"native"` or a
+token address) in base units, checked against the spend and the approvals the
+call's intent declares; `max_mech_payment` caps `mech_request`'s
+`max_payment`. A token with a value cap cannot do what a cap
 cannot bound: sign a raw digest, approve more than its cap, or move an NFT or
 outcome-token position out of the safe. A token can only mint a narrower one.
 

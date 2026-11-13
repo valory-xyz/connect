@@ -33,10 +33,18 @@ Usage:
 
 A call that moves value needs an intent, which only signer.send_transaction
 carries: w3.eth.send_transaction and .transact() suit calls that move nothing.
+
+To run another script under a narrower token, mint one and hand it over in
+the environment; that script's connect() picks it up:
+
+    token = signer.mint_token({"scopes": ["read", "tx"], ...})
+    subprocess.run([sys.executable, "job.py"],
+                   env={**os.environ, TOKEN_ENV_VAR: token}, check=True)
 """
 
 import http.client
 import json
+import os
 import sys
 import typing as t
 import urllib.error
@@ -48,6 +56,9 @@ from web3 import HTTPProvider, Web3
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 
 MCP_SERVER_NAME = "pearl-connect"
+# a token connect() uses instead of the one in .mcp.json, for a script that
+# was handed a narrower one
+TOKEN_ENV_VAR = "PEARL_CONNECT_TOKEN"  # nosec B105 - a variable name
 SEND_ATTEMPTS = 3
 
 # web3 middlewares that only earn their place when the sending process also
@@ -159,6 +170,14 @@ class SignerClient:
             f"retry with request_id='{request_id}' to avoid double-spending"
         ) from last_error
 
+    def mint_token(self, grant: dict) -> str:
+        """Mint a token no wider than this client's, and return it.
+
+        `grant` is POST /tokens' body: scopes, value caps, max_mech_payment,
+        expires_at. connect() reads /wallet, so a script's token needs `read`.
+        """
+        return self._post("/tokens", grant)["token"]
+
     def sign_digest(self, digest: str | bytes) -> str:
         """Sign a raw 32-byte digest (0x-hex or bytes), unprefixed."""
         if isinstance(digest, bytes):
@@ -268,9 +287,13 @@ def _strip_unused_send_middleware(w3: Web3) -> None:
             )
 
 
-def connect(chain: str) -> tuple[Web3, SignerClient]:
-    """Web3 instance whose sends go through the signer, plus the raw client."""
-    base_url, token = load_mcp_config()
+def connect(chain: str, token: str | None = None) -> tuple[Web3, SignerClient]:
+    """Web3 instance whose sends go through the signer, plus the raw client.
+
+    The token is `token`, else $PEARL_CONNECT_TOKEN, else the one in .mcp.json.
+    """
+    base_url, workspace_token = load_mcp_config()
+    token = token or os.environ.get(TOKEN_ENV_VAR) or workspace_token
     signer = SignerClient(base_url, token, chain)
     entry = signer.chain_info(chain)
     w3 = Web3(provider=SignerProvider(entry["rpc"], signer))

@@ -383,7 +383,11 @@ harness runs: fewer scopes, value caps per transaction and per session (per
 token, `"native"` or an address in any case, in base units; Celo's CELO face
 counts as `"native"`), a mech payment cap, an expiry. A grant wider than the
 presenting token's is refused (`token-scope`), and unknown fields are refused by
-name like every other body.
+name like every other body. The bundled `signer_client` mints one with
+`SignerClient.mint_token(grant)`, and its `connect(chain, token=None)` signs with
+`token`, else `$PEARL_CONNECT_TOKEN`, else the workspace token, so a launcher
+can hand a script a narrower token without the session ever reading
+`.mcp.json`.
 
 | Scope | Allows |
 |---|---|

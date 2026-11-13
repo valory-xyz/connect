@@ -208,6 +208,64 @@ def test_connect_says_so_when_there_is_no_safe_to_read_as(monkeypatch, capsys) -
     assert "no service safe" in capsys.readouterr().err
 
 
+# --- narrower tokens: minted by one script, handed to another -------------------
+
+
+@pytest.mark.parametrize(
+    ("argument", "env", "expected"),
+    [(None, None, "t0ken"), (None, "child", "child"), ("given", "child", "given")],
+)
+def test_connect_takes_a_narrower_token(monkeypatch, argument, env, expected) -> None:
+    """connect() uses token=, else the env var, else the token in .mcp.json."""
+    if env is None:
+        monkeypatch.delenv(signer_client.TOKEN_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(signer_client.TOKEN_ENV_VAR, env)
+    monkeypatch.setattr(
+        signer_client, "load_mcp_config", lambda: ("http://127.0.0.1:8716", "t0ken")
+    )
+    seen: list = []
+
+    def chain_info(self, c=None):
+        seen.append(self._token)  # pylint: disable=protected-access
+        return {"rpc": "http://127.0.0.1:9", "safe": SAFE_ADDR}
+
+    monkeypatch.setattr(signer_client.SignerClient, "chain_info", chain_info)
+    signer_client.connect("polygon", token=argument)
+    assert seen == [expected]
+
+
+def test_mint_token_mints_a_narrower_token_the_server_honours(
+    make_app, test_signer, app_config, activity, monkeypatch
+) -> None:
+    """The documented path: mint through the client, then read with the child."""
+    app = make_app(test_signer, app_config, activity, token="tok")  # nosec B106
+
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+
+        def post(self, path, payload):
+            response = client.post(
+                path,
+                json=payload,
+                headers={"Authorization": f"Bearer {self._token}"},
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        monkeypatch.setattr(signer_client.SignerClient, "_post", post)
+        root = signer_client.SignerClient("http://127.0.0.1:8716", "tok", "testchain")
+        child = root.mint_token({"scopes": ["read"]})
+        assert child != "tok"  # nosec B105
+        bearer = {"Authorization": f"Bearer {child}"}
+        assert client.get("/wallet", headers=bearer).status_code == 200
+        refused = client.post(
+            "/safe-transaction",
+            json={"chain": "testchain", "target": ADDR_A},
+            headers=bearer,
+        )
+        assert refused.status_code == 403
+
+
 # --- .mcp.json base URL: the trailing slash that 404'd a whole live run ----------
 
 
