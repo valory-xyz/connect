@@ -121,6 +121,10 @@ class _DepositAllowance:
     expires: float
 
 
+# the handle allow_safe_deposit_once returns, for revoke_safe_deposit
+DepositGrant = _DepositAllowance
+
+
 class Guard:
     """Mode/whitelist enforcement backed by the tamper-evident settings store."""
 
@@ -156,7 +160,7 @@ class Guard:
 
     def allow_safe_deposit_once(
         self, *, chain: str, tracker: str, amount_cap: int, is_token: bool
-    ) -> None:
+    ) -> "DepositGrant":
         """Permit one restricted-mode safe payment to a mech balance tracker.
 
         Server-side callers only (the mech flow, arming a request's possible
@@ -172,15 +176,15 @@ class Guard:
                 for a in self._deposit_allowances
                 if (a.chain, a.tracker) != (chain.lower(), tracker.lower())
             ]
-            self._deposit_allowances.append(
-                _DepositAllowance(
-                    chain=chain.lower(),
-                    tracker=tracker.lower(),
-                    is_token=is_token,
-                    amount_cap=amount_cap,
-                    expires=time.monotonic() + ALLOWANCE_TTL,
-                )
+            grant = _DepositAllowance(
+                chain=chain.lower(),
+                tracker=tracker.lower(),
+                is_token=is_token,
+                amount_cap=amount_cap,
+                expires=time.monotonic() + ALLOWANCE_TTL,
             )
+            self._deposit_allowances.append(grant)
+            return grant
 
     def allow_agent_topup_once(self, *, chain: str, amount_cap: int) -> None:
         """Permit one restricted-mode native transfer from the safe to the agent EOA.
@@ -204,20 +208,16 @@ class Guard:
         with self._allowance_lock:
             self._allowed_digests.pop(bytes(digest), None)
 
-    def revoke_safe_deposit(
-        self, *, chain: str, tracker: str, amount_cap: int, is_token: bool
-    ) -> None:
-        """Withdraw the unused safe payment allowance armed with exactly this shape.
+    def revoke_safe_deposit(self, grant: "DepositGrant") -> None:
+        """Withdraw one unused safe payment allowance: the one `grant` names.
 
-        A no-op once it was used or expired, and it never touches an allowance
-        of another shape.
+        `grant` is what allow_safe_deposit_once returned, so a flow withdraws
+        only its own: another request's allowance of the same shape stands. A
+        no-op once it was used, expired or replaced.
         """
-        shape = (chain.lower(), tracker.lower(), is_token, amount_cap)
         with self._allowance_lock:
             self._deposit_allowances = [
-                a
-                for a in self._deposit_allowances
-                if (a.chain, a.tracker, a.is_token, a.amount_cap) != shape
+                a for a in self._deposit_allowances if a is not grant
             ]
 
     def _purge_expired(self) -> None:

@@ -139,14 +139,10 @@ class MechAllowances:
             return True
         amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate
         if restricted:
-            shape: dict[str, t.Any] = {
-                "chain": chain,
-                "tracker": tracker,
-                "amount_cap": amount_cap,
-                "is_token": is_token,
-            }
-            self._guard.allow_safe_deposit_once(**shape)
-            armed.append(functools.partial(self._guard.revoke_safe_deposit, **shape))
+            grant = self._guard.allow_safe_deposit_once(
+                chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
+            )
+            armed.append(functools.partial(self._guard.revoke_safe_deposit, grant))
         self._activity.record(
             "mech_deposit_allowance",
             chain=chain,

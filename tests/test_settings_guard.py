@@ -837,13 +837,26 @@ class TestGuard:
         shape: dict[str, t.Any] = dict(
             chain="testchain", tracker=TRACKER, amount_cap=10, is_token=False
         )
-        guard.allow_safe_deposit_once(**shape)
-        guard.revoke_safe_deposit(**{**shape, "amount_cap": 11})  # not its shape
+        grant = guard.allow_safe_deposit_once(**shape)
         deposit = exec_transaction_calldata(TRACKER, value=10)
         guard.check_transaction("testchain", SAFE, 0, deposit, consume=False)
-        guard.revoke_safe_deposit(**shape)
+        guard.revoke_safe_deposit(grant)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    def test_a_request_withdraws_only_its_own_deposit_allowance(
+        self, store: SettingsStore
+    ) -> None:
+        """Two requests to one mech arm the same shape; one withdrawn, the other stands."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        shape: dict[str, t.Any] = dict(
+            chain="testchain", tracker=TRACKER, amount_cap=10, is_token=False
+        )
+        first = guard.allow_safe_deposit_once(**shape)
+        guard.allow_safe_deposit_once(**shape)  # the second request's, same shape
+        guard.revoke_safe_deposit(first)  # the first was refused before its POST
+        deposit = exec_transaction_calldata(TRACKER, value=10)
+        guard.check_transaction("testchain", SAFE, 0, deposit)  # the second's 402
 
     def test_deposit_allowance_native(self, store: SettingsStore) -> None:
         """A pre-authorized bare transfer to the tracker passes — once, capped.
