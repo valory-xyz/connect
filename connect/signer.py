@@ -609,7 +609,13 @@ class Signer:
         except intent_module.SimulationUnavailable as e:
             # every agent send on this chain is refused until it can simulate:
             # log.txt must say why, including when the cause is our own code
-            logger.warning("intent gate cannot simulate on %s", chain, exc_info=True)
+            logger.error(
+                "intent gate cannot simulate on %s (%s -> %s)",
+                chain,
+                call.sender,
+                call.to,
+                exc_info=True,
+            )
             return (
                 None,
                 parsed,

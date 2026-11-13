@@ -209,6 +209,8 @@ class TestSignerGate:
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
         (record,) = [r for r in caplog.records if "cannot simulate" in r.message]
         assert record.exc_info is not None
+        assert record.levelname == "ERROR"
+        assert EOA in record.message  # which call it could not simulate
 
     def test_holds_request_keeps_the_two_paths_apart(
         self, test_signer: Signer, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
