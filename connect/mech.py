@@ -739,6 +739,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 logger.warning("could not read the delivery for %s: %s", key, e)
                 payload.setdefault("watch_errors", {})[key] = str(e)
                 continue
+            if report.get("url"):
+                payload.setdefault("delivery_urls", {})[key] = report["url"]
             if report.get("delivered"):
                 payload.setdefault("delivery_results", {})[key] = report["result"]
                 payload["pending_request_ids"].remove(key)

@@ -4825,6 +4825,34 @@ class TestMech:
         assert report["watch_errors"] == {"ab": "the gateway timed out"}
         assert report["tx_hash"] == patched_mech.result["tx_hash"]
 
+    @pytest.mark.parametrize("readable", [False, True])
+    def test_a_resumed_watch_reports_the_delivery_url(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        readable: bool,
+    ) -> None:
+        """A delivery collected after the nonce lock still names its url."""
+        patched_mech.result["deliveries"] = {}
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            data = {"answer": "42"} if readable else None
+            return {"ab": DeliveryResult("ab", data, "ipfs://later")}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        report = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, timeout=30
+        )
+        assert report["delivery_urls"] == {"ab": "ipfs://later"}
+        if readable:
+            assert report["delivery_results"] == {"ab": {"answer": "42"}}
+            assert "pending_request_ids" not in report
+        else:
+            assert report["pending_request_ids"] == ["ab"]
+
     def test_a_refusal_before_sending_frees_the_request_id(
         self,
         mech_service: MechService,

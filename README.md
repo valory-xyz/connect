@@ -490,7 +490,9 @@ On both paths the lock is held only `ACK_WAIT_SECONDS` (1 s) of the delivery
 wait: the rest runs after it is released, up to the request's `timeout`, so
 other requests from the safe are not held behind a delivery. A read that fails
 during that wait keeps the request pending, with its cause in
-`watch_errors`, and never loses the report of a request already paid for.
+`watch_errors`, and never loses the report of a request already paid for; a
+delivery collected there reports its url in `delivery_urls`, as one collected
+under the lock does, also while its file cannot be read yet.
 
 **Validity.** An off-chain request carries no deadline (mech-client sends
 none), so it can settle whenever the mech delivers it, also after the
