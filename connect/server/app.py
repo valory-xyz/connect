@@ -201,6 +201,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            mech.queue.close()  # release STORE_PATH's queue store
 
     app = FastAPI(title="connect", lifespan=lifespan)
     # DNS-rebinding defense: a rebound hostname reaches the socket with the

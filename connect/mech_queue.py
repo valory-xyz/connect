@@ -85,7 +85,10 @@ class MechQueue:
         activity: ActivityLog,
         clock: t.Callable[[], float] = time.time,
     ) -> None:
-        """Load the allocator's persisted queues from STORE_PATH."""
+        """Load the allocator's persisted queues from STORE_PATH.
+
+        :raises NonceRefused: mech-queue-locked, if another allocator holds it.
+        """
         self._config = config
         self._activity = activity
         self._clock = clock
@@ -95,6 +98,10 @@ class MechQueue:
             gap_retries=config.mech_gap_retries,
             clock=clock,
         )
+
+    def close(self) -> None:
+        """Release STORE_PATH's queue store, so another allocator may take it."""
+        self.allocator.close()
 
     def report(self, chain: str) -> dict:
         """Report whether the safe's queue on `chain` is stalled, and since when.

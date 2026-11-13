@@ -44,6 +44,7 @@ from mech_client import (
     MechPriceExceeded,
     NonceRefused,
     PreSignHook,
+    RULE_ANSWER_UNKNOWN,
     chat_report,
     is_chat_prompt,
     offchain_blocker,
@@ -55,7 +56,6 @@ from mech_client.domain.delivery import (
 )
 from mech_client.infrastructure.config.payment_config import PaymentType
 from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
-from mech_client.nonces import REJECTION_RULES, UNKNOWN
 from mech_client.services.marketplace_service import MarketplaceService
 from safe_eth.eth import EthereumClient
 
@@ -154,17 +154,14 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         # mech_result can resume the watch a paid-for request deserves
         self._pending: dict[str, PendingDelivery] = {}
         self._requests = RequestLedger()
-        self._queue = MechQueue(config, activity)
-        self._nonces = self._queue.allocator
+        # the one allocator on STORE_PATH: the app's lifespan closes it
+        self.queue = MechQueue(config, activity)
+        self._nonces = self.queue.allocator
 
     def hard_cancel(self, chain: str) -> dict:
         """Run the operator's hard cancel on the safe's queue on `chain` (D27)."""
         chain = chain.lower()
-        return self._queue.hard_cancel(self._service(chain), chain)
-
-    def queue_status(self) -> dict:
-        """Report every safe's queue, per chain, for the operator's UI."""
-        return self._queue.status()
+        return self.queue.hard_cancel(self._service(chain), chain)
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
@@ -614,7 +611,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             ) from e
         except NonceRefused as e:
             self._allowances.revoke(plan.armed)
-            note = self._queue.note(plan.chain)
+            note = self.queue.note(plan.chain)
             self._record_deposit(plan, request_id, getattr(e.__cause__, "deposited", 0))
             self._activity.record(
                 "refusal",
@@ -672,7 +669,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # deadline): it can settle whenever the mech delivers it, or the
             # operator's hard cancel consumes its nonce
             payload["expires"] = None
-            payload.update(self._queue.report(plan.chain))
+            payload.update(self.queue.report(plan.chain))
         self._resume_watch(payload, deadline)
         if plan.offchain:  # a delivery starts the settle clock
             by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
@@ -794,7 +791,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         except MechPriceExceeded:
             raise
         except NonceRefused as e:
-            if e.rule != REJECTION_RULES[UNKNOWN]:
+            if e.rule != RULE_ANSWER_UNKNOWN:
                 raise
             raise self._lost(plan, sent, armed, e) from e
         except Exception as e:
@@ -816,8 +813,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         """Describe a signed request whose answer was lost, its armed id pending."""
         held = [armed[sent[-1][0]].hex()]
         return MechAnswerUnknown(
-            f"rule '{REJECTION_RULES[UNKNOWN]}': {said(error)}"
-            f"{self._queue.note(plan.chain)}; "
+            f"rule '{RULE_ANSWER_UNKNOWN}': {said(error)}"
+            f"{self.queue.note(plan.chain)}; "
             f"pending_request_ids: {held} (mech_result collects it if the mech "
             "delivers it)",
             held,
@@ -908,7 +905,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             "delivered": key in data,
         }
         if pending.offchain:
-            report.update(self._queue.report(pending.chain))
+            report.update(self.queue.report(pending.chain))
         if key not in data:
             unreadable = split.get(key)
             if unreadable is None:

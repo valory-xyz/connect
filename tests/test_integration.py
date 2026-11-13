@@ -1006,7 +1006,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
         monkeypatch.setattr(
             service.tool_manager,
             "read_tools_metadata",
-            lambda sid: MetadataRead({"tools": [tool], "url": url}, None),
+            lambda sid: MetadataRead.ok({"tools": [tool], "url": url}),
         )
         monkeypatch.setattr(service.tool_manager, "get_offchain_url", lambda sid: url)
         first = mech_service.request(

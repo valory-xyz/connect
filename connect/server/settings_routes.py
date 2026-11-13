@@ -195,7 +195,7 @@ class HardCancelRequest(StrictBody):
 @router.get("/mech-queue")
 def mech_queue(request: Request) -> dict:
     """Report each safe's mech queue per chain: stalled, since when, cancellable."""
-    return request.app.state.mech.queue_status()
+    return request.app.state.mech.queue.status()
 
 
 @router.post("/mech-queue/hard-cancel")

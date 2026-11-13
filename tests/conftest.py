@@ -550,9 +550,14 @@ def guard(
 @pytest.fixture
 def mech_service(
     test_signer: Signer, app_config: AppConfig, activity: ActivityLog, guard: Guard
-) -> MechService:
-    """Mech service over the fake-backed signer (never contacts a chain)."""
-    return MechService(test_signer, app_config, activity, guard)
+) -> t.Iterator[MechService]:
+    """Mech service over the fake-backed signer (never contacts a chain).
+
+    Closed after the test: it holds STORE_PATH's queue store.
+    """
+    service = MechService(test_signer, app_config, activity, guard)
+    yield service
+    service.queue.close()
 
 
 @pytest.fixture

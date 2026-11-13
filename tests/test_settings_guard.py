@@ -1845,7 +1845,9 @@ NATIVE_PAYMENT_TYPE = "ba699a34be8fe0e7725e93dcbce1701b0211a8ca61330aaeb8a05bf2e
 
 def metadata_read(document: t.Any) -> MetadataRead:
     """Answer ToolManager.read_tools_metadata: the document, or an unreadable one."""
-    return MetadataRead(document if isinstance(document, dict) else None, None)
+    if isinstance(document, dict):
+        return MetadataRead.ok(document)
+    return MetadataRead.failed("TimeoutError")
 
 
 def native_mech_info(rate: int) -> tuple:
@@ -1943,7 +1945,7 @@ class FakeMarketplaceService:
         self.calls.append(kwargs)
         hook = kwargs.get("on_request_id")
         if isinstance(hook, PreSignHook):
-            hook.received = True  # on entry, as mech-client marks it
+            hook.mark_received()  # on entry, as mech-client marks it
         # the mech's own answer to a POST comes after signing, as it does live
         answered = isinstance(
             self.raises, (OffchainRequestRejected, OffchainTopUpFailed)
@@ -1998,7 +2000,7 @@ class FakeMarketplaceService:
                 local,
             )
             if isinstance(hook, PreSignHook):
-                hook.posting = True  # signed: the POST is next
+                hook.mark_posting()  # signed: the POST is next
             if answered:
                 raise t.cast(Exception, self.raises)
             if self.raises_after_signing is not None:
@@ -4019,8 +4021,8 @@ class TestMech:
         the off-chain flow will go through with a known tool name.
         """
         patched_mech.tool_manager = SimpleNamespace(
-            read_tools_metadata=lambda service_id: MetadataRead(
-                None, "TimeoutError: slow"
+            read_tools_metadata=lambda service_id: MetadataRead.failed(
+                "TimeoutError: slow"
             ),
             terms_report=patched_mech.tool_manager.terms_report,
             mech_report_or_terms=patched_mech.tool_manager.mech_report_or_terms,
@@ -4054,19 +4056,17 @@ class TestMech:
     def test_unreadable_metadata_verdict_never_claims_permanence(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
-        """A miss with no cause must not be reported as a permanent one.
+        """An unreadable document must not be reported as a permanent miss.
 
-        mech-client swallows the common transport failures and returns a bare
-        None, so nothing here knows whether the mech never published metadata
-        or the gateway simply timed out. An earlier version asserted the
-        former outright, which sends an operator on-chain for good over what
-        may be a blip.
+        Its cause (only an exception type, as mech-client names it) cannot
+        tell a mech that never published metadata from a gateway that timed
+        out; asserting the former sends an operator on-chain over a blip.
         """
         patched_mech.metadata = None
         note = mech_service.tools(chain="testchain", priority_mech=OTHER)[
             "offchain_note"
         ]
-        assert "no cause reported" in note  # stands in for the absent cause
+        assert "TimeoutError" in note  # the cause travels with the verdict
         # hedged, not asserted: "may be" is what keeps this honest
         assert "may be transient or never published" in note
 
@@ -4954,7 +4954,7 @@ class TestMech:
             monkeypatch.setattr(
                 patched_mech.tool_manager,
                 "read_tools_metadata",
-                lambda sid: MetadataRead(None, "TimeoutError: slow"),
+                lambda sid: MetadataRead.failed("TimeoutError: slow"),
             )
         if case == "over-budget":
             patched_mech.info = native_mech_info(10**18)

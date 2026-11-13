@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client import NonceAllocator, NonceRefused, RULE_QUEUE_LOCKED
 from web3.exceptions import ContractLogicError
 
 from connect import wallet as wallet_module
@@ -756,3 +757,23 @@ class TestAuth:
             headers=auth(),
         )
         assert response.status_code == 400
+
+
+def test_the_app_holds_the_one_queue_store_and_releases_it_on_shutdown(
+    make_app: t.Callable,
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+) -> None:
+    """One allocator per STORE_PATH: a second is refused while the app runs.
+
+    mech-client's allocator takes an advisory lock on the store, so the
+    lifespan must close it on shutdown or a restart in this process (or the
+    next one, on some platforms) is refused as mech-queue-locked.
+    """
+    app = make_app(test_signer, app_config, activity)
+    with TestClient(app, base_url="http://127.0.0.1:8716"):
+        with pytest.raises(NonceRefused) as refused:
+            NonceAllocator(app_config.store_path, settle_timeout=1, gap_retries=0)
+        assert refused.value.rule == RULE_QUEUE_LOCKED
+    NonceAllocator(app_config.store_path, settle_timeout=1, gap_retries=0).close()

@@ -534,7 +534,10 @@ itself, so it waits until no off-chain slot is held. Held slots, their metadata
 salt and the stall are persisted in `mech_nonces.json` under STORE_PATH, written
 before the POST, so a restart never reissues a held nonce; an unreadable file
 refuses every request (`mech-queue-unreadable`) and an unwritable one new ones
-(`mech-queue-unwritable`). Every refusal above is recorded as an activity
+(`mech-queue-unwritable`). The store is one allocator's: mech-client locks it
+(`mech_nonces.lock`), a second allocator on it — another Connect on the same
+STORE_PATH — is refused (`mech-queue-locked`), and Connect releases it on
+shutdown. Every refusal above is recorded as an activity
 `refusal` with its `rule`, and leaves a caller's `request_id` free to send
 again, since nothing reached the mech; only `mech-answer-unknown` is recorded
 as possibly paid for — a 5xx, or a transport error after the request was
