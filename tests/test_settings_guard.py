@@ -4693,6 +4693,32 @@ class TestMech:
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         assert mech_service.result(held, timeout=1)["result"] == {"answer": "42"}
 
+    def test_a_lost_answer_after_a_top_up_records_its_deposit(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """A 5xx after the top-up landed: the deposit is on record, the id pending."""
+        patched_mech.raises = OffchainRequestRejected(
+            "HTTP 502",
+            request_id="0x01",
+            nonce=5,
+            status=502,
+            reason="Bad Gateway",
+            unsent=[],
+            deposited=7,
+        )
+        with pytest.raises(MechAnswerUnknown) as raised:
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r3"
+            )
+        assert raised.value.deposited == 7
+        (deposit,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_deposit"
+        ]
+        assert (deposit["amount"], deposit["request_id"]) == ("7", "r3")
+
     def test_a_transport_error_after_signing_keeps_the_id_pending(
         self,
         mech_service: MechService,
