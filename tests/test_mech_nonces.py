@@ -34,6 +34,7 @@ from connect.signer import SignerError
 SAFE = "0x" + "22" * 20
 MECH_A = "0x" + "a1" * 20
 MECH_B = "0x" + "b2" * 20
+MECH_A_CHECKSUMMED = "0xA1A1a1a1A1A1A1A1A1a1a1a1a1a1A1A1a1A1a1a1"
 
 
 class Clock:
@@ -161,9 +162,9 @@ def test_an_unanswered_reservation_is_held_as_unknown(
 
 def test_a_checksummed_mech_is_the_same_mech(allocator: NonceAllocator) -> None:
     """The mech's address in any case is one mech: its own slot never blocks it."""
-    with take(allocator, 5, MECH_A.lower()) as slot:
-        slot.answered("accepted", mech=MECH_A.lower(), salt="")
-    with take(allocator, 5, MECH_A.upper().replace("0X", "0x"), timeout=0) as slot:
+    with take(allocator, 5, MECH_A_CHECKSUMMED) as slot:
+        slot.answered("accepted", mech=MECH_A_CHECKSUMMED, salt="")
+    with take(allocator, 5, MECH_A.lower(), timeout=0) as slot:
         assert slot.nonce == 6
 
 
