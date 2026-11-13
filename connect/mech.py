@@ -118,12 +118,16 @@ class _RequestPlan(t.NamedTuple):
     service: MarketplaceService
     priced: PricedMech
     extra_attributes: dict | None
-    offchain: OffchainDigests | None
+    offchain: OffchainDigests | None  # the flow: None is the on-chain one
     auto_deposit: bool
-    legacy_on_chain: bool
     tool: str
     max_payment: int
     terms: dict  # mech-client's mech report, merged into the request's report
+
+    @property
+    def legacy_on_chain(self) -> bool:
+        """Whether the request goes on-chain: read off `offchain`, never apart."""
+        return self.offchain is None
 
 
 def _clamp_timeout(timeout: float) -> float:
@@ -600,7 +604,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             extra_attributes=extra_attributes,
             offchain=offchain,
             auto_deposit=auto_deposit,
-            legacy_on_chain=legacy_on_chain,
             tool=tool,
             max_payment=max_payment,
             terms=terms,
