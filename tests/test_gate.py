@@ -212,6 +212,16 @@ class TestSignerGate:
         assert record.levelname == "ERROR"
         assert EOA in record.message  # which call it could not simulate
 
+    @pytest.mark.parametrize("via_safe", [True, False])
+    def test_a_replay_only_send_without_an_id_is_refused(
+        self, test_signer: Signer, fake_w3: FakeW3, via_safe: bool
+    ) -> None:
+        """There is nothing it could replay, and it must never send fresh."""
+        send = test_signer.send_via_safe if via_safe else test_signer.send
+        with pytest.raises(SignerError, match="needs the request id"):
+            send("testchain", TOKEN, data=TOKEN_CALL, replay_only=True)
+        assert not fake_w3.eth.sent
+
     def test_holds_request_keeps_the_two_paths_apart(
         self, test_signer: Signer, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
     ) -> None:

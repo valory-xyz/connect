@@ -354,6 +354,8 @@ class Signer:
         because the id was held: it is answered from the id's completed send
         or refused, never sent fresh, since the hold may have ended since.
         """
+        if replay_only and request_id is None:
+            raise SignerError("a replay-only send needs the request id it replays")
         stamp = _call_stamp(chain, to, value, data)
         if request_id is not None:
             # a completed send stays answerable even if the guardrail has
