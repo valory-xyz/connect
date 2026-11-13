@@ -66,6 +66,7 @@ from web3.datastructures import AttributeDict
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
+from connect import mech_queue as mech_queue_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -4634,6 +4635,201 @@ class TestMech:
 
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         assert mech_service.result(held, timeout=1)["result"] == {"answer": "42"}
+
+    @pytest.fixture(name="operator")
+    def operator_fixture(  # pylint: disable=too-many-arguments
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        keystore_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> t.Iterator[TestClient]:
+        """Return the operator's client, with the keystore at cwd as in production."""
+        monkeypatch.chdir(keystore_dir)
+        with TestClient(
+            make_app(test_signer, app_config, activity, token="tok"),  # nosec B106
+            base_url="http://127.0.0.1:8716",
+        ) as client:
+            yield client
+
+    @staticmethod
+    def _stall(mech_service: MechService, for_seconds: float) -> None:
+        """Hold one accepted slot, then stall the queue `for_seconds` ago."""
+        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+            slot.answered("taken", mech=OTHER, salt="")  # another signer took it
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        queue.stalled_at = time.time() - for_seconds
+
+    def test_hard_cancel_needs_the_password_never_a_token(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+    ) -> None:
+        """It pays a mech from the safe: the session's bearer token proves nothing."""
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        sent = len(patched_mech.calls)
+        bearer = {"Authorization": "Bearer tok"}
+        for body, reason in (
+            ({"chain": "testchain"}, "missing password"),
+            ({"chain": "testchain", "password": "wrong"}, "bad password"),  # nosec B105
+        ):
+            refused = operator.post(
+                "/mech-queue/hard-cancel", json=body, headers=bearer
+            )
+            assert refused.status_code == 401
+            failed = [
+                e for e in audit_entries(store_path) if e["kind"] == "auth_failed"
+            ]
+            assert (failed[-1]["reason"], failed[-1]["path"]) == (
+                reason,
+                "/mech-queue/hard-cancel",
+            )
+        assert len(patched_mech.calls) == sent  # nothing was sent
+        assert (
+            operator.post(
+                "/mech-queue/hard-cancel",
+                json={"chain": "testchain", "password": TEST_PASSWORD, "mech": OTHER},
+            ).status_code
+            == 422
+        )  # strict: only {chain, password}
+
+    def test_hard_cancel_waits_for_the_stall_to_be_old_enough(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+    ) -> None:
+        """Stalled, but not for MECH_HARD_CANCEL_AFTER: refused by rule, nothing sent."""
+        self._stall(mech_service, app_config.mech_hard_cancel_after - 60)
+        sent = len(patched_mech.calls)
+        refused = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert refused.status_code == 409
+        assert "mech-queue-not-stalled" in refused.json()["detail"]
+        assert len(patched_mech.calls) == sent
+        (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert refusal["rule"] == "mech-queue-not-stalled"
+        assert operator.get("/mech-queue").json()["testchain"] == {
+            "stalled": True,
+            "stalled_since": pytest.approx(
+                time.time() - app_config.mech_hard_cancel_after + 60, abs=30
+            ),
+            "hard_cancel_available": False,
+        }
+
+    def test_hard_cancel_sends_one_on_chain_request_to_the_stuck_mech(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Once available, the reports say so; the operator's confirmation sends one."""
+
+        async def no_delivery(*_args: t.Any) -> dict:
+            return {}
+
+        monkeypatch.setattr(
+            mech_module.MechService, "_watch", staticmethod(no_delivery)
+        )
+        patched_mech.result["deliveries"] = {}  # the first request stays pending
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        available = mech_queue_module.HARD_CANCEL_AVAILABLE
+        assert mech_service.result("ab", timeout=1)["hard_cancel"] == available
+        assert operator.get("/mech-queue").json()["testchain"]["hard_cancel_available"]
+        sent = len(patched_mech.calls)
+        done = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert done.status_code == 200
+        assert done.json() == {
+            "tx_hash": patched_mech.result["tx_hash"],
+            "nonce": 5,
+            "mech": Web3.to_checksum_address(OTHER),
+            "paid": str(10**16),
+        }
+        (call,) = patched_mech.calls[sent:]  # exactly one request
+        assert call["use_offchain"] is False
+        assert call["priority_mech"] == Web3.to_checksum_address(OTHER)
+        assert call["max_price"] == 10**17  # the mech's default max_payment
+        assert call["tools"] == ("prediction-online",)
+        (audited,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_hard_cancel"
+        ]
+        assert audited["nonce"] == 5
+        # the stall clock restarts: a second cancel needs its own window
+        again = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert again.status_code == 409
+
+    @pytest.mark.parametrize(
+        ("case", "status", "says"),
+        [
+            ("unknown-chain", 400, "unknown chain"),
+            ("no-slot", 400, "holds no off-chain slot"),
+            ("no-tool", 400, "publishes no tool"),
+            ("over-budget", 400, "over the cap"),
+            ("rpc-down", 502, "cause is in Connect's log"),
+        ],
+    )
+    def test_hard_cancel_says_why_it_could_not_send(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        case: str,
+        status: int,
+        says: str,
+    ) -> None:
+        """Each failure is Connect's own words; a library's text stays in the log."""
+        app_config.chains["nosafe"] = ChainConfig(rpc_url="http://127.0.0.1:9")
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        if case == "no-slot":  # stalled by another signer, with nothing of ours held
+            with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+                slot.answered("taken", mech=OTHER, salt="")
+            queue = nonces._queue(  # pylint: disable=protected-access
+                nonces.key("testchain", SAFE)
+            )
+            queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
+        else:
+            self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        if case == "no-tool":
+            patched_mech.metadata = {"tools": []}
+        if case == "over-budget":
+            patched_mech.info = native_mech_info(10**18)
+        if case == "rpc-down":
+            patched_mech.raises = RuntimeError("https://rpc.example/v3/SECRETKEY down")
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={
+                "chain": "atlantis" if case == "unknown-chain" else "testchain",
+                "password": TEST_PASSWORD,
+            },
+        )
+        assert answer.status_code == status
+        assert says in answer.json()["detail"]
+        assert "SECRETKEY" not in answer.text
+        assert "nosafe" not in operator.get("/mech-queue").json()
 
     def test_a_stalled_queue_is_reported(
         self,

@@ -153,7 +153,9 @@ to see the tools it serves and whether it can be reached off-chain.
   route and `mech_request` from the same safe at once: both sign marketplace
   nonces for it, and they collide, pausing the safe's settlement. Connect
   orders its own requests, one mech at a time per safe; on
-  `mech_queue_stalled`, wait, then retry.
+  `mech_queue_stalled`, wait, then retry. A report carrying `hard_cancel`
+  means only the user can unstick it, by confirming one paid on-chain request
+  in Connect's UI: tell them, and do not try to work around it.
 - **Chat tools.** Send `prompt` as a JSON `messages` list (`[{"role": "user",
   "content": "..."}]`) to a chat tool; the report adds `completion` and
   `usage`. A tool call the model made comes back as a fenced bash block in

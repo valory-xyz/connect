@@ -27,6 +27,8 @@ other non-aea agent. It:
      read into memory at boot and served from there. It ships a stand-in page
      (settings, harness, open a session — everything it shows comes from
      `GET /settings`); see [docs/agent-ui.md](docs/agent-ui.md)
+   - Mech queue: `GET /mech-queue` and the operator's
+     `POST /mech-queue/hard-cancel` (password-gated; "One payer per safe")
    - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its
@@ -372,7 +374,8 @@ Binding to `127.0.0.1` does **not** make the server unreachable from the web:
 any page the user's browser visits can fire requests at localhost, and DNS
 rebinding defeats some browser-side protections. Hence: every route that moves
 funds or changes the guardrail requires the bearer token (or the keystore
-password for the `protected` settings), Origin headers are validated, only
+password for the `protected` settings and the mech queue's hard cancel, which
+no bearer token can authorize), Origin headers are validated, only
 loopback Host headers are accepted, and no CORS is enabled. Two state-changing
 routes are gated on **origin locality alone**, because the FE that calls them
 holds no token: `POST /session` (spawns an agent session on the operator's
@@ -499,7 +502,21 @@ probe at `mapNonces` is sent until one is accepted again, and refusals and
 `mech_result` say `mech_queue_stalled`. A queue stalled for
 `CONNECTION_CONFIGS_CONFIG_MECH_HARD_CANCEL_AFTER` (default 21600 s; it must
 be longer than the settle timeout, or Connect refuses to start) can be hard
-cancelled by the operator (below). An on-chain request takes `mapNonces`
+cancelled by the operator, and from then on `mech_request` and `mech_result`
+report `"hard_cancel": "available: the operator can confirm one on-chain
+request in Connect's UI"`; the session can only be told, never run it. The
+hard cancel is `POST /mech-queue/hard-cancel` with `{chain, password}`
+(origin-gated; the keystore password, checked as `PATCH /settings` checks it —
+re-decrypted, rate-limited, audited — authorizes it, never a bearer token). It
+is refused (409, `mech-queue-not-stalled`) until the stall is that old;
+otherwise it sends one on-chain marketplace request from the safe, to the mech
+of the stuck slot, capped by that mech's default `max_payment` and signed
+through the guard like any on-chain mech request, which consumes the stuck
+`mapNonces` (mech-client's `allocator.hard_cancel`). It answers
+`{tx_hash, nonce, mech, paid}`, is audited as `mech_hard_cancel`, and restarts
+the stall clock, so a second one needs its own window. `GET /mech-queue`
+(origin-gated) reports each safe's queue per chain — `stalled`,
+`stalled_since`, `hard_cancel_available` — for the operator's UI. An on-chain request takes `mapNonces`
 itself, so it waits until no off-chain slot is held. Held slots, their metadata
 salt and the stall are persisted in `mech_nonces.json` under STORE_PATH, written
 before the POST, so a restart never reissues a held nonce; an unreadable file

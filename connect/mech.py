@@ -151,8 +151,17 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         # mech_result can resume the watch a paid-for request deserves
         self._pending: dict[str, PendingDelivery] = {}
         self._requests = RequestLedger()
-        self._queue = MechQueue(config)
+        self._queue = MechQueue(config, activity)
         self._nonces = self._queue.allocator
+
+    def hard_cancel(self, chain: str) -> dict:
+        """Run the operator's hard cancel on the safe's queue on `chain` (D27)."""
+        chain = chain.lower()
+        return self._queue.hard_cancel(self._service(chain), chain)
+
+    def queue_status(self) -> dict:
+        """Report every safe's queue, per chain, for the operator's UI."""
+        return self._queue.status()
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
@@ -662,8 +671,10 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         payload.update(plan.terms)
         if plan.offchain:
             # nothing in the signed request expires it (mech-client sends no
-            # deadline): it can settle whenever the mech delivers it
+            # deadline): it can settle whenever the mech delivers it, or the
+            # operator's hard cancel consumes its nonce
             payload["expires"] = None
+            payload.update(self._queue.report(plan.chain))
         self._resume_watch(payload, deadline)
         if plan.offchain:  # a delivery starts the settle clock
             by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
