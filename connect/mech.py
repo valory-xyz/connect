@@ -41,7 +41,7 @@ import typing as t
 from collections.abc import Mapping
 
 from eth_typing import URI
-from mech_client import chat_report, is_chat_prompt
+from mech_client import chat_report, is_chat_prompt, offchain_blocker
 from mech_client.domain.delivery import (
     OffchainDeliveryWatcher,
     OnchainDeliveryWatcher,
@@ -62,7 +62,6 @@ from connect.mech_allowances import (
     read_map_nonces,
 )
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
-from connect.mech_metadata import offchain_blocker, read_service_metadata
 from connect.mech_nonces import (
     ANSWER_UNKNOWN_RULE,
     NonceAllocator,
@@ -269,7 +268,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             "service_id": service_id,
             "max_delivery_rate": str(max_delivery_rate),
         }
-        read = read_service_metadata(service, service_id)
+        read = service.tool_manager.read_tools_metadata(service_id)
         # The document is published by the mech operator, so neither its shape
         # nor its contents are ours to assume. A `tools` that is not a list
         # must not be iterated (a bare string yields one "tool" per character),
@@ -560,7 +559,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # a message about metadata, which reads as a transient gateway
             # problem. Most listed mechs publish no endpoint at all, so decide
             # it here, before any payment, and name the flow that does work.
-            read = read_service_metadata(service, service_id)
+            read = service.tool_manager.read_tools_metadata(service_id)
             blocker = offchain_blocker(read)
             if blocker is not None:
                 self._blocked(chain, tool, "offchain-unreachable", blocker)

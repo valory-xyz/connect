@@ -41,6 +41,7 @@ from eth_account.signers.local import LocalAccount
 from eth_typing import URI
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from mech_client import MetadataRead
 from mech_client.infrastructure.blockchain.abi_loader import get_abi
 from mech_client.infrastructure.config import PaymentType
 from safe_eth.eth import EthereumClient
@@ -1044,8 +1045,8 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
         # endpoint, and reachability pre-flight + send both read it
         monkeypatch.setattr(
             service.tool_manager,
-            "fetch_tools_metadata",
-            lambda sid: {"tools": [tool], "url": url},
+            "read_tools_metadata",
+            lambda sid: MetadataRead({"tools": [tool], "url": url}, None),
         )
         monkeypatch.setattr(service.tool_manager, "get_offchain_url", lambda sid: url)
         first = mech_service.request(

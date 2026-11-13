@@ -39,7 +39,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
-from mech_client import OffchainRequestRejected, OffchainTopUpFailed
+from mech_client import MetadataRead, OffchainRequestRejected, OffchainTopUpFailed
 from mech_client.domain import identification
 from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
@@ -1803,6 +1803,11 @@ class FakeMarketplaceContract:
 NATIVE_PAYMENT_TYPE = "ba699a34be8fe0e7725e93dcbce1701b0211a8ca61330aaeb8a05bf2ec7abed1"
 
 
+def metadata_read(document: t.Any) -> MetadataRead:
+    """Answer ToolManager.read_tools_metadata: the document, or an unreadable one."""
+    return MetadataRead(document if isinstance(document, dict) else None, None)
+
+
 def native_mech_info(rate: int) -> tuple:
     """Canned _fetch_mech_info answer for a native-payment mech."""
     return (PaymentType(NATIVE_PAYMENT_TYPE), 42, rate)
@@ -1850,7 +1855,7 @@ class FakeMarketplaceService:
         # whether each report ran with mech-client's RPC mismatch warning muted
         self.report_muted: list[bool] = []
         self.tool_manager = SimpleNamespace(
-            fetch_tools_metadata=lambda service_id: self.metadata,
+            read_tools_metadata=lambda service_id: metadata_read(self.metadata),
             terms_report=self._terms_report,
             mech_report_or_terms=self._mech_report_or_terms,
         )
@@ -1958,7 +1963,7 @@ def _wire_real_report(
     manager.chain_config = "gnosis"
     manager.mech_config = SimpleNamespace(ledger_config=SimpleNamespace(chain_id=100))
     patched_mech.tool_manager = SimpleNamespace(
-        fetch_tools_metadata=lambda service_id: metadata,
+        read_tools_metadata=lambda service_id: metadata_read(metadata),
         terms_report=manager.terms_report,
         mech_report_or_terms=manager.mech_report_or_terms,
     )
@@ -3651,7 +3656,7 @@ class TestMech:
         """
         patched_mech.mech_info = native_mech_info(10**18)
         patched_mech.tool_manager = SimpleNamespace(
-            fetch_tools_metadata=lambda service_id: pytest.fail(
+            read_tools_metadata=lambda service_id: pytest.fail(
                 "priced out already; the metadata fetch should not be reached"
             )
         )
@@ -3950,8 +3955,8 @@ class TestMech:
         the off-chain flow will go through with a known tool name.
         """
         patched_mech.tool_manager = SimpleNamespace(
-            fetch_tools_metadata=lambda service_id: (_ for _ in ()).throw(
-                TimeoutError("slow")
+            read_tools_metadata=lambda service_id: MetadataRead(
+                None, "TimeoutError: slow"
             ),
             terms_report=patched_mech.tool_manager.terms_report,
             mech_report_or_terms=patched_mech.tool_manager.mech_report_or_terms,
@@ -3964,9 +3969,6 @@ class TestMech:
         # a transient timeout is permanent
         assert "TimeoutError: slow" in info["offchain_note"]
         assert "may be transient" in info["offchain_note"]
-        # an unreadable fetch may clear on its own, so paying for gas is the
-        # second move, not the first
-        assert "retry before paying" in info["offchain_note"]
 
     def test_the_two_blockers_advise_differently(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3983,7 +3985,7 @@ class TestMech:
 
         patched_mech.metadata = None  # unreadable
         unreadable = mech_service.tools(chain="testchain", priority_mech=OTHER)
-        assert "retry before paying" in unreadable["offchain_note"]
+        assert "may be transient" in unreadable["offchain_note"]
 
     def test_unreadable_metadata_verdict_never_claims_permanence(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
