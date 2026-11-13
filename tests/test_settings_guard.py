@@ -39,7 +39,12 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
-from mech_client import MetadataRead, OffchainRequestRejected, OffchainTopUpFailed
+from mech_client import (
+    MechInfo,
+    MetadataRead,
+    OffchainRequestRejected,
+    OffchainTopUpFailed,
+)
 from mech_client.domain import identification
 from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
@@ -1809,7 +1814,7 @@ def metadata_read(document: t.Any) -> MetadataRead:
 
 
 def native_mech_info(rate: int) -> tuple:
-    """Canned _fetch_mech_info answer for a native-payment mech."""
+    """Canned (payment_type, service_id, rate) for a native-payment mech."""
     return (PaymentType(NATIVE_PAYMENT_TYPE), 42, rate)
 
 
@@ -1832,7 +1837,7 @@ class FakeMarketplaceService:
         self.raises: Exception | None = None
         # raised once the request is signed: the POST may have reached the mech
         self.raises_after_signing: Exception | None = None
-        self.mech_info = native_mech_info(10**16)
+        self.info = native_mech_info(10**16)
         # A mech that publishes both a tool list and an off-chain endpoint —
         # the rare healthy case; tests that need a blocker override `metadata`.
         self.metadata: dict | None = {
@@ -1881,9 +1886,10 @@ class FakeMarketplaceService:
             return {**self.terms, "report_note": self.report_fallback}
         return {**self.terms, **self.report}
 
-    def _fetch_mech_info(self, mech: str) -> tuple:
+    def mech_info(self, mech: str) -> MechInfo:
         """Return the canned (payment_type, service_id, max_delivery_rate)."""
-        return self.mech_info
+        payment_type, service_id, rate = self.info
+        return MechInfo(mech, service_id, payment_type, rate)
 
     def _get_marketplace_contract(self) -> FakeMarketplaceContract:
         """Return the contract stand-in (the private helper the code pins)."""
@@ -1914,8 +1920,8 @@ class FakeMarketplaceService:
                 kwargs["priority_mech"],
                 self.safe_address,
                 bytes.fromhex(data_hash.removeprefix("0x")),
-                self.mech_info[2],
-                bytes.fromhex(self.mech_info[0].value),
+                self.info[2],
+                bytes.fromhex(self.info[0].value),
                 nonces[0],
             ).call()
             hook = kwargs.get("on_request_id")
@@ -2220,7 +2226,7 @@ class TestMech:
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """A request refused on price spends no DNS lookups either."""
-        patched_mech.mech_info = native_mech_info(10**18)
+        patched_mech.info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
         assert not patched_mech.terms_calls
@@ -3623,13 +3629,13 @@ class TestMech:
         attempted, and the rules must be distinguishable from each other.
         """
         # 1. price cap
-        patched_mech.mech_info = native_mech_info(10**18)
+        patched_mech.info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request(
                 "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
             )
         # 2. mech unreachable off-chain
-        patched_mech.mech_info = native_mech_info(10**16)
+        patched_mech.info = native_mech_info(10**16)
         patched_mech.metadata = {"tools": ["prediction-online"]}
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
             mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
@@ -3654,7 +3660,7 @@ class TestMech:
         Ordering matters: an over-priced mech is disqualified on price alone,
         so the pre-flight's network fetch is never reached.
         """
-        patched_mech.mech_info = native_mech_info(10**18)
+        patched_mech.info = native_mech_info(10**18)
         patched_mech.tool_manager = SimpleNamespace(
             read_tools_metadata=lambda service_id: pytest.fail(
                 "priced out already; the metadata fetch should not be reached"
@@ -4122,7 +4128,7 @@ class TestMech:
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """A mech pricing above max_payment is refused before any work."""
-        patched_mech.mech_info = native_mech_info(10**18)
+        patched_mech.info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request(
                 "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
@@ -4158,12 +4164,12 @@ class TestMech:
     ) -> None:
         """0.1 of the asset, pinned per type: a dropped key must fail here."""
         assert set(mech_budget.DEFAULT_MAX_PAYMENT) == set(PaymentType)
-        patched_mech.mech_info = (kind, 42, budget + 1)
+        patched_mech.info = (kind, 42, budget + 1)
         with pytest.raises(MechError, match=f"above max_payment={budget}"):
             mech_service.request(
                 "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
             )
-        patched_mech.mech_info = (kind, 42, budget)
+        patched_mech.info = (kind, 42, budget)
         mech_service.request(
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
@@ -4198,7 +4204,7 @@ class TestMech:
         self, kind: PaymentType, chain: str, token: t.Optional[str]
     ) -> None:
         """A known chain without the token and an unknown chain both say None."""
-        assert mech_budget.payment_token(kind, chain) == token
+        assert mech_budget.payment_report(kind, chain)["payment_token"] == token
 
     def test_the_report_keeps_its_keys_when_there_is_no_default(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4214,12 +4220,12 @@ class TestMech:
     ) -> None:
         """0.1 of a 6-decimal token is 10**5, not the native 10**17."""
         usdc = PaymentType.USDC_TOKEN
-        patched_mech.mech_info = (usdc, 42, 10**5 + 1)
+        patched_mech.info = (usdc, 42, 10**5 + 1)
         with pytest.raises(MechError, match="above max_payment=100000"):
             mech_service.request(
                 "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
             )
-        patched_mech.mech_info = (usdc, 42, 10**5)
+        patched_mech.info = (usdc, 42, 10**5)
         mech_service.request(
             "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
         )
@@ -4256,7 +4262,7 @@ class TestMech:
         mech_service._config.chains["robinhood"] = ChainConfig(
             rpc_url="http://127.0.0.1:9", safe_address=SAFE
         )
-        patched_mech.mech_info = (
+        patched_mech.info = (
             PaymentType.USDC_TOKEN,
             1,
             10000,
@@ -4424,7 +4430,7 @@ class TestMech:
         """A failing price lookup surfaces as MechError, not a raw exception."""
         monkeypatch.setattr(
             patched_mech,
-            "_fetch_mech_info",
+            "mech_info",
             lambda mech: (_ for _ in ()).throw(RuntimeError("rpc down")),
         )
         with pytest.raises(MechError, match="could not price"):

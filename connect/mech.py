@@ -256,10 +256,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             self._config.chain(chain)
             return self._list_mechs(chain, limit=limit, offset=offset)
         service = self._service(chain)
-        # no public single-mech info API in mech-client yet; the protected
-        # helper is the same one send_request() uses internally
-        fetch_info = service._fetch_mech_info  # pylint: disable=protected-access
-        payment_type, service_id, max_delivery_rate = fetch_info(priority_mech)
+        mech_info = service.mech_info(priority_mech)
+        payment_type, service_id = mech_info.payment_type, mech_info.service_id
+        max_delivery_rate = mech_info.max_delivery_rate
         info: dict = {
             "chain": chain,
             "mech": priority_mech,
@@ -984,14 +983,13 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             if not listing["mechs"]:
                 raise MechError(f"no live mechs found for '{chain}'")
             priority_mech = str(listing["mechs"][0]["address"])
-        fetch_info = service._fetch_mech_info  # pylint: disable=protected-access
         try:
-            payment_type, service_id, max_delivery_rate = fetch_info(priority_mech)
+            info = service.mech_info(priority_mech)
         except Exception as e:
             raise MechError(f"could not price mech {priority_mech}: {e}") from e
         return PricedMech(
             mech=priority_mech,
-            service_id=int(service_id),
-            rate=int(max_delivery_rate),
-            payment_type=str(payment_type.value),
+            service_id=int(info.service_id),
+            rate=int(info.max_delivery_rate),
+            payment_type=str(info.payment_type.value),
         )

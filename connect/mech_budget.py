@@ -17,16 +17,12 @@
 #
 # ------------------------------------------------------------------------------
 
-"""What a mech request may pay by default, and in which token it pays."""
+"""What a mech request may pay by default, and the token report beside it."""
 
 import typing as t
 
-from mech_client.infrastructure.config.contract_addresses import (
-    CHAIN_TO_PRICE_TOKEN_OLAS,
-    CHAIN_TO_PRICE_TOKEN_USDC,
-)
+from mech_client import payment_token
 from mech_client.infrastructure.config.payment_config import PaymentType
-from mech_client.utils.constants import CHAIN_NAME_TO_ID
 
 # The agent's per-request spending budget, not a guardrail: the caller picks
 # max_payment per call and the server does not clamp it — the guardrail only
@@ -42,27 +38,25 @@ DEFAULT_MAX_PAYMENT = {
     PaymentType.USDC_TOKEN: 10**5,
     PaymentType.TOKEN_NVM_USDC: 10**5,
 }
-PAYMENT_TOKENS = {
-    PaymentType.OLAS_TOKEN: CHAIN_TO_PRICE_TOKEN_OLAS,
-    PaymentType.USDC_TOKEN: CHAIN_TO_PRICE_TOKEN_USDC,
-    PaymentType.TOKEN_NVM_USDC: CHAIN_TO_PRICE_TOKEN_USDC,
-}
 
 
-def payment_token(payment_type: PaymentType, chain: str) -> t.Optional[str]:
-    """Name the token a mech is paid in on a chain: "native", an address, or None."""
-    if payment_type not in PAYMENT_TOKENS:
+def _payment_token(payment_type: PaymentType, chain: str) -> str | None:
+    """Name the token a mech is paid in: "native", mech-client's address, or None.
+
+    None when mech-client knows no such token on the chain, or not the chain.
+    """
+    if not payment_type.is_token():
         return "native"
-    chain_id = CHAIN_NAME_TO_ID.get(chain)
-    if chain_id is None:
+    try:
+        return payment_token(payment_type, chain)
+    except ValueError:
         return None
-    return PAYMENT_TOKENS[payment_type].get(chain_id) or None
 
 
 def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
     """Report the token a mech is paid in and the budget a request defaults to."""
     default = DEFAULT_MAX_PAYMENT.get(payment_type)
     return {
-        "payment_token": payment_token(payment_type, chain),
+        "payment_token": _payment_token(payment_type, chain),
         "default_max_payment": None if default is None else str(default),
     }

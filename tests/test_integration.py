@@ -1022,7 +1022,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     # price the mech as the flow will, and resolve the tracker our way
     service = mech_service._service("gnosis")  # pylint: disable=protected-access
     # pylint: disable-next=protected-access
-    _, service_id, rate = service._fetch_mech_info(mech_address)
+    _, service_id, _, rate = service.mech_info(mech_address)
     tracker, is_token = deposit_tracker("gnosis", PaymentType.NATIVE.value)
     assert tracker is not None
     assert is_token is False
