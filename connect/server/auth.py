@@ -338,7 +338,9 @@ class GrantStore:
             )
         return False
 
-    def intent_for(self, token: str | None, intent: t.Any) -> t.Any:
+    def intent_for(
+        self, token: str | None, intent: dict | None
+    ) -> intent_module.AgentIntent:
         """Return the intent the gate holds a call to, for the calling token.
 
         A value-capped token's intent is `intent.Capped`, so the gate refuses

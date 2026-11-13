@@ -39,6 +39,7 @@ from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
+from connect.intent import AgentIntent
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
 from connect.server.auth import (
     GrantRefused,
@@ -451,7 +452,9 @@ def _ctx_token(ctx: Context | None) -> str | None:
     return request_token(_ctx_request(ctx))
 
 
-def _for_token(grants: GrantStore, ctx: Context | None, intent: dict | None) -> t.Any:
+def _for_token(
+    grants: GrantStore, ctx: Context | None, intent: dict | None
+) -> AgentIntent:
     """Return the intent the gate holds this call to, for the calling token.
 
     The MCP mount stamps the token on the request; `GrantStore.intent_for`
@@ -487,7 +490,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     address: str,
     value: int,
     data: str,
-    intent: t.Any,
+    intent: AgentIntent,
     request_id: str | None,
     replay_only: bool,
     wait_for_receipt: bool,

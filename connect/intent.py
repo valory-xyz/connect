@@ -128,6 +128,12 @@ class Capped(t.NamedTuple):
     raw: t.Any
 
 
+# what an agent surface may hand the gate: an intent as sent, or one Capped.
+# Never the signer's SERVER_BUILT, the one gate bypass, so mypy keeps that
+# sentinel off every agent path.
+AgentIntent = dict | Capped | None
+
+
 class Problem(t.TypedDict):
     """One rule a simulated transaction broke."""
 
