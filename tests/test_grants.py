@@ -817,3 +817,77 @@ def test_http_mint_refuses_an_unknown_field_by_name(
     assert "max_value_per_tx" in json.dumps(refused.json())
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert rules == ["unknown-parameter"]
+
+
+def _session_capped(client: TestClient) -> str:
+    minted = client.post(
+        "/tokens",
+        json={"scopes": ["read", "tx"], "max_value_per_session": {"native": 10}},
+        headers=_bearer(WORKSPACE),
+    )
+    assert minted.status_code == 200
+    return minted.json()["token"]
+
+
+def test_http_a_replayed_request_id_draws_the_session_once(
+    client: TestClient, fake_w3: FakeW3
+) -> None:
+    """A retry of a send that went out answers its hash; it is not charged again.
+
+    signer_client retries on a timeout: charging the retry would refuse it
+    while its transaction is on-chain, and the script would never learn so.
+    """
+    capped = _session_capped(client)
+    body = {
+        "chain": "testchain",
+        "target": RECIPIENT,
+        "value": 10,
+        "intent": pay(RECIPIENT, 10),
+        "request_id": "r1",
+    }
+    first = client.post("/safe-transaction", json=body, headers=_bearer(capped))
+    assert first.status_code == 200
+    again = client.post("/safe-transaction", json=body, headers=_bearer(capped))
+    assert again.json() == first.json()
+    assert len(fake_w3.eth.sent) == 1
+    # the id is the safe path's: on the EOA path it is a new send, and drawn
+    eoa = client.post(
+        "/sign-and-send",
+        json={**{k: v for k, v in body.items() if k != "target"}, "to": RECIPIENT},
+        headers=_bearer(capped),
+    )
+    assert eoa.status_code == 403
+    assert "token-cap-per-session" in eoa.json()["detail"]
+    fresh = client.post(
+        "/safe-transaction", json={**body, "request_id": "r2"}, headers=_bearer(capped)
+    )
+    assert fresh.status_code == 403
+
+
+def test_mcp_a_replayed_request_id_draws_the_session_once(
+    client: TestClient, fake_w3: FakeW3
+) -> None:
+    """The MCP mount authorizes a replay as the HTTP route does."""
+    call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "safe_transaction",
+            "arguments": {
+                "chain": "testchain",
+                "target": RECIPIENT,
+                "value": 10,
+                "intent": pay(RECIPIENT, 10),
+                "request_id": "r1",
+            },
+        },
+    }
+    headers = {"Accept": "application/json, text/event-stream"}
+    headers.update(_bearer(_session_capped(client)))
+    first = client.post("/mcp/", json=call, headers=headers)
+    assert "tx_hash" in first.text
+    again = client.post("/mcp/", json=call, headers=headers)
+    assert "token-cap-per-session" not in again.text
+    assert "tx_hash" in again.text
+    assert len(fake_w3.eth.sent) == 1

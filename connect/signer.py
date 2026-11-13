@@ -207,6 +207,11 @@ class _IdempotencyCache:
             cached = self._results.get(key)
         return None if cached is None else _same_call(key, cached, stamp)
 
+    def completed(self, key: str) -> bool:
+        """Whether a run of this key completed, so the key only replays now."""
+        with self._lock:
+            return key in self._results
+
     def _execute(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
         try:
             result = action()
@@ -253,6 +258,15 @@ class Signer:
     def address(self) -> str:
         """Address."""
         return self._account.address
+
+    def has_sent(self, request_id: str, via_safe: bool) -> bool:
+        """Whether a send under this request id completed, so it only replays.
+
+        `via_safe` picks the namespace: send_via_safe keeps its ids apart.
+        """
+        return self._requests.completed(
+            f"safe:{request_id}" if via_safe else request_id
+        )
 
     def w3(self, chain: str) -> Web3:
         """W3."""

@@ -210,8 +210,18 @@ def _is_universal_router(spender: str, chain: t.Any) -> bool:
 class GrantStore:
     """The bearer tokens this process honours, and what each may do."""
 
-    def __init__(self, workspace_token: str) -> None:
-        """Hold the workspace token, the root every other token is minted from."""
+    def __init__(
+        self,
+        workspace_token: str,
+        *,
+        sent: t.Callable[[str, bool], bool] = lambda request_id, via_safe: False,
+    ) -> None:
+        """Hold the workspace token, the root every other token is minted from.
+
+        `sent(request_id, via_safe)` says whether the signer already sent that
+        request id, so its replay is not drawn on a session budget twice.
+        """
+        self._sent = sent
         self._lock = threading.Lock()
         self._grants: dict[str, TokenGrant] = {workspace_token: WORKSPACE_GRANT}
         self._spent: dict[str, dict[str, int]] = {}
@@ -260,7 +270,10 @@ class GrantStore:
         return grant
 
     def authorize(
-        self, token: str, action: str, arguments: t.Mapping[str, t.Any]
+        self,
+        token: str,
+        action: str,
+        arguments: t.Mapping[str, t.Any],
     ) -> None:
         """Raise unless `token` may perform `action` with `arguments`.
 
@@ -271,7 +284,9 @@ class GrantStore:
         move a position (`intent.Capped`, which the send surfaces apply).
         A capped token's per-session budget is drawn down when a call is
         authorized, whether or not the send then succeeds: it can be spent
-        early, never exceeded.
+        early, never exceeded. A call whose `request_id` the signer already
+        sent draws nothing: the signer answers it with the sent hash, and
+        sends nothing new.
         """
         grant = self._live(token)
         scope = ACTION_SCOPES.get(action)
@@ -290,7 +305,7 @@ class GrantStore:
                 "authorize a safe transaction that no cap or intent sees",
             )
         if scope == "tx" and action != "sign_message":
-            self._check_value(token, grant, arguments)
+            self._check_value(token, grant, action, arguments)
 
     def intent_for(self, token: str | None, intent: t.Any) -> t.Any:
         """Return the intent the gate holds a call to, for the calling token.
@@ -321,7 +336,11 @@ class GrantStore:
             )
 
     def _check_value(  # pylint: disable=too-many-locals
-        self, token: str, grant: TokenGrant, arguments: t.Mapping[str, t.Any]
+        self,
+        token: str,
+        grant: TokenGrant,
+        action: str,
+        arguments: t.Mapping[str, t.Any],
     ) -> None:
         declared, approvals = _declared(arguments)  # refuses malformed first
         self._check_approvals(grant, approvals)
@@ -345,6 +364,11 @@ class GrantStore:
                 continue
             key = intent_module.balance_key(approval["token"])
             drawn[key] = drawn.get(key, 0) + approval["amount"]
+        request_id = arguments.get("request_id")
+        if isinstance(request_id, str) and self._sent(
+            request_id, action == "safe_transaction"
+        ):
+            drawn = {}  # a replay: the signer sends nothing new for it
         with self._lock:
             # this token and every ancestor it was minted from: minting more
             # children must not multiply a parent's session budget
