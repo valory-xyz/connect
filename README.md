@@ -44,7 +44,11 @@ other non-aea agent. It:
      `target`, `value`, `data`), `POST /sign-and-send` (the EOA's: `to`,
      `value`, `data`; both also take `request_id`, `intent`, and
      `wait_for_receipt`/`timeout`, answering `status` and the receipt as the
-     MCP send tools do), `POST /sign-message`, `GET /wallet`. Every body and
+     MCP send tools do), `POST /sign-message`, `GET /wallet`. An error body
+     carries Connect's own message with any URL in it redacted, and a receipt
+     that cannot be read is `pending` with Connect's `receipt_error`: what an
+     RPC library says, which may name the RPC URL and its key, goes only to
+     `log.txt`. Every body and
      every MCP tool refuses a parameter it does not take, with an error naming
      the ones it does (`to` on the safe path is pointed at `target`); read-only
      tools carry `readOnlyHint`

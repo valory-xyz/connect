@@ -23,6 +23,7 @@ The MCP send tools and the HTTP send routes are sibling adapters over the
 signer; neither imports the other, so what they both answer lives here.
 """
 
+import logging
 import typing as t
 
 from hexbytes import HexBytes
@@ -32,6 +33,12 @@ from connect.signer import Signer
 
 RECEIPT_POLL_SECONDS = 2
 MAX_RECEIPT_TIMEOUT = 300
+RECEIPT_ERROR = (
+    "the transaction was sent, but its receipt could not be read (the cause is "
+    "in Connect's log); check it with transaction_status before resending"
+)
+
+logger = logging.getLogger("agent")
 
 
 def settled(
@@ -62,9 +69,12 @@ def settled(
         return mined_result(tx_hash, receipt)
     except TimeExhausted:
         return {"tx_hash": tx_hash, "status": "pending"}
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        # the send already happened; a receipt-read hiccup must not lose the hash
-        return {"tx_hash": tx_hash, "status": "pending", "receipt_error": str(e)}
+    except Exception:  # pylint: disable=broad-exception-caught
+        # the send already happened; a receipt-read hiccup must not lose the
+        # hash. Its text is the RPC library's (an RPC URL may carry a key), so
+        # it goes to the log, and the caller gets Connect's own words.
+        logger.warning("could not read the receipt of %s", tx_hash, exc_info=True)
+        return {"tx_hash": tx_hash, "status": "pending", "receipt_error": RECEIPT_ERROR}
 
 
 def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:

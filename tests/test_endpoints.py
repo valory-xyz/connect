@@ -589,6 +589,43 @@ class TestAuth:
         )
         assert set(quick.json()) == {"tx_hash"}
 
+    @pytest.mark.parametrize(
+        ("path", "to_key"), [("/safe-transaction", "target"), ("/sign-and-send", "to")]
+    )
+    @pytest.mark.parametrize("fails", ["broadcast", "receipt"])
+    def test_a_library_error_never_reaches_the_body(  # pylint: disable=too-many-arguments
+        self,
+        client: TestClient,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        to_key: str,
+        fails: str,
+    ) -> None:
+        """An RPC's error text may name its URL, key and all: only the log sees it."""
+        leak = "HTTPSConnectionPool: https://rpc.example/v3/SECRETKEY timed out"
+
+        def broken(*_args: t.Any, **_kwargs: t.Any) -> t.Any:
+            raise ConnectionError(leak)
+
+        name = (
+            "send_raw_transaction"
+            if fails == "broadcast"
+            else "wait_for_transaction_receipt"
+        )
+        monkeypatch.setattr(fake_w3.eth, name, broken)
+        body = {
+            "chain": "testchain",
+            to_key: "0x" + "aa" * 20,
+            "value": 16,
+            "intent": pay("0x" + "aa" * 20, 16),
+            "wait_for_receipt": True,
+        }
+        answer = client.post(path, json=body, headers=auth())
+        assert "SECRETKEY" not in answer.text
+        assert "rpc.example" not in answer.text
+        assert answer.status_code == (400 if fails == "broadcast" else 200)
+
     def test_safe_transaction_without_a_safe_is_400(
         self, client: TestClient, fake_w3: FakeW3
     ) -> None:

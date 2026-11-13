@@ -53,6 +53,7 @@ from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
 from connect.run_goal import RunGoal
+from connect.server import receipts
 from connect.server.auth import AuthFailureLimiter, AuthMiddleware
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
@@ -1121,7 +1122,7 @@ class TestMcpTools:
         assert fake_w3.eth.sent  # the premise: it really was broadcast first
         assert result["status"] == "pending"
         assert result["tx_hash"].startswith("0x")
-        assert "rpc dropped" in result["receipt_error"]
+        assert result["receipt_error"] == receipts.RECEIPT_ERROR  # not the RPC's text
 
     async def test_safe_transaction_rejects_a_negative_value(
         self, tools: dict[str, t.Callable]
