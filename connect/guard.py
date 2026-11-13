@@ -77,6 +77,7 @@ from connect.safe import (
     EXEC_TRANSACTION_SELECTOR,
     OPERATION_CALL,
     SafeExec,
+    calldata_hex,
     decode_approve,
     decode_deposit,
 )
@@ -248,7 +249,7 @@ class Guard:
         """
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
-        calldata = (data or "0x").removeprefix("0x").lower()
+        calldata = calldata_hex(data)
         exec_call = None
         if calldata.startswith(EXEC_TRANSACTION_SELECTOR):
             # decode and floor-check every execTransaction, whatever it targets

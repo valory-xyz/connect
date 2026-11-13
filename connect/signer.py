@@ -163,7 +163,7 @@ def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
 def _decode_calldata(data: str) -> bytes:
     """Return the calldata bytes, or :raises SignerError: on malformed hex."""
     try:
-        return bytes.fromhex((data or "0x").removeprefix("0x"))
+        return bytes.fromhex(safe_module.calldata_hex(data))
     except ValueError as e:
         raise SignerError(f"cannot decode the calldata: {e}") from e
 
@@ -442,7 +442,7 @@ class Signer:
             anyone may then execute), and an execTransaction that also carries
             EOA value, pays a gas refund or is not a CALL.
         """
-        calldata = (data or "0x").removeprefix("0x").lower()
+        calldata = safe_module.calldata_hex(data)
         if calldata.startswith(safe_module.APPROVE_HASH_SELECTOR):
             raise _GateRefused(
                 "approve-hash",
@@ -733,7 +733,7 @@ class Signer:
                 chain=chain,
                 to=to,
                 value=str(value),
-                data_size=len((data or "0x").removeprefix("0x")) // 2,
+                data_size=len(safe_module.calldata_hex(data)) // 2,
                 tx_hash=tx_hash,
                 request_id=request_id,
             )

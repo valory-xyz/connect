@@ -300,6 +300,69 @@ class TestSignerGate:
         assert "'approve-hash'" in str(reason)
         assert problems[0]["rule"] == "approve-hash"
 
+    def test_an_uppercase_hex_prefix_is_read_as_the_same_bytes(
+        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
+    ) -> None:
+        """`0X...` signs the same bytes as `0x...`, so it meets the same checks.
+
+        A selector check that stripped only `0x` would simulate the EOA's own
+        call, which moves nothing, and the safe's execTransaction inside would
+        be signed with no intent; approveHash would slip past its refusal.
+        """
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        calldata = safe_module.exec_transaction(
+            target=EOA, value=7, data="0xabcdef", owner=test_signer.address
+        )
+        with pytest.raises(SignerError, match="'missing-intent'"):
+            test_signer.send("testchain", SAFE, data="0X" + calldata[2:])
+        assert fake_w3.provider.simulated[-1]["from"] == SAFE
+        with pytest.raises(SignerError, match="'approve-hash'"):
+            test_signer.send("testchain", SAFE, data="0Xd4d9bdcd" + "ab" * 32)
+        assert fake_w3.eth.sent == []
+        rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert rules == ["missing-intent", "approve-hash"]
+
+    def test_the_floor_reads_an_uppercase_hex_prefix(
+        self, test_signer: Signer, guard: Guard, fake_w3: FakeW3
+    ) -> None:
+        """The guard's floor decodes `0X` execTransaction calldata too."""
+        from eth_abi import encode  # pylint: disable=import-outside-toplevel
+
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        test_signer.set_guard(guard)
+        args: list = [EOA, 0, b"", 1, 0, 0, 0, safe_module.ZERO_ADDRESS]
+        args += [safe_module.ZERO_ADDRESS, b""]
+        calldata = "0X" + safe_module.EXEC_TRANSACTION_SELECTOR
+        calldata += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()
+        with pytest.raises(SignerError, match="delegatecall"):
+            test_signer.send("testchain", TOKEN, data=calldata, intent={})
+        assert fake_w3.eth.sent == []
+
+    def test_a_checksummed_safe_address_still_unwraps(
+        self, test_signer: Signer, app_config: AppConfig, fake_w3: FakeW3
+    ) -> None:
+        """The safe is matched case-insensitively, whichever side is checksummed."""
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        lower = "0x" + "ab" * 20
+        app_config.chain("testchain").safe_address = (
+            "0xABaBaBaBABabABabAbAbABAbABabababaBaBABaB"
+        )
+        calldata = safe_module.exec_transaction(
+            target=EOA, value=7, data="0x", owner=test_signer.address
+        )
+        with pytest.raises(SignerError, match="'missing-intent'"):
+            test_signer.send("testchain", lower, data=calldata)
+        assert fake_w3.provider.simulated[-1]["from"].lower() == lower
+
     def test_exec_transaction_bytes_to_another_contract_run_as_the_eoa(
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:

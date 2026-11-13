@@ -125,9 +125,20 @@ def prevalidated_signature(owner: str) -> bytes:
     )
 
 
+def calldata_hex(data: str | None) -> str:
+    """Return calldata as bare lowercase hex, its `0x`/`0X` prefix removed.
+
+    The one reading of a calldata string every selector check shares: a
+    signer reads `0X...` as the same bytes as `0x...`, so a check that
+    strips only the lowercase prefix would miss the selector it guards.
+    """
+    raw = data or ""
+    return (raw[2:] if raw[:2].lower() == "0x" else raw).lower()
+
+
 def _hex_to_bytes(value: str) -> bytes:
     """Read 0x-hex (or bare hex) as bytes."""
-    return bytes.fromhex(value.removeprefix("0x"))
+    return bytes.fromhex(calldata_hex(value))
 
 
 def exec_transaction(target: str, value: int, data: str, owner: str) -> str:
@@ -159,7 +170,7 @@ def decode_approve(data: str) -> str | None:
 
     None means the calldata is not a decodable approve.
     """
-    calldata = (data or "").removeprefix("0x").lower()
+    calldata = calldata_hex(data)
     if not calldata.startswith(APPROVE_SELECTOR):
         return None
     try:
@@ -175,7 +186,7 @@ def decode_deposit(data: str) -> int | None:
     None means the calldata is not a decodable deposit — the guard treats
     that as "not the transaction the allowance covers", never as zero.
     """
-    calldata = (data or "").removeprefix("0x").lower()
+    calldata = calldata_hex(data)
     if not calldata.startswith(DEPOSIT_SELECTOR):
         return None
     try:
@@ -204,7 +215,7 @@ class SafeExec:
     @classmethod
     def decode(cls, data: str) -> "SafeExec":
         """Decode execTransaction calldata; ValueError when it will not read."""
-        calldata = (data or "0x").removeprefix("0x").lower()
+        calldata = calldata_hex(data)
         if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
             raise ValueError("not execTransaction calldata")
         try:
@@ -235,6 +246,4 @@ class SafeExec:
 
 def is_exec_transaction(data: str) -> bool:
     """Whether calldata calls execTransaction."""
-    return (
-        (data or "0x").removeprefix("0x").lower().startswith(EXEC_TRANSACTION_SELECTOR)
-    )
+    return calldata_hex(data).startswith(EXEC_TRANSACTION_SELECTOR)
