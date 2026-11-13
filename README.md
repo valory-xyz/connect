@@ -207,8 +207,9 @@ it also carries value from the EOA, is not a CALL, or pays a gas refund (any of
 simulation would not show. The safe's `approveHash` is refused outright
 (`approve-hash`): it pre-approves a safe transaction by hash, which anyone may
 then execute, so no intent could hold it. These refusals are audited like the
-rest, after the guard has answered. Calldata that is not hex is refused before
-anything reaches the RPC (`bad-calldata`), on a send, `preflight_transaction`
+rest, after the guard has answered. Calldata that is not strictly hex of whole
+bytes (a space or a newline included) is refused before anything reaches the
+RPC (`bad-calldata`), on a send, `preflight_transaction`
 and `simulate_transaction` alike, rather than reading as an RPC that cannot
 simulate. An RPC that cannot simulate is also logged to `log.txt` with the
 cause, since every agent send on that chain is refused until it can. An amount in an intent is a whole number

@@ -164,24 +164,35 @@ class TestSignerGate:
         assert entry["rule"] == "reverts"
 
     @pytest.mark.parametrize("via_safe", [True, False])
+    @pytest.mark.parametrize(
+        "data", ["0xzz", "0xa9059cbb 00", "0xa9059cbb\n00", "0xabc", " 0x00"]
+    )
     def test_calldata_that_is_not_hex_is_refused_before_the_rpc(
-        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any, via_safe: bool
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        store_path: t.Any,
+        via_safe: bool,
+        data: str,
     ) -> None:
-        """A caller's typo is refused as one, not as an RPC that cannot simulate."""
+        """A caller's typo is refused as one, not as an RPC that cannot simulate.
+
+        Strictly: bytes.fromhex skips whitespace, and the raw string goes on.
+        """
         send = test_signer.send_via_safe if via_safe else test_signer.send
         with pytest.raises(SignerError, match="'bad-calldata': cannot decode"):
-            send("testchain", TOKEN, data="0xzz")
+            send("testchain", TOKEN, data=data)
         assert fake_w3.provider.simulated == []
         assert not fake_w3.eth.sent
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert entry["rule"] == "bad-calldata"
         reason, problems = test_signer.check(
-            "testchain", TOKEN, data="0xzz", via_safe=via_safe
+            "testchain", TOKEN, data=data, via_safe=via_safe
         )
         assert "'bad-calldata'" in str(reason)
         assert problems[0]["rule"] == "bad-calldata"
         simulated = test_signer.simulate(
-            "testchain", TOKEN, data="0xzz", via_safe=via_safe
+            "testchain", TOKEN, data=data, via_safe=via_safe
         )
         assert simulated["problems"][0]["rule"] == "bad-calldata"
         assert fake_w3.provider.simulated == []
