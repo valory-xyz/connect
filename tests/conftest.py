@@ -42,6 +42,7 @@ from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechService
 from connect.server.app import create_app
+from connect.server.auth import GrantStore
 from connect.settings import (
     MODE_UNRESTRICTED,
     Protected,
@@ -681,6 +682,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """End a run that stopped on a failed collection with exit 1, not 2."""
     if exitstatus == pytest.ExitCode.INTERRUPTED and session.testsfailed:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def grant_store(token: str) -> GrantStore:
+    """Return a GrantStore over a signer that holds no request id."""
+    return GrantStore(token, held=lambda request_id, via_safe: False)
 
 
 def pay(to: str, value: int) -> dict:

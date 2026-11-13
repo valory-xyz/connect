@@ -114,7 +114,14 @@ from connect.settings import (
 )
 from connect.signer import Signer, SignerError, _ChainState
 
-from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds, pay
+from tests.conftest import (
+    FakeW3,
+    TEST_PASSWORD,
+    audit_entries,
+    audit_kinds,
+    grant_store,
+    pay,
+)
 
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
@@ -5686,9 +5693,6 @@ def _build_tools(  # pylint: disable=too-many-arguments
     test must monkeypatch the flag *before* build_mcp runs, which fixture
     ordering cannot express.
     """
-    from connect.server.auth import (  # pylint: disable=import-outside-toplevel
-        GrantStore,
-    )
     from connect.server.mcp_tools import (  # pylint: disable=import-outside-toplevel
         build_mcp,
     )
@@ -5700,7 +5704,7 @@ def _build_tools(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech_service,
         settings_store=settings_store,
-        grants=GrantStore("workspace-token"),
+        grants=grant_store("workspace-token"),
     )
     manager = mcp._tool_manager  # pylint: disable=protected-access
     return {tool.name: tool.fn for tool in manager.list_tools()}

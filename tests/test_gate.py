@@ -30,12 +30,11 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
-from connect.server.auth import GrantStore
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import SERVER_BUILT, Signer, SignerError
 
-from tests.conftest import FakeW3, audit_entries, pay
+from tests.conftest import FakeW3, audit_entries, grant_store, pay
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -75,7 +74,7 @@ def tools(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech_service,
         settings_store=settings_store,
-        grants=GrantStore("workspace-token"),
+        grants=grant_store("workspace-token"),
     )
     manager = mcp._tool_manager  # pylint: disable=protected-access
     return {tool.name: tool.fn for tool in manager.list_tools()}

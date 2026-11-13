@@ -41,7 +41,7 @@ import secrets
 import threading
 import time
 import typing as t
-from collections import deque
+from collections import OrderedDict, deque
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
@@ -111,6 +111,9 @@ class TokenGrant(StrictBody):
 
 
 WORKSPACE_GRANT = TokenGrant(scopes=list(SCOPES))
+# request ids whose draws GrantStore remembers, as many as the signer keeps
+# results for (MAX_CACHED_RESULTS); one forgotten is only drawn again
+MAX_DRAWN_REQUEST_IDS = 1024
 
 # the request-state key the MCP mount sets: the bearer token that authorized it
 AUTH_TOKEN = "auth_token"  # nosec B105 - a state key, not a credential
@@ -211,17 +214,19 @@ class GrantStore:
     """The bearer tokens this process honours, and what each may do."""
 
     def __init__(
-        self,
-        workspace_token: str,
-        *,
-        sent: t.Callable[[str, bool], bool] = lambda request_id, via_safe: False,
+        self, workspace_token: str, *, held: t.Callable[[str, bool], bool]
     ) -> None:
         """Hold the workspace token, the root every other token is minted from.
 
-        `sent(request_id, via_safe)` says whether the signer already sent that
-        request id, so its replay is not drawn on a session budget twice.
+        `held(request_id, via_safe)` says whether the signer holds that request
+        id, completed or still sending (`Signer.holds_request`): a call
+        repeating it then sends nothing new.
         """
-        self._sent = sent
+        self._held = held
+        # what each (token, action, request_id) has drawn, so a retry of a
+        # request this token already paid for is not drawn again; forgotten
+        # past the bound, which only draws again
+        self._drawn: OrderedDict[tuple[str, str, str], dict[str, int]] = OrderedDict()
         self._lock = threading.Lock()
         self._grants: dict[str, TokenGrant] = {workspace_token: WORKSPACE_GRANT}
         self._spent: dict[str, dict[str, int]] = {}
@@ -286,9 +291,11 @@ class GrantStore:
         move a position (`intent.Capped`, which the send surfaces apply).
         A capped token's per-session budget is drawn down when a call is
         authorized, whether or not the send then succeeds: it can be spent
-        early, never exceeded. A call whose `request_id` the signer already
-        sent draws nothing: the signer answers it with the sent hash, and
-        sends nothing new. `draw=False` answers without drawing, for a dry run.
+        early, never exceeded. A call repeating a `request_id` this token
+        already drew for is drawn only past that draw while the signer holds
+        the id (sent, or still sending), since the signer then sends nothing
+        new; once it does not, the call may really send, and is drawn in full.
+        `draw=False` answers without drawing, for a dry run.
         """
         grant = self._live(token)
         scope = ACTION_SCOPES.get(action)
@@ -370,11 +377,17 @@ class GrantStore:
                 continue
             key = intent_module.balance_key(approval["token"])
             drawn[key] = drawn.get(key, 0) + approval["amount"]
+        # a retry of a request id this token drew for, which the signer still
+        # holds, sends nothing new: only what it declares past that draw is owed
         request_id = arguments.get("request_id")
-        if isinstance(request_id, str) and self._sent(
-            request_id, action == "safe_transaction"
-        ):
-            drawn = {}  # a replay: the signer sends nothing new for it
+        id_key = None
+        paid: dict[str, int] = {}
+        if isinstance(request_id, str):
+            id_key = (token, action, request_id)
+            if self._held(request_id, action == "safe_transaction"):
+                with self._lock:
+                    paid = self._drawn.get(id_key, {})
+        owed = {asset: max(0, n - paid.get(asset, 0)) for asset, n in drawn.items()}
         with self._lock:
             # this token and every ancestor it was minted from: minting more
             # children must not multiply a parent's session budget
@@ -388,7 +401,7 @@ class GrantStore:
             ]
             for holder, per_session in capped:
                 spent = self._spent.get(holder, {})
-                for asset, amount in drawn.items():
+                for asset, amount in owed.items():
                     cap = t.cast(dict, per_session).get(asset, 0)
                     if spent.get(asset, 0) + amount > cap:
                         raise GrantRefused(
@@ -402,8 +415,22 @@ class GrantStore:
                 return
             for holder, _ in capped:
                 spent = self._spent.setdefault(holder, {})
-                for asset, amount in drawn.items():
+                for asset, amount in owed.items():
                     spent[asset] = spent.get(asset, 0) + amount
+            if id_key is not None and capped:
+                self._remember(id_key, paid, drawn)
+
+    def _remember(
+        self, key: tuple[str, str, str], paid: dict[str, int], drawn: dict[str, int]
+    ) -> None:
+        """Record what a request id has drawn, keeping the most per asset."""
+        merged = {**paid}
+        for asset, amount in drawn.items():
+            merged[asset] = max(amount, merged.get(asset, 0))
+        self._drawn[key] = merged
+        self._drawn.move_to_end(key)
+        while len(self._drawn) > MAX_DRAWN_REQUEST_IDS:
+            self._drawn.popitem(last=False)
 
     @staticmethod
     def _check_approvals(
@@ -438,11 +465,6 @@ def request_token(request: t.Any) -> str | None:
     request, the MCP mount's middleware on the scope the tool's request reads.
     """
     return getattr(getattr(request, "state", None), AUTH_TOKEN, None)
-
-
-def as_store(grants: "GrantStore | str") -> GrantStore:
-    """Accept a GrantStore, or a bare workspace token for a store of one."""
-    return GrantStore(grants) if isinstance(grants, str) else grants
 
 
 LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
@@ -514,12 +536,12 @@ class RequireAuth:
 
     def __init__(
         self,
-        grants: "GrantStore | str",
+        grants: GrantStore,
         activity: ActivityLog,
         limiter: AuthFailureLimiter,
     ) -> None:
         """Initialize."""
-        self._grants = as_store(grants)
+        self._grants = grants
         self._activity = activity
         self._limiter = limiter
 
@@ -557,13 +579,13 @@ class AuthMiddleware:
     def __init__(
         self,
         app: t.Callable,
-        grants: "GrantStore | str",
+        grants: GrantStore,
         activity: ActivityLog,
         limiter: AuthFailureLimiter,
     ) -> None:
         """Initialize."""
         self._app = app
-        self._grants = as_store(grants)
+        self._grants = grants
         self._activity = activity
         self._limiter = limiter
 

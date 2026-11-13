@@ -176,7 +176,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     """Create app."""
     # the run's token is the workspace's scoped token (read + mech + tx);
     # narrower ones are minted from it through POST /tokens
-    grants = GrantStore(token, sent=signer.has_sent)
+    grants = GrantStore(token, held=signer.holds_request)
     mcp = build_mcp(
         signer,
         config,

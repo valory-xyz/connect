@@ -160,6 +160,15 @@ def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _safe_request_key(request_id: str) -> str:
+    """Return send_via_safe's idempotency key: its own namespace, apart from send's.
+
+    The same id on the EOA path is a different logical action and must not
+    collide with it.
+    """
+    return f"safe:{request_id}"
+
+
 def _decode_calldata(data: str) -> bytes:
     """Return the calldata bytes, or :raises SignerError: on malformed hex."""
     try:
@@ -207,10 +216,10 @@ class _IdempotencyCache:
             cached = self._results.get(key)
         return None if cached is None else _same_call(key, cached, stamp)
 
-    def completed(self, key: str) -> bool:
-        """Whether a run of this key completed, so the key only replays now."""
+    def holds(self, key: str) -> bool:
+        """Whether a run of this key completed or is running: a new run sends nothing."""
         with self._lock:
-            return key in self._results
+            return key in self._results or key in self._in_flight
 
     def _execute(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
         try:
@@ -259,13 +268,14 @@ class Signer:
         """Address."""
         return self._account.address
 
-    def has_sent(self, request_id: str, via_safe: bool) -> bool:
-        """Whether a send under this request id completed, so it only replays.
+    def holds_request(self, request_id: str, via_safe: bool) -> bool:
+        """Whether a send under this request id completed or is still sending.
 
-        `via_safe` picks the namespace: send_via_safe keeps its ids apart.
+        Either way a call repeating it sends nothing new: it replays the hash,
+        or is refused as in flight. `via_safe` picks send_via_safe's namespace.
         """
-        return self._requests.completed(
-            f"safe:{request_id}" if via_safe else request_id
+        return self._requests.holds(
+            _safe_request_key(request_id) if via_safe else request_id
         )
 
     def w3(self, chain: str) -> Web3:
@@ -429,9 +439,7 @@ class Signer:
             safe,
             value=0,  # the outer transaction carries none; the safe pays
             data=calldata,
-            # the safe path keeps its own idempotency namespace: the same id on
-            # the EOA path is a different logical action and must not collide
-            request_id=None if request_id is None else f"safe:{request_id}",
+            request_id=None if request_id is None else _safe_request_key(request_id),
             gas=gas,
             audit=audit,
             # the gate simulates the call the safe makes, as the safe: that is
