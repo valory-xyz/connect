@@ -224,6 +224,14 @@ def test_a_malformed_batch_is_simulation_unavailable() -> None:
     }
     with pytest.raises(intent.SimulationUnavailable, match="TransferBatch"):
         simulate([huge])
+    # equal counts, so only the bounds checks stand between the gate and a loop
+    one_word = dict(huge, data="0x" + _word(64) + _word(64) + _word(2**200))
+    # the ids fit; only the amounts array runs past the data
+    short = "0x" + _word(64) + _word(160) + _word(2) + _word(1) + _word(2)
+    amounts_overrun = dict(huge, data=short + _word(2) + _word(5))
+    for malformed in (one_word, amounts_overrun):
+        with pytest.raises(intent.SimulationUnavailable, match="TransferBatch"):
+            simulate([malformed])
     with pytest.raises(intent.SimulationUnavailable, match="unreadable"):
         intent.simulate(
             lambda m, p: [{"calls": [{"status": "0x1", "gasUsed": "zz", "logs": []}]}],
@@ -606,6 +614,14 @@ def test_a_malformed_simulation_answer_is_simulation_unavailable(
             data="0x",
             get_code=lambda a: b"",
         )
+
+
+def test_receive_min_holds_when_nothing_arrives() -> None:
+    """A token that never arrives is absent from the diff: still short of its minimum."""
+    problems = intent.check_intent(
+        _diff(native="-5"), {"spend": {"native": 5}, "receive_min": {TOKEN: 1}}
+    )
+    assert rules(problems) == ["receive-min"]
 
 
 def test_reverts_is_refused_even_with_an_intent() -> None:
