@@ -169,12 +169,19 @@ def _safe_request_key(request_id: str) -> str:
     return f"safe:{request_id}"
 
 
-def _decode_calldata(data: str) -> bytes:
-    """Return the calldata bytes, or :raises SignerError: on malformed hex."""
+def _calldata_problem(data: str) -> intent_module.Problem | None:
+    """Return the bad-calldata problem for calldata that is not hex, else None.
+
+    Checked before anything reaches the RPC, so a caller's typo is refused as
+    one rather than as the RPC failing to simulate it.
+    """
     try:
-        return bytes.fromhex(safe_module.calldata_hex(data))
+        bytes.fromhex(safe_module.calldata_hex(data))
     except ValueError as e:
-        raise SignerError(f"cannot decode the calldata: {e}") from e
+        return intent_module.Problem(
+            rule="bad-calldata", detail=f"cannot decode the calldata: {e}"
+        )
+    return None
 
 
 class _IdempotencyCache:
@@ -310,11 +317,7 @@ class Signer:
             request_id=request_id,
             gas=gas,
             audit=audit,
-            gate=(
-                None
-                if intent is SERVER_BUILT
-                else lambda: self._eoa_gate(chain, to, value, data)
-            ),
+            gate=lambda: self._eoa_gate(chain, to, value, data),
             intent=intent,
         )
 
@@ -328,13 +331,15 @@ class Signer:
         request_id: str | None,
         gas: int | None,
         audit: bool,
-        gate: GateFactory | None,
+        gate: GateFactory,
         intent: t.Any,
     ) -> str:
         """Replay, guard, intent gate, then broadcast: the one path to signing.
 
         `gate` builds the call the intent gate simulates, after the guard has
         answered, so a gate refusal and a guard refusal are audited alike.
+        Only `SERVER_BUILT`, a private object no request body can produce,
+        skips the gate.
         """
         stamp = _call_stamp(chain, to, value, data)
         if request_id is not None:
@@ -345,7 +350,7 @@ class Signer:
             if cached is not None:
                 return cached
         self._check_transaction(chain=chain, to=to, value=value, data=data, audit=audit)
-        if gate is not None:
+        if intent is not SERVER_BUILT:
             # after the guard, so the cheap static rules answer first and the
             # simulation only ever runs on a call the guard already permits
             gated_to, gated_value = to, value
@@ -356,17 +361,7 @@ class Signer:
             except _GateRefused as e:
                 problems = [e.problem]
             if problems:
-                if audit:
-                    self._activity.record(
-                        "refusal",
-                        chain=chain,
-                        to=gated_to,
-                        value=str(gated_value),
-                        rule=problems[0]["rule"],
-                        rules=[p["rule"] for p in problems],
-                        reason=intent_module.refusal_message(problems),
-                    )
-                raise SignerError(intent_module.refusal_message(problems))
+                self._refuse(chain, gated_to, gated_value, problems, audit=audit)
 
         def broadcast() -> str:
             return self._send(
@@ -382,6 +377,28 @@ class Signer:
         if request_id is None:
             return broadcast()
         return self._requests.run(request_id, stamp, broadcast)
+
+    def _refuse(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        to: str,
+        value: int,
+        problems: list[intent_module.Problem],
+        *,
+        audit: bool,
+    ) -> t.NoReturn:
+        """Audit a gate refusal (unless the caller audits its own), then raise it."""
+        if audit:
+            self._activity.record(
+                "refusal",
+                chain=chain,
+                to=to,
+                value=str(value),
+                rule=problems[0]["rule"],
+                rules=[p["rule"] for p in problems],
+                reason=intent_module.refusal_message(problems),
+            )
+        raise SignerError(intent_module.refusal_message(problems))
 
     def _compose_safe_call(
         self, chain: str, target: str, value: int, data: str
@@ -433,6 +450,9 @@ class Signer:
         send() takes too, so it meets the same guard and intent gate as
         anything else — a caller of the gate, not a way around it.
         """
+        problem = _calldata_problem(data)
+        if problem is not None:  # composing it would fail on the same bytes
+            self._refuse(chain, target, value, [problem], audit=audit)
         safe, calldata = self._compose_safe_call(chain, target, value, data)
         return self._send_guarded(
             chain,
@@ -444,11 +464,7 @@ class Signer:
             audit=audit,
             # the gate simulates the call the safe makes, as the safe: that is
             # whose assets move, and what the intent describes
-            gate=(
-                None
-                if intent is SERVER_BUILT
-                else lambda: _GateCall(sender=safe, to=target, value=value, data=data)
-            ),
+            gate=lambda: _GateCall(sender=safe, to=target, value=value, data=data),
             intent=intent,
         )
 
@@ -552,12 +568,18 @@ class Signer:
         The one path the send-time gate and simulate_transaction share, so the
         two cannot answer differently about the same call.
         """
+        problem = _calldata_problem(call.data)
+        if problem is not None:
+            return None, None, [problem]
         parsed, problems = intent_module.parse_intent(raw_intent)
         if problems:
             return None, None, problems
         try:
             diff = self._simulate(chain, call)
         except intent_module.SimulationUnavailable as e:
+            # every agent send on this chain is refused until it can simulate:
+            # log.txt must say why, including when the cause is our own code
+            logger.warning("intent gate cannot simulate on %s", chain, exc_info=True)
             return (
                 None,
                 parsed,
@@ -664,13 +686,15 @@ class Signer:
                     if via_safe
                     else partial(self._eoa_gate, chain, target, value, data)
                 )
+                problem = _calldata_problem(data)
+                if problem is not None:  # as the send refuses it, before the RPC
+                    problems = [problem]
+                    raise SignerError(intent_module.refusal_message(problems))
                 if via_safe:
                     target, data = self._compose_safe_call(chain, target, value, data)
                     value = 0
-                else:
-                    if value < 0:
-                        raise SignerError("value must be a non-negative amount in wei")
-                    _decode_calldata(data)
+                elif value < 0:
+                    raise SignerError("value must be a non-negative amount in wei")
                 reason = self._refused_by_guard(chain, target, value, data)
                 if reason is None:
                     try:

@@ -420,6 +420,7 @@ def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
         ).json()["token"]
         send(headers={"Authorization": f"Bearer {expired}"})
         send(to="0x1234")
+        send(data="0xzz")  # not hex: refused before the RPC, as bad-calldata
         send(to=safe)
         with monkeypatch.context() as patched:
             patched.setattr(fake_w3.eth, "estimate_gas", reverting)

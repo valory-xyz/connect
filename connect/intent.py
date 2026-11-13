@@ -89,6 +89,7 @@ Rule = t.Literal[
     "token-cap-positions",
     "approve-hash",
     "bad-exec-transaction",
+    "bad-calldata",
 ]
 RULES: tuple[str, ...] = t.get_args(Rule)
 

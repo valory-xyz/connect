@@ -163,6 +163,42 @@ class TestSignerGate:
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert entry["rule"] == "reverts"
 
+    @pytest.mark.parametrize("via_safe", [True, False])
+    def test_calldata_that_is_not_hex_is_refused_before_the_rpc(
+        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any, via_safe: bool
+    ) -> None:
+        """A caller's typo is refused as one, not as an RPC that cannot simulate."""
+        send = test_signer.send_via_safe if via_safe else test_signer.send
+        with pytest.raises(SignerError, match="'bad-calldata': cannot decode"):
+            send("testchain", TOKEN, data="0xzz")
+        assert fake_w3.provider.simulated == []
+        assert not fake_w3.eth.sent
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry["rule"] == "bad-calldata"
+        reason, problems = test_signer.check(
+            "testchain", TOKEN, data="0xzz", via_safe=via_safe
+        )
+        assert "'bad-calldata'" in str(reason)
+        assert problems[0]["rule"] == "bad-calldata"
+        simulated = test_signer.simulate(
+            "testchain", TOKEN, data="0xzz", via_safe=via_safe
+        )
+        assert simulated["problems"][0]["rule"] == "bad-calldata"
+        assert fake_w3.provider.simulated == []
+
+    def test_an_unavailable_simulation_is_logged(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Every send on the chain is refused, so log.txt must say why."""
+        fake_w3.provider.unavailable = True
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
+            test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
+        (record,) = [r for r in caplog.records if "cannot simulate" in r.message]
+        assert record.exc_info is not None
+
     def test_no_simulation_means_no_signature(
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
