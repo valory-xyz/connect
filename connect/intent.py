@@ -333,21 +333,24 @@ def _native_moves(logs: list[dict]) -> list[tuple[str, str, int]]:
     ERC-20 face (a CELO.transfer emits only the face's). Checked against Celo's
     RPC: a plain send logs only the synthetic one, a face transfer only its own.
     """
-    moves = []
+    return [
+        (src, dst, _word(data, 0))
+        for address, src, dst, data in _erc20_transfers(logs)
+        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES
+    ]
+
+
+def _erc20_transfers(logs: list[dict]) -> t.Iterator[tuple[str, str, str, str]]:
+    """Yield (token, from, to, data) of every 3-topic `Transfer` log, lowercased."""
     for log in logs:
         topics = [str(x).lower() for x in log.get("topics") or []]
-        if len(topics) != 3 or topics[0] != TRANSFER:
-            continue
-        address = str(log.get("address", "")).lower()
-        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES:
-            moves.append(
-                (
-                    _topic_address(topics[1]),
-                    _topic_address(topics[2]),
-                    _word(str(log.get("data", "0x")), 0),
-                )
+        if len(topics) == 3 and topics[0] == TRANSFER:
+            yield (
+                str(log.get("address", "")).lower(),
+                _topic_address(topics[1]),
+                _topic_address(topics[2]),
+                str(log.get("data", "0x")),
             )
-    return moves
 
 
 def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
@@ -502,12 +505,7 @@ def _wrapped_by_transfer(holder: str, logs: list[dict]) -> tuple[set, set]:
     """
     minted: set[str] = set()
     burned: set[str] = set()
-    for log in logs:
-        topics = [str(x).lower() for x in log.get("topics") or []]
-        if len(topics) != 3 or topics[0] != TRANSFER:
-            continue
-        address = str(log.get("address", "")).lower()
-        src, dst = _topic_address(topics[1]), _topic_address(topics[2])
+    for address, src, dst, _ in _erc20_transfers(logs):
         if src == ZERO_ADDRESS and dst == holder:
             minted.add(address)
         if src == holder and dst == ZERO_ADDRESS:
