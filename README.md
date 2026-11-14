@@ -292,8 +292,8 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   a lying RPC can only cause a refusal. The only allowed
   transaction is a safe `execTransaction` CALL to a whitelisted address with
   the gas-refund fields zeroed (a non-zero SafeTx `gasPrice` would pay a refund
-  out of the safe past the whitelist) — plus one analogous carve-out: before
-  an off-chain request that may auto-deposit, the mech flow pre-authorizes
+  out of the safe past the whitelist) — plus one analogous carve-out: as it
+  sends an off-chain request that may auto-deposit, the mech flow pre-authorizes
   the one safe→balance-tracker payment a 402 top-up would send, single-use,
   shape-checked (bare native transfer or `deposit(uint256)` with no inner
   value) and capped at the same bound mech-client itself enforces on the
@@ -607,8 +607,11 @@ mech-client as `send_request(max_price=...)`: a mech pricing above it is
 refused (`MechPriceExceeded`, reported as `over-max-payment`) before any
 deposit, signature or POST. A request withdraws every guard allowance it
 armed (the ERC-1271 digest, the capped top-up) once its send ends, whether it
-was refused, failed or sent, so none outlives it; concurrent requests to one
-tracker each hold and withdraw their own. It is denominated in the mech's payment
+was refused, failed or sent, so none outlives it. The top-up's grant is armed
+only inside the send, while the request holds the safe's queue, and withdrawn
+before it lets go: the guard spends a grant of the right shape whoever armed
+it, so concurrent requests to one tracker never hold one at the same time,
+and one request's top-up cannot spend another's. It is denominated in the mech's payment
 asset, so its default is 0.1 of that asset — 10^17 base units for native and
 OLAS mechs, 10^5 for USDC ones, including Robinhood Chain, where that payment
 type is USDG. `mech_tools` reports the asset as `payment_token`.

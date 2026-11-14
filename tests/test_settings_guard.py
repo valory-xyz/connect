@@ -2275,7 +2275,7 @@ class TestMech:
             armed.append("deposit")
             return True
 
-        monkeypatch.setattr(allowances, "arm_auto_deposit", arm_deposit)
+        monkeypatch.setattr(allowances, "_arm_deposit", arm_deposit)
 
         def broken(mech: str, doc: t.Any) -> dict:
             raise RuntimeError("executor shut down")
@@ -3397,6 +3397,54 @@ class TestMech:
         assert armed[0]["tracker"] == TRACKER
         assert armed[0]["amount_cap"] == str(_MAX_AUTO_DEPOSIT_RATIO * 10**16)
 
+    def test_a_top_up_spends_only_its_own_request_s_grant(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B is planned before A, A sends first: both 402 top-ups still pass.
+
+        The guard consumes a deposit grant by its shape, not by who armed it.
+        Armed when a request was planned, before the queue's lock, A's top-up
+        spent B's grant, A's exit withdrew its own unused one, and B's top-up
+        was then refused.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        service, guard = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        deposit = exec_transaction_calldata(TRACKER, value=10**16)
+        send_request = patched_mech.send_request
+
+        async def topped_up(**kwargs: t.Any) -> dict:
+            guard.check_transaction("testchain", SAFE, 0, deposit)  # its 402 top-up
+            return await send_request(**kwargs)
+
+        monkeypatch.setattr(patched_mech, "send_request", topped_up)
+        plan_b = service._prepare(  # pylint: disable=protected-access
+            "tool",
+            chain="testchain",
+            legacy_on_chain=False,
+            priority_mech=OTHER,
+            auto_deposit=True,
+            max_payment=None,
+            request_context=None,
+        )
+        service.request("a", "tool", chain="testchain", priority_mech=OTHER)
+        service._dispatch(  # pylint: disable=protected-access
+            plan_b, "b", timeout=1, request_id=None
+        )
+        assert [call["prompts"] for call in patched_mech.calls] == [("a",), ("b",)]
+        assert not guard._deposit_allowances  # pylint: disable=protected-access
+
     @pytest.mark.parametrize(
         "case", ["price", "id-mismatch", "map-nonces", "rejected", "lost", "sent"]
     )
@@ -3531,7 +3579,7 @@ class TestMech:
         """Unrestricted mode passes auto_deposit through, and still audits.
 
         The audit record is written in every mode, but the allowance itself
-        is armed only while restricted — see _arm_auto_deposit for why.
+        is armed only while restricted — see auto_deposit_armed for why.
         """
         mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         assert patched_mech.calls[0]["auto_deposit"] is True

@@ -19,6 +19,7 @@
 
 """The single-use grants the mech flow registers with the guard."""
 
+import contextlib
 import functools
 import logging
 import typing as t
@@ -111,34 +112,58 @@ class MechAllowances:
             nonce=nonce,
         )
 
-    def arm_auto_deposit(self, chain: str, priced: PricedMech, armed: Armed) -> bool:
-        """Pre-authorize the one 402 top-up this request may send, and say so.
+    def keeps_auto_deposit(self, chain: str, priced: PricedMech) -> bool:
+        """Say whether auto_deposit should stay on for this request.
 
-        Returns whether auto_deposit should stay on. The deposit pays the
-        balance tracker from the safe, which restricted mode only allows
-        through a one-shot allowance bounded by the same cap mech-client
-        itself enforces on the shortfall (ratio x the mech's per-request
-        rate). The audit record is written in every mode; the allowance is
-        armed only while restricted — unrestricted needs none, and one armed
-        there would outlive a switch back to restricted for its TTL.
-        When no tracker resolves for the payment type, restricted mode
-        disarms instead of letting the flow die mid-request on a guard
-        denial; unrestricted stays armed.
+        Restricted mode lets the 402 top-up through only on a grant naming its
+        tracker, so where no tracker resolves for the payment type it disarms
+        instead of letting the flow die mid-request on a guard denial;
+        unrestricted stays armed.
         """
-        restricted = self._guard.mode() == MODE_RESTRICTED
-        tracker, is_token = deposit_tracker(chain, priced.payment_type)
-        if tracker is None:
-            if restricted:
-                logger.info(
-                    "no balance tracker for payment type %s on %s; auto_deposit "
-                    "disarmed in restricted mode",
-                    priced.payment_type,
-                    chain,
-                )
-                return False
+        if self._guard.mode() != MODE_RESTRICTED:
             return True
+        if deposit_tracker(chain, priced.payment_type)[0] is not None:
+            return True
+        logger.info(
+            "no balance tracker for payment type %s on %s; auto_deposit "
+            "disarmed in restricted mode",
+            priced.payment_type,
+            chain,
+        )
+        return False
+
+    @contextlib.contextmanager
+    def auto_deposit_armed(
+        self, chain: str, priced: PricedMech, *, auto_deposit: bool
+    ) -> t.Iterator[None]:
+        """Pre-authorize the one 402 top-up of the send this wraps, then withdraw it.
+
+        The deposit pays the balance tracker from the safe, which restricted
+        mode only allows through a one-shot allowance bounded by the same cap
+        mech-client itself enforces on the shortfall (ratio x the mech's
+        per-request rate). The guard consumes a grant by its shape, not by who
+        armed it, so it is armed only inside the send, under the queue's
+        lock, and withdrawn before that lock is released: one request at a
+        time holds one, and a top-up cannot spend another request's grant.
+        The audit record is written in every mode; the allowance is armed
+        only while restricted — unrestricted needs none, and one armed there
+        would outlive a switch back to restricted for its TTL.
+        """
+        armed: Armed = []
+        if auto_deposit:
+            self._arm_deposit(chain, priced, armed)
+        try:
+            yield
+        finally:
+            self.revoke(armed)
+
+    def _arm_deposit(self, chain: str, priced: PricedMech, armed: Armed) -> None:
+        """Arm the top-up's grant (restricted only) and audit it (every mode)."""
+        tracker, is_token = deposit_tracker(chain, priced.payment_type)
+        if tracker is None:  # restricted already disarmed it; unrestricted needs none
+            return
         amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate
-        if restricted:
+        if self._guard.mode() == MODE_RESTRICTED:
             grant = self._guard.allow_safe_deposit_once(
                 chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
             )
@@ -150,7 +175,13 @@ class MechAllowances:
             amount_cap=str(amount_cap),
             is_token=is_token,
         )
-        return True
+
+    def record_deposit(self, chain: str, request_id: str | None, amount: int) -> None:
+        """Audit what a top-up deposited before the mech refused or lost it."""
+        if amount:
+            self._activity.record(
+                "mech_deposit", chain=chain, request_id=request_id, amount=str(amount)
+            )
 
     @staticmethod
     def revoke(armed: Armed) -> None:

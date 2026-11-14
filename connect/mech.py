@@ -546,7 +546,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             extra_attributes = metadata_extras(request_context)
             offchain = True
             if auto_deposit:
-                auto_deposit = self._allowances.arm_auto_deposit(chain, priced, armed)
+                auto_deposit = self._allowances.keeps_auto_deposit(chain, priced)
         else:
             # nothing reads the document on-chain, so no operator link here
             terms = service.tool_manager.terms_report(priority_mech, None)
@@ -593,7 +593,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 service_id=plan.priced.service_id,
                 offchain=not plan.legacy_on_chain,
             )
-            self._record_deposit(plan, request_id, e.deposited)
+            self._allowances.record_deposit(plan.chain, request_id, e.deposited)
             self._activity.record(
                 "mech_request_failed",
                 chain=plan.chain,
@@ -612,7 +612,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             ) from e
         except NonceRefused as e:
             note = self.queue.note(plan.chain)
-            self._record_deposit(plan, request_id, getattr(e.__cause__, "deposited", 0))
+            deposited = getattr(e.__cause__, "deposited", 0)
+            self._allowances.record_deposit(plan.chain, request_id, deposited)
             self._activity.record(
                 "refusal",
                 rule=e.rule,
@@ -777,7 +778,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
 
         def send_one(nonce: int, hook: PreSignHook) -> dict:
             sent.append((nonce, hook))
-            return send(nonces=[nonce], on_request_id=hook)
+            # under the queue's lock: no other request's top-up can spend it
+            with self._allowances.auto_deposit_armed(
+                plan.chain, plan.priced, auto_deposit=plan.auto_deposit
+            ):
+                return send(nonces=[nonce], on_request_id=hook)
 
         try:
             return send_with_nonce(
@@ -826,13 +831,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             held,
             getattr(error.__cause__, "deposited", 0),
         )
-
-    def _record_deposit(self, plan: _RequestPlan, rid: str | None, amount: int) -> None:
-        """Audit what a top-up deposited before the mech refused or lost it."""
-        if amount:
-            self._activity.record(
-                "mech_deposit", chain=plan.chain, request_id=rid, amount=str(amount)
-            )
 
     def _with_pending(  # pylint: disable=too-many-locals
         self,
