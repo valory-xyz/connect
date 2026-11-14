@@ -12,7 +12,10 @@ other non-aea agent. It:
    process;
 2. populates the service's persistent workspace (`STORE_PATH`) for either
    harness: the MCP entry with a fresh bearer token every run (`.mcp.json` for
-   Claude Code, `.codex/config.toml` for Codex), the context brief (`CLAUDE.md`,
+   Claude Code, `.codex/config.toml` for Codex; that token is the uncapped root
+   grant, so a harness must keep it out of the agent's reach and give the
+   agent only a minted, capped child token, `$PEARL_CONNECT_TOKEN` — see
+   [Scoped tokens](#scoped-tokens)), the context brief (`CLAUDE.md`,
    copied to `AGENTS.md`), the bundled skills (`pearl-connect` for signing,
    `connect-polymarket` for prediction markets, `connect-stocktokens` for
    Robinhood Chain Stock Tokens, `connect-pons` for the Pons memecoin
@@ -187,7 +190,10 @@ and the skills reach operator-configured RPCs and several venue APIs, so the
 list would differ per operator. Two differences from Claude Code remain. Every MCP tool call asks
 for approval, as Claude Code's do without an allow rule. And there is no
 equivalent of the `Read` deny rule: the token in `.codex/config.toml` is
-gitignored, not kept out of transcripts.
+gitignored, not kept out of transcripts. It is the same uncapped root token as
+`.mcp.json`'s, and the same requirement holds: a harness must keep it out of
+the agent's reach and give the agent only a minted, capped child token
+(`$PEARL_CONNECT_TOKEN`; see [Scoped tokens](#scoped-tokens)).
 
 ## Intent gate
 
@@ -431,6 +437,12 @@ connect-polymarket's `ConnectSigner.from_workspace` alike) signs with
 narrower token without the session ever reading `.mcp.json`. A blank value is
 an error, never a fall-back to the workspace token. The cap bounds a script's
 mistakes, not a hostile script, which can still read `.mcp.json` itself.
+
+**A harness must keep `.mcp.json` (the root token) out of the agent's reach and
+give the agent only a minted, capped child token (`$PEARL_CONNECT_TOKEN`).**
+The workspace token stays the uncapped root grant on that condition: every cap
+above binds only a token minted from it, so an agent that can read
+`.mcp.json` holds the uncapped root and none of them.
 
 | Scope | Allows |
 |---|---|
