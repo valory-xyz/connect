@@ -33,6 +33,7 @@ from aea_ledger_ethereum import rpc_rotation
 from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client import NonceAllocator
 from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
 from web3.exceptions import ContractLogicError
@@ -446,6 +447,21 @@ class TestMain:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
         assert main_module.main(["--password", "x"]) == 1
+
+    def test_main_exits_with_a_reason_when_another_connect_holds_the_store(
+        self,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A second Connect on one STORE_PATH: logged for Pearl's log.txt, exit 1."""
+        holder = NonceAllocator(boot_env, settle_timeout=1, gap_retries=0)
+        try:
+            assert main_module.main(["--password", TEST_PASSWORD]) == 1
+        finally:
+            holder.close()
+        assert not served
+        assert "mech queue store is locked" in caplog.text
 
     def test_main_happy_path(
         self,

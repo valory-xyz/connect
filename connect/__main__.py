@@ -38,6 +38,7 @@ import threading
 from pathlib import Path
 
 import uvicorn
+from mech_client import NonceRefused
 
 from connect import workspace
 from connect.activity import ActivityLog
@@ -196,7 +197,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     guard = Guard(settings_store, config, agent_signer=account.address)
     signer = Signer(account=account, config=config, activity=activity, guard=guard)
-    mech = MechService(signer, config, activity, guard)
+    try:
+        mech = MechService(signer, config, activity, guard)
+    except NonceRefused as e:  # another Connect holds STORE_PATH's mech queue
+        logger.error("mech queue store is locked: %s", e)
+        return 1
     logger.info("guardrail mode: %s", guard.mode())
     token = secrets.token_urlsafe(32)
 

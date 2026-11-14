@@ -564,7 +564,8 @@ before the POST, so a restart never reissues a held nonce; an unreadable file
 refuses every request (`mech-queue-unreadable`) and an unwritable one new ones
 (`mech-queue-unwritable`). The store is one allocator's: mech-client locks it
 (`mech_nonces.lock`), a second allocator on it — another Connect on the same
-STORE_PATH — is refused (`mech-queue-locked`), and Connect releases it on
+STORE_PATH — is refused (`mech-queue-locked`; that Connect logs it and exits
+1 at start), and Connect releases it on
 shutdown, after which a request still arriving is refused
 (`mech-queue-closed`). Every refusal above is recorded as an activity
 `refusal` with its `rule`, and leaves a caller's `request_id` free to send
