@@ -199,5 +199,5 @@ def mint_token(grant: TokenGrant, request: Request) -> dict:
         token = request.app.state.grants.mint(request_token(request), grant)
     except GrantRefused as e:
         raise refused_route(request, request.app.state.activity, e) from e
-    request.app.state.activity.record("token_minted", scopes=grant.scopes)
+    request.app.state.activity.record("token_minted", scopes=list(grant.scopes))
     return {"token": token, "grant": grant.model_dump()}

@@ -173,7 +173,8 @@ class SignerClient:
         """Mint a token no wider than this client's, and return it.
 
         `grant` is POST /tokens' body: scopes, value caps, max_mech_payment,
-        expires_at. connect() reads /wallet, so a script's token needs `read`.
+        max_mech_payment_per_session (required with `mech`), expires_at
+        (required). connect() reads /wallet, so a script's token needs `read`.
         """
         return self._post("/tokens", grant)["token"]
 

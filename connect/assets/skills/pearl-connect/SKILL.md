@@ -125,7 +125,9 @@ mint a token with fewer scopes or an expiry, but no value caps.
 Scopes are `read`, `mech` and `tx`; caps are per token (`"native"` or a
 token address) in base units, checked against the spend and the approvals the
 call's intent declares; `max_mech_payment` caps `mech_request`'s
-`max_payment`. A token with a value cap cannot do what a cap
+`max_payment`, and `max_mech_payment_per_session` caps their sum. A minted
+token needs an `expires_at` in the future, and a `mech` one a
+`max_mech_payment_per_session`. A token with a value cap cannot do what a cap
 cannot bound: sign a raw digest, approve more than its cap, or move an NFT or
 outcome-token position out of the safe. A token can only mint a narrower one.
 

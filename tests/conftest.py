@@ -23,9 +23,11 @@ import io
 import json
 import sys
 import threading
+import time
 import typing as t
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from eth_abi import decode as abi_decode
@@ -41,6 +43,7 @@ from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechService
+from connect.server import auth as auth_module
 from connect.server.app import create_app
 from connect.server.auth import GrantStore
 from connect.settings import (
@@ -719,6 +722,20 @@ def _no_handed_token() -> t.Iterator[None]:
 def grant_store(token: str) -> GrantStore:
     """Return a GrantStore over a signer that holds no request id."""
     return GrantStore(token, held=lambda request_id, via_safe: False)
+
+
+# a minted token's expiry, far enough out never to pass during a test
+TOKEN_EXPIRES_AT = 4_000_000_000
+
+
+def advance_token_clock(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Move the clock the grant store reads expiries by, and nothing else."""
+    real = time.time
+    monkeypatch.setattr(
+        auth_module,
+        "time",
+        SimpleNamespace(time=lambda: real() + seconds, monotonic=time.monotonic),
+    )
 
 
 def pay(to: str, value: int) -> dict:

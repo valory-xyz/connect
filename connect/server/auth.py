@@ -24,7 +24,7 @@ the .mcp.json and .codex/config.toml files in STORE_PATH. It is a *scoped*
 token: `read` + `mech` + `tx` with no caps of its own, so a
 session can do what it always could, and it is the root every narrower token
 is minted from: a harness mints them for the scripts it runs (fewer scopes,
-value caps per transaction and per session, a mech payment cap, an expiry).
+value caps per transaction and per session, mech payment caps, an expiry).
 Origin validation
 defends the localhost server against DNS-rebinding: browsers always attach an
 Origin to cross-origin requests, so anything non-local is rejected before
@@ -34,7 +34,7 @@ threshold, rate-limited — a stolen token or password being probed should be
 loud and slow, not silent.
 """
 
-import hmac
+import hashlib
 import json
 import math
 import secrets
@@ -45,7 +45,7 @@ from collections import OrderedDict, deque
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
-from pydantic import ConfigDict, field_validator
+from pydantic import ConfigDict, Field, field_validator
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
@@ -56,6 +56,25 @@ from connect.signer import MAX_CACHED_RESULTS
 
 Scope = t.Literal["read", "mech", "tx"]
 SCOPES: tuple[Scope, ...] = ("read", "mech", "tx")
+# every rule a grant refusal names; clients branch on it (`GrantRefused.message`)
+GrantRule = t.Literal[
+    "token-scope",
+    "token-expired",
+    "token-expiry-required",
+    "token-mech-cap-required",
+    "token-limit",
+    "token-cap-per-tx",
+    "token-cap-per-session",
+    "token-cap-sign",
+    "token-mech-payment-cap",
+    "token-mech-session-cap",
+    "bad-intent",
+    "bad-value",
+]
+# live tokens one token may have minted, and in all: minting is open to any
+# token, so neither may grow without bound
+MAX_CHILDREN_PER_TOKEN = 64
+MAX_LIVE_TOKENS = 1024
 
 # what each action needs: MCP tools by name, HTTP routes by the same names
 ACTION_SCOPES: dict[str, Scope] = {
@@ -86,11 +105,12 @@ class TokenGrant(StrictBody):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    scopes: list[Scope]
+    scopes: tuple[Scope, ...]
     max_value_per_tx: dict[str, int] | None = None
     max_value_per_session: dict[str, int] | None = None
-    max_mech_payment: int | None = None
-    expires_at: int | None = None  # unix seconds
+    max_mech_payment: int | None = Field(default=None, ge=0)
+    max_mech_payment_per_session: int | None = Field(default=None, ge=0)
+    expires_at: int | None = Field(default=None, gt=0)  # unix seconds
 
     @field_validator("max_value_per_tx", "max_value_per_session")
     @classmethod
@@ -115,7 +135,7 @@ class TokenGrant(StrictBody):
         )
 
 
-WORKSPACE_GRANT = TokenGrant(scopes=list(SCOPES))
+WORKSPACE_GRANT = TokenGrant(scopes=SCOPES)
 # as many request ids' draws as the signer keeps results; one forgotten is drawn again
 MAX_DRAWN_REQUEST_IDS = MAX_CACHED_RESULTS
 
@@ -128,7 +148,7 @@ REPLAYS = "replays"
 class GrantRefused(Exception):
     """A token may not do this; `rule` names why."""
 
-    def __init__(self, rule: str, detail: str, status: int = 403) -> None:
+    def __init__(self, rule: GrantRule, detail: str, status: int = 403) -> None:
         """Initialize."""
         super().__init__(rule, detail, status)
         self.rule = rule
@@ -167,16 +187,17 @@ def narrower(child: TokenGrant, parent: TokenGrant) -> bool:
         return False
     if not _within(child.max_value_per_session, parent.max_value_per_session):
         return False
-    if parent.max_mech_payment is not None and (
-        child.max_mech_payment is None
-        or child.max_mech_payment > parent.max_mech_payment
-    ):
-        return False
-    if parent.expires_at is not None and (
-        child.expires_at is None or child.expires_at > parent.expires_at
-    ):
-        return False
+    for field in ("max_mech_payment", "max_mech_payment_per_session", "expires_at"):
+        limit = getattr(parent, field)
+        mine = getattr(child, field)
+        if limit is not None and (mine is None or mine > limit):
+            return False
     return True
+
+
+def _key(token: str) -> str:
+    """Return the key a token is stored under: its SHA-256, one dict lookup away."""
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def _declared(
@@ -224,8 +245,11 @@ def _is_universal_router(spender: str, chain: t.Any) -> bool:
     return known is not None and known.name == UNIVERSAL_ROUTER_NAME
 
 
-class GrantStore:
-    """The bearer tokens this process honours, and what each may do."""
+class GrantStore:  # pylint: disable=too-many-instance-attributes
+    """The bearer tokens this process honours, and what each may do.
+
+    Every table is keyed by the token's SHA-256 (`_key`), never the token.
+    """
 
     def __init__(
         self, workspace_token: str, *, held: t.Callable[[str, bool], bool]
@@ -242,8 +266,9 @@ class GrantStore:
         # past the bound, which only draws again
         self._drawn: OrderedDict[tuple[str, str, str], dict[str, int]] = OrderedDict()
         self._lock = threading.Lock()
-        self._grants: dict[str, TokenGrant] = {workspace_token: WORKSPACE_GRANT}
+        self._grants: dict[str, TokenGrant] = {_key(workspace_token): WORKSPACE_GRANT}
         self._spent: dict[str, dict[str, int]] = {}
+        self._mech_spent: dict[str, int] = {}
         # a minted token's parent: a session cap binds every descendant
         self._parents: dict[str, str] = {}
 
@@ -251,26 +276,37 @@ class GrantStore:
         """Return the presented token if it is one we issued, else None."""
         if not header or not header.startswith("Bearer "):
             return None
-        presented = header.removeprefix("Bearer ").encode()
+        presented = header.removeprefix("Bearer ")
         with self._lock:
-            tokens = list(self._grants)
-        found = None
-        for token in tokens:  # compare against every token, in constant time
-            if hmac.compare_digest(token.encode(), presented):
-                found = token
-        return found
+            return presented if _key(presented) in self._grants else None
 
     def grant(self, token: str) -> TokenGrant:
         """Return a copy of a known token's grant."""
         with self._lock:
-            return self._grants[token].model_copy(deep=True)
+            return self._grants[_key(token)].model_copy(deep=True)
 
     def mint(self, parent: str, grant: TokenGrant) -> str:
         """Mint a token for `grant`, which must be no wider than `parent`'s.
 
-        :raises GrantRefused: rule "token-scope" for a wider grant.
+        :raises GrantRefused: a wider grant (`token-scope`), one with no future
+            expiry or a `mech` one with no session cap, or past the limits.
         """
-        if not narrower(grant, self._live(parent)):
+        now = time.time()
+        live = self._live(parent)
+        if grant.expires_at is None or grant.expires_at <= now:
+            raise GrantRefused(
+                "token-expiry-required",
+                "a minted token needs an expires_at in the future (unix seconds)",
+                400,
+            )
+        if "mech" in grant.scopes and grant.max_mech_payment_per_session is None:
+            raise GrantRefused(
+                "token-mech-cap-required",
+                "a minted token with the 'mech' scope needs a "
+                "max_mech_payment_per_session",
+                400,
+            )
+        if not narrower(grant, live):
             raise GrantRefused(
                 "token-scope",
                 "a token can only mint a narrower one: the requested grant "
@@ -278,15 +314,53 @@ class GrantStore:
             )
         token = secrets.token_urlsafe(32)
         with self._lock:
-            self._grants[token] = grant.model_copy(deep=True)
-            self._parents[token] = parent
+            self._prune(now)
+            siblings = sum(1 for p in self._parents.values() if p == _key(parent))
+            if (
+                siblings >= MAX_CHILDREN_PER_TOKEN
+                or len(self._grants) >= MAX_LIVE_TOKENS
+            ):
+                raise GrantRefused(
+                    "token-limit",
+                    f"too many live tokens (at most {MAX_CHILDREN_PER_TOKEN} "
+                    f"minted by one token, {MAX_LIVE_TOKENS} in all); let some "
+                    "expire first",
+                )
+            self._grants[_key(token)] = grant.model_copy(deep=True)
+            self._parents[_key(token)] = _key(parent)
         return token
+
+    def _prune(self, now: float) -> None:
+        """Forget every expired token; the caller holds the lock.
+
+        A child never outlives its parent (`narrower`), so no live token
+        loses an ancestor here.
+        """
+        expired = {
+            key
+            for key, grant in self._grants.items()
+            if grant.expires_at is not None and grant.expires_at <= now
+        }
+        for key in expired:
+            del self._grants[key]
+            self._parents.pop(key, None)
+            self._spent.pop(key, None)
+            self._mech_spent.pop(key, None)
+        for drawn in [k for k in self._drawn if k[0] in expired]:
+            del self._drawn[drawn]
 
     def _live(self, token: str) -> TokenGrant:
         grant = self.grant(token)
         if grant.expires_at is not None and time.time() >= grant.expires_at:
             raise GrantRefused("token-expired", "this token has expired", 401)
         return grant
+
+    def _lineage(self, key: str) -> list[str]:
+        """Return `key` and every ancestor it was minted from; holds the lock."""
+        chain = [key]
+        while chain[-1] in self._parents:
+            chain.append(self._parents[chain[-1]])
+        return chain
 
     def authorize(
         self,
@@ -296,25 +370,9 @@ class GrantStore:
         *,
         draw: bool = True,
     ) -> bool:
-        """Raise unless `token` may perform `action` with `arguments`.
+        """Refuse what `token` may not do; return whether a retry's draw was spared.
 
-        Value caps are checked against the spend the call's intent declares,
-        which the intent gate then holds the transaction to, and bound the
-        approvals it declares too. What a cap cannot bound, a capped token may
-        not do: sign a raw digest (it can authorize any safe transaction), or
-        move a position (`intent.Capped`, which the send surfaces apply).
-        A capped token's per-session budget is drawn down when a call is
-        authorized, whether or not the send then succeeds: it can be spent
-        early, never exceeded. A call repeating a `request_id` this token
-        already drew for is drawn only past that draw while the signer holds
-        the id (sent, or still sending), since the signer then sends nothing
-        new; once it does not, the call may really send, and is drawn in full.
-        `draw=False` answers without drawing, for a dry run.
-
-        Returns whether the call was relieved so. That holds only while the
-        signer still holds the id when the call reaches it, so the caller must
-        send it `replay_only`: answered from the signer's result or refused,
-        never sent fresh on a draw it was spared.
+        The rules are the README's ("Scoped tokens"); `draw=False` is a dry run.
         """
         grant = self._live(token)
         scope = ACTION_SCOPES.get(action)
@@ -325,7 +383,7 @@ class GrantStore:
                 f"'{scope or 'unknown'}' scope)",
             )
         if action == "mech_request":
-            self._check_mech_payment(grant, arguments)
+            self._check_mech_payment(_key(token), grant, arguments, draw=draw)
         if action == "sign_message" and grant.value_capped():
             raise GrantRefused(
                 "token-cap-sign",
@@ -334,7 +392,7 @@ class GrantStore:
             )
         if scope == "tx" and action != "sign_message":
             return self._check_value(
-                token, grant, action=action, arguments=arguments, draw=draw
+                _key(token), grant, action=action, arguments=arguments, draw=draw
             )
         return False
 
@@ -348,29 +406,61 @@ class GrantStore:
         it fails closed: a call with no known token is treated as capped.
         """
         with self._lock:
-            grant = self._grants.get(token) if token else None
+            grant = self._grants.get(_key(token)) if token else None
         if grant is None or grant.value_capped():
             return intent_module.Capped(intent)
         return intent
 
-    @staticmethod
     def _check_mech_payment(
-        grant: TokenGrant, arguments: t.Mapping[str, t.Any]
+        self,
+        key: str,
+        grant: TokenGrant,
+        arguments: t.Mapping[str, t.Any],
+        *,
+        draw: bool,
     ) -> None:
-        cap = grant.max_mech_payment
-        if cap is None:
-            return
+        """Hold a mech payment to the per-request cap and every session cap."""
         asked = arguments.get("max_payment")
-        if not isinstance(asked, int) or isinstance(asked, bool) or asked > cap:
+        whole = isinstance(asked, int) and not isinstance(asked, bool) and asked >= 0
+        cap = grant.max_mech_payment
+        if cap is not None and (not whole or t.cast(int, asked) > cap):
             raise GrantRefused(
                 "token-mech-payment-cap",
                 f"this token pays a mech at most {cap} base units; pass a "
                 f"max_payment no higher than that (got {asked})",
             )
+        with self._lock:
+            capped = [
+                (holder, t.cast(int, self._grants[holder].max_mech_payment_per_session))
+                for holder in self._lineage(key)
+                if self._grants[holder].max_mech_payment_per_session is not None
+            ]
+            if not capped:
+                return
+            if not whole:
+                raise GrantRefused(
+                    "token-mech-session-cap",
+                    "this token's mech payments draw on a session budget; pass "
+                    f"max_payment as a whole number of base units (got {asked})",
+                )
+            for holder, per_session in capped:
+                spent = self._mech_spent.get(holder, 0)
+                if spent + t.cast(int, asked) > per_session:
+                    raise GrantRefused(
+                        "token-mech-session-cap",
+                        f"this token pays mechs at most {per_session} base units "
+                        f"in all (with every token minted from it); {spent} is "
+                        f"drawn and this asks up to {asked}",
+                    )
+            if draw:
+                for holder, _ in capped:
+                    self._mech_spent[holder] = self._mech_spent.get(holder, 0) + t.cast(
+                        int, asked
+                    )
 
     def _check_value(  # pylint: disable=too-many-arguments,too-many-locals
         self,
-        token: str,
+        key: str,
         grant: TokenGrant,
         *,
         action: str,
@@ -398,15 +488,15 @@ class GrantStore:
         for approval in approvals:
             if _is_universal_router(approval["spender"], arguments.get("chain")):
                 continue
-            key = intent_module.balance_key(approval["token"])
-            drawn[key] = drawn.get(key, 0) + approval["amount"]
+            asset = intent_module.balance_key(approval["token"])
+            drawn[asset] = drawn.get(asset, 0) + approval["amount"]
         # a retry of a request id this token drew for, which the signer still
         # holds, sends nothing new: only what it declares past that draw is owed
         request_id = arguments.get("request_id")
         id_key = None
         paid: dict[str, int] = {}
         if isinstance(request_id, str):
-            id_key = (token, action, request_id)
+            id_key = (key, action, request_id)
             if self._held(request_id, action == "safe_transaction"):
                 with self._lock:
                     paid = self._drawn.get(id_key, {})
@@ -414,9 +504,7 @@ class GrantStore:
         with self._lock:
             # this token and every ancestor it was minted from: minting more
             # children must not multiply a parent's session budget
-            chain = [token]
-            while chain[-1] in self._parents:
-                chain.append(self._parents[chain[-1]])
+            chain = self._lineage(key)
             capped = [
                 (holder, self._grants[holder].max_value_per_session)
                 for holder in chain

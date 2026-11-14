@@ -406,12 +406,19 @@ not read into session transcripts.
 The token in the workspace is a **scoped** token: `read` + `mech` + `tx`, with no
 caps of its own, so a session can do what it always could, and it is the root
 every other token is minted from. Any token can mint a narrower one with `POST /tokens` (`{scopes, max_value_per_tx,
-max_value_per_session, max_mech_payment, expires_at}`), for the scripts a
-harness runs: fewer scopes, value caps per transaction and per session (per
-token, `"native"` or an address in any case, in base units; Celo's CELO face
-counts as `"native"`), a mech payment cap, an expiry. A grant wider than the
-presenting token's is refused (`token-scope`), and unknown fields are refused by
-name like every other body. The bundled `signer_client` mints one with
+max_value_per_session, max_mech_payment, max_mech_payment_per_session,
+expires_at}`), for the scripts a harness runs: fewer scopes, value caps per
+transaction and per session (per token, `"native"` or an address in any case,
+in base units; Celo's CELO face counts as `"native"`), mech payment caps per
+request and per session, an expiry. A minted token must carry an `expires_at`
+in the future (`token-expiry-required`), and one with the `mech` scope a
+`max_mech_payment_per_session` (`token-mech-cap-required`); an `expires_at`
+that is not positive or a negative mech cap is not a valid body (422). A grant
+wider than the presenting token's is refused (`token-scope`), and unknown
+fields are refused by name like every other body. One token may have at most
+64 live tokens minted from it, and the server at most 1024 in all
+(`token-limit`); expired tokens are forgotten whenever one is minted, after
+which they read as unknown (401) rather than `token-expired`. The bundled `signer_client` mints one with
 `SignerClient.mint_token(grant)`, and every bundled reader of `.mcp.json`
 (`signer_client.load_mcp_config_dir`, so `connect(chain, token=None)` and
 connect-polymarket's `ConnectSigner.from_workspace` alike) signs with
@@ -428,7 +435,11 @@ mistakes, not a hostile script, which can still read `.mcp.json` itself.
 
 Value caps are checked against the spend the call's intent declares (and its
 native `value`), which the intent gate then holds the transaction to; a capped
-`mech` token must pass a `max_payment` within `max_mech_payment`. A per-session
+`mech` token must pass a `max_payment` within `max_mech_payment`, and a token
+with a `max_mech_payment_per_session` (its own or an ancestor's) must pass one
+too, which draws on each such budget whether or not the mech then charges that much, in the
+mech's payment-asset base units whatever the asset, and is drawn again on a
+retry. A per-session
 budget is drawn down when a call is authorized, whether or not the send then
 succeeds, so it can be spent early but never exceeded; a retry naming a
 `request_id` the same token already drew for is drawn only past that draw while
@@ -451,17 +462,21 @@ do: approve more of a token than its caps allow (an approval is spend the
 spender takes later; refused under the rule of the cap it exceeds), sign a raw digest (`sign_message`: a digest can authorize
 any safe transaction), or move an ERC-721/1155 position out of the safe (the
 gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
-`token-expired`, `token-cap-per-tx`, `token-cap-per-session`, `token-cap-sign`
+`token-expired`, `token-expiry-required`, `token-mech-cap-required`,
+`token-limit`, `token-cap-per-tx`, `token-cap-per-session`, `token-cap-sign`
 (a raw digest refused to a value-capped token),
-`token-mech-payment-cap`, and `bad-intent` or `bad-value` for an amount that is
+`token-mech-payment-cap`, `token-mech-session-cap`, and `bad-intent` or `bad-value` for an amount that is
 not a whole number >= 0), come back as the HTTP 403/401 detail or the MCP tool
 error, and are recorded as activity `refusal` entries. MCP calls are authorized
 in the mount's middleware, which reads each JSON-RPC `tools/call` before the
 MCP server does, and stamps the token on the request; whether its intent is
 held as capped is decided from the token in one place (`GrantStore.intent_for`)
 for both surfaces, and a call with no known token is treated as capped. A mech
-payment (`mech_request`) is held to `max_mech_payment` per request and draws
-nothing from a session cap.
+payment never draws on `max_value_per_session`: its asset is the mech's,
+known only once the mech is read, so it has its own session budget. The
+workspace token has none, and a 402 top-up's deposit into the balance
+tracker (the safe's own prepaid balance) is bounded by mech-client's ratio,
+not by these caps.
 
 Out of scope for v1: SSH port forwarding or running on a shared/remote
 machine voids the loopback assumption entirely, and same-user local malware
