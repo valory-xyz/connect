@@ -195,6 +195,11 @@ def narrower(child: TokenGrant, parent: TokenGrant) -> bool:
     return True
 
 
+def _expired() -> GrantRefused:
+    """Return the refusal of an expired token: a 401, as the README says."""
+    return GrantRefused("token-expired", "this token has expired", 401)
+
+
 def _key(token: str) -> str:
     """Return the key a token is stored under: its SHA-256, one dict lookup away."""
     return hashlib.sha256(token.encode()).hexdigest()
@@ -281,9 +286,16 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
             return presented if _key(presented) in self._grants else None
 
     def grant(self, token: str) -> TokenGrant:
-        """Return a copy of a known token's grant."""
+        """Return a copy of a known token's grant.
+
+        :raises GrantRefused: `token-expired`: `lookup` accepted it, but a
+            mint has pruned it since, which only an expired token is.
+        """
         with self._lock:
-            return self._grants[_key(token)].model_copy(deep=True)
+            grant = self._grants.get(_key(token))
+        if grant is None:
+            raise _expired()
+        return grant.model_copy(deep=True)
 
     def mint(self, parent: str, grant: TokenGrant) -> str:
         """Mint a token for `grant`, which must be no wider than `parent`'s.
@@ -352,15 +364,26 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
     def _live(self, token: str) -> TokenGrant:
         grant = self.grant(token)
         if grant.expires_at is not None and time.time() >= grant.expires_at:
-            raise GrantRefused("token-expired", "this token has expired", 401)
+            raise _expired()
         return grant
 
-    def _lineage(self, key: str) -> list[str]:
-        """Return `key` and every ancestor it was minted from; holds the lock."""
+    def _lineage(self, key: str) -> list[tuple[str, TokenGrant]]:
+        """Return `key` and every ancestor it was minted from, with their grants.
+
+        The caller holds the lock. A token checked live a moment ago may have
+        expired and been pruned by a mint since; its call is then refused as
+        expired, as it would be had it arrived a moment later.
+        """
         chain = [key]
         while chain[-1] in self._parents:
             chain.append(self._parents[chain[-1]])
-        return chain
+        lineage = []
+        for holder in chain:
+            grant = self._grants.get(holder)
+            if grant is None:
+                raise _expired()
+            lineage.append((holder, grant))
+        return lineage
 
     def authorize(
         self,
@@ -431,9 +454,9 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
             )
         with self._lock:
             capped = [
-                (holder, t.cast(int, self._grants[holder].max_mech_payment_per_session))
-                for holder in self._lineage(key)
-                if self._grants[holder].max_mech_payment_per_session is not None
+                (holder, t.cast(int, held.max_mech_payment_per_session))
+                for holder, held in self._lineage(key)
+                if held.max_mech_payment_per_session is not None
             ]
             if not capped:
                 return
@@ -504,11 +527,10 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
         with self._lock:
             # this token and every ancestor it was minted from: minting more
             # children must not multiply a parent's session budget
-            chain = self._lineage(key)
             capped = [
-                (holder, self._grants[holder].max_value_per_session)
-                for holder in chain
-                if self._grants[holder].max_value_per_session is not None
+                (holder, held.max_value_per_session)
+                for holder, held in self._lineage(key)
+                if held.max_value_per_session is not None
             ]
             for holder, per_session in capped:
                 spent = self._spent.get(holder, {})

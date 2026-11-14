@@ -421,7 +421,9 @@ wider than the presenting token's is refused (`token-scope`), and unknown
 fields are refused by name like every other body. One token may have at most
 64 live tokens minted from it, and the server at most 1024 in all
 (`token-limit`); expired tokens are forgotten whenever one is minted, after
-which they read as unknown (401) rather than `token-expired`. The bundled `signer_client` mints one with
+which they read as unknown (401) rather than `token-expired`; a call whose
+token was forgotten so after it was looked up is refused as `token-expired`
+(401). The bundled `signer_client` mints one with
 `SignerClient.mint_token(grant)`, and every bundled reader of `.mcp.json`
 (`signer_client.load_mcp_config_dir`, so `connect(chain, token=None)` and
 connect-polymarket's `ConnectSigner.from_workspace` alike) signs with

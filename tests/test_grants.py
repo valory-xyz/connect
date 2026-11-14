@@ -182,6 +182,78 @@ def test_an_expired_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
         assert (refused.value.rule, refused.value.status) == ("token-expired", 401)
 
 
+def test_a_token_pruned_after_its_lookup_is_refused_as_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Looked up, then pruned by another caller's mint: a 401, not a KeyError."""
+    store = grant_store(WORKSPACE)
+    soon = store.mint(WORKSPACE, grant(expires_at=int(time.time()) + 60))
+    assert store.lookup(f"Bearer {soon}") == soon
+    advance_token_clock(monkeypatch, 120)
+    store.mint(WORKSPACE, grant(scopes=["read"]))  # prunes it
+    for call in (
+        lambda: store.authorize(soon, "wallet_info", {}),
+        lambda: store.grant(soon),
+    ):
+        with pytest.raises(GrantRefused) as refused:
+            call()
+        assert (refused.value.rule, refused.value.status) == ("token-expired", 401)
+
+
+@pytest.mark.parametrize(
+    ("action", "arguments"),
+    [
+        ("mech_request", {"max_payment": 1}),
+        ("safe_transaction", {"value": 1, "request_id": "r1"}),
+    ],
+)
+def test_a_token_pruned_while_its_caps_are_read_is_refused_as_expired(
+    monkeypatch: pytest.MonkeyPatch, action: str, arguments: dict
+) -> None:
+    """Live when checked, pruned before its session budgets are read: a 401."""
+    store = grant_store(WORKSPACE)
+    soon = store.mint(
+        WORKSPACE,
+        grant(expires_at=int(time.time()) + 60, max_value_per_session={"native": 5}),
+    )
+    live = store._live  # pylint: disable=protected-access
+
+    def pruned_after(token: str) -> TokenGrant:
+        checked = live(token)
+        if token == soon:  # the mint below checks its own parent here too
+            advance_token_clock(monkeypatch, 120)
+            store.mint(WORKSPACE, grant(scopes=["read"]))  # another caller's mint
+        return checked
+
+    monkeypatch.setattr(store, "_live", pruned_after)
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(soon, action, arguments)
+    assert (refused.value.rule, refused.value.status) == ("token-expired", 401)
+
+
+def test_http_a_token_pruned_after_its_lookup_is_a_401(
+    client: TestClient, store_path: t.Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route answers the README's 401 and audits it, never a 500."""
+    body = {"scopes": ["read"], "expires_at": int(time.time()) + 60}
+    token = client.post("/tokens", json=body, headers=_bearer(WORKSPACE))
+    store = client.app.state.grants  # type: ignore[attr-defined]
+    lookup = store.lookup
+
+    def pruned_after(header: str | None) -> str | None:
+        found = lookup(header)
+        advance_token_clock(monkeypatch, 120)
+        store.mint(WORKSPACE, grant(scopes=["read"]))  # another caller's mint
+        return found
+
+    monkeypatch.setattr(store, "lookup", pruned_after)
+    refused = client.get("/wallet", headers=_bearer(token.json()["token"]))
+    assert refused.status_code == 401
+    assert "token-expired" in refused.json()["detail"]
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert (entry["rule"], entry["path"]) == ("token-expired", "/wallet")
+
+
 def test_mech_payment_cap() -> None:
     """A capped token must name a max_payment within its cap."""
     store = grant_store(WORKSPACE)
