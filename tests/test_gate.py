@@ -25,6 +25,7 @@ import typing as t
 import pytest
 from fastapi.testclient import TestClient
 from web3 import Web3
+from web3.exceptions import Web3RPCError
 
 from connect import chain_read
 from connect.activity import ActivityLog
@@ -583,6 +584,8 @@ class TestSignerGate:
         ("broadcast", ConnectionError("read timed out"), SEND_UNKNOWN),
         ("broadcast", TimeoutError("read timed out"), SEND_UNKNOWN),
         ("broadcast", ValueError("nonce too low"), SEND_FAILED),  # the RPC answered
+        # web3 7's node rejection, which is not a ValueError
+        ("broadcast", Web3RPCError("replacement transaction underpriced"), SEND_FAILED),
         ("estimate", ConnectionError("rpc down"), SEND_FAILED),  # nothing signed
     ],
 )

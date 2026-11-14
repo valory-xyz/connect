@@ -37,7 +37,7 @@ from eth_account.signers.local import LocalAccount
 from eth_utils import to_checksum_address
 from hexbytes import HexBytes
 from web3 import Web3
-from web3.exceptions import TimeExhausted, TransactionNotFound
+from web3.exceptions import TimeExhausted, TransactionNotFound, Web3RPCError
 
 from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig
@@ -407,7 +407,8 @@ class FakeEth:
     def send_raw_transaction(self, raw: bytes) -> HexBytes:
         """Record the raw tx and return its keccak hash."""
         if self.fail_broadcast:
-            raise ValueError("nonce too low")
+            # what web3 7 raises for a node's rejection: not a ValueError
+            raise Web3RPCError("nonce too low")
         with self._lock:
             self.sent.append(bytes(raw))
         return HexBytes(Web3.keccak(bytes(raw)))
