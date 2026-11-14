@@ -22,7 +22,7 @@
 import logging
 import typing as t
 
-from mech_client import NonceRefused, RequestIdMismatch
+from mech_client import NonceRefused, RequestIdMismatch, RequestIdRpcError
 
 from connect.signer import SignerError
 
@@ -136,11 +136,15 @@ def said(error: Exception, context: str) -> str:
     """Return what a caller is told of a failure on the mech path.
 
     Connect's own errors and refusals (MechError and the signer's, rule-named),
-    mech-client's NonceRefused and its id check keep their words; anything
+    mech-client's NonceRefused, its id check and its unreachable-RPC id
+    derivation (which names only the error class) keep their words; anything
     else is a library's, so it is UNSAID and logged under `context` (what
     failed, on which chain and mech), which tells concurrent failures apart.
     """
-    if isinstance(error, (MechError, SignerError, NonceRefused, RequestIdMismatch)):
+    if isinstance(
+        error,
+        (MechError, SignerError, NonceRefused, RequestIdMismatch, RequestIdRpcError),
+    ):
         return str(error)
     logger.warning("%s", context, exc_info=error)
     return UNSAID

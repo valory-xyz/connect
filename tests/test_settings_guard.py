@@ -48,6 +48,7 @@ from mech_client import (
     OffchainTopUpFailed,
     PreSignHook,
     RequestIdMismatch,
+    RequestIdRpcError,
 )
 from mech_client import nonces as mech_nonces_module
 from mech_client.domain import identification
@@ -3351,6 +3352,29 @@ class TestMech:
             service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         assert "mech_offchain_digest" not in audit_kinds(store_path)
         assert signed == []
+
+    def test_an_unreachable_rpc_in_id_derivation_keeps_its_words(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """mech-client's RequestIdRpcError names only the error class: it is said.
+
+        It is raised before anything is signed, so the request is not sent and
+        its request_id is free for the retry an RPC blip calls for.
+        """
+        words = (
+            "Failed to derive the request id for nonce 5 (ConnectionError); "
+            "see the log or the chained cause."
+        )
+        patched_mech.raises = RequestIdRpcError(words)
+        with pytest.raises(MechNotSent) as refused:
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+            )
+        assert str(refused.value) == f"mech request not sent: {words}"
+        patched_mech.raises = None
+        assert mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+        ).get("replayed") is None
 
     def test_restricted_auto_deposit_is_armed_via_allowance(  # pylint: disable=too-many-arguments
         self,

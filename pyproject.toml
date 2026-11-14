@@ -11,7 +11,7 @@ dependencies = [
     "web3==7.16.0",
     "eth-account==0.13.7",
     "mcp==1.28.1",
-    "mech-client @ git+https://github.com/valory-xyz/mech-client.git@5034db75c710c849c9f1c633375524035a406839",
+    "mech-client @ git+https://github.com/valory-xyz/mech-client.git@0023b3919724bbaa42408b93444864cca41100ce",
     "open-aea-ledger-ethereum==2.2.9",
     "tomli-w==1.2.0",
 ]
