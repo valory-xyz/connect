@@ -65,7 +65,7 @@ from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import Armed, MechAllowances, read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
-from connect.mech_queue import MechQueue
+from connect.mech_queue import HardCancelRefused, MechQueue
 from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
 from connect.mech_types import (
@@ -77,6 +77,7 @@ from connect.mech_types import (
     PricedMech,
     SPEND_UNCERTAIN,
     published_tools,
+    request_key,
     request_label,
     said,
 )
@@ -132,11 +133,6 @@ def _clamp_timeout(timeout: float) -> float:
     return min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
 
 
-def _request_key(request_id: object) -> str:
-    """Normalize a caller's request id: mech-client's are bare lowercase hex."""
-    return str(request_id).lower().removeprefix("0x")
-
-
 class MechService:  # pylint: disable=too-many-instance-attributes
     """Per-chain mech-client marketplace services over the guarded signer."""
 
@@ -160,8 +156,12 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         self._nonces = self.queue.allocator
 
     def hard_cancel(self, chain: str) -> dict:
-        """Run the operator's hard cancel on the safe's queue on `chain`."""
+        """Run the operator's hard cancel on `chain`; a chain with no safe is `no-safe`."""
         chain = chain.lower()
+        if self._config.chain(chain).safe_address is None:
+            raise HardCancelRefused(
+                "no-safe", f"no service safe is configured for chain '{chain}'"
+            )
         return self.queue.hard_cancel(self._service(chain), chain)
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
@@ -884,7 +884,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         right place, and none of that survives a restart.
         """
         timeout = _clamp_timeout(timeout)
-        key = _request_key(request_id)
+        key = request_key(request_id)
         with self._lock:
             pending = self._pending.get(key)
         if pending is None:
@@ -899,7 +899,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         except Exception as e:
             what = f"could not read delivery for request {key}"
             raise MechError(f"{what}: {said(e, f'{what} on {pending.chain}')}") from e
-        split = {_request_key(k): v for k, v in (delivered or {}).items()}
+        split = {request_key(k): v for k, v in (delivered or {}).items()}
         data = {k: d.data for k, d in split.items() if d.data is not None}
         report = {
             "request_id": key,

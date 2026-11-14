@@ -215,13 +215,9 @@ def hard_cancel(body: HardCancelRequest, request: Request) -> dict:
         return HTTPException(status_code=status, detail=f"rule '{rule}': {detail}")
 
     try:
-        safe = state.config.chain(body.chain).safe_address
+        state.config.chain(body.chain)
     except ValueError as e:  # Connect's own words: an unknown chain
         raise refuse(400, "unknown-chain", str(e)) from e
-    if safe is None:
-        raise refuse(
-            400, "no-safe", f"no service safe is configured for chain '{body.chain}'"
-        )
     try:
         return state.mech.hard_cancel(body.chain)
     except NonceRefused as e:  # closed: Connect is shutting down, not a conflict

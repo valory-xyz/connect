@@ -148,7 +148,7 @@ class MechQueue:
         :raises SignerError: the guard refused the request.
         :raises HardCancelFailed: the request failed (audited, logged).
         """
-        # the service was built for this chain, so it has a safe
+        # MechService.hard_cancel refused a chain with no safe (`no-safe`)
         safe = t.cast(str, self._config.chain(chain).safe_address)
         contract = service.marketplace_contract()
 

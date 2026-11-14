@@ -5147,6 +5147,20 @@ class TestMech:
             assert failed["error"] == "RuntimeError"
         assert "nosafe" not in operator.get("/mech-queue").json()
 
+    def test_a_hard_cancel_on_a_chain_with_no_safe_names_its_rule(
+        self,
+        mech_service: MechService,
+        app_config: AppConfig,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """Any caller of MechService.hard_cancel reads `no-safe`, never a bare MechError."""
+        app_config.chains["nosafe"] = ChainConfig(rpc_url="http://127.0.0.1:9")
+        with pytest.raises(mech_queue_module.HardCancelRefused) as refused:
+            mech_service.hard_cancel("NoSafe")
+        assert refused.value.rule == "no-safe"
+        assert str(refused.value) == "no service safe is configured for chain 'nosafe'"
+        assert not patched_mech.calls
+
     @pytest.mark.parametrize(
         "case",
         ["guardrail", "guardrail-wrapped", "mech-cap", "rpc-down", "broadcast-failed"],

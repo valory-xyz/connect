@@ -117,6 +117,11 @@ def published_tools(document: t.Any) -> list[str]:
     return [name for name in raw if isinstance(name, str) and name.strip()]
 
 
+def request_key(request_id: object) -> str:
+    """Normalize a caller's request id: mech-client's are bare lowercase hex."""
+    return str(request_id).lower().removeprefix("0x")
+
+
 # what a caller is told of a failure whose words are a library's, which may
 # name an RPC URL and its key; the cause goes to the log
 UNSAID = "mech-client failed (the cause is in Connect's log)"
