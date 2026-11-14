@@ -123,6 +123,14 @@ def test_narrower_is_a_partial_order_on_every_field() -> None:
     assert narrower(grant(**_capped(1, 1, 1, 1)), WORKSPACE_GRANT)
 
 
+def test_narrower_holds_the_mech_session_budget() -> None:
+    """A child may not report a wider mech session budget than its parent's."""
+    parent = grant(max_mech_payment_per_session=100)
+    assert narrower(grant(max_mech_payment_per_session=100), parent)
+    for wider in (101, None):
+        assert not narrower(grant(max_mech_payment_per_session=wider), parent)
+
+
 def _capped(per_tx: int, session: int, mech: int, expiry: int) -> dict:
     return {
         "max_value_per_tx": {"native": per_tx},
