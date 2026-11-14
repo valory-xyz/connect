@@ -473,7 +473,7 @@ class FakeProvider:
         assert params[1] == "latest"
         if self.unavailable:
             return {"error": {"code": -32601, "message": "method not whitelisted"}}
-        call, canary = params[0]["blockStateCalls"][0]["calls"]
+        call, _ = params[0]["blockStateCalls"][0]["calls"]
         self.simulated.append(call)
         logs = list(self.logs)
         value = int(call["value"], 16)
@@ -487,16 +487,26 @@ class FakeProvider:
         result["logs"] = logs
         if self.error is not None:
             result["error"] = self.error
-        return {"result": [{"calls": [result, canary_result(canary, self.traced)]}]}
+        block = params[0]["blockStateCalls"][0]
+        return {"result": [{"calls": [result, canary_result(block, self.traced)]}]}
 
 
-def canary_result(canary: dict, traced: bool = True) -> dict:
-    """Answer the gate's traceTransfers canary as a node would, or would not."""
-    logs = (
-        [native_transfer_log(canary["from"], canary["to"], int(canary["value"], 16))]
-        if traced
-        else []
-    )
+def canary_result(block: dict, traced: bool = True) -> dict:
+    """Answer the gate's traceTransfers canary as a node would, or would not.
+
+    `block` is the simulated block, whose second call is the canary. A real
+    node moves the canary's value only if the block's state override funds
+    its sender: unfunded, the transfer fails and logs nothing.
+    """
+    canary = block["calls"][1]
+    value = int(canary["value"], 16)
+    overrides = {
+        address.lower(): state for address, state in block["stateOverrides"].items()
+    }
+    balance = int(overrides.get(canary["from"].lower(), {}).get("balance", "0x0"), 16)
+    if not traced or balance < value:
+        return {"status": "0x0", "returnData": "0x", "gasUsed": "0x5208", "logs": []}
+    logs = [native_transfer_log(canary["from"], canary["to"], value)]
     return {"status": "0x1", "returnData": "0x", "gasUsed": "0x5208", "logs": logs}
 
 

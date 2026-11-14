@@ -78,8 +78,8 @@ def rpc_with(
         call: dict = {"status": status, "gasUsed": "0x10", "logs": logs}
         if error is not None:
             call["error"] = error
-        canary = params[0]["blockStateCalls"][0]["calls"][1]
-        return [{"calls": [call, canary_result(canary, traced)]}]
+        block = params[0]["blockStateCalls"][0]
+        return [{"calls": [call, canary_result(block, traced)]}]
 
     return rpc
 
@@ -245,7 +245,7 @@ def test_a_malformed_batch_is_simulation_unavailable() -> None:
                 {
                     "calls": [
                         {"status": "0x1", "gasUsed": "zz", "logs": []},
-                        canary_result(p[0]["blockStateCalls"][0]["calls"][1]),
+                        canary_result(p[0]["blockStateCalls"][0]),
                     ]
                 }
             ],
@@ -575,8 +575,12 @@ def test_the_trace_canary_rides_beside_the_call_and_is_not_in_its_diff() -> None
         rpc, sender=SAFE, to=EOA, value=0, data="0x", get_code=lambda a: b""
     )
     (block,) = seen[0]["blockStateCalls"]
-    assert block["calls"][1]["from"] == intent.TRACE_CANARY_FROM
-    assert intent.TRACE_CANARY_FROM in block["stateOverrides"]
+    canary = block["calls"][1]
+    assert canary["from"] == intent.TRACE_CANARY_FROM
+    # an unfunded canary moves nothing on a real node, and every send would
+    # then fail closed as simulation-unavailable
+    funded = block["stateOverrides"][intent.TRACE_CANARY_FROM]["balance"]
+    assert int(funded, 16) >= int(canary["value"], 16) > 0
     assert diff["native"] == "0"
     assert diff["called"] == [EOA]
     assert diff["recipients"] == []
