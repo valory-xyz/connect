@@ -548,8 +548,10 @@ the stall clock, so a second one needs its own window. What can refuse it
 before anything is sent — no slot of the safe's to name the mech, a price
 above that mech's default budget, no tool it publishes (with why its metadata
 could not be read) — is settled before the queue is held, so it costs no
-window. Every refusal names its rule (`unknown-chain`, `hard-cancel-no-slot`,
-`over-max-payment`, `hard-cancel-no-tool`, `guardrail`,
+window. Every refusal names its rule (`unknown-chain`, `no-safe`,
+`hard-cancel-no-slot`, `over-max-payment`, `hard-cancel-no-tool`,
+`hard-cancel-moved` (the stuck slot changed once the queue was held: try
+again), `guardrail`,
 `mech-queue-not-stalled`, and `mech-queue-closed`, a 503, once Connect is
 shutting down) and is audited as a `refusal`; a request that fails
 once sent answers a fixed 502 and is audited as `mech_hard_cancel_failed` with

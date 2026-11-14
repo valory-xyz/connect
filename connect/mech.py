@@ -159,7 +159,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         self._nonces = self.queue.allocator
 
     def hard_cancel(self, chain: str) -> dict:
-        """Run the operator's hard cancel on the safe's queue on `chain` (D27)."""
+        """Run the operator's hard cancel on the safe's queue on `chain`."""
         chain = chain.lower()
         return self.queue.hard_cancel(self._service(chain), chain)
 

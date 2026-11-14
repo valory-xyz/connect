@@ -200,11 +200,10 @@ def mech_queue(request: Request) -> dict:
 
 @router.post("/mech-queue/hard-cancel")
 def hard_cancel(body: HardCancelRequest, request: Request) -> dict:
-    """Consume a long-stalled queue's stuck nonce with one on-chain request (D27).
+    """Run the operator's hard cancel (README, "One payer per safe").
 
     Operator-only: the password, never a bearer token, authorizes it, since
-    it pays a mech from the safe. Refused (409, the allocator's rule) unless
-    the queue has been stalled for MECH_HARD_CANCEL_AFTER.
+    it pays a mech from the safe.
     """
     require_password(request, body.password, "a hard cancel")
     state = request.app.state
@@ -216,9 +215,13 @@ def hard_cancel(body: HardCancelRequest, request: Request) -> dict:
         return HTTPException(status_code=status, detail=f"rule '{rule}': {detail}")
 
     try:
-        state.config.chain(body.chain)
+        safe = state.config.chain(body.chain).safe_address
     except ValueError as e:  # Connect's own words: an unknown chain
         raise refuse(400, "unknown-chain", str(e)) from e
+    if safe is None:
+        raise refuse(
+            400, "no-safe", f"no service safe is configured for chain '{body.chain}'"
+        )
     try:
         return state.mech.hard_cancel(body.chain)
     except NonceRefused as e:  # closed: Connect is shutting down, not a conflict

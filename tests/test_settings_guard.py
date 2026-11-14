@@ -5014,6 +5014,7 @@ class TestMech:
         ("case", "status", "rule", "says"),
         [
             ("unknown-chain", 400, "unknown-chain", "unknown chain"),
+            ("no-safe", 400, "no-safe", "no service safe"),
             ("no-slot", 400, "hard-cancel-no-slot", "holds no off-chain slot"),
             ("no-tool", 400, "hard-cancel-no-tool", "publishes no tool"),
             ("unreadable", 400, "hard-cancel-no-tool", "unreadable: TimeoutError"),
@@ -5071,7 +5072,9 @@ class TestMech:
         answer = operator.post(
             "/mech-queue/hard-cancel",
             json={
-                "chain": "atlantis" if case == "unknown-chain" else "testchain",
+                "chain": {"unknown-chain": "atlantis", "no-safe": "nosafe"}.get(
+                    case, "testchain"
+                ),
                 "password": TEST_PASSWORD,
             },
         )
@@ -5095,7 +5098,8 @@ class TestMech:
         assert "nosafe" not in operator.get("/mech-queue").json()
 
     @pytest.mark.parametrize(
-        "case", ["guardrail", "mech-cap", "rpc-down", "broadcast-failed"]
+        "case",
+        ["guardrail", "guardrail-wrapped", "mech-cap", "rpc-down", "broadcast-failed"],
     )
     def test_a_hard_cancel_that_fails_sending_says_what_it_touched(  # pylint: disable=too-many-arguments
         self,
@@ -5112,6 +5116,12 @@ class TestMech:
             refused = SignerError("the operator's guardrail settings do not allow it")
             refused.__cause__ = GuardError("not whitelisted")
             patched_mech.raises = refused
+        if case == "guardrail-wrapped":  # as mech-client's agent-mode executor does
+            refused = SignerError("the operator's guardrail settings do not allow it")
+            refused.__cause__ = GuardError("not whitelisted")
+            wrapped = Exception(f"Failed to execute Safe transaction: {refused}")
+            wrapped.__cause__ = refused
+            patched_mech.raises = wrapped
         if case == "mech-cap":
             patched_mech.raises = MechPriceExceeded("over", price=2, max_price=1)
         if case == "rpc-down":
@@ -5134,10 +5144,64 @@ class TestMech:
             assert failed["error"] in ("RuntimeError", "SignerError")
             return
         assert answer.status_code == 400
-        rule = "guardrail" if case == "guardrail" else "over-max-payment"
+        rule = "over-max-payment" if case == "mech-cap" else "guardrail"
         assert answer.json()["detail"].startswith(f"rule '{rule}'")
         (refusal,) = [e for e in audited if e["kind"] == "refusal"]
         assert refusal["rule"] == rule
+
+    @pytest.mark.parametrize(("rate", "status"), [(10**17, 200), (10**17 + 1, 400)])
+    def test_a_hard_cancel_pays_up_to_its_default_budget_and_no_more(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        rate: int,
+        status: int,
+    ) -> None:
+        """At the cap it pays, as mech-client's own `price > max_price` agrees; past it, refused."""
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        patched_mech.info = native_mech_info(rate)
+        sent = len(patched_mech.calls)
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert answer.status_code == status
+        if status == 400:
+            assert answer.json()["detail"].startswith("rule 'over-max-payment'")
+            assert len(patched_mech.calls) == sent
+            return
+        (call,) = patched_mech.calls[sent:]
+        assert call["max_price"] == 10**17
+
+    def test_a_hard_cancel_ignores_a_slot_mapnonces_has_passed(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """Slot 4 settled but not yet synced, 6 held, mapNonces 5: 6's mech is paid."""
+        mech_b = Web3.to_checksum_address("0x" + "b2" * 20)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        for mech in (OTHER, OTHER, mech_b):  # slots 4, 5 and 6
+            with nonces.reserve("testchain", SAFE, OTHER, lambda: 4, timeout=1) as slot:
+                slot.answered("accepted", mech=mech, salt="")
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        del queue.slots[5]
+        queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
+        sent = len(patched_mech.calls)
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["mech"] == mech_b
+        (call,) = patched_mech.calls[sent:]
+        assert call["priority_mech"] == mech_b
 
     def test_a_hard_cancel_whose_stuck_slot_moved_sends_nothing(  # pylint: disable=too-many-arguments
         self,

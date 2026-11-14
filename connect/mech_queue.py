@@ -19,10 +19,8 @@
 
 """The safe's off-chain marketplace queue on each chain, as Connect reports it.
 
-The queue itself is mech-client's NonceAllocator, persisted in
-STORE_PATH/mech_nonces.json; this holds it, says when a safe's queue on a
-chain is stalled, and runs the operator's hard cancel (D27): one on-chain
-marketplace request from the safe that consumes the stuck mapNonces.
+The queue itself is mech-client's NonceAllocator; this holds it, reports a
+stall and runs the operator's hard cancel (README, "One payer per safe").
 """
 
 import asyncio
@@ -104,11 +102,7 @@ class MechQueue:
         self.allocator.close()
 
     def report(self, chain: str) -> dict:
-        """Report whether the safe's queue on `chain` is stalled, and since when.
-
-        Once it has been stalled for MECH_HARD_CANCEL_AFTER, the report says
-        the operator's hard cancel is available; the session cannot run it.
-        """
+        """Report whether the safe's queue on `chain` is stalled, and if cancellable."""
         safe = self._config.chain(chain).safe_address
         since = None if safe is None else self.allocator.stalled_since(chain, safe)
         if since is None:
@@ -144,18 +138,13 @@ class MechQueue:
     def hard_cancel(self, service: MarketplaceService, chain: str) -> dict:
         """Consume the stuck mapNonces with one on-chain request, and audit it.
 
-        mech-client's `allocator.hard_cancel` refuses (`mech-queue-not-stalled`)
-        unless the queue has been stalled for MECH_HARD_CANCEL_AFTER, holds the
-        queue meanwhile, and restarts the stall clock when it exits, whatever
-        happened inside. So everything that can refuse before the broadcast
-        (the stuck mech, its price against its default budget, a tool to send)
-        is settled first, outside it: such a refusal costs the operator no
-        window. The request goes to the mech of the stuck slot, capped by that
-        mech's default max_payment, and is signed like any on-chain mech
-        request: through the guard, server-built.
+        The allocator's context restarts the stall clock on exit, so every
+        refusal that needs nothing sent is settled before it is entered.
 
         :raises NonceRefused: the allocator's refusal, naming its rule.
-        :raises HardCancelRefused: nothing to cancel, or nothing to send it with.
+        :raises HardCancelRefused: nothing to cancel, nothing to send it with,
+            or the stuck slot moved once the queue was held.
+        :raises MechPriceExceeded: mech-client's cap, before anything is paid.
         :raises SignerError: the guard refused the request.
         :raises HardCancelFailed: the request failed (audited, logged).
         """
@@ -233,11 +222,10 @@ class MechQueue:
             )
         except MechPriceExceeded:  # mech-client's cap: refused before paying
             raise
-        except SignerError as e:
-            if isinstance(e.__cause__, GuardError):  # refused before signing
-                raise
-            failure: Exception = e
         except Exception as e:  # pylint: disable=broad-exception-caught
+            refused = _guard_refusal(e)
+            if refused is not None:  # refused before signing
+                raise refused  # pylint: disable=raise-missing-from
             failure = e
         logger.error(
             "the hard cancel on %s (nonce %s, mech %s) failed",
@@ -258,13 +246,14 @@ class MechQueue:
     def _stuck_mech(self, chain: str, safe: str, nonce: int) -> str:
         """Return the mech of the safe's slot at `nonce`, else its lowest held one.
 
-        mech-client exposes no reader of a held slot, so this reads the
-        allocator's queue directly (a private, so it is the one place that does).
+        Slots below `nonce` are settled, as the allocator's own sync will find,
+        so they are never the stuck one. mech-client exposes no reader of a
+        held slot, so this reads the allocator's private queue (the one place).
         """
         queue = self.allocator._queue(  # pylint: disable=protected-access
             self.allocator.key(chain, safe)
         )
-        slots = dict(queue.slots)
+        slots = {n: slot for n, slot in dict(queue.slots).items() if n >= nonce}
         slot = slots.get(nonce) or (slots[min(slots)] if slots else None)
         if slot is None:
             raise HardCancelRefused(
@@ -273,3 +262,17 @@ class MechQueue:
                 "stuck request's mech to send the hard cancel to",
             )
         return Web3.to_checksum_address(slot.mech)
+
+
+def _guard_refusal(error: BaseException) -> SignerError | None:
+    """Return the guard's refusal in `error`'s cause chain, if there is one.
+
+    mech-client's agent-mode executor wraps every Safe send failure in a bare
+    Exception, so the signer's refusal sits below it.
+    """
+    cause: BaseException | None = error
+    while cause is not None:
+        if isinstance(cause, SignerError) and isinstance(cause.__cause__, GuardError):
+            return cause
+        cause = cause.__cause__
+    return None
