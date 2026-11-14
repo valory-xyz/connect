@@ -86,7 +86,7 @@ from connect.mech import (
     PendingDelivery,
 )
 from connect.mech_allowances import _MAX_AUTO_DEPOSIT_RATIO, deposit_tracker
-from connect.mech_types import MechAnswerUnknown, UNSAID
+from connect.mech_types import MechAnswerUnknown, MechDepositUnknown, UNSAID
 from connect.safe import (
     APPROVE_SELECTOR,
     DEPOSIT_SELECTOR,
@@ -118,7 +118,13 @@ from connect.settings import (
     derive_mac_key,
     token_approve_targets,
 )
-from connect.signer import SEND_FAILED, Signer, SignerError, _ChainState
+from connect.signer import (
+    SEND_FAILED,
+    SendUnknown,
+    Signer,
+    SignerError,
+    _ChainState,
+)
 
 from tests.conftest import (
     FakeW3,
@@ -2025,6 +2031,16 @@ class FakeMarketplaceService:
         return self.result
 
 
+def _executor_wrapped(failure: Exception) -> Exception:
+    """Wrap a signer failure as mech-client's agent-mode executor does."""
+    try:
+        raise failure
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        wrapped = Exception(f"Failed to execute Safe transfer transaction: {e}")
+        wrapped.__cause__ = e
+        return wrapped
+
+
 REAL_MANIFEST: dict = {
     "tools": ["prediction-online"],
     "termsUrl": "https://www.valory.xyz/terms/mechs",
@@ -3528,6 +3544,7 @@ class TestMech:
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
 
+    @pytest.mark.parametrize("wrapped", [False, True])
     def test_a_refused_top_up_after_the_402_is_not_sent(  # pylint: disable=too-many-arguments
         self,
         account: LocalAccount,
@@ -3536,12 +3553,14 @@ class TestMech:
         settings_store: SettingsStore,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
+        wrapped: bool,
     ) -> None:
         """The mech answered 402 and the signer refused the top-up: nothing stands.
 
         mech-client frees the nonce of a SignerError (Connect names it in
         not_sent) though the POST went out; Connect reports it not sent too,
-        keeps no id pending, and withdraws what it armed.
+        keeps no id pending, and withdraws what it armed. Its agent-mode
+        executor wraps the refusal in a bare Exception, which Connect unwraps.
         """
         monkeypatch.setattr(
             allowances_module,
@@ -3551,8 +3570,9 @@ class TestMech:
         service, guard = self._restricted_mech_service(
             account, app_config, activity, settings_store
         )
-        patched_mech.raises_after_signing = SignerError(
-            "the operator's guardrail settings do not allow it"
+        refusal = SignerError("the operator's guardrail settings do not allow it")
+        patched_mech.raises_after_signing = (
+            _executor_wrapped(refusal) if wrapped else refusal
         )
         with pytest.raises(MechNotSent, match="guardrail"):
             service.request("q", "tool", chain="testchain", priority_mech=OTHER)
@@ -3567,6 +3587,64 @@ class TestMech:
             assert (
                 slot.nonce == patched_mech.contract.nonce
             )  # freed, as mech-client did
+
+    @pytest.mark.parametrize("request_id", [None, "dep-1"])
+    def test_a_top_up_deposit_that_may_have_landed_is_spend_uncertain(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        request_id: str | None,
+    ) -> None:
+        """The 402 top-up's broadcast went unanswered: audited, never "not sent".
+
+        The mech answered 402, so it holds nothing and the nonce is freed;
+        the deposit may have landed, so the error names its hash and makes no
+        replay promise, and a caller's request_id is held as spend-uncertain
+        rather than freed for a resend that could top up again.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        deposit = "0x" + "d0" * 32
+        patched_mech.raises_after_signing = _executor_wrapped(
+            SendUnknown(deposit, held=False)
+        )
+        with pytest.raises(MechDepositUnknown) as lost:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id=request_id,
+            )
+        assert deposit in str(lost.value)
+        assert "request_id" not in str(lost.value)
+        (audited,) = [
+            e
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_deposit_unconfirmed"
+        ]
+        assert audited["tx_hash"] == deposit
+        assert not mech_service._pending  # pylint: disable=protected-access
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
+        ) as slot:
+            assert slot.nonce == patched_mech.contract.nonce  # no POST holds it
+            slot.answered("not_accepted", mech=OTHER, salt="")
+        if request_id is None:
+            return
+        sent = len(patched_mech.calls)
+        patched_mech.raises_after_signing = None
+        with pytest.raises(MechError, match="cannot tell whether it was paid for"):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, request_id=request_id
+            )
+        assert len(patched_mech.calls) == sent
 
     def test_auto_deposit_cap_matches_mech_client(self) -> None:
         """The armed cap multiplies by the exact bound mech-client enforces.

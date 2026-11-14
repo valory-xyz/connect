@@ -70,6 +70,7 @@ from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
 from connect.mech_types import (
     MechAnswerUnknown,
+    MechDepositUnknown,
     MechError,
     MechNotSent,
     MechUnknownRequest,
@@ -793,7 +794,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 salt=str((plan.extra_attributes or {})["nonce"]),
                 read_map_nonces=read_map,
                 send=send_one,
-                not_sent=(MechNotSent, SignerError),
+                not_sent=(MechNotSent, SignerError, MechDepositUnknown),
                 timeout=timeout,
                 on_request_id=arm,
             )
@@ -805,8 +806,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             raise self._lost(plan, sent, armed, e) from e
         except Exception as e:
             # mech-client frees the nonce of what not_sent names, posting or not
-            # (a SignerError after the POST is the 402 top-up's): so does Connect
-            if isinstance(e, MechNotSent):  # the mapNonces read: nothing sent
+            # (a SignerError after the POST is the 402 top-up's): so does Connect;
+            # a deposit that may have landed is no POST, but it may be a spend
+            if isinstance(e, (MechNotSent, MechDepositUnknown)):
                 raise
             if sent and sent[-1][1].posting and not isinstance(e, SignerError):
                 raise self._lost(plan, sent, armed, e) from e

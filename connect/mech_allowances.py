@@ -32,7 +32,7 @@ from web3 import Web3
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.mech_types import PricedMech
+from connect.mech_types import MechDepositUnknown, PricedMech, top_up_failure
 from connect.safe import safe_message_hash
 from connect.settings import MODE_RESTRICTED
 
@@ -147,13 +147,28 @@ class MechAllowances:
         time holds one, and a top-up cannot spend another request's grant.
         The audit record is written in every mode; the allowance is armed
         only while restricted — unrestricted needs none, and one armed there
-        would outlive a switch back to restricted for its TTL.
+        would outlive a switch back to restricted for its TTL. A top-up's
+        signer failure is raised unwrapped (`top_up_failure`), and a deposit
+        that may have landed is audited as `mech_deposit_unconfirmed`.
         """
         armed: Armed = []
         if auto_deposit:
             self._arm_deposit(chain, priced, armed)
         try:
             yield
+        except Exception as e:
+            failure = top_up_failure(e)
+            if isinstance(failure, MechDepositUnknown):
+                self._activity.record(
+                    "mech_deposit_unconfirmed",
+                    chain=chain,
+                    mech=priced.mech,
+                    tx_hash=failure.tx_hash,
+                )
+                raise failure from e
+            # e itself, or the signer's error already below it: `from e` would
+            # make its cause chain a loop
+            raise failure
         finally:
             self.revoke(armed)
 

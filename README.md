@@ -547,7 +547,14 @@ still answered 402, the amount it deposited into the balance tracker is
 audited as `mech_deposit`; any other 5xx or a transport error after the request
 was posted holds the nonce, since the mech may have stored the request. A
 failure before the POST (an RPC or gateway error assembling the request, a
-signer or guard refusal) never reached the mech, so it frees the nonce too. A
+signer or guard refusal) never reached the mech, so it frees the nonce too, as
+does a signer or guard refusal of the 402 top-up (mech-client's agent executor
+wraps it in a bare exception; Connect unwraps it). A top-up deposit the RPC
+never answered may have landed: the mech answered 402 and holds nothing, so
+its nonce is freed, but the request fails with an error naming the deposit's
+hash and promising no replay, the deposit is audited as
+`mech_deposit_unconfirmed`, and a caller's `request_id` is held as possibly
+paid for rather than freed for a resend that could top up again. A
 queue whose held slot `mapNonces` has not passed within the settle timeout
 (`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s) after its
 delivery, or after the request's own 300 s response timeout, stalls: only a

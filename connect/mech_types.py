@@ -24,7 +24,7 @@ import typing as t
 
 from mech_client import NonceRefused, RequestIdMismatch, RequestIdRpcError
 
-from connect.signer import SignerError
+from connect.signer import SendUnknown, SignerError
 
 logger = logging.getLogger("agent")
 
@@ -38,6 +38,44 @@ class MechNotSent(MechError):
 
     Nothing was paid for, so a caller's request_id is free to use again.
     """
+
+
+class MechDepositUnknown(MechError):
+    """The 402 top-up's deposit was broadcast and never answered: it may have landed.
+
+    The mech answered the request 402, so it holds nothing at its nonce and
+    the nonce is free; the spend is not settled, so `request()` keeps a
+    caller's request_id as spend-uncertain rather than freeing it.
+    """
+
+    def __init__(self, tx_hash: str) -> None:
+        """Initialize."""
+        super().__init__(
+            "the mech asked for a top-up (HTTP 402), and the safe's deposit "
+            f"{tx_hash} was broadcast without an answer from the RPC, so it may "
+            "have landed (the cause is in Connect's log). The request itself "
+            "did not reach the mech. Read the deposit's receipt "
+            "(transaction_status) before sending again: a resend may top up "
+            "again."
+        )
+        self.tx_hash = tx_hash
+
+
+def top_up_failure(error: Exception) -> Exception:
+    """Return the signer's failure under `error`, else `error` itself.
+
+    mech-client's agent-mode executor wraps every Safe send failure, the 402
+    top-up's included, in a bare Exception, which no `not_sent` can name: a
+    deposit the RPC never answered becomes MechDepositUnknown.
+    """
+    cause: BaseException | None = error
+    while cause is not None:
+        if isinstance(cause, SendUnknown):
+            return MechDepositUnknown(cause.tx_hash)
+        if isinstance(cause, SignerError):
+            return cause
+        cause = cause.__cause__
+    return error
 
 
 class MechAnswerUnknown(MechError):
