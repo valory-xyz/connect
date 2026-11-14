@@ -1832,7 +1832,7 @@ class FakeMarketplaceContract:
             marketplace=self.address,
             mech=mech,
             requester=requester,
-            data_hash=bytes(data),
+            data=bytes(data),
             delivery_rate=rate,
             payment_type=bytes(payment_type),
             nonce=nonce,
@@ -1980,7 +1980,7 @@ class FakeMarketplaceService:
                 marketplace=self.contract.address,
                 mech=t.cast(str, kwargs["priority_mech"]),
                 requester=t.cast(str, self.safe_address),
-                data_hash=bytes.fromhex(data_hash.removeprefix("0x")),
+                data=bytes.fromhex(data_hash.removeprefix("0x")),
                 delivery_rate=self.info[2],
                 payment_type=bytes.fromhex(self.info[0].value),
                 nonce=nonces[0],
@@ -4655,20 +4655,26 @@ class TestMech:
         with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
             assert slot.nonce == 5  # freed, not held as unknown
 
-    def test_a_lost_answer_is_possibly_paid_not_a_refusal(
+    @pytest.mark.parametrize(
+        ("status", "reason"),
+        [(502, "Bad Gateway"), (401, "nonce already used")],  # a reworded 401 too
+    )
+    def test_a_lost_answer_is_possibly_paid_not_a_refusal(  # pylint: disable=too-many-arguments
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         store_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        status: int,
+        reason: str,
     ) -> None:
-        """A 5xx: the mech may have stored it, so the id is not freed."""
+        """A 5xx or an unrecognised 401: the mech may hold it, so the id is not freed."""
         patched_mech.raises = OffchainRequestRejected(
-            "HTTP 502",
+            f"HTTP {status}",
             request_id="0x01",
             nonce=5,
-            status=502,
-            reason="Bad Gateway",
+            status=status,
+            reason=reason,
             unsent=[],
         )
         with pytest.raises(MechError, match="rule 'mech-answer-unknown'") as raised:
@@ -4907,6 +4913,71 @@ class TestMech:
         )
         assert again.status_code == 409
 
+    def test_a_hard_cancel_after_shutdown_is_unavailable_not_a_conflict(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+    ) -> None:
+        """A closed allocator refuses as mech-queue-closed: 503, nothing sent."""
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        mech_service.queue.close()
+        sent = len(patched_mech.calls)
+        refused = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert refused.status_code == 503
+        assert "rule 'mech-queue-closed'" in refused.json()["detail"]
+        assert len(patched_mech.calls) == sent
+        (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert refusal["rule"] == "mech-queue-closed"
+
+    def test_a_request_after_shutdown_is_refused_and_arms_nothing(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        guard: Guard,
+    ) -> None:
+        """mech-queue-closed is a refusal before the POST: nothing sent or armed."""
+        mech_service.queue.close()
+        with pytest.raises(MechNotSent, match="rule 'mech-queue-closed'"):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+            )
+        assert patched_mech.calls == []
+        assert not guard._allowed_digests  # pylint: disable=protected-access
+        assert not guard._deposit_allowances  # pylint: disable=protected-access
+
+    def test_a_hard_cancel_on_a_taken_nonce_goes_to_the_mech_that_holds_it(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """No slot of ours, only mech-client's taken marker: that mech is stuck."""
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, WHITELISTED, lambda: 5, timeout=1
+        ) as slot:
+            slot.answered("taken", mech=WHITELISTED, salt="")
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
+        sent = len(patched_mech.calls)
+        done = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert done.status_code == 200
+        assert done.json()["mech"] == Web3.to_checksum_address(WHITELISTED)
+        (call,) = patched_mech.calls[sent:]
+        assert call["priority_mech"] == Web3.to_checksum_address(WHITELISTED)
+
     @pytest.mark.parametrize(
         ("case", "status", "rule", "says"),
         [
@@ -4938,9 +5009,7 @@ class TestMech:
         """
         app_config.chains["nosafe"] = ChainConfig(rpc_url="http://127.0.0.1:9")
         nonces = mech_service._nonces  # pylint: disable=protected-access
-        if case == "no-slot":  # stalled by another signer, with nothing of ours held
-            with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
-                slot.answered("taken", mech=OTHER, salt="")
+        if case == "no-slot":  # stalled, with no slot held at all
             queue = nonces._queue(  # pylint: disable=protected-access
                 nonces.key("testchain", SAFE)
             )

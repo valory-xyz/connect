@@ -47,8 +47,8 @@ def deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
     The tracker is mech-client's `balance_tracker`, the contract its deposit
     path pays, so the allowance armed from this answer names the contract
     mech-client will actually pay. None where it names none (NVM
-    subscriptions, no deployment, a chain it does not know): auto-deposit is
-    then disarmed rather than a request dying mid-flow.
+    subscriptions) or raises (no deployment, a chain it does not know):
+    auto-deposit is then disarmed rather than a request dying mid-flow.
     """
     kind = PaymentType(payment_type)
     try:

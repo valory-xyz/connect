@@ -34,7 +34,7 @@ import logging
 import time
 
 from fastapi import APIRouter, HTTPException, Request
-from mech_client import MechPriceExceeded, NonceRefused
+from mech_client import MechPriceExceeded, NonceRefused, RULE_QUEUE_CLOSED
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from connect.keystore import KeystoreError, load_account
@@ -221,8 +221,8 @@ def hard_cancel(body: HardCancelRequest, request: Request) -> dict:
         raise refuse(400, "unknown-chain", str(e)) from e
     try:
         return state.mech.hard_cancel(body.chain)
-    except NonceRefused as e:
-        raise refuse(409, e.rule, str(e)) from e
+    except NonceRefused as e:  # closed: Connect is shutting down, not a conflict
+        raise refuse(503 if e.rule == RULE_QUEUE_CLOSED else 409, e.rule, str(e)) from e
     except HardCancelRefused as e:
         raise refuse(400, e.rule, str(e)) from e
     except MechPriceExceeded as e:  # mech-client's own cap, before anything paid

@@ -492,7 +492,10 @@ and the queue's settings. The mech's answer decides the slot: 200 holds it;
 `CONNECTION_CONFIGS_CONFIG_MECH_GAP_RETRIES` times (default 3), then refuses as
 `mech-nonce-gap`; a 401 whose reason is exactly
 `wire nonce below sender's next expected slot` means the nonce is taken
-(`mech-nonce-taken`); any other 4xx, a 402 after the top-up retry included,
+(`mech-nonce-taken`), and when no slot of the safe's is at that nonce the mech
+that answered stays in flight there until `mapNonces` passes it; any other 401
+holds the nonce like a 5xx, since it may be the same answer reworded; any
+other 4xx, a 402 after the top-up retry included,
 frees it (`mech-request-rejected`), as does mech-client's auto top-up failing
 on the safe's side (`OffchainTopUpFailed`). When that top-up landed and the mech
 still answered 402, the amount it deposited into the balance tracker is
@@ -515,7 +518,7 @@ hard cancel is `POST /mech-queue/hard-cancel` with `{chain, password}`
 re-decrypted, rate-limited, audited — authorizes it, never a bearer token). It
 is refused (409, `mech-queue-not-stalled`) until the stall is that old;
 otherwise it sends one on-chain marketplace request from the safe, to the mech
-of the stuck slot, capped by that mech's default `max_payment` and signed
+of the stuck slot (or the one that answered its nonce taken), capped by that mech's default `max_payment` and signed
 through the guard like any on-chain mech request, which consumes the stuck
 `mapNonces` (mech-client's `allocator.hard_cancel`). It answers
 `{tx_hash, nonce, mech, paid}`, is audited as `mech_hard_cancel`, and restarts
@@ -525,7 +528,8 @@ above that mech's default budget, no tool it publishes (with why its metadata
 could not be read) — is settled before the queue is held, so it costs no
 window. Every refusal names its rule (`unknown-chain`, `hard-cancel-no-slot`,
 `over-max-payment`, `hard-cancel-no-tool`, `guardrail`,
-`mech-queue-not-stalled`) and is audited as a `refusal`; a request that fails
+`mech-queue-not-stalled`, and `mech-queue-closed`, a 503, once Connect is
+shutting down) and is audited as a `refusal`; a request that fails
 once sent answers a fixed 502 and is audited as `mech_hard_cancel_failed` with
 its nonce, mech and error class, since it may have paid. `GET /mech-queue`
 (origin-gated) reports each safe's queue per chain — `stalled`,
@@ -537,7 +541,8 @@ refuses every request (`mech-queue-unreadable`) and an unwritable one new ones
 (`mech-queue-unwritable`). The store is one allocator's: mech-client locks it
 (`mech_nonces.lock`), a second allocator on it — another Connect on the same
 STORE_PATH — is refused (`mech-queue-locked`), and Connect releases it on
-shutdown. Every refusal above is recorded as an activity
+shutdown, after which a request still arriving is refused
+(`mech-queue-closed`). Every refusal above is recorded as an activity
 `refusal` with its `rule`, and leaves a caller's `request_id` free to send
 again, since nothing reached the mech; only `mech-answer-unknown` is recorded
 as possibly paid for — a 5xx, or a transport error after the request was
