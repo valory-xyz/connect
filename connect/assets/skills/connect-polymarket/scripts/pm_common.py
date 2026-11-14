@@ -348,18 +348,25 @@ class ConnectSigner(signer_client.SignerClient):
         )
         return self.sign_digest(digest)
 
-    def safe_transaction(
-        self, to: str, data: str, value: int = 0, request_id: str | None = None
+    def safe_transaction(  # pylint: disable=too-many-arguments
+        self,
+        to: str,
+        data: str,
+        value: int = 0,
+        request_id: str | None = None,
+        intent: dict | None = None,
     ) -> str:
         """Have the service safe make this call on Polygon; returns tx_hash.
 
         Thin wrapper over the inherited idempotent send: the sibling client
         fills nonce/gas, signs, broadcasts, and replays the same request_id
-        on a lost response so a retry never double-spends.
+        on a lost response so a retry never double-spends. `intent` is what
+        the call may do; the server refuses a value-moving call without one.
         """
         return self.send_transaction(
             {"to": to_checksum_address(to), "value": value, "data": data},
             request_id=request_id,
+            intent=intent,
         )
 
     def wait_receipt(self, tx_hash: str, timeout: float = 300) -> dict:

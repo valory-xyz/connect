@@ -32,6 +32,8 @@ no safe nonce appears anywhere here. Nothing is signed over it, so nobody has
 to predict it; the Safe reads and increments its own.
 """
 
+from dataclasses import dataclass
+
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from web3 import Web3
@@ -55,6 +57,9 @@ OPERATION_CALL = 0
 ZERO_ADDRESS = "0x" + "00" * 20
 
 APPROVE_SELECTOR = "095ea7b3"  # approve(address,uint256)
+# Safe.approveHash(bytes32): an owner pre-approves a safe transaction by hash,
+# which anyone may then execute with no further signature
+APPROVE_HASH_SELECTOR = "d4d9bdcd"
 DEPOSIT_SELECTOR = "b6b55f25"  # deposit(uint256) — mech BalanceTracker top-up
 
 # EIP-712 typehashes of the Safe v1.3.0+ SafeMessage wrapping (unchanged in
@@ -120,9 +125,20 @@ def prevalidated_signature(owner: str) -> bytes:
     )
 
 
+def calldata_hex(data: str | None) -> str:
+    """Return calldata as bare lowercase hex, its `0x`/`0X` prefix removed.
+
+    The one reading of a calldata string every selector check shares: a
+    signer reads `0X...` as the same bytes as `0x...`, so a check that
+    strips only the lowercase prefix would miss the selector it guards.
+    """
+    raw = data or ""
+    return (raw[2:] if raw[:2].lower() == "0x" else raw).lower()
+
+
 def _hex_to_bytes(value: str) -> bytes:
     """Read 0x-hex (or bare hex) as bytes."""
-    return bytes.fromhex(value.removeprefix("0x"))
+    return bytes.fromhex(calldata_hex(value))
 
 
 def exec_transaction(target: str, value: int, data: str, owner: str) -> str:
@@ -154,7 +170,7 @@ def decode_approve(data: str) -> str | None:
 
     None means the calldata is not a decodable approve.
     """
-    calldata = (data or "").removeprefix("0x").lower()
+    calldata = calldata_hex(data)
     if not calldata.startswith(APPROVE_SELECTOR):
         return None
     try:
@@ -170,7 +186,7 @@ def decode_deposit(data: str) -> int | None:
     None means the calldata is not a decodable deposit — the guard treats
     that as "not the transaction the allowance covers", never as zero.
     """
-    calldata = (data or "").removeprefix("0x").lower()
+    calldata = calldata_hex(data)
     if not calldata.startswith(DEPOSIT_SELECTOR):
         return None
     try:
@@ -178,3 +194,56 @@ def decode_deposit(data: str) -> int | None:
     except Exception:  # pylint: disable=broad-exception-caught
         return None
     return int(amount)
+
+
+@dataclass(frozen=True)
+class SafeExec:
+    """An execTransaction, decoded: the call the safe makes and its refund fields.
+
+    The one decoder of these bytes: the guard judges them and the intent gate
+    simulates the call inside, so the two cannot read them differently.
+    """
+
+    to: str
+    value: int
+    data: str
+    operation: int
+    gas_price: int
+    gas_token: str
+    refund_receiver: str
+
+    @classmethod
+    def decode(cls, data: str) -> "SafeExec":
+        """Decode execTransaction calldata; ValueError when it will not read."""
+        calldata = calldata_hex(data)
+        if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
+            raise ValueError("not execTransaction calldata")
+        try:
+            decoded = tuple(
+                abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
+            )
+        except Exception as e:
+            raise ValueError(f"could not decode execTransaction calldata: {e}") from e
+        return cls(
+            to=str(decoded[0]),
+            value=int(decoded[1]),
+            data="0x" + bytes(decoded[2]).hex(),
+            operation=int(decoded[3]),
+            gas_price=int(decoded[6]),
+            gas_token=str(decoded[7]),
+            refund_receiver=str(decoded[8]),
+        )
+
+    @property
+    def pays_refund(self) -> bool:
+        """Whether the safe would also pay a gas refund, outside the call itself."""
+        return (
+            self.gas_price != 0
+            or self.gas_token.lower() != ZERO_ADDRESS
+            or self.refund_receiver.lower() != ZERO_ADDRESS
+        )
+
+
+def is_exec_transaction(data: str) -> bool:
+    """Whether calldata calls execTransaction."""
+    return calldata_hex(data).startswith(EXEC_TRANSACTION_SELECTOR)

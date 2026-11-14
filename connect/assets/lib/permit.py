@@ -186,7 +186,17 @@ def approval_call(
         ["address", "address", "uint160", "uint48"],
         [to_checksum_address(token), to_checksum_address(spender), amount, expiry],
     )
-    return {"to": permit2, "data": "0x" + data.hex(), "what": "approve router"}
+    return {
+        "to": permit2,
+        "data": "0x" + data.hex(),
+        "what": "approve router",
+        # Permit2's own grant: the gate reads it as an approval of the token
+        "intent": {
+            "approvals": [
+                {"token": token.lower(), "spender": spender.lower(), "amount": amount}
+            ]
+        },
+    }
 
 
 def signed_action(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals

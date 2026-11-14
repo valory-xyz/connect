@@ -4635,6 +4635,7 @@ class _SafeChain:
 
     def __init__(self, monkeypatch, balances: dict, approved=()) -> None:
         """Hold `balances`, (contract, owner, id) -> units, and `approved` pairs."""
+        self.intents: list = []  # the intent each safe call carried
         self.balances = {_key(*k): units for k, units in balances.items()}
         self.approved = {_key(*pair) for pair in approved}
         self.sent: list = []
@@ -4644,10 +4645,13 @@ class _SafeChain:
         ):
             monkeypatch.setattr(pm, name, read)
 
-    def safe_transaction(self, to, data, value=0, request_id=None) -> str:
+    def safe_transaction(  # pylint: disable=too-many-arguments
+        self, to, data, value=0, request_id=None, intent=None
+    ) -> str:
         """Record one safe call and apply it as the chain would."""
         target, data = _call(to, data)
         self.sent.append((target, data))
+        self.intents.append(intent)
         args = bytes.fromhex(data[10:])
         if data.startswith(_APPROVAL):
             operator, granted = abi_decode(["address", "bool"], args)
@@ -4722,6 +4726,8 @@ def test_v2_position_funds_through_position_manager(monkeypatch, command) -> Non
         for token_id in (_V2_HELD, _V1_HELD):
             funds.cmd_return_position(cs, token_id, None)
         moved = cs.sent
+        # a position leaves the safe to the DW, the one recipient it names
+        assert cs.intents == [{"recipients": [DW_ADDR.lower()]}] * 2
 
     assert moved == [
         (
@@ -4730,6 +4736,37 @@ def test_v2_position_funds_through_position_manager(monkeypatch, command) -> Non
         ),
         (_CTF, _calldata(_TRANSFER, holder, receiver, _V1_HELD, 7_000_000, b"")),
     ]
+
+
+def test_wrap_and_top_up_carry_their_intents(monkeypatch) -> None:
+    """The approval the wrap grants, what it spends, and the top-up's recipient."""
+    cs = _SafeChain(monkeypatch, {})
+    monkeypatch.setattr(pm, "erc20_balance_of", lambda w3, token, owner: 5_000_000)
+    monkeypatch.setattr(funds, "dw_or_exit", lambda cs: DW_ADDR)
+    monkeypatch.setattr(pm, "print_json", lambda payload: None)
+    funds.cmd_wrap(cs, 2.0)
+    funds.cmd_top_up(cs, 1.0)
+    usdc_e, onramp, pusd = (
+        a.lower() for a in (pm.USDC_E, pm.COLLATERAL_ONRAMP, pm.PUSD)
+    )
+    assert cs.intents == [
+        {"approvals": [{"token": usdc_e, "spender": onramp, "amount": 2_000_000}]},
+        {"spend": {usdc_e: 2_000_000}},
+        {"spend": {pusd: 1_000_000}, "recipients": [DW_ADDR.lower()]},
+    ]
+
+
+def test_the_connect_signer_sends_the_intent_it_is_given(monkeypatch) -> None:
+    """ConnectSigner.safe_transaction forwards `intent` to /safe-transaction."""
+    sent: list = []
+    cs = pm.ConnectSigner.__new__(pm.ConnectSigner)
+    cs.chain = "polygon"
+    monkeypatch.setattr(
+        cs, "_post", lambda path, payload: sent.append(payload) or {"tx_hash": "0x1"}
+    )
+    cs.safe_transaction(pm.PUSD, "0x", intent={"spend": {"native": 0}})
+    cs.safe_transaction(pm.PUSD, "0x", intent={})
+    assert [p["intent"] for p in sent] == [{"spend": {"native": 0}}, {}]
 
 
 # A resolved binary V2 market, as the data API lists the safe's sides of it.
@@ -4786,6 +4823,20 @@ def test_v2_position_claim_through_router(monkeypatch, command, won) -> None:
         granted = [(_CTF, _calldata(_APPROVE_ALL, a, True)) for a in _ADAPTERS]
         assert sorted(approvals) == sorted([*granted[: 2 * won], _ROUTER_APPROVAL])
         assert claims == [(_ROUTER, claim), *[_adapter_claim(0)] * 2 * won]
+    # every call carries the intent the server re-checks: an approval its
+    # grant (setApprovalForAll as the maximum), a claim nothing to spend
+    for (target, data), intent in zip(cs.sent, cs.intents):
+        if data.startswith(_APPROVAL):
+            operator, _ = abi_decode(["address", "bool"], bytes.fromhex(data[10:]))
+            assert intent["approvals"] == [
+                {
+                    "token": target.lower(),
+                    "spender": operator.lower(),
+                    "amount": 2**256 - 1,
+                }
+            ]
+        else:
+            assert intent == {}
 
 
 def test_v2_position_losing_row_not_claimed(monkeypatch, capsys) -> None:

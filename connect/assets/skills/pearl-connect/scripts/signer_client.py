@@ -26,11 +26,25 @@ goes straight to the chain RPC. No key material in this process.
 Usage:
     from signer_client import connect
     w3, signer = connect("gnosis")
-    tx_hash = w3.eth.send_transaction({"to": "0x...", "value": 0, "data": "0x"})
+    tx_hash = signer.send_transaction(
+        {"to": "0x...", "value": 10**16, "data": "0x"},
+        intent={"spend": {"native": 10**16}, "recipients": ["0x..."]},
+    )
+
+A call that moves value needs an intent, which only signer.send_transaction
+carries: w3.eth.send_transaction and .transact() suit calls that move nothing.
+
+To run another script under a narrower token, mint one and hand it over in
+the environment; every .mcp.json reader here picks it up (see _signing_token):
+
+    token = signer.mint_token({"scopes": ["read", "tx"], ...})
+    subprocess.run([sys.executable, "job.py"],
+                   env={**os.environ, TOKEN_ENV_VAR: token}, check=True)
 """
 
 import http.client
 import json
+import os
 import sys
 import typing as t
 import urllib.error
@@ -42,6 +56,8 @@ from web3 import HTTPProvider, Web3
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 
 MCP_SERVER_NAME = "pearl-connect"
+# hands a script a narrower token than .mcp.json's; see _signing_token
+TOKEN_ENV_VAR = "PEARL_CONNECT_TOKEN"  # nosec B105 - a variable name
 SEND_ATTEMPTS = 3
 
 # web3 middlewares that only earn their place when the sending process also
@@ -106,7 +122,9 @@ class SignerClient:
         except urllib.error.HTTPError as e:
             _raise_with_detail(e)
 
-    def send_transaction(self, tx: dict, request_id: str | None = None) -> str:
+    def send_transaction(
+        self, tx: dict, request_id: str | None = None, intent: dict | None = None
+    ) -> str:
         """Have the service safe make this call; retries stay idempotent.
 
         `tx` is the call the *safe* makes — to, value, data. The safe is the
@@ -122,11 +140,16 @@ class SignerClient:
         request_id = request_id or str(uuid.uuid4())
         payload = {
             "chain": self.chain,
-            "to": tx["to"],
+            "target": tx["to"],
             "value": _to_int(tx.get("value", 0)),
             "data": tx.get("data", "0x"),
             "request_id": request_id,
         }
+        # what the call may do; the server refuses a value-moving call without
+        # one, after simulating it (see "Intents" in SKILL.md)
+        intent = intent if intent is not None else tx.get("intent")
+        if intent is not None:
+            payload["intent"] = intent
         # tx["gas"], if the caller set it, was estimated against this inner call;
         # the server wraps it in an execTransaction whose gas is larger (safe
         # dispatch, signature check, nonce write). Forwarding the inner estimate
@@ -145,6 +168,15 @@ class SignerClient:
             f"send not confirmed after {SEND_ATTEMPTS} attempts ({last_error}); "
             f"retry with request_id='{request_id}' to avoid double-spending"
         ) from last_error
+
+    def mint_token(self, grant: dict) -> str:
+        """Mint a token no wider than this client's, and return it.
+
+        `grant` is POST /tokens' body: scopes, value caps, max_mech_payment,
+        max_mech_payment_per_session (required with `mech`), expires_at
+        (required). connect() reads /wallet, so a script's token needs `read`.
+        """
+        return self._post("/tokens", grant)["token"]
 
     def sign_digest(self, digest: str | bytes) -> str:
         """Sign a raw 32-byte digest (0x-hex or bytes), unprefixed."""
@@ -210,11 +242,36 @@ class SignerProvider(HTTPProvider):
         return super().make_request(method, params)
 
 
-def load_mcp_config_dir(start: Path | None = None) -> tuple[str, str, Path]:
+def _signing_token(token: str | None, workspace_token: str) -> str:
+    """Pick the signing token: `token`, else $PEARL_CONNECT_TOKEN, else the root.
+
+    Only an absent value falls back. A blank one is a handover that failed (a
+    launcher whose mint printed nothing), and falling back would sign with the
+    widest token there is, so it is an error naming where it came from.
+    """
+    source = "token"
+    if token is None:
+        token, source = os.environ.get(TOKEN_ENV_VAR), f"${TOKEN_ENV_VAR}"
+    if token is None:
+        return workspace_token
+    if not token.strip():
+        raise SignerRequestError(
+            f"{source} is set but empty; refusing to fall back to the workspace "
+            "token — mint the narrower token again, or unset it"
+        )
+    return token.strip()
+
+
+def load_mcp_config_dir(
+    start: Path | None = None, token: str | None = None
+) -> tuple[str, str, Path]:
     """Find .mcp.json (cwd upwards); return (base_url, token, containing_dir).
 
-    The containing directory is the agent workspace — sibling skills that
-    keep their own state files there use it to locate that root.
+    The token is the one to sign with, resolved here and only here by
+    `_signing_token` from `token` and .mcp.json's, so every bundled script
+    honours a narrower token it was handed. The containing directory is the
+    agent workspace — sibling skills that keep their own state files there
+    use it to locate that root.
     """
     directory = (start or Path.cwd()).resolve()
     for candidate in (directory, *directory.parents):
@@ -224,14 +281,16 @@ def load_mcp_config_dir(start: Path | None = None) -> tuple[str, str, Path]:
                 MCP_SERVER_NAME
             ]
             base_url = entry["url"].rstrip("/").removesuffix("/mcp")
-            token = entry["headers"]["Authorization"].removeprefix("Bearer ")
-            return base_url, token, candidate
+            workspace_token = entry["headers"]["Authorization"].removeprefix("Bearer ")
+            return base_url, _signing_token(token, workspace_token), candidate
     raise FileNotFoundError(".mcp.json not found in cwd or parents")
 
 
-def load_mcp_config(start: Path | None = None) -> tuple[str, str]:
+def load_mcp_config(
+    start: Path | None = None, token: str | None = None
+) -> tuple[str, str]:
     """Find .mcp.json (cwd upwards) and return (server_base_url, token)."""
-    base_url, token, _ = load_mcp_config_dir(start)
+    base_url, token, _ = load_mcp_config_dir(start, token)
     return base_url, token
 
 
@@ -255,9 +314,12 @@ def _strip_unused_send_middleware(w3: Web3) -> None:
             )
 
 
-def connect(chain: str) -> tuple[Web3, SignerClient]:
-    """Web3 instance whose sends go through the signer, plus the raw client."""
-    base_url, token = load_mcp_config()
+def connect(chain: str, token: str | None = None) -> tuple[Web3, SignerClient]:
+    """Web3 instance whose sends go through the signer, plus the raw client.
+
+    `token` is the one to sign with, if given; see `_signing_token`.
+    """
+    base_url, token = load_mcp_config(token=token)
     signer = SignerClient(base_url, token, chain)
     entry = signer.chain_info(chain)
     w3 = Web3(provider=SignerProvider(entry["rpc"], signer))

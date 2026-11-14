@@ -28,6 +28,9 @@ import pytest
 from connect.config import (
     FUND_REQUIREMENTS_ENV,
     LOG_LEVEL_ENV,
+    MECH_GAP_RETRIES_ENV,
+    MECH_HARD_CANCEL_AFTER_ENV,
+    MECH_SETTLE_TIMEOUT_ENV,
     MINUTES_PER_RUN_ENV,
     SAFES_ENV,
     STORE_PATH_ENV,
@@ -197,8 +200,36 @@ def test_invalid_minutes_per_run_is_a_configuration_error(
         load_config(base_env(tmp_path) | {MINUTES_PER_RUN_ENV: raw})
 
 
+def test_mech_settle_timeout_and_gap_retries_are_configurable(tmp_path: Path) -> None:
+    """Both default as before; any whole number >= 0 is taken; junk is refused."""
+    env = base_env(tmp_path)
+    config = load_config(env)
+    assert (config.mech_settle_timeout, config.mech_gap_retries) == (1800, 3)
+    config = load_config(
+        env | {MECH_SETTLE_TIMEOUT_ENV: " 600 ", MECH_GAP_RETRIES_ENV: "0"}
+    )
+    assert (config.mech_settle_timeout, config.mech_gap_retries) == (600, 0)
+    for name in (MECH_SETTLE_TIMEOUT_ENV, MECH_GAP_RETRIES_ENV):
+        for raw in ("-1", "1.5", "soon"):
+            with pytest.raises(ValueError, match=name):
+                load_config(env | {name: raw})
+
+
 def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:
     """Test unknown chain lookup raises."""
     config = load_config(base_env(tmp_path))
     with pytest.raises(ValueError, match="unknown chain"):
         config.chain("solana")
+
+
+def test_the_hard_cancel_window_outlasts_the_settle_timeout(tmp_path: Path) -> None:
+    """Six hours by default; configurable, but never within the settle timeout."""
+    env = base_env(tmp_path)
+    assert load_config(env).mech_hard_cancel_after == 21600
+    config = load_config(env | {MECH_HARD_CANCEL_AFTER_ENV: "3600"})
+    assert config.mech_hard_cancel_after == 3600
+    for raw in ("1800", "60"):
+        with pytest.raises(ValueError, match="must be longer than"):
+            load_config(env | {MECH_HARD_CANCEL_AFTER_ENV: raw})
+    with pytest.raises(ValueError, match=MECH_HARD_CANCEL_AFTER_ENV):
+        load_config(env | {MECH_HARD_CANCEL_AFTER_ENV: "soon"})

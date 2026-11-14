@@ -72,9 +72,9 @@ For **any** on-chain action — checking balances, sending transactions,
 acting through the service safe, making mech requests, signing mech-request
 digests — use the **pearl-connect skill**. It documents which tool
 to reach for, `scripts/signer_client.py` for web3.py code run by spawned
-scripts, and the guardrail: a signing gate that may refuse a request, always
-naming the rule it violated. You cannot lift it yourself — when a task needs
-more than it allows, tell the user what was blocked and why.
+scripts, the guardrail, and **intents**. Either may refuse a request, always
+naming the rule it violated. You cannot lift them yourself — when a task needs
+more than they allow, tell the user what was blocked and why.
 
 Don't hand-roll signing, key loading, or raw RPC sends — the skill's paths
 are the supported, audited ones. Start any on-chain task with `wallet_info`
@@ -144,6 +144,13 @@ Robinhood Chain also hosts **Pons**, a memecoin launchpad, via the
   its Uniswap pool, paying in ETH or USDG.
 - **Launch a token** — name, symbol, logo and an optional first buy, then
   claim the creator fees it earns.
+
+**`arbitrum_one`** and **`celo`** — no chain-specific recipe yet: report
+balances, put the safe's funds to work with `safe_transaction`, and read or
+decode contracts with `chain_call`, `get_abi` and `decode_calldata`. Each
+chain's `wallet_info` entry says whether a mech marketplace is there
+(`marketplace`); where it is `false`, say up front that mech requests are not
+available on that chain rather than trying one.
 
 Keep it short: a line of intro, two or three examples drawn from the chain
 they actually have, an invitation. The skills carry the details once they

@@ -17,13 +17,87 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Shared between connect/mech.py and connect/mech_allowances.py."""
+"""Errors and shapes shared by connect/mech.py and mech_allowances.py."""
 
+import logging
 import typing as t
+
+from mech_client import NonceRefused, RequestIdMismatch, RequestIdRpcError
+
+from connect.signer_errors import SendUnknown, SignerError
+
+logger = logging.getLogger("agent")
 
 
 class MechError(Exception):
     """A mech request failure with an agent-facing message."""
+
+
+class MechNotSent(MechError):
+    """A request refused or failed before anything reached the mech.
+
+    Nothing was paid for, so a caller's request_id is free to use again.
+    """
+
+
+class MechDepositUnknown(MechError):
+    """The 402 top-up's deposit was broadcast and never answered: it may have landed.
+
+    The mech answered the request 402, so it holds nothing at its nonce and
+    the nonce is free; the spend is not settled, so `request()` keeps a
+    caller's request_id as spend-uncertain rather than freeing it.
+    """
+
+    def __init__(self, tx_hash: str) -> None:
+        """Initialize."""
+        super().__init__(
+            "the mech asked for a top-up (HTTP 402), and the safe's deposit "
+            f"{tx_hash} was broadcast without an answer from the RPC, so it may "
+            "have landed (the cause is in Connect's log). The request itself "
+            "did not reach the mech. Read the deposit's receipt "
+            "(transaction_status) before sending again: a resend may top up "
+            "again."
+        )
+        self.tx_hash = tx_hash
+
+
+def top_up_failure(error: Exception) -> Exception:
+    """Return the signer's failure under `error`, else `error` itself.
+
+    mech-client's agent-mode executor wraps every Safe send failure, the 402
+    top-up's included, in a bare Exception, which no `not_sent` can name: a
+    deposit the RPC never answered becomes MechDepositUnknown.
+    """
+    cause: BaseException | None = error
+    while cause is not None:
+        if isinstance(cause, SendUnknown):
+            return MechDepositUnknown(cause.tx_hash)
+        if isinstance(cause, SignerError):
+            return cause
+        cause = cause.__cause__
+    return error
+
+
+class MechAnswerUnknown(MechError):
+    """The mech's answer to a signed request was lost: it may be paid for.
+
+    `pending_request_ids` are registered for mech_result to collect, since
+    the mech may still store and deliver the request; `deposited` is what an
+    auto top-up paid into the balance tracker on the way, else 0.
+    """
+
+    def __init__(
+        self, message: str, pending_request_ids: list[str], deposited: int = 0
+    ) -> None:
+        """Initialize."""
+        super().__init__(message, pending_request_ids, deposited)
+        self.message = message
+        self.pending_request_ids = pending_request_ids
+        self.deposited = deposited
+
+    def __str__(self) -> str:
+        """Return the error a caller reads."""
+        return self.message
 
 
 class MechUnknownRequest(MechError):
@@ -48,3 +122,67 @@ class PricedMech(t.NamedTuple):
     # native mechs, token base units for OLAS/USDC ones)
     rate: int
     payment_type: str
+
+
+class PendingDelivery(t.NamedTuple):
+    """Where to resume looking for a request whose delivery had not arrived.
+
+    `from_block` is the request's own transaction block: the on-chain watcher
+    otherwise scans from the head minus a hundred blocks, which finds nothing
+    for a request that has been waiting a while — exactly the case this exists
+    to serve.
+    """
+
+    chain: str
+    mech: str
+    service_id: int
+    offchain: bool
+    from_block: int | None
+
+
+def published_tools(document: t.Any) -> list[str]:
+    """Return the tool names a mech's metadata document publishes.
+
+    The document is published by the mech operator, so neither its shape nor
+    its contents are ours to assume. A `tools` that is not a list must not be
+    iterated (a bare string yields one "tool" per character), and an entry that
+    is not a name must not be stringified into one: both invent
+    plausible-looking tools that no mech serves.
+    """
+    raw = (document if isinstance(document, dict) else {}).get("tools")
+    if not isinstance(raw, list):
+        return []
+    return [name for name in raw if isinstance(name, str) and name.strip()]
+
+
+def request_key(request_id: object) -> str:
+    """Normalize a caller's request id: mech-client's are bare lowercase hex."""
+    return str(request_id).lower().removeprefix("0x")
+
+
+# what a caller is told of a failure whose words are a library's, which may
+# name an RPC URL and its key; the cause goes to the log
+UNSAID = "mech-client failed (the cause is in Connect's log)"
+
+
+def request_label(chain: str, mech: str, tool: str, request_id: str | None) -> str:
+    """Name a mech request in the log: its chain, mech, tool and id."""
+    return f"mech request to {mech} on {chain} (tool {tool}, id {request_id})"
+
+
+def said(error: Exception, context: str) -> str:
+    """Return what a caller is told of a failure on the mech path.
+
+    Connect's own errors and refusals (MechError and the signer's, rule-named),
+    mech-client's NonceRefused, its id check and its unreachable-RPC id
+    derivation (which names only the error class) keep their words; anything
+    else is a library's, so it is UNSAID and logged under `context` (what
+    failed, on which chain and mech), which tells concurrent failures apart.
+    """
+    if isinstance(
+        error,
+        (MechError, SignerError, NonceRefused, RequestIdMismatch, RequestIdRpcError),
+    ):
+        return str(error)
+    logger.warning("%s", context, exc_info=error)
+    return UNSAID

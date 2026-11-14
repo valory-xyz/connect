@@ -23,9 +23,11 @@ import io
 import json
 import sys
 import threading
+import time
 import typing as t
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from eth_abi import decode as abi_decode
@@ -35,13 +37,15 @@ from eth_account.signers.local import LocalAccount
 from eth_utils import to_checksum_address
 from hexbytes import HexBytes
 from web3 import Web3
-from web3.exceptions import TimeExhausted, TransactionNotFound
+from web3.exceptions import TimeExhausted, TransactionNotFound, Web3RPCError
 
 from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechService
+from connect.server import auth as auth_module
 from connect.server.app import create_app
+from connect.server.auth import GrantStore
 from connect.settings import (
     MODE_UNRESTRICTED,
     Protected,
@@ -345,11 +349,17 @@ class FakeEth:
         self.fail_broadcast = False
         self.base_fee: int | None = 10**9
         self.priority_fee_raises = False
+        self.contracts: set[str] = set()
+        self.receipt_waits: list[float] = []  # the timeout of each receipt wait
         self._lock = threading.Lock()
 
     def get_balance(self, address: str) -> int:
         """Return the fixed balance."""
         return self.balance
+
+    def get_code(self, address: str) -> bytes:
+        """Return code for the addresses configured as contracts, else none."""
+        return b"\x01" if address.lower() in self.contracts else b""
 
     def get_transaction_receipt(self, tx_hash: object) -> dict:
         """Return the configured receipt or raise TransactionNotFound (as web3 does)."""
@@ -360,7 +370,8 @@ class FakeEth:
     def wait_for_transaction_receipt(
         self, tx_hash: object, timeout: float = 120, poll_latency: float = 0.1
     ) -> dict:
-        """Return the configured receipt or raise TimeExhausted."""
+        """Record the timeout; return the configured receipt or raise TimeExhausted."""
+        self.receipt_waits.append(timeout)
         if self.receipt is None:
             raise TimeExhausted(f"tx not mined within {timeout}s")
         return self.receipt
@@ -396,7 +407,8 @@ class FakeEth:
     def send_raw_transaction(self, raw: bytes) -> HexBytes:
         """Record the raw tx and return its keccak hash."""
         if self.fail_broadcast:
-            raise ValueError("nonce too low")
+            # what web3 7 raises for a node's rejection: not a ValueError
+            raise Web3RPCError("nonce too low")
         with self._lock:
             self.sent.append(bytes(raw))
         return HexBytes(Web3.keccak(bytes(raw)))
@@ -414,6 +426,90 @@ class FakeMiddlewareOnion:
         self.injected.append((middleware, layer))
 
 
+NATIVE_LOG = "0x" + "ee" * 20
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def native_transfer_log(src: str, dst: str, amount: int) -> dict:
+    """Return the synthetic log eth_simulateV1's traceTransfers emits for value."""
+    return {
+        "address": NATIVE_LOG,
+        "topics": [
+            TRANSFER_TOPIC,
+            "0x" + src.lower().removeprefix("0x").rjust(64, "0"),
+            "0x" + dst.lower().removeprefix("0x").rjust(64, "0"),
+        ],
+        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
+    }
+
+
+class FakeProvider:
+    """eth_simulateV1 stand-in: the call succeeds, and native value is logged.
+
+    `logs` adds logs to every simulation; `status` and `error` make it revert;
+    `unavailable` makes the RPC refuse the method, as forno.celo.org does.
+    """
+
+    def __init__(self) -> None:
+        """Initialize."""
+        self.simulated: list[dict] = []
+        self.logs: list[dict] = []
+        self.status = "0x1"
+        self.error: dict | str | None = None
+        self.unavailable = False
+        self.traced = True  # False: an RPC that ignores traceTransfers
+        self.symbols: dict[str, str] = {}  # token -> symbol() answer, 0x-hex
+
+    def make_request(self, method: str, params: list) -> dict:
+        """Answer eth_simulateV1, and a token's symbol() read with no answer."""
+        if method == "eth_call":
+            return {"result": self.symbols.get(params[0]["to"], "0x")}
+        assert method == "eth_simulateV1"
+        # what the gate's diff depends on: without traceTransfers a real node
+        # emits no native Transfer logs, and a plain value send would look
+        # like it moves nothing
+        assert params[0]["traceTransfers"] is True
+        assert params[0]["validation"] is False
+        assert params[1] == "latest"
+        if self.unavailable:
+            return {"error": {"code": -32601, "message": "method not whitelisted"}}
+        call, _ = params[0]["blockStateCalls"][0]["calls"]
+        self.simulated.append(call)
+        logs = list(self.logs)
+        value = int(call["value"], 16)
+        if value and self.traced:
+            logs.insert(0, native_transfer_log(call["from"], call["to"], value))
+        result: dict[str, t.Any] = {
+            "status": self.status,
+            "returnData": "0x",
+            "gasUsed": "0x5208",
+        }
+        result["logs"] = logs
+        if self.error is not None:
+            result["error"] = self.error
+        block = params[0]["blockStateCalls"][0]
+        return {"result": [{"calls": [result, canary_result(block, self.traced)]}]}
+
+
+def canary_result(block: dict, traced: bool = True) -> dict:
+    """Answer the gate's traceTransfers canary as a node would, or would not.
+
+    `block` is the simulated block, whose second call is the canary. A real
+    node moves the canary's value only if the block's state override funds
+    its sender: unfunded, the transfer fails and logs nothing.
+    """
+    canary = block["calls"][1]
+    value = int(canary["value"], 16)
+    overrides = {
+        address.lower(): state for address, state in block["stateOverrides"].items()
+    }
+    balance = int(overrides.get(canary["from"].lower(), {}).get("balance", "0x0"), 16)
+    if not traced or balance < value:
+        return {"status": "0x0", "returnData": "0x", "gasUsed": "0x5208", "logs": []}
+    logs = [native_transfer_log(canary["from"], canary["to"], value)]
+    return {"status": "0x1", "returnData": "0x", "gasUsed": "0x5208", "logs": logs}
+
+
 class FakeW3:
     """Minimal Web3 stand-in for signer tests."""
 
@@ -421,6 +517,7 @@ class FakeW3:
         """Initialize."""
         self.eth = FakeEth()
         self.middleware_onion = FakeMiddlewareOnion()
+        self.provider = FakeProvider()
 
     def to_wei(self, value: float, unit: str) -> int:
         """Convert gwei to wei."""
@@ -478,9 +575,14 @@ def guard(
 @pytest.fixture
 def mech_service(
     test_signer: Signer, app_config: AppConfig, activity: ActivityLog, guard: Guard
-) -> MechService:
-    """Mech service over the fake-backed signer (never contacts a chain)."""
-    return MechService(test_signer, app_config, activity, guard)
+) -> t.Iterator[MechService]:
+    """Mech service over the fake-backed signer (never contacts a chain).
+
+    Closed after the test: it holds STORE_PATH's queue store.
+    """
+    service = MechService(test_signer, app_config, activity, guard)
+    yield service
+    service.queue.close()
 
 
 @pytest.fixture
@@ -612,3 +714,41 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """End a run that stopped on a failed collection with exit 1, not 2."""
     if exitstatus == pytest.ExitCode.INTERRUPTED and session.testsfailed:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+@pytest.fixture(autouse=True)
+def _no_handed_token() -> t.Iterator[None]:
+    """Keep a developer's $PEARL_CONNECT_TOKEN out of every test.
+
+    The bundled clients read it wherever they load .mcp.json, and tox passes
+    the whole environment through. Its own MonkeyPatch, not the shared
+    fixture: requesting that from an autouse fixture here would make every
+    test's monkeypatch undo last, after the modules' own autouse teardowns.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("PEARL_CONNECT_TOKEN", raising=False)
+        yield
+
+
+def grant_store(token: str) -> GrantStore:
+    """Return a GrantStore over a signer that holds no request id."""
+    return GrantStore(token, held=lambda request_id, via_safe: False)
+
+
+# a minted token's expiry, far enough out never to pass during a test
+TOKEN_EXPIRES_AT = 4_000_000_000
+
+
+def advance_token_clock(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Move the clock the grant store reads expiries by, and nothing else."""
+    real = time.time
+    monkeypatch.setattr(
+        auth_module,
+        "time",
+        SimpleNamespace(time=lambda: real() + seconds, monotonic=time.monotonic),
+    )
+
+
+def pay(to: str, value: int) -> dict:
+    """Return the intent for sending `value` native to `to`, and nothing else."""
+    return {"spend": {"native": value}, "recipients": [to]}

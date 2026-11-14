@@ -27,7 +27,9 @@ import threading
 import typing as t
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from hexbytes import HexBytes
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -36,21 +38,19 @@ from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
-from connect.server import pearl_routes, settings_routes, signer_routes
+from connect.server import pearl_routes, settings_routes, signer_routes, strict
 from connect.server.auth import (
     ALLOWED_HOSTS,
     AuthFailureLimiter,
     AuthMiddleware,
+    GrantStore,
     RequireAuth,
     require_local_origin,
 )
-from connect.server.mcp_tools import (
-    MAX_RECEIPT_TIMEOUT,
-    RECEIPT_POLL_SECONDS,
-    build_mcp,
-)
+from connect.server.mcp_tools import build_mcp
+from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
 from connect.settings import MODE_RESTRICTED, SettingsStore
-from connect.signer import Signer
+from connect.signer import SERVER_BUILT, Signer
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
@@ -88,7 +88,14 @@ def _send_agent_topup(  # pylint: disable=too-many-arguments,too-many-positional
         # audited below under its own kind, so Pearl's transactions metric and
         # last_activity show only what the agent did
         tx_hash = signer.send_via_safe(
-            chain, signer.address, value=amount, data="0x", audit=False
+            chain,
+            signer.address,
+            value=amount,
+            data="0x",
+            audit=False,
+            # the server's own top-up, capped by plan_agent_topup and, while
+            # restricted, by its single-use allowance: no session intent applies
+            intent=SERVER_BUILT,
         )
         receipt = signer.w3(chain).eth.wait_for_transaction_receipt(
             HexBytes(tx_hash),
@@ -152,7 +159,7 @@ async def top_up_agent(  # pylint: disable=too-many-arguments,too-many-positiona
         await asyncio.sleep(AGENT_TOPUP_INTERVAL_SECONDS)
 
 
-def create_app(  # pylint: disable=too-many-arguments
+def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     signer: Signer,
     config: AppConfig,
     activity: ActivityLog,
@@ -164,6 +171,9 @@ def create_app(  # pylint: disable=too-many-arguments
     workspace: Workspace,
 ) -> FastAPI:
     """Create app."""
+    # the run's token is the workspace's scoped token (read + mech + tx);
+    # narrower ones are minted from it through POST /tokens
+    grants = GrantStore(token, held=signer.holds_request)
     mcp = build_mcp(
         signer,
         config,
@@ -171,6 +181,7 @@ def create_app(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech,
         settings_store=settings_store,
+        grants=grants,
     )
 
     @asynccontextmanager
@@ -190,12 +201,14 @@ def create_app(  # pylint: disable=too-many-arguments
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            mech.queue.close()  # release STORE_PATH's queue store
 
     app = FastAPI(title="connect", lifespan=lifespan)
     # DNS-rebinding defense: a rebound hostname reaches the socket with the
     # attacker's Host header — refuse anything that isn't a loopback name
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
     limiter = AuthFailureLimiter()
+    app.state.grants = grants
     app.state.signer = signer
     app.state.config = config
     app.state.activity = activity
@@ -213,17 +226,23 @@ def create_app(  # pylint: disable=too-many-arguments
     # chains whose last agent top-up succeeded, for /funds-status
     app.state.topped_up = set()
 
+    @app.exception_handler(RequestValidationError)
+    async def refused_body(request: Request, exc: RequestValidationError) -> Response:
+        """Audit an unknown-parameter refusal, then answer as FastAPI would."""
+        strict.audit_unknown_parameters(activity, request.url.path, exc.errors())
+        return await request_validation_exception_handler(request, exc)
+
     app.include_router(pearl_routes.router)
     app.include_router(
         settings_routes.router, dependencies=[Depends(require_local_origin)]
     )
     app.include_router(
         signer_routes.router,
-        dependencies=[Depends(RequireAuth(token, activity, limiter))],
+        dependencies=[Depends(RequireAuth(grants, activity, limiter))],
     )
     app.mount(
         "/mcp",
-        AuthMiddleware(mcp.streamable_http_app(), token, activity, limiter),
+        AuthMiddleware(mcp.streamable_http_app(), grants, activity, limiter),
     )
 
     # the agent UI last, so it can own / without shadowing an endpoint: routes

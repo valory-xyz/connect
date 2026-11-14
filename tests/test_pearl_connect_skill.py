@@ -33,6 +33,7 @@ answered from a table, and the signer's own HTTP surface is stubbed.
 import io
 import json
 import sys
+import time
 import urllib.error
 from email.message import Message
 from pathlib import Path
@@ -50,7 +51,7 @@ from connect.config import AGENT_HTTP_PORT, BIND_HOST, ChainConfig
 from connect.server.auth import MAX_AUTH_FAILURES
 from connect.settings import MODE_RESTRICTED, Protected, Settings
 
-from tests.conftest import evm
+from tests.conftest import TOKEN_EXPIRES_AT, advance_token_clock, evm
 
 # The skill ships as bundled assets, not an installed package; put its scripts
 # dir on the path so we can import the client under test.
@@ -90,7 +91,9 @@ ERC20_APPROVE_ABI = [
 def _connected(monkeypatch, chain_entry: dict):
     """Build the client's web3 without touching .mcp.json or the network."""
     monkeypatch.setattr(
-        signer_client, "load_mcp_config", lambda: ("http://127.0.0.1:8716", "t0ken")
+        signer_client,
+        "load_mcp_config",
+        lambda token=None: ("http://127.0.0.1:8716", token or "t0ken"),
     )
     monkeypatch.setattr(
         signer_client.SignerClient, "chain_info", lambda self, c=None: chain_entry
@@ -164,7 +167,7 @@ def test_a_contract_send_reaches_the_signer_without_estimating_locally(
     assert "eth_getBlockByNumber" not in seen
     ((path, payload),) = sent
     assert path == "/safe-transaction"  # made by the safe, not the EOA
-    assert payload["to"] == ADDR_A
+    assert payload["target"] == ADDR_A
     assert payload["data"].startswith("0x095ea7b3")  # approve(address,uint256)
 
 
@@ -206,6 +209,116 @@ def test_connect_says_so_when_there_is_no_safe_to_read_as(monkeypatch, capsys) -
     w3, _ = _connected(monkeypatch, {"rpc": "http://127.0.0.1:9", "safe": None})
     assert not w3.eth.default_account  # nothing to point `from` at, and no crash
     assert "no service safe" in capsys.readouterr().err
+
+
+# --- narrower tokens: minted by one script, handed to another -------------------
+
+
+@pytest.mark.parametrize(
+    ("argument", "env", "expected"),
+    [
+        (None, None, "t0ken"),
+        (None, "child", "child"),
+        ("given", "child", "given"),
+        ("given", "", "given"),  # an explicit token wins over a blank variable
+    ],
+)
+def test_connect_takes_a_narrower_token(
+    monkeypatch, tmp_path, argument, env, expected
+) -> None:
+    """connect() uses token=, else the env var, else the token in .mcp.json."""
+    _write_mcp_config(tmp_path, "http://127.0.0.1:8716/mcp/")
+    monkeypatch.chdir(tmp_path)
+    if env is None:
+        monkeypatch.delenv(signer_client.TOKEN_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(signer_client.TOKEN_ENV_VAR, env)
+    seen: list = []
+
+    def chain_info(self, c=None):
+        seen.append(self._token)  # pylint: disable=protected-access
+        return {"rpc": "http://127.0.0.1:9", "safe": SAFE_ADDR}
+
+    monkeypatch.setattr(signer_client.SignerClient, "chain_info", chain_info)
+    signer_client.connect("polygon", token=argument)
+    assert seen == [expected]
+
+
+@pytest.mark.parametrize(("argument", "env"), [(None, ""), (None, "  "), ("", None)])
+def test_a_blank_handover_is_an_error_not_the_root_token(
+    monkeypatch, tmp_path, argument, env
+) -> None:
+    """A mint that printed nothing must not leave the script on the root token."""
+    _write_mcp_config(tmp_path, "http://127.0.0.1:8716/mcp/")
+    monkeypatch.chdir(tmp_path)
+    if env is None:
+        monkeypatch.delenv(signer_client.TOKEN_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(signer_client.TOKEN_ENV_VAR, env)
+    with pytest.raises(signer_client.SignerRequestError, match="set but empty"):
+        signer_client.connect("polygon", token=argument)
+    if env is not None:
+        with pytest.raises(signer_client.SignerRequestError, match="PEARL_CONNECT"):
+            signer_client.load_mcp_config_dir(tmp_path)
+
+
+def test_a_bundled_script_signs_with_the_handed_token(monkeypatch, tmp_path) -> None:
+    """connect-polymarket's from_workspace reads .mcp.json too: it honours the handover."""
+    monkeypatch.syspath_prepend(
+        str(_SCRIPTS.parent.parent / "connect-polymarket" / "scripts")
+    )
+    import pm_common  # noqa: E402  pylint: disable=import-outside-toplevel
+
+    _write_mcp_config(tmp_path, "http://127.0.0.1:8716/mcp/")
+    monkeypatch.setenv(signer_client.TOKEN_ENV_VAR, "child")
+    sent: list = []
+
+    class _Answer(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(request, timeout):  # noqa: ARG001
+        sent.append(request.get_header("Authorization"))
+        return _Answer(json.dumps({"tx_hash": "0x01"}).encode())
+
+    monkeypatch.setattr(signer_client.urllib.request, "urlopen", urlopen)
+    signer = pm_common.ConnectSigner.from_workspace(tmp_path)
+    signer.send_transaction({"to": ADDR_A, "data": "0x"})
+    assert sent == ["Bearer child"]
+
+
+def test_mint_token_mints_a_narrower_token_the_server_honours(
+    make_app, test_signer, app_config, activity, monkeypatch
+) -> None:
+    """The documented path: mint through the client, then read with the child."""
+    app = make_app(test_signer, app_config, activity, token="tok")  # nosec B106
+
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+
+        def post(self, path, payload):
+            response = client.post(
+                path,
+                json=payload,
+                headers={"Authorization": f"Bearer {self._token}"},
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        monkeypatch.setattr(signer_client.SignerClient, "_post", post)
+        root = signer_client.SignerClient("http://127.0.0.1:8716", "tok", "testchain")
+        child = root.mint_token({"scopes": ["read"], "expires_at": TOKEN_EXPIRES_AT})
+        assert child != "tok"  # nosec B105
+        bearer = {"Authorization": f"Bearer {child}"}
+        assert client.get("/wallet", headers=bearer).status_code == 200
+        refused = client.post(
+            "/safe-transaction",
+            json={"chain": "testchain", "target": ADDR_A},
+            headers=bearer,
+        )
+        assert refused.status_code == 403
 
 
 # --- .mcp.json base URL: the trailing slash that 404'd a whole live run ----------
@@ -288,10 +401,10 @@ def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
     bad = {"Authorization": "Bearer nope"}
     outcomes: list[tuple[str, str]] = []
 
-    def send(chain="testchain", to="0x" + "aa" * 20, headers=None) -> None:
+    def send(chain="testchain", to="0x" + "aa" * 20, headers=None, **extra) -> None:
         response = client.post(
             "/safe-transaction",
-            json={"chain": chain, "to": to},
+            json={"chain": chain, "target": to, **extra},
             headers=good if headers is None else headers,
         )
         error = _as_client_error(response)
@@ -303,7 +416,27 @@ def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         send(chain="mystery")
         send(chain="nosafe")
+        send(value=1)  # moves value with no intent: the intent gate refuses
+        capped = client.post(
+            "/tokens",
+            json={
+                "scopes": ["tx"],
+                "max_value_per_tx": {"native": 1},
+                "expires_at": TOKEN_EXPIRES_AT,
+            },
+            headers=good,
+        ).json()["token"]
+        send(value=2, headers={"Authorization": f"Bearer {capped}"})
+        expired = client.post(
+            "/tokens",
+            json={"scopes": ["tx"], "expires_at": int(time.time()) + 60},
+            headers=good,
+        ).json()["token"]
+        with monkeypatch.context() as later:
+            advance_token_clock(later, 120)
+            send(headers={"Authorization": f"Bearer {expired}"})
         send(to="0x1234")
+        send(data="0xzz")  # not hex: refused before the RPC, as bad-calldata
         send(to=safe)
         with monkeypatch.context() as patched:
             patched.setattr(fake_w3.eth, "estimate_gas", reverting)
@@ -337,7 +470,33 @@ def test_send_outcome_treats_a_failed_broadcast_as_possibly_sent(
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         response = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "to": "0x" + "aa" * 20},
+            json={"chain": "testchain", "target": "0x" + "aa" * 20},
             headers={"Authorization": "Bearer tok"},
         )
     assert evm.send_outcome(_as_client_error(response)) == evm.MAY_HAVE_BROADCAST
+
+
+def test_send_transaction_forwards_the_intent(monkeypatch) -> None:
+    """A call's intent, or one passed directly, reaches /safe-transaction."""
+    sent: list = []
+    monkeypatch.setattr(
+        signer_client.SignerClient,
+        "_post",
+        lambda self, path, payload: sent.append(payload)
+        or {"tx_hash": "0x" + "ab" * 32},
+    )
+    client = signer_client.SignerClient(
+        "http://127.0.0.1:9", "tok", chain="polygon"  # nosec B106
+    )
+    client.send_transaction({"to": ADDR_A, "intent": {"spend": {"native": 1}}})
+    client.send_transaction({"to": ADDR_A}, intent={"recipients": [ADDR_B]})
+    client.send_transaction({"to": ADDR_A})
+    client.send_transaction({"to": ADDR_A}, intent={})  # "moves nothing", kept
+    client.send_transaction(  # the argument wins over the tx's own key
+        {"to": ADDR_A, "intent": {"spend": {"native": 1}}}, intent={}
+    )
+    assert sent[0]["intent"] == {"spend": {"native": 1}}
+    assert sent[1]["intent"] == {"recipients": [ADDR_B]}
+    assert "intent" not in sent[2]
+    assert sent[3]["intent"] == {}
+    assert sent[4]["intent"] == {}
