@@ -230,9 +230,16 @@ of base units: a float or a bool is `bad-intent`, never truncated. An ERC-20
 `Approval` whose amount is no higher than the spender's allowance before the
 call (read at head; OpenZeppelin 4.x tokens emit one from `transferFrom` as
 they spend an allowance down) is no new grant and needs no declaring; a read
-that fails keeps it. A call that sends native value but whose simulation logs
-no native transfer of it fails closed as `simulation-unavailable`: the RPC
-ignored `traceTransfers`. Permit2's own grants (its `Approval` from
+that fails keeps it. Every simulation also carries a 1 wei transfer between
+two fixed addresses (`TRACE_CANARY_FROM`, funded by a state override, after
+the call in the same request, so it never reaches the call's diff); if the RPC
+logs no native transfer for it, it ignored `traceTransfers` and the send fails
+closed as `simulation-unavailable`, at any value, since a zero-value call can
+move native internally. So does a call whose simulation logs less native out
+than the value it sends. The diff sees only what the logs say: a balance that
+changes without a `Transfer` log (a rebasing token's shares, some non-standard
+ERC-20s) shows no spend, so `overspend`, `receive-min` and the token caps
+("Scoped tokens") do not see it. Permit2's own grants (its `Approval` from
 `approve()` and its `Permit` from a signed permit, from the canonical Permit2
 address) are approvals of the token to their spender, declared and capped like
 an ERC-20 approval, and always declared: the allowance exemption above reads

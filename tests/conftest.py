@@ -453,6 +453,7 @@ class FakeProvider:
         self.status = "0x1"
         self.error: dict | str | None = None
         self.unavailable = False
+        self.traced = True  # False: an RPC that ignores traceTransfers
         self.symbols: dict[str, str] = {}  # token -> symbol() answer, 0x-hex
 
     def make_request(self, method: str, params: list) -> dict:
@@ -468,11 +469,11 @@ class FakeProvider:
         assert params[1] == "latest"
         if self.unavailable:
             return {"error": {"code": -32601, "message": "method not whitelisted"}}
-        call = params[0]["blockStateCalls"][0]["calls"][0]
+        call, canary = params[0]["blockStateCalls"][0]["calls"]
         self.simulated.append(call)
         logs = list(self.logs)
         value = int(call["value"], 16)
-        if value:
+        if value and self.traced:
             logs.insert(0, native_transfer_log(call["from"], call["to"], value))
         result: dict[str, t.Any] = {
             "status": self.status,
@@ -482,7 +483,17 @@ class FakeProvider:
         result["logs"] = logs
         if self.error is not None:
             result["error"] = self.error
-        return {"result": [{"calls": [result]}]}
+        return {"result": [{"calls": [result, canary_result(canary, self.traced)]}]}
+
+
+def canary_result(canary: dict, traced: bool = True) -> dict:
+    """Answer the gate's traceTransfers canary as a node would, or would not."""
+    logs = (
+        [native_transfer_log(canary["from"], canary["to"], int(canary["value"], 16))]
+        if traced
+        else []
+    )
+    return {"status": "0x1", "returnData": "0x", "gasUsed": "0x5208", "logs": logs}
 
 
 class FakeW3:

@@ -17,36 +17,10 @@
 #
 # ------------------------------------------------------------------------------
 
-"""The intent gate: simulate a send and check it against its intent.
+"""The intent gate: simulate a send at head and check it against its intent.
 
-A model can report success on a transaction
-that moved the wrong amount. So every agent-originated value-moving send
-carries an *intent* (what it may spend, the least it must receive, who may
-receive and what may be approved),
-and the transaction is simulated at head with `eth_simulateV1` before it is
-signed. The asset diff comes from the simulated logs: ERC-20/721 `Transfer`,
-`Approval`, `ApprovalForAll`, ERC-1155 `TransferSingle`/`TransferBatch`, WETH
-`Deposit`/`Withdrawal`, and the synthetic `Transfer` logs `traceTransfers`
-emits from `0xeeee...eeee` for native value (with the `Transfer` logs of a
-native ERC-20 face, Celo's CELO; its other logs count as any token's). There is
-no fork and no trace,
-so "contracts touched" is the target plus every contract that emitted
-a log; a contract called without emitting one is not listed.
-
-The rules (`Rule` is the full list):
-`reverts`, `bad-intent`, `overspend`, `receive-min`, `undeclared-recipient`
-(EOAs only, an EIP-7702 delegated EOA counted as one; burns to the zero
-address are skipped) and `undeclared-approval` (a 0 approval, a revoke, is
-not checked; `setApprovalForAll` counts as a maximum approval, even when
-revoking). The intent is required: `missing-intent` refuses a value-moving
-call that carries none, and `simulation-unavailable` refuses anything an RPC
-cannot simulate — nothing falls back to signing unchecked. Under a
-value-capped token (`Capped`) `token-cap-positions` refuses any ERC-721/1155
-position leaving the sender, which no cap can bound. Three are raised by the
-signer before anything is simulated: `bad-calldata` (calldata that is not
-strictly hex), `approve-hash` (any EOA send of the safe's approveHash,
-whatever its target) and `bad-exec-transaction` (an EOA's execTransaction
-to the safe); see `connect/signer.py`.
+The rules, what the asset diff is read from and what it cannot see are in
+the README, "Intent gate"; `Rule` is the full list of rule names.
 """
 
 import typing as t
@@ -59,6 +33,11 @@ NATIVE = "native"
 MAX_UINT256 = 2**256 - 1
 # traceTransfers reports native value as Transfer logs from this address
 NATIVE_LOG_ADDRESS = "0x" + "ee" * 20
+# a native transfer simulated beside every call, whose log proves the RPC
+# honoured traceTransfers: without it no call's native moves can be seen
+TRACE_CANARY_FROM = "0x" + "00" * 18 + "c0de"
+TRACE_CANARY_TO = "0x" + "00" * 18 + "c0df"
+TRACE_CANARY_VALUE = 1
 
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 APPROVAL = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
@@ -162,10 +141,6 @@ class SimulationUnavailable(Exception):
 Rpc = t.Callable[[str, list], t.Any]
 
 
-def _hex(value: int) -> str:
-    return hex(value)
-
-
 def _word(data: str, index: int) -> int:
     """Return the `index`-th 32-byte word of hex `data` as an int."""
     raw = data.removeprefix("0x")
@@ -215,14 +190,22 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
     payload = {
         "blockStateCalls": [
             {
+                "stateOverrides": {
+                    TRACE_CANARY_FROM: {"balance": hex(TRACE_CANARY_VALUE)}
+                },
                 "calls": [
                     {
                         "from": sender,
                         "to": to,
-                        "value": _hex(value),
+                        "value": hex(value),
                         "data": data or "0x",
-                    }
-                ]
+                    },
+                    {
+                        "from": TRACE_CANARY_FROM,
+                        "to": TRACE_CANARY_TO,
+                        "value": hex(TRACE_CANARY_VALUE),
+                    },
+                ],
             }
         ],
         "traceTransfers": True,
@@ -230,21 +213,33 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
     }
     result = rpc("eth_simulateV1", [payload, "latest"])
     try:
-        call = result[0]["calls"][0]
+        call, canary = result[0]["calls"][:2]
         ok = str(call.get("status", "0x0")) in ("0x1", "1")
         logs = list(call.get("logs") or [])
-    except (IndexError, KeyError, TypeError, AttributeError) as e:
+        canary_logs = list(canary.get("logs") or [])
+    except (IndexError, KeyError, TypeError, AttributeError, ValueError) as e:
         raise SimulationUnavailable(f"unexpected eth_simulateV1 answer: {e}") from e
     try:
         diff = _diff(sender.lower(), logs, get_code)
         gas_used = int(str(call.get("gasUsed", "0x0")), 16)
+        traced = (
+            TRACE_CANARY_FROM,
+            TRACE_CANARY_TO,
+            TRACE_CANARY_VALUE,
+        ) in _native_moves(canary_logs)
     except (TypeError, ValueError, AttributeError) as e:
         raise SimulationUnavailable(f"unreadable eth_simulateV1 answer: {e}") from e
+    if not traced:
+        # an RPC that ignores traceTransfers logs no native move at all, so a
+        # call moving native internally, at any value, would look like none
+        raise SimulationUnavailable(
+            "the RPC did not trace a native transfer (traceTransfers), so the "
+            "call's native moves cannot be checked"
+        )
     if ok and value > 0:
         sent = sum(a for src, _, a in _native_moves(logs) if src == sender.lower())
         if sent < value:
-            # an RPC that ignores traceTransfers logs no native move at all,
-            # and a value send would then look like it moves nothing
+            # traced, yet short of the value sent: an answer not to trust
             raise SimulationUnavailable(
                 "the RPC did not trace the call's native transfer "
                 "(traceTransfers), so its native moves cannot be checked"
@@ -346,8 +341,13 @@ def _native_moves(logs: list[dict]) -> list[tuple[str, str, int]]:
     return [
         (src, dst, _word(data, 0))
         for address, src, dst, data in _erc20_transfers(logs)
-        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES
+        if _is_native_log(address)
     ]
+
+
+def _is_native_log(address: str) -> bool:
+    """Whether a `Transfer` log from `address` moves native value, not a token."""
+    return address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES
 
 
 def _erc20_transfers(logs: list[dict]) -> t.Iterator[tuple[str, str, str, str]]:
@@ -386,7 +386,7 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
             native += amount
 
     for address, src, dst, data in _erc20_transfers(logs):
-        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES:
+        if _is_native_log(address):
             continue  # native moves, counted above
         amount = _word(data, 0)
         if src == holder:

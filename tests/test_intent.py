@@ -25,7 +25,7 @@ import pytest
 
 from connect import intent
 
-from tests.conftest import native_transfer_log
+from tests.conftest import canary_result, native_transfer_log
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -62,7 +62,10 @@ def approval(token: str, owner: str, spender: str, amount: int) -> dict:
 
 
 def rpc_with(
-    logs: list[dict], status: str = "0x1", error: dict | None = None
+    logs: list[dict],
+    status: str = "0x1",
+    error: dict | None = None,
+    traced: bool = True,
 ) -> intent.Rpc:
     """Return an rpc callable answering eth_simulateV1 with these logs."""
 
@@ -75,7 +78,8 @@ def rpc_with(
         call: dict = {"status": status, "gasUsed": "0x10", "logs": logs}
         if error is not None:
             call["error"] = error
-        return [{"calls": [call]}]
+        canary = params[0]["blockStateCalls"][0]["calls"][1]
+        return [{"calls": [call, canary_result(canary, traced)]}]
 
     return rpc
 
@@ -237,7 +241,14 @@ def test_a_malformed_batch_is_simulation_unavailable() -> None:
             simulate([malformed])
     with pytest.raises(intent.SimulationUnavailable, match="unreadable"):
         intent.simulate(
-            lambda m, p: [{"calls": [{"status": "0x1", "gasUsed": "zz", "logs": []}]}],
+            lambda m, p: [
+                {
+                    "calls": [
+                        {"status": "0x1", "gasUsed": "zz", "logs": []},
+                        canary_result(p[0]["blockStateCalls"][0]["calls"][1]),
+                    ]
+                }
+            ],
             sender=SAFE,
             to=CONTRACT,
             value=0,
@@ -531,6 +542,57 @@ def test_an_approval_that_only_spends_an_allowance_down_is_no_grant(
     spend_only: intent.Intent = {"spend": {TOKEN: 400}}
     expected = ["undeclared-approval"] if kept else []
     assert rules(intent.check_intent(diff, spend_only)) == expected
+
+
+@pytest.mark.parametrize("value", [0, 5])
+def test_any_call_on_an_rpc_that_ignores_trace_transfers_fails_closed(
+    value: int,
+) -> None:
+    """A zero-value call can move native internally: the canary must be traced."""
+    logs = [native_transfer_log(SAFE, EOA, value)] if value else []
+    with pytest.raises(intent.SimulationUnavailable, match="traceTransfers"):
+        intent.simulate(
+            rpc_with(logs, traced=False),
+            sender=SAFE,
+            to=EOA,
+            value=value,
+            data="0x",
+            get_code=lambda a: b"",
+        )
+
+
+def test_the_trace_canary_rides_beside_the_call_and_is_not_in_its_diff() -> None:
+    """One request: the canary is funded by an override and never reaches the diff."""
+    seen: list[dict] = []
+    inner = rpc_with([])
+
+    def rpc(method: str, params: list) -> t.Any:
+        if method == "eth_simulateV1":
+            seen.append(params[0])
+        return inner(method, params)
+
+    diff = intent.simulate(
+        rpc, sender=SAFE, to=EOA, value=0, data="0x", get_code=lambda a: b""
+    )
+    (block,) = seen[0]["blockStateCalls"]
+    assert block["calls"][1]["from"] == intent.TRACE_CANARY_FROM
+    assert intent.TRACE_CANARY_FROM in block["stateOverrides"]
+    assert diff["native"] == "0"
+    assert diff["called"] == [EOA]
+    assert diff["recipients"] == []
+
+
+def test_an_answer_without_the_canary_is_simulation_unavailable() -> None:
+    """An RPC that drops the second call cannot vouch for traceTransfers."""
+    with pytest.raises(intent.SimulationUnavailable, match="unexpected"):
+        intent.simulate(
+            lambda m, p: [{"calls": [{"status": "0x1", "logs": []}]}],
+            sender=SAFE,
+            to=EOA,
+            value=0,
+            data="0x",
+            get_code=lambda a: b"",
+        )
 
 
 def test_a_value_send_the_rpc_did_not_trace_fails_closed() -> None:
