@@ -118,13 +118,8 @@ from connect.settings import (
     derive_mac_key,
     token_approve_targets,
 )
-from connect.signer import (
-    SEND_FAILED,
-    SendUnknown,
-    Signer,
-    SignerError,
-    _ChainState,
-)
+from connect.signer import Signer, SignerError, _ChainState
+from connect.signer_errors import SEND_FAILED, SendUnknown
 
 from tests.conftest import (
     FakeW3,
@@ -3388,9 +3383,12 @@ class TestMech:
             )
         assert str(refused.value) == f"mech request not sent: {words}"
         patched_mech.raises = None
-        assert mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
-        ).get("replayed") is None
+        assert (
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+            ).get("replayed")
+            is None
+        )
 
     def test_restricted_auto_deposit_is_armed_via_allowance(  # pylint: disable=too-many-arguments
         self,
@@ -3642,7 +3640,11 @@ class TestMech:
         patched_mech.raises_after_signing = None
         with pytest.raises(MechError, match="cannot tell whether it was paid for"):
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id=request_id
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id=request_id,
             )
         assert len(patched_mech.calls) == sent
 

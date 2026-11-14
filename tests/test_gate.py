@@ -36,14 +36,8 @@ from connect.guard import Guard
 from connect.mech import MechService
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
-from connect.signer import (
-    SEND_FAILED,
-    SEND_UNKNOWN,
-    SERVER_BUILT,
-    SendUnknown,
-    Signer,
-    SignerError,
-)
+from connect.signer import SERVER_BUILT, Signer, SignerError
+from connect.signer_errors import SEND_FAILED, SEND_UNKNOWN, SendUnknown
 
 from tests.conftest import FakeW3, audit_entries, grant_store, pay
 

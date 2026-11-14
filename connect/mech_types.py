@@ -24,7 +24,7 @@ import typing as t
 
 from mech_client import NonceRefused, RequestIdMismatch, RequestIdRpcError
 
-from connect.signer import SendUnknown, SignerError
+from connect.signer_errors import SendUnknown, SignerError
 
 logger = logging.getLogger("agent")
 

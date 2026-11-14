@@ -166,9 +166,11 @@ class MechAllowances:
                     tx_hash=failure.tx_hash,
                 )
                 raise failure from e
-            # e itself, or the signer's error already below it: `from e` would
-            # make its cause chain a loop
-            raise failure
+            if failure is e:
+                raise
+            # the signer's error already below e keeps its own cause: `from e`
+            # would make the chain a loop
+            raise failure from failure.__cause__
         finally:
             self.revoke(armed)
 

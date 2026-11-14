@@ -38,7 +38,6 @@ from eth_abi.exceptions import EncodingError
 from eth_account.signers.local import LocalAccount
 from eth_typing import Hash32
 from web3 import Web3
-from web3.exceptions import ContractLogicError, Web3RPCError
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 from web3.types import TxParams
 
@@ -47,28 +46,11 @@ from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
+from connect.signer_errors import SEND_UNKNOWN, SendUnknown, SignerError, send_failure
 
 logger = logging.getLogger("agent")
 
 GAS_ESTIMATE_BUFFER = 1.2
-
-
-class SignerError(Exception):
-    """Signing or broadcast failure."""
-
-
-class SendUnknown(SignerError):
-    """A broadcast the RPC never answered: it may have landed, as `tx_hash`.
-
-    The hash is the signed bytes', known before the broadcast, so the request
-    id it was sent under keeps it (`held`): a retry raises this again rather
-    than signing a second transaction at the next nonce.
-    """
-
-    def __init__(self, tx_hash: str, *, held: bool) -> None:
-        """Initialize."""
-        super().__init__(_send_unknown_words(tx_hash, held=held))
-        self.tx_hash = tx_hash
 
 
 class _ServerBuilt:
@@ -190,52 +172,10 @@ def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-# What a caller is told of a failure that is not one of Connect's refusals:
-# Connect's own words, never the library's, which may name the RPC URL and its
-# key (urllib3 writes "with url: /v2/<key>"); the cause goes to the log.
-SEND_FAILED = (
-    "send failed: the RPC could not take the transaction (the cause is in "
-    "Connect's log)"
-)
-# the broadcast itself failed with no answer from the RPC: it may have landed
-SEND_UNKNOWN = "send failed while broadcasting: the transaction may have been sent"
-
-
-def _send_unknown_words(tx_hash: str, *, held: bool) -> str:
-    """Return SEND_UNKNOWN for `tx_hash`; only a `held` request id promises a replay."""
-    said = f"{SEND_UNKNOWN} as {tx_hash} (the cause is in Connect's log); "
-    if held:
-        return said + (
-            "its request_id stays held with that hash, so a retry under it "
-            "sends nothing and answers this again; read the hash's receipt "
-            "(transaction_status) before sending under a new id"
-        )
-    return said + (
-        "read the hash's receipt (transaction_status) or the account's nonce "
-        "before sending again"
-    )
 COMPOSE_FAILED = (
     "cannot compose the safe call: the target must be an address, the value a "
     "whole amount and the data hex"
 )
-
-
-def _send_failure(error: Exception, *, broadcasting: bool) -> str:
-    """Return what a caller is told of a failed send.
-
-    A revert in gas estimation is the contract's own answer, so its reason
-    stays (the shipped client reads it as reverted before signing). A
-    broadcast that failed without the RPC's answer (a timeout, a dropped
-    connection) is SEND_UNKNOWN; anything else is SEND_FAILED.
-    """
-    if isinstance(error, ContractLogicError):
-        reason = str(error.message or "execution reverted")
-        if "execution reverted" not in reason:
-            reason = f"execution reverted: {reason}"
-        return f"send failed: {reason}"
-    if broadcasting and not isinstance(error, (Web3RPCError, ValueError)):
-        return SEND_UNKNOWN
-    return SEND_FAILED
 
 
 def _safe_request_key(request_id: str) -> str:
@@ -894,7 +834,7 @@ class Signer:
                 # (e.g. "nonce too low" after a pool drop): forget it so the
                 # next send resyncs from the node's pending count.
                 state.next_nonce = None
-                said = _send_failure(e, broadcasting=signed is not None)
+                said = send_failure(e, broadcasting=signed is not None)
                 if signed is None or said != SEND_UNKNOWN:
                     self._send_failed(chain, to, value, e, audit=audit)
                     raise SignerError(said) from e

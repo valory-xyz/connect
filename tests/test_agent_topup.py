@@ -36,7 +36,8 @@ from connect.config import AppConfig, ChainConfig, FundRequirement, NATIVE_ASSET
 from connect.guard import Guard
 from connect.server import app as app_module
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
-from connect.signer import SEND_FAILED, Signer, SignerError, _ChainState
+from connect.signer import Signer, SignerError, _ChainState
+from connect.signer_errors import SEND_FAILED
 from connect.wallet import AgentTopUp, plan_agent_topup
 
 from tests.conftest import FakeW3, audit_entries
