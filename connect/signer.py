@@ -61,13 +61,13 @@ class SendUnknown(SignerError):
     """A broadcast the RPC never answered: it may have landed, as `tx_hash`.
 
     The hash is the signed bytes', known before the broadcast, so the request
-    id it was sent under keeps it: a retry replays it rather than signing a
-    second transaction at the next nonce.
+    id it was sent under keeps it (`held`): a retry raises this again rather
+    than signing a second transaction at the next nonce.
     """
 
-    def __init__(self, tx_hash: str) -> None:
+    def __init__(self, tx_hash: str, *, held: bool) -> None:
         """Initialize."""
-        super().__init__(SEND_UNKNOWN)
+        super().__init__(_send_unknown_words(tx_hash, held=held))
         self.tx_hash = tx_hash
 
 
@@ -158,16 +158,30 @@ class _ChainPool:
 MAX_CACHED_RESULTS = 1024
 
 
-def _same_call(key: str, cached: tuple[str, str], stamp: str) -> str:
-    """Return the cached tx hash, or :raises SignerError: on a different call."""
-    tx_hash, seen = cached
-    if seen != stamp:
+class _Sent(t.NamedTuple):
+    """What a request id's send left: its hash, and whether the RPC took it."""
+
+    tx_hash: str
+    stamp: str
+    # False for a broadcast the RPC never answered (SendUnknown)
+    confirmed: bool
+
+
+def _same_call(key: str, cached: _Sent, stamp: str) -> str:
+    """Return the cached tx hash.
+
+    :raises SignerError: on a different call.
+    :raises SendUnknown: again, for a broadcast that may not have landed.
+    """
+    if cached.stamp != stamp:
         raise SignerError(
             f"request id '{key}' was already used for a different call; "
             "choose a new id rather than replaying this one, which would "
             "report a transaction that was never sent for it"
         )
-    return tx_hash
+    if not cached.confirmed:
+        raise SendUnknown(cached.tx_hash, held=True)
+    return cached.tx_hash
 
 
 def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
@@ -184,12 +198,22 @@ SEND_FAILED = (
     "Connect's log)"
 )
 # the broadcast itself failed with no answer from the RPC: it may have landed
-SEND_UNKNOWN = (
-    "send failed while broadcasting: the transaction may have been sent (the "
-    "cause is in Connect's log); a retry with the same request_id answers its "
-    "tx_hash without sending again, otherwise check the account's nonce "
-    "before sending again"
-)
+SEND_UNKNOWN = "send failed while broadcasting: the transaction may have been sent"
+
+
+def _send_unknown_words(tx_hash: str, *, held: bool) -> str:
+    """Return SEND_UNKNOWN for `tx_hash`; only a `held` request id promises a replay."""
+    said = f"{SEND_UNKNOWN} as {tx_hash} (the cause is in Connect's log); "
+    if held:
+        return said + (
+            "its request_id stays held with that hash, so a retry under it "
+            "sends nothing and answers this again; read the hash's receipt "
+            "(transaction_status) before sending under a new id"
+        )
+    return said + (
+        "read the hash's receipt (transaction_status) or the account's nonce "
+        "before sending again"
+    )
 COMPOSE_FAILED = (
     "cannot compose the safe call: the target must be an address, the value a "
     "whole amount and the data hex"
@@ -250,7 +274,7 @@ class _IdempotencyCache:
         """Initialize."""
         self._lock = threading.Lock()
         self._max_results = max_results
-        self._results: dict[str, tuple[str, str]] = {}  # id -> (tx_hash, stamp)
+        self._results: dict[str, _Sent] = {}
         self._in_flight: set[str] = set()  # request_ids currently executing
 
     def run(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
@@ -260,9 +284,10 @@ class _IdempotencyCache:
         executing raises (the caller retries after the original settles); a
         failed attempt releases the key so a retry can run the action again,
         except a broadcast that may have landed (`SendUnknown`), whose hash is
-        kept as the key's result so a retry replays it.
+        kept as the key's unconfirmed result so a retry raises it again.
 
         :raises SignerError: when the key was used for a different call.
+        :raises SendUnknown: for a key whose broadcast may not have landed.
         """
         with self._lock:
             cached = self._results.get(key)
@@ -279,6 +304,7 @@ class _IdempotencyCache:
         """Return the result of a completed run of this key, if any.
 
         :raises SignerError: when the key was used for a different call.
+        :raises SendUnknown: for a key whose broadcast may not have landed.
         """
         with self._lock:
             cached = self._results.get(key)
@@ -294,22 +320,23 @@ class _IdempotencyCache:
             result = action()
         except SendUnknown as e:
             # it may have landed: re-running would sign a second transaction
-            # at the next nonce, so a retry replays this hash instead and the
-            # receipt read settles whether it was mined
-            self._store(key, stamp, e.tx_hash)
+            # at the next nonce, so a retry raises this hash again instead,
+            # never as a confirmed send, and its receipt settles whether it
+            # was mined
+            self._store(key, _Sent(e.tx_hash, stamp, confirmed=False))
             raise
         except Exception:
             with self._lock:
                 self._in_flight.discard(key)
             raise
-        self._store(key, stamp, result)
+        self._store(key, _Sent(result, stamp, confirmed=True))
         return result
 
-    def _store(self, key: str, stamp: str, result: str) -> None:
+    def _store(self, key: str, sent: _Sent) -> None:
         # cache the result and release the reservation atomically, so no retry
         # can observe "not cached and not in flight" after a success
         with self._lock:
-            self._results[key] = (result, stamp)
+            self._results[key] = sent
             self._in_flight.discard(key)
             # bound memory over a long run: a request_id evicted here and
             # retried much later re-broadcasts, which is the right trade at
@@ -851,6 +878,7 @@ class Signer:
         state = self._chains.get(chain)
         with state.lock:
             signed = None
+            tx: dict = {}
             try:
                 tx = self._fill_transaction(
                     state, to=to, value=value, data=data, gas=gas
@@ -866,19 +894,23 @@ class Signer:
                 # (e.g. "nonce too low" after a pool drop): forget it so the
                 # next send resyncs from the node's pending count.
                 state.next_nonce = None
-                if audit:
-                    self._activity.record(
-                        "send_failed",
-                        chain=chain,
-                        to=to,
-                        value=str(value),
-                        error=str(e),
-                    )
-                logger.warning("send on %s to %s failed", chain, to, exc_info=True)
                 said = _send_failure(e, broadcasting=signed is not None)
-                if signed is not None and said == SEND_UNKNOWN:
-                    raise SendUnknown(signed.hash.to_0x_hex()) from e
-                raise SignerError(said) from e
+                if signed is None or said != SEND_UNKNOWN:
+                    self._send_failed(chain, to, value, e, audit=audit)
+                    raise SignerError(said) from e
+                # what the operator needs to find a broadcast that may have landed
+                tx_hash = signed.hash.to_0x_hex()
+                self._send_failed(
+                    chain,
+                    to,
+                    value,
+                    e,
+                    audit=audit,
+                    tx_hash=tx_hash,
+                    nonce=tx["nonce"],
+                    request_id=request_id,
+                )
+                raise SendUnknown(tx_hash, held=request_id is not None) from e
             state.next_nonce = tx["nonce"] + 1
         if audit:
             self._activity.record(
@@ -891,6 +923,34 @@ class Signer:
                 request_id=request_id,
             )
         return tx_hash
+
+    def _send_failed(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        to: str,
+        value: int,
+        error: Exception,
+        *,
+        audit: bool,
+        **landed: object,
+    ) -> None:
+        """Log and audit a failed send; `landed` names a broadcast that may have landed."""
+        if audit:
+            self._activity.record(
+                "send_failed",
+                chain=chain,
+                to=to,
+                value=str(value),
+                error=str(error),
+                **landed,
+            )
+        logger.warning(
+            "send on %s to %s failed%s",
+            chain,
+            to,
+            f"; it may have landed: {landed}" if landed else "",
+            exc_info=error,
+        )
 
     def _fill_transaction(
         self, state: _ChainState, *, to: str, value: int, data: str, gas: int | None

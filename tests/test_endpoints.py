@@ -30,6 +30,7 @@ import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from mech_client import NonceAllocator, NonceRefused, RULE_QUEUE_LOCKED
+from web3 import Web3
 from web3.exceptions import ContractLogicError
 
 from connect import wallet as wallet_module
@@ -675,6 +676,70 @@ class TestAuth:
             "simulation": "cannot simulate this call",
         }[fails]
         assert expected in answer.text
+
+    @pytest.mark.parametrize(
+        ("tool", "path", "to_key"),
+        [
+            ("safe_transaction", "/safe-transaction", "target"),
+            ("send_transaction", "/sign-and-send", "to"),
+        ],
+    )
+    @pytest.mark.parametrize("surface", ["http", "mcp"])
+    @pytest.mark.parametrize("wait_for_receipt", [False, True])
+    def test_a_retry_after_a_possibly_sent_broadcast_is_never_a_confirmed_send(  # pylint: disable=too-many-arguments
+        self,
+        client: TestClient,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        tool: str,
+        path: str,
+        to_key: str,
+        surface: str,
+        wait_for_receipt: bool,
+    ) -> None:
+        """The retry the error invites answers the same error: hash held, nothing sent."""
+        taken: list[bytes] = []
+
+        def timed_out(raw: bytes) -> t.Any:
+            taken.append(bytes(raw))
+            raise TimeoutError("read timed out")
+
+        monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
+        arguments = {
+            "chain": "testchain",
+            to_key: "0x" + "aa" * 20,
+            "value": 16,
+            "intent": pay("0x" + "aa" * 20, 16),
+            "request_id": "retry-me",
+            "wait_for_receipt": wait_for_receipt,
+        }
+
+        def send() -> t.Any:
+            if surface == "http":
+                return client.post(path, json=arguments, headers=auth())
+            call = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            }
+            return client.post(
+                "/mcp/",
+                json=call,
+                headers={"Accept": "application/json, text/event-stream", **auth()},
+            )
+
+        first, retry = send(), send()
+        (raw,) = taken  # the retry broadcast nothing
+        tx_hash = Web3.keccak(raw).to_0x_hex()
+        for answer in (first, retry):
+            assert tx_hash in answer.text
+            assert "its request_id stays held with that hash" in answer.text
+            if surface == "http":
+                assert answer.status_code == 400
+            else:
+                assert '"isError":true' in answer.text
+        assert fake_w3.eth.receipt_waits == []
 
     def test_a_revert_keeps_the_contract_s_reason(
         self, client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch

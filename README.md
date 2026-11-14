@@ -54,9 +54,13 @@ other non-aea agent. It:
      own words: a refusal names its rule; a revert in gas estimation keeps the
      contract's reason; an RPC that cannot take the transaction or simulate it
      is a fixed message (a broadcast it never answered says the transaction
-     may have been sent, and its `request_id` stays held with that
-     transaction's hash, so a retry under it answers the hash and sends
-     nothing; any other failure frees the id), as are a receipt that cannot be read (`pending` with
+     may have been sent and names its hash, which the `send_failed` audit
+     entry and the log carry with its nonce and `request_id`; a `request_id`
+     it was sent under stays held with that hash, so a retry under it sends
+     nothing and answers the same error, never a confirmed send — the hash's
+     receipt (`transaction_status`) settles whether it landed; with no
+     `request_id` the message promises no replay; any other failure frees the
+     id), as are a receipt that cannot be read (`pending` with
      `receipt_error`) and a failed balance read. The mech tools
      likewise: a refusal names its rule, an RPC mech-client could not reach
      while deriving a request id says so (nothing was sent), and a library's

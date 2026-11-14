@@ -20,7 +20,9 @@
 """The intent gate at the signing choke point, and the read tools."""
 
 import json
+import logging
 import typing as t
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,6 +40,7 @@ from connect.signer import (
     SEND_FAILED,
     SEND_UNKNOWN,
     SERVER_BUILT,
+    SendUnknown,
     Signer,
     SignerError,
 )
@@ -606,7 +609,55 @@ def test_a_failed_send_says_whether_it_may_have_been_broadcast(
     monkeypatch.setattr(fake_w3.eth, name, broken)
     with pytest.raises(SignerError) as failed:
         test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
-    assert str(failed.value) == said
+    assert str(failed.value).startswith(said)
+
+
+def test_a_possibly_sent_broadcast_with_no_request_id_promises_no_replay(
+    test_signer: Signer, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no request_id nothing is held: the caller gets the hash to look up."""
+
+    def timed_out(_raw: bytes) -> t.Any:
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
+    with pytest.raises(SendUnknown) as failed:
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
+    said = str(failed.value)
+    assert failed.value.tx_hash in said
+    assert "request_id" not in said
+    assert "or the account's nonce before sending again" in said
+
+
+def test_a_possibly_sent_broadcast_names_its_hash_nonce_and_id_for_the_operator(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    store_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning and the send_failed record both say where to look on chain."""
+    fake_w3.eth.pending_nonce = nonce = 7
+
+    def timed_out(_raw: bytes) -> t.Any:
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
+    with caplog.at_level(logging.WARNING, logger="agent"):
+        with pytest.raises(SendUnknown) as failed:
+            test_signer.send(
+                "testchain", EOA, value=1, intent=pay(EOA, 1), request_id="op-1"
+            )
+    tx_hash = failed.value.tx_hash
+    (record,) = [e for e in audit_entries(store_path) if e["kind"] == "send_failed"]
+    assert (record["tx_hash"], record["nonce"], record["request_id"]) == (
+        tx_hash,
+        nonce,
+        "op-1",
+    )
+    (warning,) = [r for r in caplog.records if "may have landed" in r.getMessage()]
+    for named in (tx_hash, f"'nonce': {nonce}", "'request_id': 'op-1'"):
+        assert named in warning.getMessage()
 
 
 @pytest.mark.parametrize("via_safe", [False, True])
@@ -626,13 +677,15 @@ def test_a_retry_of_a_possibly_sent_broadcast_replays_its_hash(
     monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
     send = test_signer.send_via_safe if via_safe else test_signer.send
     target = TOKEN if via_safe else EOA
-    with pytest.raises(SignerError) as failed:
+    with pytest.raises(SendUnknown) as failed:
         send("testchain", target, value=1, intent=pay(target, 1), request_id="x")
-    assert str(failed.value) == SEND_UNKNOWN
+    assert "its request_id stays held with that hash" in str(failed.value)
     assert test_signer.holds_request("x", via_safe)
-    replayed = send("testchain", target, value=1, intent=pay(target, 1), request_id="x")
+    with pytest.raises(SendUnknown) as replayed:  # never as a confirmed send
+        send("testchain", target, value=1, intent=pay(target, 1), request_id="x")
     (raw,) = taken  # one broadcast, never a second at the next nonce
-    assert replayed == Web3.keccak(raw).to_0x_hex()
+    assert replayed.value.tx_hash == Web3.keccak(raw).to_0x_hex()
+    assert str(replayed.value) == str(failed.value)
     assert not fake_w3.eth.sent
 
 
