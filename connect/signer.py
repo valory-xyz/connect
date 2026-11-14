@@ -316,7 +316,9 @@ class Signer:
         """Whether a send under this request id completed or is still sending.
 
         Either way a call repeating it sends nothing new: it replays the hash,
-        or is refused as in flight. `via_safe` picks send_via_safe's namespace.
+        re-raises `SendUnknown` with that hash for a broadcast that may not
+        have landed, or is refused as in flight. `via_safe` picks
+        send_via_safe's namespace.
         """
         return self._requests.holds(
             _safe_request_key(request_id) if via_safe else request_id

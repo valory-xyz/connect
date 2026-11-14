@@ -680,6 +680,12 @@ def test_a_retry_of_a_possibly_sent_broadcast_replays_its_hash(
     (raw,) = taken  # one broadcast, never a second at the next nonce
     assert replayed.value.tx_hash == Web3.keccak(raw).to_0x_hex()
     assert str(replayed.value) == str(failed.value)
+    # a different call under the held id is refused as one, never handed the
+    # possibly-sent hash of a transaction it did not ask for
+    with pytest.raises(SignerError, match="already used for a different call") as other:
+        send("testchain", target, value=2, intent=pay(target, 2), request_id="x")
+    assert not isinstance(other.value, SendUnknown)
+    assert len(taken) == 1
     assert not fake_w3.eth.sent
 
 
