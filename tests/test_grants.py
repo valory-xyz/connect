@@ -540,11 +540,7 @@ def test_http_mint_and_use_a_read_token(
     ("grant_body", "status", "rule"),
     [
         ({"scopes": ["tx"]}, 403, "token-scope"),
-        (
-            {"scopes": ["read"], "expires_at": int(time.time()) + 60},
-            401,
-            "token-expired",
-        ),
+        ({"scopes": ["read"], "expires_in": 60}, 401, "token-expired"),
     ],
 )
 def test_http_wallet_needs_a_live_read_token(  # pylint: disable=too-many-arguments
@@ -556,9 +552,10 @@ def test_http_wallet_needs_a_live_read_token(  # pylint: disable=too-many-argume
     rule: str,
 ) -> None:
     """GET /wallet is held to the token's grant, and its refusal audited."""
-    token = client.post(
-        "/tokens", json={**LIVE, **grant_body}, headers=_bearer(WORKSPACE)
-    )
+    body = {**LIVE, **grant_body}
+    if "expires_in" in body:  # at run time: a collection-time expiry goes stale
+        body["expires_at"] = int(time.time()) + body.pop("expires_in")
+    token = client.post("/tokens", json=body, headers=_bearer(WORKSPACE))
     assert token.status_code == 200
     advance_token_clock(monkeypatch, 120)
     refused = client.get("/wallet", headers=_bearer(token.json()["token"]))
