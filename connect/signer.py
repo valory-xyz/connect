@@ -38,7 +38,7 @@ from eth_abi.exceptions import EncodingError
 from eth_account.signers.local import LocalAccount
 from eth_typing import Hash32
 from web3 import Web3
-from web3.exceptions import ContractLogicError
+from web3.exceptions import ContractLogicError, Web3RPCError
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 from web3.types import TxParams
 
@@ -169,24 +169,33 @@ SEND_FAILED = (
     "send failed: the RPC could not take the transaction (the cause is in "
     "Connect's log)"
 )
+# the broadcast itself failed with no answer from the RPC: it may have landed
+SEND_UNKNOWN = (
+    "send failed while broadcasting: the transaction may have been sent (the "
+    "cause is in Connect's log); check the account's nonce or the transaction "
+    "before sending again"
+)
 COMPOSE_FAILED = (
     "cannot compose the safe call: the target must be an address, the value a "
     "whole amount and the data hex"
 )
 
 
-def _send_failure(error: Exception) -> str:
+def _send_failure(error: Exception, *, broadcasting: bool) -> str:
     """Return what a caller is told of a failed send.
 
     A revert in gas estimation is the contract's own answer, so its reason
-    stays (the shipped client reads it as reverted before signing); anything
-    else is SEND_FAILED.
+    stays (the shipped client reads it as reverted before signing). A
+    broadcast that failed without the RPC's answer (a timeout, a dropped
+    connection) is SEND_UNKNOWN; anything else is SEND_FAILED.
     """
     if isinstance(error, ContractLogicError):
         reason = str(error.message or "execution reverted")
         if "execution reverted" not in reason:
             reason = f"execution reverted: {reason}"
         return f"send failed: {reason}"
+    if broadcasting and not isinstance(error, (Web3RPCError, ValueError)):
+        return SEND_UNKNOWN
     return SEND_FAILED
 
 
@@ -815,6 +824,7 @@ class Signer:
         """Fill, sign and broadcast under the chain's nonce lock."""
         state = self._chains.get(chain)
         with state.lock:
+            signed = None
             try:
                 tx = self._fill_transaction(
                     state, to=to, value=value, data=data, gas=gas
@@ -839,7 +849,9 @@ class Signer:
                         error=str(e),
                     )
                 logger.warning("send on %s to %s failed", chain, to, exc_info=True)
-                raise SignerError(_send_failure(e)) from e
+                raise SignerError(
+                    _send_failure(e, broadcasting=signed is not None)
+                ) from e
             state.next_nonce = tx["nonce"] + 1
         if audit:
             self._activity.record(

@@ -614,8 +614,10 @@ class TestAuth:
         "leak",
         [
             # urllib3's own form: no scheme, the key in the path
-            "HTTPSConnectionPool(host='rpc.example', port=443): Max retries "
-            "exceeded with url: /v2/SECRETKEY (Caused by NewConnectionError)",
+            (
+                "HTTPSConnectionPool(host='rpc.example', port=443): Max retries "
+                + "exceeded with url: /v2/SECRETKEY (Caused by NewConnectionError)"
+            ),
             "https://rpc.example/v3/SECRETKEY timed out",
         ],
     )
@@ -668,7 +670,7 @@ class TestAuth:
         assert "SECRETKEY" not in answer.text
         assert "rpc.example" not in answer.text
         expected = {
-            "broadcast": "the RPC could not take the transaction",
+            "broadcast": "the transaction may have been sent",
             "receipt": "receipt could not be read",
             "simulation": "cannot simulate this call",
         }[fails]

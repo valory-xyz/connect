@@ -32,7 +32,13 @@ from connect.guard import Guard
 from connect.mech import MechService
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
-from connect.signer import SERVER_BUILT, Signer, SignerError
+from connect.signer import (
+    SEND_FAILED,
+    SEND_UNKNOWN,
+    SERVER_BUILT,
+    Signer,
+    SignerError,
+)
 
 from tests.conftest import FakeW3, audit_entries, grant_store, pay
 
@@ -568,6 +574,35 @@ class TestSignerGate:
         assert problems[0]["rule"] == "simulation-unavailable"
         with pytest.raises(ValueError, match="mystery"):  # an unknown chain is
             test_signer.simulate("mystery", EOA, via_safe=False)
+
+
+@pytest.mark.parametrize(
+    ("stage", "error", "said"),
+    [
+        ("broadcast", ConnectionError("read timed out"), SEND_UNKNOWN),
+        ("broadcast", TimeoutError("read timed out"), SEND_UNKNOWN),
+        ("broadcast", ValueError("nonce too low"), SEND_FAILED),  # the RPC answered
+        ("estimate", ConnectionError("rpc down"), SEND_FAILED),  # nothing signed
+    ],
+)
+def test_a_failed_send_says_whether_it_may_have_been_broadcast(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error: Exception,
+    said: str,
+) -> None:
+    """Only a broadcast the RPC never answered is possibly sent; retrying it pays twice."""
+
+    def broken(*_args: t.Any) -> t.Any:
+        raise error
+
+    name = {"broadcast": "send_raw_transaction", "estimate": "estimate_gas"}[stage]
+    monkeypatch.setattr(fake_w3.eth, name, broken)
+    with pytest.raises(SignerError) as failed:
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
+    assert str(failed.value) == said
 
 
 class TestSimulate:
