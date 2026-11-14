@@ -554,10 +554,11 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
         transaction this token sends, so it is held to the per-transaction and
         the per-session cap alike; a token with no cap may not be approved.
         """
-        for rule, caps in (
+        bounds: tuple[tuple[GrantRule, dict[str, int] | None], ...] = (
             ("token-cap-per-tx", grant.max_value_per_tx),
             ("token-cap-per-session", grant.max_value_per_session),
-        ):
+        )
+        for rule, caps in bounds:
             if caps is None:
                 continue
             for approval in approvals:
