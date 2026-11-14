@@ -50,7 +50,10 @@ other non-aea agent. It:
      reaches the caller, on these routes and the MCP tools alike, as Connect's
      own words: a refusal names its rule; a revert in gas estimation keeps the
      contract's reason; an RPC that cannot take the transaction or simulate it
-     is a fixed message, as are a receipt that cannot be read (`pending` with
+     is a fixed message (a broadcast it never answered says the transaction
+     may have been sent, and its `request_id` stays held with that
+     transaction's hash, so a retry under it answers the hash and sends
+     nothing; any other failure frees the id), as are a receipt that cannot be read (`pending` with
      `receipt_error`) and a failed balance read. The mech tools
      likewise: a refusal names its rule, and a library's failure reads
      `mech-client failed (the cause is in Connect's log)`. What the RPC library
@@ -443,8 +446,9 @@ retry. A per-session
 budget is drawn down when a call is authorized, whether or not the send then
 succeeds, so it can be spent early but never exceeded; a retry naming a
 `request_id` the same token already drew for is drawn only past that draw while
-the signer holds the id (sent, so the retry answers its hash, or still
-sending, so the retry is refused as in flight), since it sends nothing new —
+the signer holds the id (sent, or possibly sent by a broadcast the RPC never
+answered, so the retry answers its hash, or still sending, so the retry is
+refused as in flight), since it sends nothing new —
 an id the signer no longer holds may really send, and is drawn in full. A
 retry spared so is sent replay-only: if the first send fails before the retry
 reaches the signer, the retry is refused with nothing sent, never broadcast

@@ -24,6 +24,7 @@ import typing as t
 
 import pytest
 from fastapi.testclient import TestClient
+from web3 import Web3
 
 from connect import chain_read
 from connect.activity import ActivityLog
@@ -603,6 +604,46 @@ def test_a_failed_send_says_whether_it_may_have_been_broadcast(
     with pytest.raises(SignerError) as failed:
         test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
     assert str(failed.value) == said
+
+
+@pytest.mark.parametrize("via_safe", [False, True])
+def test_a_retry_of_a_possibly_sent_broadcast_replays_its_hash(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    via_safe: bool,
+) -> None:
+    """The node took the transaction but the answer timed out: a retry sends nothing."""
+    taken: list[bytes] = []
+
+    def timed_out(raw: bytes) -> t.Any:
+        taken.append(bytes(raw))  # the node has it
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
+    send = test_signer.send_via_safe if via_safe else test_signer.send
+    target = TOKEN if via_safe else EOA
+    with pytest.raises(SignerError) as failed:
+        send("testchain", target, value=1, intent=pay(target, 1), request_id="x")
+    assert str(failed.value) == SEND_UNKNOWN
+    assert test_signer.holds_request("x", via_safe)
+    replayed = send("testchain", target, value=1, intent=pay(target, 1), request_id="x")
+    (raw,) = taken  # one broadcast, never a second at the next nonce
+    assert replayed == Web3.keccak(raw).to_0x_hex()
+    assert not fake_w3.eth.sent
+
+
+def test_a_send_that_failed_before_broadcasting_frees_its_request_id(
+    test_signer: Signer, fake_w3: FakeW3
+) -> None:
+    """A node rejection sent nothing: the same request id may send again."""
+    fake_w3.eth.fail_broadcast = True
+    with pytest.raises(SignerError, match="the RPC could not take"):
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1), request_id="y")
+    assert not test_signer.holds_request("y", via_safe=False)
+    fake_w3.eth.fail_broadcast = False
+    test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1), request_id="y")
+    assert len(fake_w3.eth.sent) == 1
 
 
 class TestSimulate:

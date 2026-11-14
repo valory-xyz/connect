@@ -57,6 +57,20 @@ class SignerError(Exception):
     """Signing or broadcast failure."""
 
 
+class SendUnknown(SignerError):
+    """A broadcast the RPC never answered: it may have landed, as `tx_hash`.
+
+    The hash is the signed bytes', known before the broadcast, so the request
+    id it was sent under keeps it: a retry replays it rather than signing a
+    second transaction at the next nonce.
+    """
+
+    def __init__(self, tx_hash: str) -> None:
+        """Initialize."""
+        super().__init__(SEND_UNKNOWN)
+        self.tx_hash = tx_hash
+
+
 class _ServerBuilt:
     """Marks a transaction the server built itself, which the intent gate skips.
 
@@ -172,7 +186,8 @@ SEND_FAILED = (
 # the broadcast itself failed with no answer from the RPC: it may have landed
 SEND_UNKNOWN = (
     "send failed while broadcasting: the transaction may have been sent (the "
-    "cause is in Connect's log); check the account's nonce or the transaction "
+    "cause is in Connect's log); a retry with the same request_id answers its "
+    "tx_hash without sending again, otherwise check the account's nonce "
     "before sending again"
 )
 COMPOSE_FAILED = (
@@ -243,7 +258,9 @@ class _IdempotencyCache:
 
         A completed key returns its cached result; a key whose action is still
         executing raises (the caller retries after the original settles); a
-        failed attempt releases the key so a retry can run the action again.
+        failed attempt releases the key so a retry can run the action again,
+        except a broadcast that may have landed (`SendUnknown`), whose hash is
+        kept as the key's result so a retry replays it.
 
         :raises SignerError: when the key was used for a different call.
         """
@@ -275,10 +292,20 @@ class _IdempotencyCache:
     def _execute(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
         try:
             result = action()
+        except SendUnknown as e:
+            # it may have landed: re-running would sign a second transaction
+            # at the next nonce, so a retry replays this hash instead and the
+            # receipt read settles whether it was mined
+            self._store(key, stamp, e.tx_hash)
+            raise
         except Exception:
             with self._lock:
                 self._in_flight.discard(key)
             raise
+        self._store(key, stamp, result)
+        return result
+
+    def _store(self, key: str, stamp: str, result: str) -> None:
         # cache the result and release the reservation atomically, so no retry
         # can observe "not cached and not in flight" after a success
         with self._lock:
@@ -289,7 +316,6 @@ class _IdempotencyCache:
             # that distance — retries cluster within seconds of the original
             while len(self._results) > self._max_results:
                 del self._results[next(iter(self._results))]
-        return result
 
 
 class Signer:
@@ -849,9 +875,10 @@ class Signer:
                         error=str(e),
                     )
                 logger.warning("send on %s to %s failed", chain, to, exc_info=True)
-                raise SignerError(
-                    _send_failure(e, broadcasting=signed is not None)
-                ) from e
+                said = _send_failure(e, broadcasting=signed is not None)
+                if signed is not None and said == SEND_UNKNOWN:
+                    raise SendUnknown(signed.hash.to_0x_hex()) from e
+                raise SignerError(said) from e
             state.next_nonce = tx["nonce"] + 1
         if audit:
             self._activity.record(
