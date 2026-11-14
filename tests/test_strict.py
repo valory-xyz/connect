@@ -109,6 +109,57 @@ async def test_mcp_tool_refuses_to_on_safe_transaction(
     assert entry == {**entry, "rule": "unknown-parameter", "tool": "safe_transaction"}
 
 
+def _placeholder(schema: dict) -> t.Any:
+    """Return a value of the JSON schema's type, so only the unknown name fails."""
+    kinds = {schema.get("type")} | {o.get("type") for o in schema.get("anyOf", [])}
+    for kind, value in (
+        ("integer", 1),
+        ("number", 1),
+        ("boolean", False),
+        ("object", {}),
+        ("array", []),
+    ):
+        if kind in kinds:
+            return value
+    return "testchain"
+
+
+async def test_every_mcp_tool_refuses_an_unknown_parameter(
+    mcp: FastMCP, fake_w3: FakeW3, store_path: t.Any
+) -> None:
+    """A tool that skipped the strict wrapper would drop the name silently."""
+    tools = await mcp.list_tools()
+    assert len(tools) > 10
+    for tool in tools:
+        properties = tool.inputSchema.get("properties", {})
+        required = {
+            name: _placeholder(properties[name])
+            for name in tool.inputSchema.get("required", [])
+        }
+        with pytest.raises(ToolError, match="unknown parameter 'zzz'"):
+            await mcp.call_tool(tool.name, {**required, "zzz": 1})
+    assert not fake_w3.eth.sent
+    refused = [
+        e["tool"]
+        for e in audit_entries(store_path)
+        if e["kind"] == "refusal" and e["rule"] == "unknown-parameter"
+    ]
+    assert sorted(refused) == sorted(tool.name for tool in tools)
+
+
+async def test_a_misspelled_max_payment_is_refused_not_uncapped(
+    mcp: FastMCP, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mech_request's cap dropped silently would pay the default; it is named instead."""
+    monkeypatch.setattr(mech_service, "request", lambda *a, **k: pytest.fail("sent"))
+    with pytest.raises(
+        ToolError, match=r"'max_paymnet' \(did you mean 'max_payment'\?\)"
+    ):
+        await mcp.call_tool(
+            "mech_request", {"prompt": "q", "tool": "t", "max_paymnet": 10}
+        )
+
+
 async def test_send_transaction_hints_the_other_way(mcp: FastMCP) -> None:
     """The EOA path takes `to`, so `target` there is pointed back at it."""
     with pytest.raises(ToolError, match=r"'target' \(did you mean 'to'\?\)"):
