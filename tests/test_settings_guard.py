@@ -3846,6 +3846,7 @@ class TestMech:
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A subgraph failure surfaces as a structured MechError."""
         monkeypatch.setattr(
@@ -3855,6 +3856,7 @@ class TestMech:
         )
         with pytest.raises(MechError, match="cause is in Connect's log"):
             mech_service.tools(chain="testchain")
+        assert "could not list mechs for 'testchain'" in caplog.text
 
     def test_tools_for_one_mech(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -5484,6 +5486,7 @@ class TestMech:
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         store_path: Path,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """An RPC error before mech-client's pre-sign hook: n was never sent."""
         patched_mech.raises = ConnectionError("the RPC is down")
@@ -5492,6 +5495,13 @@ class TestMech:
                 "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r2"
             )
         assert "mech_request_not_sent" in audit_kinds(store_path)
+        # the log says which request failed, so two concurrent ones differ
+        (logged,) = [
+            r
+            for r in caplog.records
+            if r.exc_info and "the RPC is down" in str(r.exc_info[1])
+        ]
+        assert f"mech request to {OTHER} on testchain (tool tool" in logged.getMessage()
         patched_mech.raises = None
         mech_service.request(
             "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r2"

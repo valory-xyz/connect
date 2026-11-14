@@ -122,14 +122,20 @@ def published_tools(document: t.Any) -> list[str]:
 UNSAID = "mech-client failed (the cause is in Connect's log)"
 
 
-def said(error: Exception) -> str:
+def request_label(chain: str, mech: str, tool: str, request_id: str | None) -> str:
+    """Name a mech request in the log: its chain, mech, tool and id."""
+    return f"mech request to {mech} on {chain} (tool {tool}, id {request_id})"
+
+
+def said(error: Exception, context: str) -> str:
     """Return what a caller is told of a failure on the mech path.
 
     Connect's own errors and refusals (MechError and the signer's, rule-named),
     mech-client's NonceRefused and its id check keep their words; anything
-    else is a library's, so it is UNSAID and logged.
+    else is a library's, so it is UNSAID and logged under `context` (what
+    failed, on which chain and mech), which tells concurrent failures apart.
     """
     if isinstance(error, (MechError, SignerError, NonceRefused, RequestIdMismatch)):
         return str(error)
-    logger.warning("mech request failed", exc_info=error)
+    logger.warning("%s", context, exc_info=error)
     return UNSAID
