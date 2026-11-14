@@ -1357,6 +1357,10 @@ def test_mech_payments_draw_on_every_ancestor_s_session_budget() -> None:
         store.authorize(children[1], "mech_request", {"max_payment": 60})
     assert refused.value.rule == "token-mech-session-cap"
     store.authorize(children[1], "mech_request", {"max_payment": 40})
+    for asked in (None, "1", -1, True):  # a budget is drawn by a whole amount only
+        with pytest.raises(GrantRefused) as refused:
+            store.authorize(children[1], "mech_request", {"max_payment": asked})
+        assert refused.value.rule == "token-mech-session-cap"
     # the workspace token has no mech budget of its own, so it is never drawn
     store.authorize(WORKSPACE, "mech_request", {"max_payment": 10**30})
 
@@ -1419,7 +1423,12 @@ def test_one_token_mints_a_bounded_number_of_live_children(
     monkeypatch.setattr(auth_module, "MAX_CHILDREN_PER_TOKEN", 2)
     store = grant_store(WORKSPACE)
     soon = int(time.time()) + 60
-    short = [store.mint(WORKSPACE, grant(scopes=["read"], expires_at=soon))]
+    short = [
+        store.mint(
+            WORKSPACE, grant(expires_at=soon, max_value_per_session={"native": 5})
+        )
+    ]
+    store.authorize(short[0], "safe_transaction", {"value": 1, "request_id": "r1"})
     store.mint(WORKSPACE, grant(scopes=["read"]))
     with pytest.raises(GrantRefused) as refused:
         store.mint(WORKSPACE, grant(scopes=["read"]))
