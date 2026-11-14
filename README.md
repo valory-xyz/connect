@@ -576,10 +576,10 @@ collide.
 Each request carries a spending budget, `max_payment`, which goes to
 mech-client as `send_request(max_price=...)`: a mech pricing above it is
 refused (`MechPriceExceeded`, reported as `over-max-payment`) before any
-deposit, signature or POST. A request that ends with nothing sent — that
-refusal, mech-client's request-id check, a queue refusal or a signer error —
-withdraws every guard allowance it armed (the ERC-1271 digest, the capped
-top-up), so none outlives it. It is denominated in the mech's payment
+deposit, signature or POST. A request withdraws every guard allowance it
+armed (the ERC-1271 digest, the capped top-up) once its send ends, whether it
+was refused, failed or sent, so none outlives it; concurrent requests to one
+tracker each hold and withdraw their own. It is denominated in the mech's payment
 asset, so its default is 0.1 of that asset — 10^17 base units for native and
 OLAS mechs, 10^5 for USDC ones, including Robinhood Chain, where that payment
 type is USDG. `mech_tools` reports the asset as `payment_token`.

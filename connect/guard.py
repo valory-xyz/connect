@@ -172,11 +172,8 @@ class Guard:
         """
         with self._allowance_lock:
             self._purge_expired()
-            self._deposit_allowances = [
-                a
-                for a in self._deposit_allowances
-                if (a.chain, a.tracker) != (chain.lower(), tracker.lower())
-            ]
+            # one entry per grant: concurrent requests to one tracker each
+            # keep their own, so withdrawing one leaves the others
             grant = _DepositAllowance(
                 chain=chain.lower(),
                 tracker=tracker.lower(),
@@ -192,7 +189,14 @@ class Guard:
 
         The recipient is always the signer's own address, so the allowance
         only moves funds between the two accounts this key already controls.
+        It replaces any earlier one on the chain, which a failed top-up left.
         """
+        with self._allowance_lock:
+            self._deposit_allowances = [
+                a
+                for a in self._deposit_allowances
+                if (a.chain, a.tracker) != (chain.lower(), self._agent_signer)
+            ]
         self.allow_safe_deposit_once(
             chain=chain,
             tracker=self._agent_signer,

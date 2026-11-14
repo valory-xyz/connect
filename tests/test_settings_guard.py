@@ -852,11 +852,25 @@ class TestGuard:
         shape: dict[str, t.Any] = dict(
             chain="testchain", tracker=TRACKER, amount_cap=10, is_token=False
         )
-        first = guard.allow_safe_deposit_once(**shape)
-        guard.allow_safe_deposit_once(**shape)  # the second request's, same shape
-        guard.revoke_safe_deposit(first)  # the first was refused before its POST
         deposit = exec_transaction_calldata(TRACKER, value=10)
-        guard.check_transaction("testchain", SAFE, 0, deposit)  # the second's 402
+        for withdrawn in (0, 1):  # whichever was armed first or second
+            grants = [guard.allow_safe_deposit_once(**shape) for _ in range(2)]
+            guard.revoke_safe_deposit(grants[withdrawn])  # refused before its POST
+            guard.check_transaction("testchain", SAFE, 0, deposit)  # the other's 402
+            with pytest.raises(GuardError, match="do not allow the safe to call"):
+                guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    def test_an_agent_top_up_allowance_replaces_a_stale_one(
+        self, store: SettingsStore
+    ) -> None:
+        """A failed top-up leaves its allowance; the next arm does not stack on it."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_agent_topup_once(chain="testchain", amount_cap=10)
+        guard.allow_agent_topup_once(chain="testchain", amount_cap=10)
+        topup = exec_transaction_calldata(AGENT, value=10)
+        guard.check_transaction("testchain", SAFE, 0, topup)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, topup)
 
     def test_deposit_allowance_native(self, store: SettingsStore) -> None:
         """A pre-authorized bare transfer to the tracker passes — once, capped.
@@ -928,22 +942,24 @@ class TestGuard:
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, transfer)
 
-    def test_rearming_replaces_the_deposit_allowance(
+    def test_every_armed_deposit_allowance_is_withdrawn_by_its_own_handle(
         self, store: SettingsStore
     ) -> None:
-        """N arms for one (chain, tracker) still admit exactly one deposit.
+        """N arms for one (chain, tracker) are N grants; each request withdraws its own.
 
-        Appending would stack grants — fifty requests arming the same
-        tracker would authorize fifty deposits at fifty caps. Re-arming must
-        refresh the single grant instead.
+        Stacked grants stay bounded because every request withdraws what it
+        armed when it ends (MechService._dispatch), sent or not.
         """
         guard = make_guard(store, MODE_RESTRICTED)
-        for _ in range(3):
+        grants = [
             guard.allow_safe_deposit_once(
                 chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
             )
+            for _ in range(3)
+        ]
         deposit = exec_transaction_calldata(TRACKER, value=50)
-        guard.check_transaction("testchain", SAFE, 0, deposit)  # the one grant
+        for grant in grants:
+            guard.revoke_safe_deposit(grant)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
 
@@ -3360,6 +3376,17 @@ class TestMech:
         service, guard = self._restricted_mech_service(
             account, app_config, activity, settings_store
         )
+        deposit = exec_transaction_calldata(TRACKER, value=10**16)
+        send_request = patched_mech.send_request
+
+        async def topped_up(**kwargs: t.Any) -> dict:
+            # the 402 top-up mech-client sends inside the request
+            guard.check_transaction("testchain", SAFE, 0, deposit)  # the one top-up
+            with pytest.raises(GuardError, match="do not allow the safe to call"):
+                guard.check_transaction("testchain", SAFE, 0, deposit)
+            return await send_request(**kwargs)
+
+        monkeypatch.setattr(patched_mech, "send_request", topped_up)
         service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         assert patched_mech.calls[0]["auto_deposit"] is True
         armed = [
@@ -3369,13 +3396,11 @@ class TestMech:
         ]
         assert armed[0]["tracker"] == TRACKER
         assert armed[0]["amount_cap"] == str(_MAX_AUTO_DEPOSIT_RATIO * 10**16)
-        deposit = exec_transaction_calldata(TRACKER, value=10**16)
-        guard.check_transaction("testchain", SAFE, 0, deposit)  # the one top-up
-        with pytest.raises(GuardError, match="do not allow the safe to call"):
-            guard.check_transaction("testchain", SAFE, 0, deposit)
 
-    @pytest.mark.parametrize("case", ["price", "id-mismatch", "map-nonces", "rejected"])
-    def test_a_request_refused_before_sending_leaves_no_allowance(  # pylint: disable=too-many-arguments
+    @pytest.mark.parametrize(
+        "case", ["price", "id-mismatch", "map-nonces", "rejected", "lost", "sent"]
+    )
+    def test_a_request_leaves_no_allowance_once_it_ends(  # pylint: disable=too-many-arguments
         self,
         account: LocalAccount,
         app_config: AppConfig,
@@ -3385,11 +3410,12 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
         case: str,
     ) -> None:
-        """Every exit that sent nothing withdraws the top-up armed for it.
+        """Every exit of the send withdraws the top-up armed for it.
 
         mech-client's price cap (MechPriceExceeded), its id check
-        (RequestIdMismatch) and a failed mapNonces read (MechNotSent), and the
-        mech's refusal (NonceRefused): none may leave an allowance behind.
+        (RequestIdMismatch), a failed mapNonces read (MechNotSent), the mech's
+        refusal (NonceRefused), a lost answer (MechAnswerUnknown) and a request
+        sent with no 402: none may leave an allowance behind.
         """
         monkeypatch.setattr(
             allowances_module,
@@ -3418,8 +3444,14 @@ class TestMech:
                 reason="Payment Required",
                 unsent=[],
             )
-        with pytest.raises(MechNotSent):
+        if case == "lost":
+            patched_mech.raises_after_signing = ConnectionError("POST timed out")
+        if case == "sent":
             service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        else:
+            expected = MechAnswerUnknown if case == "lost" else MechNotSent
+            with pytest.raises(expected):
+                service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         deposit = exec_transaction_calldata(TRACKER, value=10**16)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)

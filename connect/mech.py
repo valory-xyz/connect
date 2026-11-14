@@ -602,7 +602,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             )
             raise
         except MechPriceExceeded as e:  # mech-client's cap: nothing was paid
-            self._allowances.revoke(plan.armed)
             self._blocked(plan.chain, plan.tool, "over-max-payment", str(e))
             raise MechNotSent(
                 f"mech {plan.priced.mech} charges {e.price} per request (in its "
@@ -610,7 +609,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 "pass a higher max_payment to accept that price"
             ) from e
         except NonceRefused as e:
-            self._allowances.revoke(plan.armed)
             note = self.queue.note(plan.chain)
             self._record_deposit(plan, request_id, getattr(e.__cause__, "deposited", 0))
             self._activity.record(
@@ -623,7 +621,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             )
             raise MechNotSent(f"rule '{e.rule}': {e}{note}") from e
         except MechNotSent as e:  # failed before reaching the mech: nothing paid
-            self._allowances.revoke(plan.armed)
             self._activity.record(
                 "mech_request_not_sent",
                 chain=plan.chain,
@@ -643,6 +640,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 error=str(e),
             )
             raise MechError(f"mech request failed: {said(e)}") from e
+        finally:  # nothing more is signed for this request, sent or not
+            self._allowances.revoke(plan.armed)
         self._activity.record(
             "mech_request",
             chain=plan.chain,

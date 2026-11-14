@@ -154,10 +154,11 @@ class MechAllowances:
 
     @staticmethod
     def revoke(armed: Armed) -> None:
-        """Withdraw every grant a request armed: it ended with nothing sent.
+        """Withdraw every grant a request armed; it signs nothing more.
 
-        A refusal before the POST (mech-client's price cap or id check, the
-        signer, the queue) must spend nothing, so no grant outlives it.
+        Called on every exit of the send, so no grant outlives its request:
+        a refusal before the POST spends nothing, and a grant unused by a sent
+        request is not left for another caller to consume.
         """
         while armed:
             armed.pop()()
