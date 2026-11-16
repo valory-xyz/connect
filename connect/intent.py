@@ -23,10 +23,11 @@ The rules, what the asset diff is read from and what it cannot see are in
 the README, "Intent gate"; `Rule` is the full list of rule names.
 """
 
+import re
 import typing as t
 
 from connect.chains import NATIVE_ERC20_FACES as _FACES
-from connect.safe import ZERO_ADDRESS
+from connect.safe import ZERO_ADDRESS, calldata_hex
 
 TokenKey = str  # an ERC-20 address, lower-case, or "native"
 NATIVE = "native"
@@ -123,6 +124,26 @@ class Problem(t.TypedDict):
 
     rule: Rule
     detail: str
+
+
+# strict: bytes.fromhex would skip whitespace, and the raw string goes on
+_HEX_CALLDATA = re.compile(r"(0[xX])?[0-9a-fA-F]*")
+
+
+def calldata_problem(data: str) -> Problem | None:
+    """Return the bad-calldata problem for calldata that is not hex, else None.
+
+    Checked before anything reaches the RPC, so a caller's typo is refused as
+    one rather than as the RPC failing to simulate it.
+    """
+    raw = data or ""
+    if _HEX_CALLDATA.fullmatch(raw) and len(calldata_hex(raw)) % 2 == 0:
+        return None
+    return Problem(
+        rule="bad-calldata",
+        detail="cannot decode the calldata: it must be hex of whole bytes, "
+        "0x-prefixed or bare, with nothing else in it (no spaces)",
+    )
 
 
 class AssetDiff(t.TypedDict):

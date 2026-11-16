@@ -27,7 +27,6 @@ Signer.sign_digest(). The key never leaves this module's LocalAccount.
 
 import hashlib
 import logging
-import re
 import threading
 import typing as t
 from dataclasses import dataclass
@@ -193,26 +192,6 @@ def _safe_request_key(request_id: str) -> str:
     collide with it.
     """
     return f"safe:{request_id}"
-
-
-# strict: bytes.fromhex would skip whitespace, and the raw string goes on
-_HEX_CALLDATA = re.compile(r"(0[xX])?[0-9a-fA-F]*")
-
-
-def _calldata_problem(data: str) -> intent_module.Problem | None:
-    """Return the bad-calldata problem for calldata that is not hex, else None.
-
-    Checked before anything reaches the RPC, so a caller's typo is refused as
-    one rather than as the RPC failing to simulate it.
-    """
-    raw = data or ""
-    if _HEX_CALLDATA.fullmatch(raw) and len(safe_module.calldata_hex(raw)) % 2 == 0:
-        return None
-    return intent_module.Problem(
-        rule="bad-calldata",
-        detail="cannot decode the calldata: it must be hex of whole bytes, "
-        "0x-prefixed or bare, with nothing else in it (no spaces)",
-    )
 
 
 class _IdempotencyCache:
@@ -529,7 +508,7 @@ class Signer:
         send() takes too, so it meets the same guard and intent gate as
         anything else — a caller of the gate, not a way around it.
         """
-        problem = _calldata_problem(data)
+        problem = intent_module.calldata_problem(data)
         if problem is not None:  # composing it would fail on the same bytes
             self._refuse(chain, target, value, [problem], audit=audit)
         safe, calldata = self._compose_safe_call(chain, target, value, data)
@@ -651,7 +630,7 @@ class Signer:
         The one path the send-time gate and simulate_transaction share, so the
         two cannot answer differently about the same call.
         """
-        problem = _calldata_problem(call.data)
+        problem = intent_module.calldata_problem(call.data)
         if problem is not None:
             return None, None, [problem]
         parsed, problems = intent_module.parse_intent(raw_intent)
@@ -775,7 +754,7 @@ class Signer:
                     if via_safe
                     else partial(self._eoa_gate, chain, target, value, data)
                 )
-                problem = _calldata_problem(data)
+                problem = intent_module.calldata_problem(data)
                 if problem is not None:  # as the send refuses it, before the RPC
                     problems = [problem]
                     raise SignerError(intent_module.refusal_message(problems))
