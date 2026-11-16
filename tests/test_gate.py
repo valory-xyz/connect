@@ -31,6 +31,7 @@ from web3.exceptions import Web3RPCError
 
 from connect import chain_read
 from connect import intent as intent_module
+from connect import signer as signer_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
@@ -717,6 +718,34 @@ def test_an_unavailable_simulation_s_log_locates_the_code_that_failed(
     assert "TypeError raised at:" in record.message
     assert RPC_KEY not in record.message
     assert RPC_KEY not in json.dumps(audit_entries(store_path))
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_an_unreadable_prepaid_tracker_table_refuses_every_send_unsimulated(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    value: int,
+) -> None:
+    """A prepaid fall the gate could not see is spend: no table, no signature."""
+
+    def unreadable(_chain: str) -> dict[str, str]:
+        raise ValueError("invalid literal for int() with base 10: 'not-a-number'")
+
+    monkeypatch.setattr(signer_module, "prepaid_balance_trackers", unreadable)
+    with caplog.at_level("WARNING", logger="agent"):
+        with pytest.raises(SignerError, match="'simulation-unavailable'"):
+            test_signer.send_via_safe(
+                "testchain", EOA, value=value, intent=pay(EOA, value)
+            )
+        verdict = test_signer.simulate("testchain", EOA, value=value)
+    assert not fake_w3.eth.sent
+    assert not fake_w3.provider.simulated
+    assert [p["rule"] for p in verdict["problems"]] == ["simulation-unavailable"]
+    record, _ = [r for r in caplog.records if "cannot simulate" in r.message]
+    assert "ValueError raised at:" in record.message
+    assert "in unreadable" in record.message
 
 
 def test_a_possibly_sent_broadcast_with_no_request_id_promises_no_replay(

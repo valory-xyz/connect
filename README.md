@@ -278,7 +278,11 @@ spent of the tracker's asset (`"native"`, or its payment token), listed under
 `prepaid` and counted in `native`/`tokens`, so it needs an intent whose
 `spend` covers it and draws on the token's caps; a rise (a deposit) is no
 spend of its own, and a read that does not answer fails closed as
-`simulation-unavailable`. Permit2's own grants (its `Approval` from
+`simulation-unavailable`. So does a tracker table mech-client cannot give
+(a malformed `MECHX_LEDGER_CHAIN_ID` or `MECHX_GAS_LIMIT` in Connect's
+environment): every send on the chain is refused, the cause logged, and in
+restricted mode no payment token's `approve` is admitted, since the guard
+reads its approve targets from the same table. Permit2's own grants (its `Approval` from
 `approve()` and its `Permit` from a signed permit, from the canonical Permit2
 address) are approvals of the token to their spender, declared and capped like
 an ERC-20 approval, and always declared: the allowance exemption above reads

@@ -85,7 +85,7 @@ more than that. What a refusal won't tell you:
   always declared as an approval of the token to its spender, even within an
   existing allowance.
 - A call that moves nothing (a claim, a vote) needs no intent.
-- `simulation-unavailable` means that chain's RPC cannot simulate: no
+- `simulation-unavailable` means Connect cannot simulate on that chain: no
   value-moving call can be sent there.
 
 The bundled skills attach the intents of the calls they build.

@@ -265,18 +265,30 @@ def prepaid_balance_trackers(chain: str) -> dict[str, str]:
     pinned mech-client (`balance_tracker`, `payment_token`); a payment type
     with no tracker deployed on the chain is left out, and so is every one on
     a chain mech-client does not know.
+
+    :raises ValueError: mech-client cannot resolve the chain id payments use
+        (a malformed `MECHX_LEDGER_CHAIN_ID` or `MECHX_GAS_LIMIT`), so the
+        table cannot be read; never read as "none deployed".
     """
     # pylint: disable=import-outside-toplevel
     from mech_client import balance_tracker, payment_token
     from mech_client.infrastructure.config import PaymentType
+    from mech_client.infrastructure.config.loader import get_chain_id, ledger_chain_id
 
     name = MECH_CLIENT_CHAIN_NAMES.get(chain.lower(), chain.lower())
+    try:
+        get_chain_id(name)
+    except ValueError:  # a chain mech-client does not know
+        return {}
+    # the lookups below read the same environment, so past this line their
+    # ValueError can only mean "not deployed on this chain"
+    ledger_chain_id(name)
     trackers: dict[str, str] = {}
     for payment_type in PaymentType:
         try:
             tracker = balance_tracker(name, payment_type)
             token = payment_token(payment_type, name)
-        except ValueError:  # not deployed there, or a chain it does not know
+        except ValueError:  # not deployed on this chain
             continue
         if tracker is not None:
             trackers[tracker.lower()] = (token or "native").lower()
@@ -290,7 +302,7 @@ def token_approve_targets(chain: str) -> dict[str, str]:
     tracker as spender (the guard enforces that). The inverse of
     `prepaid_balance_trackers`' token entries, so the guard's approve targets
     and the intent gate's trackers are one reading of mech-client's table.
-    Fail closed to empty if mech-client cannot be read.
+    Fail closed to empty, logged, if mech-client cannot be read.
     """
     try:
         trackers = prepaid_balance_trackers(chain)

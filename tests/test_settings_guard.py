@@ -7400,6 +7400,28 @@ def test_every_marketplace_the_pinned_mech_client_names_is_refused_to_agent_call
     assert MECH_MARKETPLACES["gnosis"] == {GNOSIS_MARKETPLACE}
 
 
+@pytest.mark.parametrize("variable", ["MECHX_LEDGER_CHAIN_ID", "MECHX_GAS_LIMIT"])
+def test_a_tracker_table_mech_client_cannot_configure_is_unreadable_not_empty(
+    monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    """A malformed mech-client setting raises: it never reads as "none deployed"."""
+    monkeypatch.setenv(variable, "not-a-number")
+    with pytest.raises(ValueError, match="not-a-number"):
+        prepaid_balance_trackers("gnosis")
+    assert prepaid_balance_trackers("testchain") == {}  # still a chain it lacks
+
+
+def test_an_unreadable_tracker_table_refuses_mech_token_approvals_with_a_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The guard's approve targets fail closed, and log.txt says why."""
+    monkeypatch.setenv("MECHX_LEDGER_CHAIN_ID", "not-a-number")
+    with caplog.at_level(logging.WARNING):
+        assert token_approve_targets("polygon") == {}
+    assert "could not load mech token payment addresses" in caplog.text
+    assert "not-a-number" in caplog.text
+
+
 def test_the_prepaid_balance_trackers_are_mech_client_s_deposit_trackers() -> None:
     """Each tracker a top-up pays, with its asset; none where it deploys none."""
     gnosis = prepaid_balance_trackers("gnosis")

@@ -583,7 +583,8 @@ class Signer:
     def _simulate(self, chain: str, call: _GateCall) -> intent_module.AssetDiff:
         """Simulate one call at head over the chain's RPC.
 
-        :raises intent_module.SimulationUnavailable: the RPC cannot simulate.
+        :raises intent_module.SimulationUnavailable: the RPC cannot simulate,
+            or mech-client's tracker table cannot be read.
         """
         self._config.chain(chain)  # ValueError: an unknown chain is the caller's
         try:
@@ -610,6 +611,12 @@ class Signer:
             except Exception as e:  # pylint: disable=broad-exception-caught
                 raise intent_module.SimulationUnavailable(str(e)) from e
 
+        try:
+            prepaid = prepaid_balance_trackers(chain)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # a fall of a prepaid balance is spend: without the trackers the
+            # diff would not see it, so the call is not simulated at all
+            raise intent_module.SimulationUnavailable(str(e)) from e
         return intent_module.simulate(
             rpc,
             sender=call.sender,
@@ -619,7 +626,7 @@ class Signer:
             # a `0X` prefix is the same calldata, so it simulates the same way
             data="0x" + safe_module.calldata_hex(call.data),
             get_code=get_code,
-            prepaid=prepaid_balance_trackers(chain),
+            prepaid=prepaid,
         )
 
     def _evaluate(
@@ -654,8 +661,8 @@ class Signer:
                 [
                     intent_module.Problem(
                         rule="simulation-unavailable",
-                        detail=f"the RPC for '{chain}' cannot simulate this call, "
-                        "so it is not signed unchecked (the cause is in Connect's log)",
+                        detail=f"Connect cannot simulate this call on '{chain}', so it "
+                        "is not signed unchecked (the cause is in Connect's log)",
                     )
                 ],
             )
