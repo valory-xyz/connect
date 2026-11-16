@@ -66,7 +66,11 @@ other non-aea agent. It:
      while deriving a request id says so (nothing was sent), and a library's
      failure reads `mech-client failed (the cause is in Connect's log)`. What the RPC library
      said, which may name the RPC URL and its key (`with url: /v2/<key>`), goes
-     only to `log.txt`. Every body and
+     only to `log.txt`, and on the send path (a send, the gate's simulation,
+     a mech request, the hard cancel) it is redacted there and in the
+     activity record as in the message: each link of the cause chain is
+     mech-client's `redacted_cause`, its class and its text with every URL
+     cut to scheme and host and every path or query cut. Every body and
      every MCP tool refuses a parameter it does not take, with an error naming
      the ones it does (`to` on the safe path is pointed at `target`); read-only
      tools carry `readOnlyHint`

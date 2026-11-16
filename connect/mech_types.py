@@ -31,7 +31,7 @@ from mech_client import (
     RequestIdRpcError,
 )
 
-from connect.signer_errors import SendUnknown, SignerError
+from connect.signer_errors import SendUnknown, SignerError, cause_of
 
 logger = logging.getLogger("agent")
 
@@ -194,14 +194,15 @@ def said(error: Exception, context: str) -> str:
     mech-client's NonceRefused, its id check and its unreachable-RPC id
     derivation (which names only the error class) keep their words; anything
     else is a library's, so it is UNSAID and logged under `context` (what
-    failed, on which chain and mech), which tells concurrent failures apart.
+    failed, on which chain and mech), which tells concurrent failures apart,
+    redacted as `cause_of` redacts it.
     """
     if isinstance(
         error,
         (MechError, SignerError, NonceRefused, RequestIdMismatch, RequestIdRpcError),
     ):
         return str(error)
-    logger.warning("%s", context, exc_info=error)
+    logger.warning("%s: %s", context, cause_of(error))
     return UNSAID
 
 

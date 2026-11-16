@@ -5460,8 +5460,13 @@ class TestMech:
         app_config: AppConfig,
         store_path: Path,
         case: str,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A refusal names its rule; a failure that may have paid names nonce and mech."""
+        """A refusal names its rule; a failure that may have paid names nonce and mech.
+
+        Its log line carries the answer's redaction: no RPC key.
+        """
+        caplog.set_level("WARNING", logger="agent")
         self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
         if case == "guardrail":
             refused = SignerError("the operator's guardrail settings do not allow it")
@@ -5484,6 +5489,7 @@ class TestMech:
             json={"chain": "testchain", "password": TEST_PASSWORD},
         )
         assert "SECRETKEY" not in answer.text
+        assert "SECRETKEY" not in caplog.text
         audited = audit_entries(store_path)
         if case in ("rpc-down", "broadcast-failed"):
             assert answer.status_code == 502
@@ -5830,6 +5836,41 @@ class TestMech:
         patched_mech.contract.nonce += 1  # the off-chain one settled
         mech_service.request("q", "tool", **on_chain)  # same id, not refused
 
+    @pytest.mark.parametrize("legacy_on_chain", [True, False])
+    def test_every_mech_send_path_record_carries_the_message_s_redaction(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        legacy_on_chain: bool,
+    ) -> None:
+        """A library's failure naming a URL keeps its path out of every record.
+
+        The caller reads UNSAID; the audit record and the log line keep the
+        failure's class and its URL's host, and none of them the opaque path.
+        """
+        secret = "v3/" + "9f1c" * 16
+        patched_mech.raises = ConnectionError(
+            f"Max retries exceeded with url: https://rpc.example/{secret}"
+        )
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(MechError) as e:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                legacy_on_chain=legacy_on_chain,
+            )
+        assert UNSAID in str(e.value)
+        records = audit_entries(store_path)
+        kind = "mech_request_failed" if legacy_on_chain else "mech_request_not_sent"
+        assert kind in [r["kind"] for r in records]
+        assert secret not in json.dumps(records)
+        assert "ConnectionError: Max retries exceeded" in caplog.text
+        assert "https://rpc.example/..." in caplog.text
+        assert secret not in caplog.text
+
     def test_a_failure_before_signing_frees_the_nonce(
         self,
         mech_service: MechService,
@@ -5848,7 +5889,7 @@ class TestMech:
         (logged,) = [
             r
             for r in caplog.records
-            if r.exc_info and "the RPC is down" in str(r.exc_info[1])
+            if "ConnectionError: the RPC is down" in r.getMessage()
         ]
         assert f"mech request to {OTHER} on testchain (tool tool" in logged.getMessage()
         patched_mech.raises = None

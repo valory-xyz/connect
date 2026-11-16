@@ -47,7 +47,13 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
 from connect.settings import prepaid_balance_trackers
-from connect.signer_errors import SEND_UNKNOWN, SendUnknown, SignerError, send_failure
+from connect.signer_errors import (
+    SEND_UNKNOWN,
+    SendUnknown,
+    SignerError,
+    cause_of,
+    send_failure,
+)
 
 logger = logging.getLogger("agent")
 
@@ -650,15 +656,15 @@ class Signer:
             return None, None, problems
         try:
             diff = self._simulate(chain, call)
-        except intent_module.SimulationUnavailable:
+        except intent_module.SimulationUnavailable as e:
             # every agent send on this chain is refused until it can simulate:
             # log.txt must say why, including when the cause is our own code
             logger.error(
-                "intent gate cannot simulate on %s (%s -> %s)",
+                "intent gate cannot simulate on %s (%s -> %s): %s",
                 chain,
                 call.sender,
                 call.to,
-                exc_info=True,
+                cause_of(e),
             )
             return (
                 None,
@@ -892,15 +898,15 @@ class Signer:
                 chain=chain,
                 to=to,
                 value=str(value),
-                error=str(error),
+                error=cause_of(error),
                 **landed,
             )
         logger.warning(
-            "send on %s to %s failed%s",
+            "send on %s to %s failed%s: %s",
             chain,
             to,
             f"; it may have landed: {landed}" if landed else "",
-            exc_info=error,
+            cause_of(error),
         )
 
     def _fill_transaction(

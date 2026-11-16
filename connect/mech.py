@@ -87,6 +87,7 @@ from connect.mech_types import (
     said,
 )
 from connect.signer import Signer, SignerError
+from connect.signer_errors import cause_of
 
 logger = logging.getLogger("agent")
 
@@ -656,7 +657,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 chain=plan.chain,
                 tool=plan.tool,
                 request_id=request_id,
-                error=str(e),
+                error=cause_of(e),
             )
             what = request_label(plan.chain, plan.priced.mech, plan.tool, request_id)
             raise MechError(f"mech request failed: {said(e, what)}") from e

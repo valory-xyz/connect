@@ -23,7 +23,11 @@ Split out of connect/signer.py for pylint's line limit; `from connect.signer
 import SignerError` still resolves.
 """
 
+from mech_client.utils.redaction import redacted_cause
 from web3.exceptions import ContractLogicError, Web3RPCError
+
+# how many links of a failure's cause chain `cause_of` describes
+MAX_CAUSES = 5
 
 
 class SignerError(Exception):
@@ -73,6 +77,24 @@ def _send_unknown_words(tx_hash: str, *, held: bool) -> str:
         "read the hash's receipt (transaction_status) or the account's nonce "
         "before sending again"
     )
+
+
+def cause_of(error: BaseException) -> str:
+    """Describe a failure and what caused it, as the log and audit trail keep it.
+
+    Each link is mech-client's `redacted_cause`: its class and its text with
+    every URL cut to scheme and host and every path or query cut, where an
+    RPC key rides. So a record keeps no library text the caller's message
+    leaves out.
+    """
+    causes: list[str] = []
+    seen: set[int] = set()
+    link: BaseException | None = error
+    while link is not None and id(link) not in seen and len(causes) < MAX_CAUSES:
+        seen.add(id(link))
+        causes.append(redacted_cause(link))
+        link = link.__cause__ or link.__context__
+    return " <- ".join(causes)
 
 
 def send_failure(error: Exception, *, broadcasting: bool) -> str:

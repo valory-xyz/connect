@@ -210,7 +210,7 @@ class TestSignerGate:
         with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
         (record,) = [r for r in caplog.records if "cannot simulate" in r.message]
-        assert record.exc_info is not None
+        assert "SimulationUnavailable: " in record.message  # and why
         assert record.levelname == "ERROR"
         assert EOA in record.message  # which call it could not simulate
 
@@ -604,6 +604,33 @@ def test_a_failed_send_says_whether_it_may_have_been_broadcast(
     with pytest.raises(SignerError) as failed:
         test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
     assert str(failed.value).startswith(said)
+
+
+# an RPC key in a URL's path, as a provider puts it there
+RPC_KEY = "k3y" + "0f9a" * 16
+
+
+def test_a_failed_send_s_record_and_log_carry_the_message_s_redaction(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    store_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The caller's message, the send_failed record and the log keep no RPC key."""
+
+    def broken(*_args: t.Any) -> t.Any:
+        raise ValueError(f"rejected by https://rpc.example/v2/{RPC_KEY}?x=1")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", broken)
+    with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError) as e:
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
+    assert str(e.value) == SEND_FAILED
+    (failed,) = [r for r in audit_entries(store_path) if r["kind"] == "send_failed"]
+    assert failed["error"] == "ValueError: rejected by https://rpc.example/..."
+    assert RPC_KEY not in json.dumps(audit_entries(store_path))
+    assert "https://rpc.example/..." in caplog.text
+    assert RPC_KEY not in caplog.text
 
 
 def test_a_possibly_sent_broadcast_with_no_request_id_promises_no_replay(

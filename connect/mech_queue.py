@@ -39,6 +39,7 @@ from connect.mech_allowances import read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT
 from connect.mech_types import MechError, published_tools
 from connect.signer import SignerError
+from connect.signer_errors import cause_of
 
 logger = logging.getLogger("agent")
 
@@ -228,11 +229,11 @@ class MechQueue:
                 raise refused  # pylint: disable=raise-missing-from
             failure = e
         logger.error(
-            "the hard cancel on %s (nonce %s, mech %s) failed",
+            "the hard cancel on %s (nonce %s, mech %s) failed: %s",
             chain,
             nonce,
             mech,
-            exc_info=failure,
+            cause_of(failure),
         )
         self._activity.record(
             "mech_hard_cancel_failed",
