@@ -66,7 +66,7 @@ from mech_client.infrastructure.subgraph.queries import MechRecord
 from web3 import Web3
 from web3.datastructures import AttributeDict
 
-from connect import guard as guard_module
+from connect import chains as chains_module
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
@@ -74,6 +74,7 @@ from connect import mech_queue as mech_queue_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
+from connect.chains import MECH_MARKETPLACES
 from connect.config import AppConfig, ChainConfig
 from connect.guard import ALLOWANCE_TTL, Guard, GuardError
 from connect.idempotency import RequestLedger
@@ -101,6 +102,7 @@ from connect.safe import (
     DEPOSIT_SELECTOR,
     EXEC_TRANSACTION_SELECTOR,
     EXEC_TRANSACTION_TYPES,
+    ZERO_ADDRESS,
     decode_approve,
     decode_deposit,
     safe_message_hash,
@@ -125,7 +127,6 @@ from connect.settings import (
     default_whitelist,
     defaults,
     derive_mac_key,
-    mech_marketplace,
     prepaid_balance_trackers,
     token_approve_targets,
 )
@@ -6878,11 +6879,7 @@ def test_the_marketplace_takes_a_safe_call_only_from_the_server_built_mech_flow(
     call to it and the dry run are refused, while the mech flow's own
     request goes through on the same settings.
     """
-    monkeypatch.setattr(
-        guard_module,
-        "mech_marketplace",
-        lambda chain: MARKETPLACE if chain == "testchain" else None,
-    )
+    monkeypatch.setitem(MECH_MARKETPLACES, "testchain", frozenset({MARKETPLACE}))
     settings_store.save(
         Settings(
             protected=Protected(mode=mode, whitelist={"testchain": (MARKETPLACE,)})
@@ -6912,12 +6909,97 @@ def test_the_marketplace_takes_a_safe_call_only_from_the_server_built_mech_flow(
     assert len(fake_w3.eth.sent) == 1
 
 
-def test_the_marketplace_is_the_one_mech_client_names_for_the_chain() -> None:
-    """Connect's chain names map onto mech-client's, as the whitelist reads them."""
-    assert mech_marketplace("gnosis") == GNOSIS_MARKETPLACE
-    assert mech_marketplace("Gnosis") == GNOSIS_MARKETPLACE
-    assert mech_marketplace("arbitrum_one") == mech_marketplace("arbitrum")
-    assert mech_marketplace("testchain") is None
+@pytest.mark.parametrize("mode", [MODE_RESTRICTED, MODE_UNRESTRICTED])
+def test_an_agent_call_to_the_marketplace_is_refused_when_mech_client_s_config_is_unreadable(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    guard: Guard,
+    settings_store: SettingsStore,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """The marketplace rule fails closed: mech-client's file is not what it reads."""
+    monkeypatch.setitem(MECH_MARKETPLACES, "testchain", frozenset({MARKETPLACE}))
+    monkeypatch.setattr(settings_module, "_mech_system_addresses", lambda: {})
+    settings_store.save(
+        Settings(
+            protected=Protected(mode=mode, whitelist={"testchain": (MARKETPLACE,)})
+        )
+    )
+    test_signer.set_guard(guard)
+    with pytest.raises(SignerError, match="mech marketplace"):
+        test_signer.send_via_safe(
+            "testchain", MARKETPLACE, data="0x" + AGENT_COMPOSED.hex(), intent={}
+        )
+    assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize("mode", [MODE_RESTRICTED, MODE_UNRESTRICTED])
+def test_a_marketplace_a_pin_moved_away_from_stays_refused_to_agent_calls(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    guard: Guard,
+    settings_store: SettingsStore,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """A persisted whitelist holding the retired address admits no agent call to it."""
+    retired = "0x" + "4e" * 20
+    monkeypatch.setitem(
+        MECH_MARKETPLACES, "testchain", frozenset({MARKETPLACE, retired})
+    )
+    settings_store.save(
+        Settings(protected=Protected(mode=mode, whitelist={"testchain": (retired,)}))
+    )
+    test_signer.set_guard(guard)
+    with pytest.raises(SignerError, match=f"mech marketplace {retired}"):
+        test_signer.send_via_safe(
+            "testchain", retired, data="0x" + AGENT_COMPOSED.hex(), intent={}
+        )
+    assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize(
+    "spelling", [str.lower, Web3.to_checksum_address, lambda a: "0X" + a[2:]]
+)
+def test_a_direct_call_to_the_marketplace_is_refused_however_its_address_is_spelled(
+    test_signer: Signer,
+    guard: Guard,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: t.Callable[[str], str],
+) -> None:
+    """The EOA's own call to the marketplace, checksummed or 0X-prefixed, is refused."""
+    monkeypatch.setitem(MECH_MARKETPLACES, "testchain", frozenset({MARKETPLACE}))
+    test_signer.set_guard(guard)
+    with pytest.raises(SignerError, match="mech marketplace"):
+        test_signer.send(
+            "testchain",
+            spelling(MARKETPLACE),
+            data="0x" + AGENT_COMPOSED.hex(),
+            intent={},
+        )
+    assert not fake_w3.eth.sent
+
+
+def test_every_marketplace_the_pinned_mech_client_names_is_refused_to_agent_calls() -> (
+    None
+):
+    """Connect's marketplace table holds each one mech-client configures.
+
+    A pin bump that moves a marketplace fails here until the new address is
+    added beside the one it replaces, which stays.
+    """
+    named = {
+        chain: address.lower()
+        for chain, address in chains_module._marketplaces().items()  # pylint: disable=protected-access
+        if address.lower() != ZERO_ADDRESS
+    }
+    connect_name = {v: k for k, v in chains_module.MECH_CLIENT_CHAIN_NAMES.items()}
+    assert named
+    for chain, address in named.items():
+        assert address in MECH_MARKETPLACES[connect_name.get(chain, chain)], chain
+    assert MECH_MARKETPLACES["gnosis"] == {GNOSIS_MARKETPLACE}
 
 
 def test_the_prepaid_balance_trackers_are_mech_client_s_deposit_trackers() -> None:

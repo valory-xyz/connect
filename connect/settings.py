@@ -217,8 +217,9 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     token_approve_targets(). Its whitelist entry admits the calls the
     server's own mech flow composes, bounded by `max_payment` and the
     session's mech budget, and nothing else: the guard refuses a call to it
-    from any agent-facing send path in every mode (`mech_marketplace`), since
-    such a call could spend the safe's prepaid balance outside both. Balance
+    from any agent-facing send path in every mode (from Connect's own
+    `chains.MECH_MARKETPLACES`, not from this read), since such a call could
+    spend the safe's prepaid balance outside both. Balance
     trackers are deliberately NOT whitelisted —
     the safe only calls them for prepaid deposits, which restricted mode
     admits through the guard's one-shot capped deposit allowances (armed per
@@ -234,7 +235,8 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     their persisted whitelist as-is — it is operator-owned state, and merging
     defaults at load time would silently re-add an address the operator
     deliberately removed. An upgrade that moves the marketplace reaches them
-    only when settings are reset or re-saved.
+    only when settings are reset or re-saved; until then the address they
+    hold stays in `chains.MECH_MARKETPLACES`, so it admits no agent call.
     """
     # pylint: disable=import-outside-toplevel
     try:
@@ -254,17 +256,6 @@ def _mech_system_addresses() -> dict[str, list[str]]:
         # loads defaults. Fail closed to an empty whitelist instead.
         logger.warning("could not load mech marketplace addresses: %s", e)
         return {}
-
-
-def mech_marketplace(chain: str) -> str | None:
-    """Return the marketplace the mech flow calls on `chain`, lowercase, or None.
-
-    `chain` is Connect's name for it; mech-client names a few chains
-    differently (`MECH_CLIENT_CHAIN_NAMES`).
-    """
-    name = chain.lower()
-    addresses = _mech_system_addresses().get(MECH_CLIENT_CHAIN_NAMES.get(name, name))
-    return addresses[0] if addresses else None
 
 
 def prepaid_balance_trackers(chain: str) -> dict[str, str]:

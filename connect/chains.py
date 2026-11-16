@@ -67,6 +67,20 @@ NATIVE_ERC20_FACES: dict[str, str] = {
     "celo": "0x471ece3750da237f93b8e339c536989b8978a438",
 }
 
+# Every MechMarketplace contract a pinned mech-client has named, by Connect's
+# chain name: the guard refuses an agent-facing call to any of them. Connect's
+# own table rather than a read of mech-client's file, so a mech-client install
+# that cannot be read leaves the rule whole, and an address a pin bump moves
+# away from stays refused while a persisted whitelist still holds it. A test
+# fails on a pinned mech-client naming one this table does not hold.
+MECH_MARKETPLACES: dict[str, frozenset[str]] = {
+    "base": frozenset({"0xf24ee42eda0fc9b33b7d41b06ee8ccd2ef7c5020"}),
+    "gnosis": frozenset({"0x735faab1c4ec41128c367afb5c3bac73509f70bb"}),
+    "optimism": frozenset({"0x46c0d07f55d4f9b5eed2fc9680b5953e5fd7b461"}),
+    "polygon": frozenset({"0x343f2b005cf6d70ba610cd9f1f1927049414b582"}),
+    "robinhood": frozenset({"0xa45e64d13a30a51b91ae0eb182e88a40e9b18ed8"}),
+}
+
 # No facilitator route is configured in Connect, and no repo it reads lists
 # the facilitator's chains, so every chain starts without one; the facilitator
 # team says where it runs.

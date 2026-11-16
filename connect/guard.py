@@ -34,7 +34,9 @@ wider gate, not a one-way door.
 A third holds in every mode: only the server's own mech flow may call the
 mech marketplace (`check_transaction(server_built=True)`). Its calls are
 bounded by `max_payment` and the session's mech budget; one composed by the
-agent could spend the safe's prepaid mech balance outside both.
+agent could spend the safe's prepaid mech balance outside both. The
+marketplaces are Connect's own table (`chains.MECH_MARKETPLACES`), so the
+rule holds whether or not mech-client's configuration can be read.
 
 That guarantee is scoped to the safe itself. State granted on *other*
 contracts while unrestricted — an ERC-20 allowance above all — persists until
@@ -78,6 +80,7 @@ import threading
 import time
 from dataclasses import dataclass
 
+from connect.chains import MECH_MARKETPLACES
 from connect.config import AppConfig
 from connect.safe import (
     EXEC_TRANSACTION_SELECTOR,
@@ -87,12 +90,7 @@ from connect.safe import (
     decode_approve,
     decode_deposit,
 )
-from connect.settings import (
-    MODE_RESTRICTED,
-    SettingsStore,
-    mech_marketplace,
-    token_approve_targets,
-)
+from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
 
 logger = logging.getLogger("agent")
 
@@ -345,16 +343,16 @@ class Guard:
 
     @staticmethod
     def _check_marketplace(chain: str, to: str, exec_call: "SafeExec | None") -> None:
-        """Refuse a call to the mech marketplace, by the EOA or by the safe.
+        """Refuse a call to a mech marketplace, by the EOA or by the safe.
 
-        In every mode: the marketplace takes only the requests the server's
+        In every mode: a marketplace takes only the requests the server's
         mech flow composes; see the module docstring.
         """
-        marketplace = mech_marketplace(chain)
         called = {to.lower()} | ({exec_call.to.lower()} if exec_call else set())
-        if marketplace is not None and marketplace in called:
+        marketplaces = sorted(called & MECH_MARKETPLACES.get(chain, frozenset()))
+        if marketplaces:
             raise GuardError(
-                f"the mech marketplace {marketplace} on {chain} takes only the "
+                f"the mech marketplace {marketplaces[0]} on {chain} takes only the "
                 "requests Connect composes; send a mech request with mech_request"
             )
 

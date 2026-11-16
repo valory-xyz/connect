@@ -301,11 +301,13 @@ Both would outlive a switch back to restricted mode, so the guardrail refuses
 them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
 A third holds in every mode too: the mech marketplace takes only the calls the
 server's own mech flow composes (`mech_request`, bounded by `max_payment` and
-the token's mech budget). A call to the chain's marketplace (mech-client's
-`mech_marketplace_contract`) through any agent-facing send path —
-`safe_transaction`, `send_transaction` (to the marketplace, or an
-`execTransaction` carrying a call to it) and their HTTP routes — is refused,
-and `preflight_transaction` answers the same.
+the token's mech budget). A call to the chain's marketplace (every
+`mech_marketplace_contract` a pinned mech-client has named, kept in Connect's
+own table, so the rule holds when mech-client's configuration cannot be read
+and still covers an address a later pin moved away from) through any
+agent-facing send path — `safe_transaction`, `send_transaction` (to the
+marketplace, or an `execTransaction` carrying a call to it) and their HTTP
+routes — is refused, and `preflight_transaction` answers the same.
 
 On that floor, the signer enforces one of two persistent modes. The modes are
 an operator concept only: agent-facing surfaces (the MCP tools, `GET /wallet`,
