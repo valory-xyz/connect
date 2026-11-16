@@ -679,7 +679,8 @@ deposit, signature or POST. It bounds the request's 402 top-up as well: a
 shortfall above `max_payment` (or above 10× the mech's price) is refused
 before anything is deposited, by mech-client and, in every mode, by Connect,
 which reads each transaction the flow sends and audits the refused deposit
-as `mech_deposit_refused`; the top-up then draws on the calling token's mech
+as `mech_deposit_refused`. mech-client also holds the request's top-ups
+together, across its 503 resends, within `max_payment`; the top-up then draws on the calling token's mech
 session budget ("Scoped tokens"). A request withdraws every guard allowance it
 armed (the ERC-1271 digest, the capped top-up) once its send ends, whether it
 was refused, failed or sent, so none outlives it. The top-up's grant is armed

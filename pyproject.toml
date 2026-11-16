@@ -11,7 +11,7 @@ dependencies = [
     "web3==7.16.0",
     "eth-account==0.13.7",
     "mcp==1.28.1",
-    "mech-client @ git+https://github.com/valory-xyz/mech-client.git@93491df0175172a83c3e208d1c3140475a6e35ce",
+    "mech-client @ git+https://github.com/valory-xyz/mech-client.git@b98fbc504e483a8e40f83661136b12f72c4e8db3",
     "open-aea-ledger-ethereum==2.2.9",
     "tomli-w==1.2.0",
 ]
@@ -42,7 +42,8 @@ packages = ["connect"]
 # mech-client is pinned to a commit of valory-xyz/mech-client#274
 # (the allocator, its store lock and closed/taken rules, the held slot of a
 # posted request, id derivation, and the price cap on a request and on its
-# 402 auto-deposits, which one call's deposits share), until it is released;
+# 402 auto-deposits, which one request's deposits share across its 503
+# resends), until it is released;
 # this goes away with the bump to that release.
 [tool.hatch.metadata]
 allow-direct-references = true
