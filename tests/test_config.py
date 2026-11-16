@@ -70,6 +70,22 @@ def test_safes_json_format(tmp_path: Path) -> None:
     assert config.chains["base"].safe_address is None
 
 
+@pytest.mark.parametrize(
+    ("safes", "expected"),
+    [
+        ({"gnosis": "0x" + "11" * 20}, "gnosis"),
+        ({}, None),
+        ({"gnosis": "0x" + "11" * 20, "base": "0x" + "22" * 20}, None),
+    ],
+)
+def test_instance_chain_is_the_one_chain_with_a_safe(
+    tmp_path: Path, safes: dict, expected: str | None
+) -> None:
+    """Every chain has an RPC; only the instance's own chain has a safe."""
+    env = base_env(tmp_path) | {SAFES_ENV: json.dumps(safes)}
+    assert load_config(env).instance_chain == expected
+
+
 def test_safe_for_unconfigured_chain_warns(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

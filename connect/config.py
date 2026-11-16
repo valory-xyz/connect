@@ -84,6 +84,16 @@ class AppConfig:
     # wins from then on, so changing this never reaches an existing install
     minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
 
+    @property
+    def instance_chain(self) -> str | None:
+        """The one chain this instance runs on: the chain carrying its safe.
+
+        Pearl configures an RPC for every chain but a safe for one, so a
+        config with no safe, or with several, names no instance chain.
+        """
+        chains = [name for name, chain in self.chains.items() if chain.safe_address]
+        return chains[0] if len(chains) == 1 else None
+
     def chain(self, name: str) -> ChainConfig:
         """Chain."""
         try:
