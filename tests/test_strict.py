@@ -19,6 +19,7 @@
 
 """Unknown parameters are refused by name on both surfaces."""
 
+import json
 import typing as t
 
 import pytest
@@ -431,3 +432,77 @@ async def test_a_decimal_string_intent_amount_reaches_the_gate_exactly(
         else:
             assert parsed[where] == {"native": exact}  # type: ignore[literal-required]
     assert len(seen) == 2
+
+
+@pytest.mark.parametrize("where", ["spend", "receive_min", "approvals"])
+@pytest.mark.parametrize("amount", [5, 2**53 - 1])
+async def test_a_json_integer_intent_amount_reaches_the_gate_exactly(
+    mcp: FastMCP,
+    test_signer: Signer,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+    amount: int,
+) -> None:
+    """An intent amount sent as a JSON integer up to 2^53 - 1 arrives as itself."""
+    seen: list[t.Any] = []
+
+    def send_via_safe(*_args: t.Any, **kwargs: t.Any) -> str:
+        seen.append(kwargs["intent"])
+        return "0x" + "11" * 32
+
+    monkeypatch.setattr(test_signer, "send_via_safe", send_via_safe)
+    await mcp.call_tool(
+        "safe_transaction",
+        {
+            "chain": "testchain",
+            "target": RECIPIENT,
+            "intent": _intent_with(where, amount),
+        },
+    )
+    (intent,) = seen
+    parsed, problems = parse_intent(intent)
+    assert not problems
+    assert parsed is not None
+    if where == "approvals":
+        assert parsed["approvals"][0]["amount"] == amount
+    else:
+        assert parsed[where] == {"native": amount}  # type: ignore[literal-required]
+
+
+@pytest.mark.parametrize(
+    ("intent", "unknown"),
+    [
+        ({"receive_minimum": {"native": "1000"}}, "receive_minimum"),
+        (
+            {
+                "approvals": [
+                    {
+                        "token": RECIPIENT,
+                        "spender": RECIPIENT,
+                        "amount": "1",
+                        "amout": "1",
+                    }
+                ]
+            },
+            "amout",
+        ),
+    ],
+)
+async def test_a_misspelled_intent_key_on_a_tool_is_refused_not_dropped(
+    mcp: FastMCP, fake_w3: FakeW3, intent: dict, unknown: str
+) -> None:
+    """A key the intent does not know reaches the gate, which refuses it by name."""
+    with pytest.raises(ToolError, match="rule 'bad-intent'") as refused:
+        await mcp.call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+        )
+    assert unknown in str(refused.value)
+    (content,) = await mcp.call_tool(
+        "simulate_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+    )
+    (problem,) = json.loads(content.text)["problems"]  # type: ignore[union-attr]
+    assert problem["rule"] == "bad-intent"
+    assert unknown in problem["detail"]
+    assert not fake_w3.eth.sent
