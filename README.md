@@ -187,20 +187,23 @@ Claude `Read` deny rules.
 session could read the keys in `~/.operate`. Elsewhere it is unavailable with
 `model_unavailable` unless the instance's chain (the one chain carrying the
 safe) has a confirmed chat mech in `OCB_CHAT_MECHS` (`connect/settings.py`).
-None is confirmed yet, so every entry is `None` and "OCB CLI" is offered
-nowhere until a release fills them in. `PATCH /settings` and `POST /session`
+A chain whose entry is `None` has no confirmed chat mech, so OCB is
+unavailable there. `PATCH /settings` and `POST /session`
 refuse an unavailable harness with a 400, and a saved `ocb_cli` that has
 become unavailable (a settings file copied between machines) loads as the
 default.
 
-**Install.** Connect bundles OCB's `install.sh` and a built `ocb_agent` wheel
-under `connect/assets/ocb/` (from `olas-ocb-agent`, committed as given;
-`VERSION` names the tag to install from once that repo is public). Selecting
+**Install.** Connect installs from OCB's `install.sh` and a built `ocb_agent`
+wheel under `connect/assets/ocb/`, which `olas-ocb-agent` supplies and which
+are committed as given (`VERSION` names the tag to install from once that repo
+is public). Until they are committed, every install fails with
+`install_failed`. Selecting
 `ocb_cli` in `PATCH /settings` starts the install in the background and
 returns. `POST /session` with `ocb_cli` waits for an install already running,
 or runs one when the path it stored is gone. The script runs as `sh install.sh`
 in STORE_PATH, with stdin closed, `harness_env()` plus `OCB_AGENT_SPEC=<the
-bundled wheel>`, and a 10-minute timeout. It brings uv and a Python of its own,
+bundled wheel>`, and the `OCB_INSTALL_TIMEOUT_SECONDS` timeout
+(`connect/workspace.py`). It brings uv and a Python of its own,
 prints the absolute path of `ocb-agent` on success, and a one-line reason on
 stderr otherwise; that line becomes `/session`'s `error`. Connect keeps the
 path in `STORE_PATH/.ocb-agent-path`. One install runs at a time. Nothing is
@@ -209,7 +212,7 @@ installed for an operator who never selects `ocb_cli`.
 **Launch.** A terminal opens, the same way as for `codex_cli`, running
 
 ```sh
-<stored path> --model 'mech:chat@<the chain's chat mech>' --model-budget 1
+<stored path> --model 'mech:chat@<the chain's chat mech>' --model-budget <OCB_MODEL_BUDGET_USD>
 ```
 
 by absolute path, without a PATH probe: uv's tool directory is not always on
@@ -492,7 +495,7 @@ tox -p -e flake8 -e pylint
 tox -p -e black-check -e isort-check -e bandit -e safety -e mypy
 tox -e unit-tests-coverage        # enforces 100% coverage
 GNOSIS_RPC=<gnosis-rpc-url> tox -e integration-tests
-tox -e launch-tests               # opens a real terminal for codex_cli (stand-in codex)
+tox -e launch-tests               # opens a real terminal for the terminal harnesses (stand-in binaries)
 ```
 
 Run standalone (mimicking the Pearl runner):

@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from connect import workspace
+from connect import settings, workspace
 from connect.workspace import Workspace
 
 LAUNCH_TIMEOUT_SECONDS = 90
@@ -97,7 +97,7 @@ def test_ocb_cli_launches_the_installed_agent_with_its_model(
 ) -> None:
     """An ocb_cli session is a terminal running the installed ocb-agent by path."""
     mech = "0x" + "ab" * 20
-    monkeypatch.setitem(workspace.OCB_CHAT_MECHS, "testchain", mech)
+    monkeypatch.setitem(settings.OCB_CHAT_MECHS, "testchain", mech)
     agent = tmp_path / "uv tools" / "ocb-agent"  # a space: the path must be quoted
     agent.parent.mkdir()
     agent.write_text(

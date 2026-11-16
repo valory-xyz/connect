@@ -125,8 +125,8 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
             raise ValueError(f"harness {requested} is unavailable: {unavailable}")
         # a harness the operator may choose but nobody can open is a bug, not a
         # server fault to 500 over: answer the caller the same way as any other
-        # unusable harness (a test pins DEEP_LINKS against HARNESSES so this
-        # cannot go unnoticed)
+        # unusable harness (test_every_choosable_harness_can_be_opened pins
+        # every launcher table against HARNESSES)
         harness = state.workspace.open_session(requested, fallback=override is None)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

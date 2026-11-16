@@ -153,6 +153,21 @@ def test_a_saved_ocb_that_became_unavailable_loads_as_the_default(
     assert '"ocb_cli"' in (store_path / SETTINGS_FILE).read_text()
 
 
+def test_patching_something_else_keeps_a_harness_unavailable_here(
+    store_path: Path, account: LocalAccount, activity: ActivityLog
+) -> None:
+    """A protected change must not rewrite the harness the file carries."""
+    saved = Settings(
+        protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}),
+        harness=HARNESS_OCB_CLI,
+    )
+    store_with(store_path, account, activity, None).save(saved)
+    elsewhere = store_with(store_path, account, activity, "windows_unsupported")
+    previous, updated = elsewhere.patch({"protected": {"mode": "restricted"}})
+    assert (previous.harness, updated.harness) == (DEFAULT_HARNESS, DEFAULT_HARNESS)
+    assert '"ocb_cli"' in (store_path / SETTINGS_FILE).read_text()
+
+
 def test_patching_to_an_unavailable_ocb_is_refused(
     store_path: Path, account: LocalAccount, activity: ActivityLog
 ) -> None:
@@ -284,8 +299,10 @@ def test_a_script_that_cannot_finish_is_an_install_failure(
         OcbInstaller(store_path).ensure(0.2)
 
 
-def test_a_session_joins_a_running_install(store_path: Path) -> None:
-    """One install at a time: a second caller waits for the first."""
+def test_a_session_gives_up_on_an_install_that_outlasts_its_timeout(
+    store_path: Path,
+) -> None:
+    """One install at a time: a caller waits for the running one, within limits."""
     installer = OcbInstaller(store_path)
     installer._install_lock.acquire()  # pylint: disable=protected-access
     with pytest.raises(InstallError, match="still being installed"):
@@ -293,29 +310,58 @@ def test_a_session_joins_a_running_install(store_path: Path) -> None:
     installer._install_lock.release()  # pylint: disable=protected-access
 
 
+def test_a_session_joins_a_running_install(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session started mid-install waits for it and installs nothing more."""
+    started, release = threading.Event(), threading.Event()
+    installs: list[float] = []
+    installer = OcbInstaller(store_path)
+    agent = store_path / "ocb-agent"
+
+    def slow(self: OcbInstaller, timeout: float) -> Path:
+        installs.append(timeout)
+        started.set()
+        release.wait(5)
+        return agent
+
+    monkeypatch.setattr(OcbInstaller, "_install", slow)
+    monkeypatch.setattr(OcbInstaller, "path", lambda self: agent if installs else None)
+    installer.start()
+    assert started.wait(5)
+    joined: list[Path] = []
+    session = threading.Thread(target=lambda: joined.append(installer.ensure(5)))
+    session.start()
+    release.set()
+    session.join(5)
+    assert joined == [agent]
+    assert len(installs) == 1
+
+
 def test_start_installs_in_the_background_once(
     store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Selection starts an install and returns; a second start is a no-op."""
-    release = threading.Event()
+    started, release = threading.Event(), threading.Event()
     calls: list[float] = []
 
     def slow(self: OcbInstaller, timeout: float) -> Path:
         calls.append(timeout)
+        started.set()
         release.wait(5)
         raise InstallError("offline")
 
     monkeypatch.setattr(OcbInstaller, "_install", slow)
     installer = OcbInstaller(store_path)
     installer.start()
-    while not calls:  # the thread has taken the lock
-        threading.Event().wait(0.01)
+    assert started.wait(5)  # the thread has taken the lock
     installer.start()
     release.set()
     for thread in threading.enumerate():
         if thread.name == "ocb-install":
             thread.join(5)
-    assert calls == [workspace.OCB_INSTALL_TIMEOUT_SECONDS]
+    assert len(calls) == 1
+    assert 0 < calls[0] <= workspace.OCB_INSTALL_TIMEOUT_SECONDS
 
 
 # --- open_session ----------------------------------------------------------
@@ -512,3 +558,42 @@ def test_ocb_session_failures_carry_their_reason(
     }
     entry = audit_entries(store_path)[-1]
     assert (entry["kind"], entry["reason"]) == ("session_launch_failed", reason)
+
+
+def test_an_unreadable_path_record_means_reinstall(
+    store_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A record that cannot be read is logged, then treated as not installed."""
+    (store_path / workspace.OCB_PATH_FILE).mkdir(parents=True)  # read -> OSError
+    assert OcbInstaller(store_path).path() is None
+    assert "reinstalling OCB" in caplog.text
+
+
+@POSIX_ONLY
+def test_an_install_that_cannot_be_recorded_fails(
+    bundle: Path, store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pearl gets install_failed, not a 500, when the record will not write."""
+    store_path.mkdir(parents=True, exist_ok=True)
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> int:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "write_text", refuse)
+    with pytest.raises(InstallError, match="read-only file system"):
+        OcbInstaller(store_path).ensure(30)
+
+
+def test_an_unexpected_background_failure_reaches_the_log(
+    store_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A thread's own excepthook would print to stderr, not to log.txt."""
+
+    def boom(self: OcbInstaller, timeout: float) -> Path:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(OcbInstaller, "ensure", boom)
+    OcbInstaller(store_path)._install_in_background()  # pylint: disable=W0212
+    assert "OCB install failed unexpectedly" in caplog.text

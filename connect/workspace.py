@@ -41,6 +41,7 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 import typing as t
 from pathlib import Path
@@ -56,8 +57,8 @@ from connect.settings import (
     HARNESS_CODEX_CLI,
     HARNESS_CODEX_DESKTOP,
     HARNESS_OCB_CLI,
-    OCB_CHAT_MECHS,
     OCB_MODEL_BUDGET_USD,
+    ocb_chat_mech,
 )
 
 logger = logging.getLogger("agent")
@@ -127,6 +128,8 @@ OCB_WHEEL_GLOB = "ocb_agent-*.whl"
 OCB_PATH_FILE = ".ocb-agent-path"
 # the script fetches uv, a Python and the wheel's dependencies
 OCB_INSTALL_TIMEOUT_SECONDS = 600.0
+# how much of the installer's output a failure log keeps
+OCB_INSTALL_LOG_CHARS = 2000
 
 
 class LaunchError(Exception):
@@ -408,7 +411,7 @@ class Workspace:
         :raises LaunchError: when none of the harnesses tried would open —
             InstallError or OcbLaunchError for OCB.
         """
-        if harness == HARNESS_OCB_CLI:
+        if harness in INSTALLED_HARNESSES:
             return self._open_ocb()
         order = [harness]
         if fallback:
@@ -449,6 +452,11 @@ class Workspace:
                 f"would open. Is Claude Code or Codex installed?"
             )
         raise LaunchError(f"{reason} The workspace is at {self.path}")
+
+    def prepare(self, harness: str) -> None:
+        """Start installing `harness` once it is chosen, if it needs installing."""
+        if harness in INSTALLED_HARNESSES:
+            self.ocb.start()
 
     def _open_ocb(self) -> str:
         """Install OCB if it is missing, then open a terminal running it."""
@@ -571,7 +579,7 @@ def ocb_command(path: Path, chain: str | None) -> str:
     :raises ValueError: when the chain has no confirmed chat mech — a launch
         must never hand OCB a model that does not exist.
     """
-    mech = OCB_CHAT_MECHS.get(chain) if chain is not None else None
+    mech = ocb_chat_mech(chain)
     if mech is None:
         raise ValueError(f"OCB has no chat mech on chain {chain!r}")
     return shlex.join(
@@ -602,7 +610,12 @@ class OcbInstaller:
         """Return the installed `ocb-agent`, or None when it is missing."""
         try:
             reported = self._path_file.read_text(encoding="utf-8").strip()
-        except OSError:
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            logger.warning(
+                "could not read %s (%s); reinstalling OCB", self._path_file, e
+            )
             return None
         return _executable(reported)
 
@@ -620,11 +633,12 @@ class OcbInstaller:
         :raises InstallError: when the install fails, or one already running
             does not finish within `timeout`.
         """
+        deadline = time.monotonic() + timeout
         # pylint: disable-next=consider-using-with  # released in the finally
         if not self._install_lock.acquire(timeout=timeout):
             raise InstallError("OCB is still being installed; try again shortly")
         try:
-            return self.path() or self._install(timeout)
+            return self.path() or self._install(max(deadline - time.monotonic(), 0))
         finally:
             self._install_lock.release()
 
@@ -632,7 +646,10 @@ class OcbInstaller:
         try:
             self.ensure(OCB_INSTALL_TIMEOUT_SECONDS)
         except InstallError as e:
-            logger.warning("OCB install failed: %s", e)
+            logger.error("OCB install failed: %s", e)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # a thread's own excepthook prints to stderr, not to log.txt
+            logger.exception("OCB install failed unexpectedly")
 
     def _install(self, timeout: float) -> Path:
         """Run the bundled script and keep the path it reports."""
@@ -658,15 +675,25 @@ class OcbInstaller:
             )
         except (OSError, subprocess.TimeoutExpired) as e:
             raise InstallError(f"the OCB installer did not finish: {e}") from e
+        installed = None if result.returncode else _executable(result.stdout.strip())
+        if installed is None:
+            logger.error(
+                "OCB installer exited %s; stdout: %s; stderr: %s",
+                result.returncode,
+                result.stdout[-OCB_INSTALL_LOG_CHARS:],
+                result.stderr[-OCB_INSTALL_LOG_CHARS:],
+            )
         if result.returncode:
             lines = result.stderr.strip().splitlines()
             raise InstallError(
                 lines[-1] if lines else f"the OCB installer exited {result.returncode}"
             )
-        installed = _executable(result.stdout.strip())
         if installed is None:
             raise InstallError("the OCB installer reported no ocb-agent executable")
-        self._path_file.write_text(f"{installed}\n", encoding="utf-8")
+        try:
+            self._path_file.write_text(f"{installed}\n", encoding="utf-8")
+        except OSError as e:
+            raise InstallError(f"could not record where OCB is installed: {e}") from e
         logger.info("OCB installed at %s", installed)
         return installed
 

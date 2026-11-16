@@ -178,9 +178,14 @@ def harness_unavailable_reason(
         return None
     if platform == "win32":
         return UNAVAILABLE_WINDOWS
-    if chain is None or OCB_CHAT_MECHS.get(chain) is None:
+    if ocb_chat_mech(chain) is None:
         return UNAVAILABLE_MODEL
     return None
+
+
+def ocb_chat_mech(chain: str | None) -> str | None:
+    """Return OCB's confirmed chat mech on `chain`, or None when it has none."""
+    return OCB_CHAT_MECHS.get(chain) if chain is not None else None
 
 
 def harness_options(unavailable: t.Callable[[str], str | None]) -> list[dict]:
@@ -397,12 +402,7 @@ class SettingsStore:
         activity: ActivityLog,
         unavailable: t.Callable[[str], str | None] = lambda _: None,
     ) -> None:
-        """Initialize.
-
-        `unavailable` names why a harness cannot be used on this instance, or
-        None when it can: a saved one that cannot loads as DEFAULT_HARNESS,
-        and a patch to one is refused.
-        """
+        """Initialize; `unavailable` names why a harness is unusable here, or None."""
         self._path = path
         self._mac_key = mac_key
         self._activity = activity
@@ -460,8 +460,10 @@ class SettingsStore:
             if reason is not None:
                 raise ValueError(f"harness {harness} is unavailable: {reason}")
         with self._lock:
-            previous = self._usable(self._load())
-            updated = previous.merged(patch)
+            # merged onto the stored harness, not the usable one: a patch of
+            # something else must not overwrite a harness unavailable only here
+            stored = self._load()
+            updated = stored.merged(patch)
             try:
                 self._save(updated)
             except OSError as e:
@@ -469,7 +471,9 @@ class SettingsStore:
                     "settings_persist_failed", path=str(self._path), error=str(e)
                 )
                 raise SettingsPersistError(str(e)) from e
-            return PatchResult(previous=previous, updated=updated)
+            return PatchResult(
+                previous=self._usable(stored), updated=self._usable(updated)
+            )
 
     def _record_once(self, condition: str, kind: str, **fields: object) -> None:
         """Audit a degraded-state transition once per episode, not per read.

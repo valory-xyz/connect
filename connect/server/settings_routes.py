@@ -35,7 +35,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from connect.keystore import KeystoreError, load_account
-from connect.settings import HARNESS_OCB_CLI, SettingsPersistError, SettingsStore
+from connect.settings import SettingsPersistError, SettingsStore
 
 logger = logging.getLogger("agent")
 
@@ -165,7 +165,7 @@ def patch_settings(body: SettingsPatch, request: Request) -> dict:
     if settings.harness != previous.harness:
         state.activity.record("harness_changed", harness=settings.harness)
         logger.info("harness updated: %s", settings.harness)
-    if body.harness == HARNESS_OCB_CLI:
+    if body.harness is not None:
         # installed on selection, so the next session need not wait for it
-        state.workspace.ocb.start()
+        state.workspace.prepare(body.harness)
     return _settings_view(state.settings_store)

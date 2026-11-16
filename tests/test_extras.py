@@ -22,6 +22,7 @@
 import io
 import json
 import logging
+import sys
 import threading
 import time as time_module
 import typing as t
@@ -37,6 +38,7 @@ from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
 
 from connect import __main__ as main_module
+from connect import settings as settings_module
 from connect import signer as signer_module
 from connect import wallet, workspace
 from connect.activity import ActivityLog, MAX_LOG_BYTES
@@ -455,6 +457,41 @@ class TestMain:
         assert app.state.workspace.reason is None
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/healthcheck").json() == {"is_healthy": True}
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="OCB is off on Windows")
+    def test_main_offers_and_launches_ocb_on_the_instance_chain(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+    ) -> None:
+        """The chain carrying the safe decides OCB's availability and its model."""
+        mech = "0x" + "ab" * 20
+        monkeypatch.setitem(settings_module.OCB_CHAT_MECHS, "gnosis", mech)
+        monkeypatch.setenv(
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
+        )
+        monkeypatch.setenv(SAFES_ENV, json.dumps({"gnosis": "0x" + "22" * 20}))
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        state = served[0].config.app.state
+        assert state.settings_store.harnesses()[-1] == {
+            "id": "ocb_cli",
+            "available": True,
+        }
+        opened: list[str] = []
+
+        def terminal(path: Path, command: str) -> bool:
+            opened.append(command)
+            return True
+
+        monkeypatch.setattr(workspace, "_open_terminal", terminal)
+        monkeypatch.setattr(
+            state.workspace.ocb, "ensure", lambda timeout: Path("/opt/ocb-agent")
+        )
+        assert state.workspace.open_session("ocb_cli") == "ocb_cli"
+        assert opened == [
+            workspace.ocb_command(Path("/opt/ocb-agent"), "gnosis"),
+        ]
 
     def test_populate_failure_serves_unhealthy(
         self,

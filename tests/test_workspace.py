@@ -416,10 +416,11 @@ def test_an_unknown_harness_raises_even_with_a_fallback_offered(
 def test_every_choosable_harness_can_be_opened() -> None:
     """Whatever the operator may choose, we must be able to open.
 
-    HARNESSES is what PATCH /settings and POST /session accept; DEEP_LINKS is
-    what can actually be launched. A member of the first missing from the
-    second is a dead end the operator only meets when a session refuses to
-    start — so the two are pinned to each other here rather than left to drift.
+    HARNESSES is what PATCH /settings and POST /session accept; the launcher
+    tables (DEEP_LINKS, TERMINAL_COMMANDS, INSTALLED_HARNESSES) are what can
+    actually be launched. A harness missing from them is a dead end the
+    operator only meets when a session refuses to start — so they are pinned
+    to each other here rather than left to drift.
     """
     launchers = (
         set(workspace.DEEP_LINKS),
