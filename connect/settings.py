@@ -287,36 +287,17 @@ def token_approve_targets(chain: str) -> dict[str, str]:
     """Payment token -> its mech balance tracker for one chain, from mech-client.
 
     In restricted mode the safe may `approve` these tokens, but only with the
-    tracker as spender (the guard enforces that). A token is included only when
-    both it and its tracker are configured for the chain. Fail closed to empty
-    if mech-client cannot be read.
+    tracker as spender (the guard enforces that). The inverse of
+    `prepaid_balance_trackers`' token entries, so the guard's approve targets
+    and the intent gate's trackers are one reading of mech-client's table.
+    Fail closed to empty if mech-client cannot be read.
     """
-    # pylint: disable=import-outside-toplevel
     try:
-        from mech_client.infrastructure.config import (
-            CHAIN_TO_PRICE_TOKEN_OLAS,
-            CHAIN_TO_PRICE_TOKEN_USDC,
-            CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS,
-            CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC,
-        )
-        from mech_client.utils.constants import CHAIN_NAME_TO_ID
-
-        chain_id = CHAIN_NAME_TO_ID.get(chain.lower())
-        if chain_id is None:
-            return {}
-        result: dict[str, str] = {}
-        for tokens, trackers in (
-            (CHAIN_TO_PRICE_TOKEN_USDC, CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC),
-            (CHAIN_TO_PRICE_TOKEN_OLAS, CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS),
-        ):
-            token = (tokens.get(chain_id) or "").lower()
-            tracker = (trackers.get(chain_id) or "").lower()
-            if token and tracker and ZERO_ADDRESS not in (token, tracker):
-                result[token] = tracker
-        return result
+        trackers = prepaid_balance_trackers(chain)
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.warning("could not load mech token payment addresses: %s", e)
         return {}
+    return {asset: tracker for tracker, asset in trackers.items() if asset != "native"}
 
 
 def default_whitelist() -> dict[str, tuple[str, ...]]:

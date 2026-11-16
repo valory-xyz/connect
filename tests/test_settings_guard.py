@@ -745,8 +745,35 @@ class TestDefaults:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A broken mech-client fails closed rather than taking the guard down."""
-        monkeypatch.setattr("mech_client.utils.constants.CHAIN_NAME_TO_ID", None)
+
+        def broken(*_args: t.Any) -> t.Any:
+            raise RuntimeError("mech-client's tables are unreadable")
+
+        monkeypatch.setattr("mech_client.balance_tracker", broken)
         assert token_approve_targets("polygon") == {}
+
+    def test_the_guard_s_approve_targets_are_the_gate_s_token_trackers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One reading of mech-client's tracker table serves the guard and the gate.
+
+        Each payment token maps to the tracker the intent gate reads its
+        prepaid balance at; the native tracker has no token to approve.
+        """
+        for chain in ("gnosis", "polygon", "base", "optimism", "robinhood"):
+            trackers = prepaid_balance_trackers(chain)
+            assert token_approve_targets(chain) == {
+                asset: tracker
+                for tracker, asset in trackers.items()
+                if asset != "native"
+            }
+        tracker, token = "0x" + "71" * 20, "0x" + "72" * 20
+        monkeypatch.setattr(
+            settings_module,
+            "prepaid_balance_trackers",
+            lambda chain: {tracker: token, "0x" + "73" * 20: "native"},
+        )
+        assert token_approve_targets("gnosis") == {token: tracker}
 
     def test_decode_approve_returns_none_on_undecodable(self) -> None:
         """The approve selector with unparseable args decodes to no spender."""
