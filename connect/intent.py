@@ -780,6 +780,9 @@ def _amounts(raw: t.Any, where: str) -> dict[TokenKey, int]:
 def _approval(raw: t.Any) -> IntentApproval:
     if not isinstance(raw, dict):
         raise TypeError("each intent approval must be {token, spender, amount}")
+    unknown = sorted(set(raw) - {"token", "spender", "amount"})
+    if unknown:
+        raise ValueError(f"unknown intent approval keys {unknown}")
     return IntentApproval(
         token=_token(raw["token"]),
         spender=_address(raw["spender"]),

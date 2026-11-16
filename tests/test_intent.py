@@ -785,6 +785,16 @@ def test_parse_intent_normalises_and_refuses_bad_shapes() -> None:
         assert rules(problems) == ["bad-intent"], bad
 
 
+def test_an_unknown_approval_key_is_refused_by_name() -> None:
+    """An approval with a key it does not know is bad-intent, naming the key."""
+    approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": 2}
+    parsed, problems = intent.parse_intent({"approvals": [approval]})
+    assert parsed is None
+    assert problems == [
+        intent.Problem(rule="bad-intent", detail="unknown intent approval keys ['max']")
+    ]
+
+
 def test_refusal_message_names_every_rule() -> None:
     """The refusal a session reads lists each rule and why."""
     message = intent.refusal_message(

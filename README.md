@@ -254,7 +254,10 @@ bytes (a space or a newline included) is refused before anything reaches the
 RPC (`bad-calldata`), on a send, `preflight_transaction`
 and `simulate_transaction` alike, rather than reading as an RPC that cannot
 simulate. An RPC that cannot simulate is also logged to `log.txt` with the
-cause, since every agent send on that chain is refused until it can. An amount in an intent is a whole number
+cause, since every agent send on that chain is refused until it can. A key
+an intent does not know, at its top level or in an approval, is `bad-intent`,
+naming the key, on every surface: a misspelled `receive_min` is refused, never
+dropped. An amount in an intent is a whole number
 of base units: a float or a bool is `bad-intent`, never truncated. On the MCP
 tools it follows the `value` rule as well (a decimal or 0x-hex string, or a
 JSON integer up to 2^53 - 1, else `bad-value`). An ERC-20
