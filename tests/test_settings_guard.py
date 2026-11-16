@@ -4908,6 +4908,39 @@ class TestMech:
         )
         assert len(fake_w3.eth.sent) == 1
 
+    def test_a_top_up_stays_within_mech_client_s_ratio_of_the_price_under_a_larger_max_payment(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A max_payment 100x the price arms a cap of only the ratio times the price.
+
+        The mech asks for more than that ratio (yet within max_payment):
+        nothing is deposited, and the refusal names the ratio's bound.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        ratio_cap = _MAX_AUTO_DEPOSIT_RATIO * 10**16  # the mech's price is 10**16
+        patched_mech.top_up = ratio_cap + 1
+        with pytest.raises(MechRefused, match=f"above the {ratio_cap} "):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, max_payment=10**18
+            )
+        assert not fake_w3.eth.sent
+        (allowance,) = [
+            e
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_deposit_allowance"
+        ]
+        assert allowance["amount_cap"] == str(ratio_cap)
+        assert "mech_deposit" not in audit_kinds(store_path)
+
     def test_only_the_safe_s_call_to_the_tracker_is_held_as_a_top_up(
         self,
         mech_service: MechService,
