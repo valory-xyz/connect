@@ -41,9 +41,11 @@ class MechError(Exception):
 
 
 class MechNotSent(MechError):
-    """A request whose nonce is free: nothing left Connect, or the mech admitted nothing.
+    """A request whose nonce is free: it never reached the mech.
 
-    Nothing was paid for, so a caller's request_id is free to use again.
+    Or the mech answered it only with a 503 that stood through every resend
+    (`mech-nonce-gap`), admitting nothing. Nothing was paid for, so a
+    caller's request_id is free to use again.
     """
 
 
