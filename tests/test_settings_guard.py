@@ -5853,6 +5853,33 @@ class TestMech:
         (refusal,) = [e for e in audited if e["kind"] == "refusal"]
         assert refusal["rule"] == rule
 
+    def test_a_failed_hard_cancel_s_log_locates_the_code_that_failed(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A hard cancel that fails sending logs where it was raised, keyless."""
+        caplog.set_level("WARNING", logger="agent")
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        patched_mech.raises = RuntimeError("https://rpc.example/v3/SECRETKEY down")
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert answer.status_code == 502
+        (record,) = [
+            r
+            for r in caplog.records
+            if r.message.startswith("the hard cancel on testchain (nonce")
+        ]
+        assert "RuntimeError raised at:" in record.message
+        assert f'"{__file__}", line ' in record.message
+        assert "in send_request" in record.message
+        assert "SECRETKEY" not in record.message
+
     @pytest.mark.parametrize(("rate", "status"), [(10**17, 200), (10**17 + 1, 400)])
     def test_a_hard_cancel_pays_up_to_its_default_budget_and_no_more(  # pylint: disable=too-many-arguments
         self,
@@ -6254,6 +6281,25 @@ class TestMech:
         assert "ConnectionError: Max retries exceeded" in caplog.text
         assert "https://rpc.example/..." in caplog.text
         assert secret not in caplog.text
+
+    def test_an_unsaid_mech_failure_s_log_locates_the_code_that_failed(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A library failure the caller reads as UNSAID logs where it was raised."""
+        secret = "v3/" + "9f1c" * 16
+        patched_mech.raises = ConnectionError(f"https://rpc.example/{secret} down")
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(MechError):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+        (record,) = [r for r in caplog.records if r.message.startswith("mech request")]
+        assert "ConnectionError raised at:" in record.message
+        assert f'"{__file__}", line ' in record.message
+        assert "in send_request" in record.message
+        assert secret not in record.message
 
     def test_a_failure_before_signing_frees_the_nonce(
         self,

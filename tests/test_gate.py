@@ -696,6 +696,26 @@ def test_a_logged_cause_says_where_each_link_was_raised() -> None:
     assert RPC_KEY not in logged
 
 
+def test_a_failed_send_s_log_locates_the_code_that_failed(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed send logs the frames it was raised from, never the RPC's key."""
+
+    def refused_broadcast(*_args: t.Any) -> t.Any:
+        raise ValueError(f"rejected by https://rpc.example/v2/{RPC_KEY}?x=1")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", refused_broadcast)
+    with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
+    (record,) = [r for r in caplog.records if r.message.startswith("send on ")]
+    assert "ValueError raised at:" in record.message
+    assert "in refused_broadcast" in record.message
+    assert RPC_KEY not in record.message
+
+
 def test_an_unavailable_simulation_s_log_locates_the_code_that_failed(
     test_signer: Signer,
     monkeypatch: pytest.MonkeyPatch,
