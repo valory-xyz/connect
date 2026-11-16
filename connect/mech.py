@@ -339,7 +339,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         max_payment: int | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
-        top_up_budget: TopUpBudget | None = None,
+        top_up_budget: TopUpBudget | None,
     ) -> dict:
         """Send one mech request and wait for its delivery.
 
@@ -347,9 +347,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         ``True`` sends the request on-chain through the marketplace. The
         mech's per-request price must not exceed ``max_payment``, in the
         mech's payment asset base units; left out, it is 0.1 of that asset.
-        A 402 top-up deposits at most ``max_payment`` too, and draws on
-        ``top_up_budget`` (the calling token's mech session budget) as it is
-        sent.
+        A 402 top-up deposits at most ``max_payment`` too, and draws on the
+        required ``top_up_budget`` (the calling token's mech session budget;
+        None only for a caller with no token) as it is sent.
 
         Pass a ``request_id`` to make an attempt replayable — see README,
         "Mech requests", for what that covers and what it deliberately does

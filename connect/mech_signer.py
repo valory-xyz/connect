@@ -40,12 +40,11 @@ class MechSigner:
     Signer.sign_digest(), both guardrail-checked. Transactions go as
     SERVER_BUILT and skip the intent gate: the mech flow builds them itself,
     bounded by max_payment and its single-use allowances. `check` sees each
-    transaction first (`MechAllowances.check_top_up`).
+    transaction first (`MechAllowances.check_top_up`); it is required, so no
+    construction signs a top-up unchecked.
     """
 
-    def __init__(
-        self, signer: Signer, chain: str, check: SendCheck | None = None
-    ) -> None:
+    def __init__(self, signer: Signer, chain: str, check: SendCheck) -> None:
         """Initialize."""
         self._signer = signer
         self._chain = chain
@@ -62,8 +61,7 @@ class MechSigner:
         if isinstance(data, (bytes, bytearray)):
             data = "0x" + bytes(data).hex()
         value = int(unsigned_tx.get("value") or 0)
-        if self._check is not None:
-            self._check(self._chain, unsigned_tx["to"], data)
+        self._check(self._chain, unsigned_tx["to"], data)
         return self._signer.send(
             chain=self._chain,
             to=unsigned_tx["to"],

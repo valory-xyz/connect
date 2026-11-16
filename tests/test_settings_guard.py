@@ -2144,6 +2144,10 @@ def _wire_real_report(
     return calls
 
 
+def _admit_every_transaction(_chain: str, _to: str, _data: str) -> None:
+    """Admit every transaction: the MechSigner check of its own tests."""
+
+
 class TestMech:
     """MechSigner adapter and MechService orchestration."""
 
@@ -2151,7 +2155,7 @@ class TestMech:
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
         """Bytes data, missing value/gas and address pass through correctly."""
-        mech_signer = MechSigner(test_signer, "testchain")
+        mech_signer = MechSigner(test_signer, "testchain", _admit_every_transaction)
         assert mech_signer.address == test_signer.address
         tx_hash = mech_signer.send_transaction(
             {"to": OTHER, "data": b"\x01\x02", "value": None}
@@ -2163,9 +2167,30 @@ class TestMech:
         assert len(fake_w3.eth.sent) == 2
         assert fake_w3.provider.simulated == []
 
+    def test_no_mech_signer_or_request_is_built_without_its_top_up_bound(
+        self, test_signer: Signer, mech_service: MechService
+    ) -> None:
+        """A top-up's check and its budget are always named, never defaulted.
+
+        A caller with no token passes None for the budget on purpose.
+        """
+        with pytest.raises(TypeError, match="check"):
+            MechSigner(test_signer, "testchain")  # type: ignore[call-arg]
+        with pytest.raises(TypeError, match="top_up_budget"):
+            mech_service.request("q", "tool", chain="testchain")  # type: ignore[call-arg]
+        allowances = mech_service._allowances  # pylint: disable=protected-access
+        priced = PricedMech(OTHER, 42, 10**16, NATIVE_PAYMENT_TYPE)
+        with pytest.raises(TypeError, match="budget"):
+            with allowances.auto_deposit_armed(  # type: ignore[call-arg]
+                "testchain", priced, auto_deposit=True, max_payment=6
+            ):
+                pass
+
     def test_mech_signer_signs_digests(self, test_signer: Signer) -> None:
         """sign_message returns the raw 65-byte signature."""
-        signature = MechSigner(test_signer, "testchain").sign_message(b"\x22" * 32)
+        signature = MechSigner(
+            test_signer, "testchain", _admit_every_transaction
+        ).sign_message(b"\x22" * 32)
         assert len(signature) == 65
 
     def test_mech_signer_signs_safe_messages(self, test_signer: Signer) -> None:
@@ -2176,9 +2201,9 @@ class TestMech:
         recovery mirrors what the safe's fallback handler checks on-chain.
         """
         digest = b"\x22" * 32
-        signature = MechSigner(test_signer, "testchain").sign_safe_message(
-            SAFE, 31337, digest
-        )
+        signature = MechSigner(
+            test_signer, "testchain", _admit_every_transaction
+        ).sign_safe_message(SAFE, 31337, digest)
         assert len(signature) == 65
         wrapped = safe_message_hash(SAFE, 31337, digest)
         # pylint: disable-next=protected-access,no-value-for-parameter
@@ -2252,7 +2277,11 @@ class TestMech:
 
         patched_mech.send_request = sending  # type: ignore[method-assign]
         out = mech_service.request(
-            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+            "q",
+            "prediction-online",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert order == ["report", "send"]
         # the default off-chain flow reuses the document its pre-flight read
@@ -2273,7 +2302,11 @@ class TestMech:
         patched_mech.terms = {"valory_operated": True, "terms": VALORY_TERMS_NOTICE}
         patched_mech.report_fallback = "record unreadable; only the terms"
         out = mech_service.request(
-            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+            "q",
+            "prediction-online",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert out["terms"] == VALORY_TERMS_NOTICE
         assert "delivery" not in out
@@ -2291,6 +2324,7 @@ class TestMech:
             chain="testchain",
             priority_mech=OTHER,
             legacy_on_chain=True,
+            top_up_budget=None,
         )
         assert patched_mech.terms_calls == [(OTHER, None)]
         assert not patched_mech.report_calls
@@ -2319,7 +2353,11 @@ class TestMech:
         patched_mech.tool_manager.mech_report_or_terms = broken
         with pytest.raises(RuntimeError, match="executor shut down"):
             mech_service.request(
-                "q", "prediction-online", chain="testchain", priority_mech=OTHER
+                "q",
+                "prediction-online",
+                chain="testchain",
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert not armed
         assert not patched_mech.calls
@@ -2333,7 +2371,11 @@ class TestMech:
             "identification_note": "Could not check whether Valory operates this mech.",
         }
         out = mech_service.request(
-            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+            "q",
+            "prediction-online",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert out["valory_operated"] is False
         assert "terms" not in out
@@ -2355,6 +2397,7 @@ class TestMech:
             priority_mech=OTHER,
             auto_deposit=False,
             timeout=42,
+            top_up_budget=None,
         )
         # the resolved chain travels with the result, so a caller that omitted
         # it can still tell which chain was paid
@@ -2377,6 +2420,7 @@ class TestMech:
             chain="testchain",
             legacy_on_chain=True,
             priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 2
 
@@ -2385,7 +2429,12 @@ class TestMech:
     ) -> None:
         """An answered request must not be offered for polling."""
         result = mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert "pending_request_ids" not in result
         with pytest.raises(MechError, match="nothing is awaiting delivery"):
@@ -2412,7 +2461,12 @@ class TestMech:
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
         result = mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert result["pending_request_ids"] == ["ab"]
 
@@ -2448,6 +2502,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
             request_id=request_id,
+            top_up_budget=None,
         )
 
     def test_replaying_a_request_id_does_not_pay_twice(
@@ -2639,6 +2694,7 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=OTHER,
                 request_id="job-chain",
+                top_up_budget=None,
             )
         with pytest.raises(
             MechError, match="prompt, tool, chain, mech, flow or context"
@@ -2650,6 +2706,7 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=WHITELISTED,
                 request_id="job-chain",
+                top_up_budget=None,
             )
         assert len(patched_mech.calls) == 1
 
@@ -2665,6 +2722,7 @@ class TestMech:
             priority_mech=OTHER,
             request_id="job-ctx",
             request_context={"market_prob": 0.4},
+            top_up_budget=None,
         )
         assert first.get("replayed") is not True
         with pytest.raises(
@@ -2678,6 +2736,7 @@ class TestMech:
                 priority_mech=OTHER,
                 request_id="job-ctx",
                 request_context={"market_prob": 0.9},
+                top_up_budget=None,
             )
         again = mech_service.request(
             "q",
@@ -2687,6 +2746,7 @@ class TestMech:
             priority_mech=OTHER,
             request_id="job-ctx",
             request_context={"market_prob": 0.4},
+            top_up_budget=None,
         )
         assert again["replayed"] is True
         assert len(patched_mech.calls) == 1
@@ -2703,6 +2763,7 @@ class TestMech:
             priority_mech=OTHER,
             request_id="job-ctx-order",
             request_context={"market_prob": 0.4, "market_id": "m1"},
+            top_up_budget=None,
         )
         again = mech_service.request(
             "q",
@@ -2712,6 +2773,7 @@ class TestMech:
             priority_mech=OTHER,
             request_id="job-ctx-order",
             request_context={"market_id": "m1", "market_prob": 0.4},
+            top_up_budget=None,
         )
         assert again["replayed"] is True
         assert len(patched_mech.calls) == 1
@@ -2731,6 +2793,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
             request_context=context,
+            top_up_budget=None,
         )
         assert patched_mech.calls[0]["extra_attributes"] == {"request_context": context}
         entry = next(
@@ -2743,7 +2806,12 @@ class TestMech:
     ) -> None:
         """A context-less on-chain request must not publish a null key."""
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert patched_mech.calls[0]["extra_attributes"] is None
 
@@ -2757,7 +2825,12 @@ class TestMech:
         caller to use a new id, which pays again.
         """
         first = mech_service.request(
-            "q", "t", legacy_on_chain=True, priority_mech=OTHER, request_id="job-spell"
+            "q",
+            "t",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            request_id="job-spell",
+            top_up_budget=None,
         )
         again = mech_service.request(
             "q",
@@ -2766,6 +2839,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER.upper(),
             request_id="job-spell",
+            top_up_budget=None,
         )
         assert again.get("replayed") is True
         assert again["request_ids"] == first["request_ids"]
@@ -2883,6 +2957,7 @@ class TestMech:
                 priority_mech=OTHER,
                 request_id="job-6",
                 max_payment=0,
+                top_up_budget=None,
             )
         assert patched_mech.priced_out[-1]["max_price"] == 0  # mech-client's cap
         assert not patched_mech.calls
@@ -2960,6 +3035,7 @@ class TestMech:
                 legacy_on_chain=False,
                 priority_mech=OTHER,
                 request_id="job-9",
+                top_up_budget=None,
             )
         assert len(patched_mech.calls) == 1
 
@@ -3066,7 +3142,12 @@ class TestMech:
             },
         }
         report = mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert report["delivery_results"] == {"ab": {"result": '{"p_yes": 0.38}'}}
         assert report["delivery_urls"] == {
@@ -3088,7 +3169,12 @@ class TestMech:
             "deliveries": {},
         }
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
 
         async def _watch(
@@ -3112,7 +3198,12 @@ class TestMech:
         """A watcher blow-up becomes a MechError; the timeout stays bounded."""
         patched_mech.result = {"request_ids": ["ab"], "deliveries": {}}
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         seen: dict = {}
 
@@ -3186,6 +3277,7 @@ class TestMech:
             chain="testchain",
             legacy_on_chain=True,
             priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert result["chain"] == "testchain"
         assert result["tx_hash"] == patched_mech.result["tx_hash"]
@@ -3236,7 +3328,9 @@ class TestMech:
         service, _ = self._restricted_mech_service(
             account, app_config, activity, settings_store
         )
-        result = service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        result = service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert result["chain"] == "testchain"
         assert result["tx_hash"] == patched_mech.result["tx_hash"]
         assert result["delivery_results"] == {"ab": {"answer": "42"}}
@@ -3288,6 +3382,7 @@ class TestMech:
             chain="testchain",
             priority_mech=OTHER,
             request_context=context,
+            top_up_budget=None,
         )
         extras = patched_mech.calls[0]["extra_attributes"]
         assert extras.keys() == {"nonce", "request_context"}
@@ -3312,6 +3407,7 @@ class TestMech:
                 priority_mech=OTHER,
                 request_id="job-bad-ctx",
                 request_context={"seen": {1, 2}},
+                top_up_budget=None,
             )
         with pytest.raises(MechError, match="could not be encoded"):
             mech_service.request(
@@ -3320,6 +3416,7 @@ class TestMech:
                 chain="testchain",
                 priority_mech=OTHER,
                 request_context={"seen": {1, 2}},
+                top_up_budget=None,
             )
         # on-chain without a request id reaches no stamp, so only the plan's
         # own check stands between a bad context and the payment boundary
@@ -3331,6 +3428,7 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=OTHER,
                 request_context={"seen": {1, 2}},
+                top_up_budget=None,
             )
         # mixed-type keys encode as metadata but not as a sorted fingerprint,
         # and the trail sorts them after the send: refuse before paying
@@ -3342,6 +3440,7 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=OTHER,
                 request_context={1: "a", "b": 2},
+                top_up_budget=None,
             )
         assert not patched_mech.calls
         assert "mech_request_failed" not in audit_kinds(store_path)
@@ -3384,7 +3483,9 @@ class TestMech:
             sign_digest,
         )
         with pytest.raises(MechNotSent, match="not sent: mismatch"):
-            service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+            service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert "mech_offchain_digest" not in audit_kinds(store_path)
         assert signed == []
 
@@ -3403,13 +3504,23 @@ class TestMech:
         patched_mech.raises = RequestIdRpcError(words)
         with pytest.raises(MechNotSent) as refused:
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
             )
         assert str(refused.value) == f"mech request not sent: {words}"
         patched_mech.raises = None
         assert (
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
             ).get("replayed")
             is None
         )
@@ -3449,7 +3560,9 @@ class TestMech:
             return await send_request(**kwargs)
 
         monkeypatch.setattr(patched_mech, "send_request", topped_up)
-        service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert patched_mech.calls[0]["auto_deposit"] is True
         armed = [
             entry
@@ -3501,7 +3614,9 @@ class TestMech:
             request_context=None,
             top_up_budget=None,
         )
-        service.request("a", "tool", chain="testchain", priority_mech=OTHER)
+        service.request(
+            "a", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         service._dispatch(  # pylint: disable=protected-access
             plan_b, "b", timeout=1, request_id=None
         )
@@ -3558,13 +3673,21 @@ class TestMech:
         if case == "lost":
             patched_mech.raises_after_signing = ConnectionError("POST timed out")
         if case == "sent":
-            service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+            service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         else:
             expected = {"lost": MechAnswerUnknown, "rejected": MechRefused}.get(
                 case, MechNotSent
             )
             with pytest.raises(expected):
-                service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+                service.request(
+                    "q",
+                    "tool",
+                    chain="testchain",
+                    priority_mech=OTHER,
+                    top_up_budget=None,
+                )
         deposit = exec_transaction_calldata(TRACKER, value=10**16)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
@@ -3600,7 +3723,9 @@ class TestMech:
             _executor_wrapped(refusal) if wrapped else refusal
         )
         with pytest.raises(MechRefused, match="guardrail") as refused:
-            service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+            service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert "nonce stays held" in str(refused.value)
         assert "mech_request_rejected" in audit_kinds(app_config.store_path)
         assert not service._pending  # pylint: disable=protected-access
@@ -3645,6 +3770,7 @@ class TestMech:
                 chain="testchain",
                 priority_mech=OTHER,
                 request_id=request_id,
+                top_up_budget=None,
             )
         assert deposit in str(lost.value)
         assert "request_id" not in str(lost.value)
@@ -3672,6 +3798,7 @@ class TestMech:
                 chain="testchain",
                 priority_mech=OTHER,
                 request_id=request_id,
+                top_up_budget=None,
             )
         assert len(patched_mech.calls) == sent
 
@@ -3712,7 +3839,9 @@ class TestMech:
         The audit record is written in every mode, but the allowance itself
         is armed only while restricted — see auto_deposit_armed for why.
         """
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert patched_mech.calls[0]["auto_deposit"] is True
         assert "mech_offchain_digest" in audit_kinds(store_path)
         # nothing armed: no grant survives a flip back to restricted
@@ -3733,7 +3862,9 @@ class TestMech:
             "deposit_tracker",
             lambda chain, payment_type: (TRACKER, False),
         )
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert "mech_deposit_allowance" in audit_kinds(store_path)
         assert not guard._deposit_allowances  # pylint: disable=protected-access
 
@@ -3750,7 +3881,9 @@ class TestMech:
 
         monkeypatch.setattr(patched_mech, "marketplace_contract", _boom)
         with pytest.raises(MechNotSent, match="could not read the marketplace"):
-            mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert not patched_mech.calls
 
     def test_request_refuses_an_unreachable_offchain_mech(
@@ -3764,11 +3897,18 @@ class TestMech:
         """
         patched_mech.metadata = {"tools": ["prediction-online"]}
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert not patched_mech.calls
         # the same mech is fine on-chain, which is what the error recommends
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -3776,7 +3916,9 @@ class TestMech:
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """The pre-flight passes a healthy mech straight through to the flow."""
-        mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert patched_mech.calls[0]["use_offchain"] is True
 
     def test_unreadable_metadata_blocks_the_offchain_flow(
@@ -3785,7 +3927,9 @@ class TestMech:
         """A mech that never published metadata cannot be reached off-chain."""
         patched_mech.metadata = None
         with pytest.raises(MechError, match="metadata unreadable"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert not patched_mech.calls
 
     def test_chain_defaults_to_one_holding_a_safe(
@@ -3801,12 +3945,16 @@ class TestMech:
         # it here cannot leak. Widening their scope would break that.
         chains = mech_service._config.chains
         assert "gnosis" not in chains  # the preferred default is not configured
-        mech_service.request("q", "t", legacy_on_chain=True, priority_mech=OTHER)
+        mech_service.request(
+            "q", "t", legacy_on_chain=True, priority_mech=OTHER, top_up_budget=None
+        )
         assert patched_mech.calls  # resolved to testchain, the only funded chain
 
         chains["testchain"].safe_address = None
         with pytest.raises(MechError, match="no configured chain has a service safe"):
-            mech_service.request("q", "t", legacy_on_chain=True, priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", legacy_on_chain=True, priority_mech=OTHER, top_up_budget=None
+            )
 
     def test_listing_still_works_with_no_safe_anywhere(
         self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
@@ -3876,6 +4024,7 @@ class TestMech:
                 chain="testchain",
                 legacy_on_chain=True,
                 priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert "mech_request_failed" in audit_kinds(store_path)
 
@@ -3897,13 +4046,20 @@ class TestMech:
         patched_mech.info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         # 2. mech unreachable off-chain
         patched_mech.info = native_mech_info(10**16)
         patched_mech.metadata = {"tools": ["prediction-online"]}
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
 
         blocked = [
             entry
@@ -3930,7 +4086,9 @@ class TestMech:
         """
         patched_mech.info = native_mech_info(10**18)
         with pytest.raises(MechNotSent, match="max_payment"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         (priced_out,) = patched_mech.priced_out
         assert priced_out["use_offchain"] is True
         assert priced_out["max_price"] == 10**17
@@ -3956,6 +4114,7 @@ class TestMech:
                 chain="testchain",
                 legacy_on_chain=True,
                 priority_mech=OTHER,
+                top_up_budget=None,
             )
 
     def test_tools_lists_mechs(
@@ -4354,7 +4513,9 @@ class TestMech:
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert info["offchain_capable"] is False
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert not patched_mech.calls
 
     def test_tools_report_a_mech_that_published_no_endpoint(
@@ -4402,7 +4563,12 @@ class TestMech:
         patched_mech.info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert not patched_mech.calls
         # an explicitly raised cap accepts the same price
@@ -4413,6 +4579,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
             max_payment=10**19,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -4438,11 +4605,21 @@ class TestMech:
         patched_mech.info = (kind, 42, budget + 1)
         with pytest.raises(MechError, match=f"above max_payment={budget}"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         patched_mech.info = (kind, 42, budget)
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -4494,11 +4671,21 @@ class TestMech:
         patched_mech.info = (usdc, 42, 10**5 + 1)
         with pytest.raises(MechError, match="above max_payment=100000"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         patched_mech.info = (usdc, 42, 10**5)
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -4512,7 +4699,12 @@ class TestMech:
         monkeypatch.delitem(mech_budget.DEFAULT_MAX_PAYMENT, PaymentType.NATIVE)
         with pytest.raises(MechError, match="no default budget"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert not patched_mech.calls
         mech_service.request(
@@ -4522,6 +4714,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
             max_payment=10**17,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -4595,6 +4788,7 @@ class TestMech:
                         chain="testchain",
                         legacy_on_chain=True,
                         priority_mech=OTHER,
+                        top_up_budget=None,
                     )
                     outcome["polled"] = mech_service.result("ab")
                 except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -4621,7 +4815,12 @@ class TestMech:
         """rpc_url per service; the process-global MECHX_CHAIN_RPC is never set."""
         monkeypatch.delenv("MECHX_CHAIN_RPC", raising=False)
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         # pylint: disable=protected-access
         assert patched_mech.rpc_url == mech_service._config.chain("testchain").rpc_url
@@ -4641,7 +4840,12 @@ class TestMech:
         )
         with pytest.raises(MechError, match="could not price"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert not patched_mech.calls
 
@@ -4664,12 +4868,16 @@ class TestMech:
                 }
             ],
         )
-        mech_service.request("q", "t", chain="testchain", legacy_on_chain=True)
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, top_up_budget=None
+        )
         assert patched_mech.calls[0]["priority_mech"] == OTHER
         # an empty listing is a structured error, not an opaque one
         monkeypatch.setattr(mech_module, "query_mm_mechs_info", lambda chain: [])
         with pytest.raises(MechError, match="no live mechs"):
-            mech_service.request("q", "t", chain="testchain", legacy_on_chain=True)
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, top_up_budget=None
+            )
 
     def test_tools_listing_wraps_malformed_entries(
         self,
@@ -4708,6 +4916,7 @@ class TestMech:
                 legacy_on_chain=True,
                 timeout=asked,
                 priority_mech=OTHER,
+                top_up_budget=None,
             )
             # the send waits only ACK_WAIT_SECONDS of the clamped timeout
             assert patched_mech.calls[-1]["timeout"] == min(
@@ -4722,7 +4931,12 @@ class TestMech:
     ) -> None:
         """Only an off-chain request is reported as carrying no deadline."""
         report = mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, legacy_on_chain=True
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            legacy_on_chain=True,
+            top_up_budget=None,
         )
         assert "expires" not in report
 
@@ -4731,14 +4945,14 @@ class TestMech:
     ) -> None:
         """mech-client is handed the allocated nonce and the verifying hook (T3)."""
         report = mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
         )
         call = patched_mech.calls[-1]
         assert call["nonces"] == [patched_mech.contract.nonce]
         assert callable(call["on_request_id"])
         assert report["expires"] is None  # an off-chain request has no deadline
         second = mech_service.request(
-            "q2", "tool", chain="testchain", priority_mech=OTHER
+            "q2", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
         )
         # the first is accepted but unsettled, so the next nonce is taken
         assert patched_mech.calls[-1]["nonces"] == [patched_mech.contract.nonce + 1]
@@ -4759,19 +4973,34 @@ class TestMech:
 
         monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(watch))
         still = mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, timeout=30
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=30,
+            top_up_budget=None,
         )
         assert patched_mech.calls[-1]["timeout"] == mech_module.ACK_WAIT_SECONDS
         assert still["pending_request_ids"] == ["ab"]  # the resumed watch saw none
         patched_mech.contract.nonce += 1
         done = mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, timeout=30
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=30,
+            top_up_budget=None,
         )
         assert done["delivery_results"] == {"ab": {"a": 1}}
         assert "pending_request_ids" not in done
         patched_mech.contract.nonce += 1
         short = mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, timeout=0.5
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=0.5,
+            top_up_budget=None,
         )
         assert short["pending_request_ids"] == ["ab"]  # no time left to resume
 
@@ -4798,6 +5027,7 @@ class TestMech:
             "chat",
             chain="testchain",
             priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert report["completion"] == "Hello"
         assert report["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
@@ -4822,14 +5052,24 @@ class TestMech:
         )
         with pytest.raises(MechRefused, match="rule 'mech-request-rejected'"):
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
             )
         (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert refusal["rule"] == "mech-request-rejected"
         assert "mech_deposit" not in audit_kinds(store_path)  # nothing was deposited
         patched_mech.raises = None
         report = mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            request_id="r1",
+            top_up_budget=None,
         )
         assert report.get("replayed") is None
 
@@ -4851,7 +5091,12 @@ class TestMech:
         )
         with pytest.raises(MechRefused, match="rule 'mech-request-rejected'"):
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
             )
         (deposit,) = [
             e for e in audit_entries(store_path) if e["kind"] == "mech_deposit"
@@ -4887,6 +5132,7 @@ class TestMech:
                 chain="testchain",
                 priority_mech=OTHER,
                 max_payment=5 * 10**16,
+                top_up_budget=None,
             )
         assert not fake_w3.eth.sent
         kinds = audit_kinds(store_path)
@@ -4904,7 +5150,12 @@ class TestMech:
         assert refused["amount"] == str(6 * 10**16)
         patched_mech.top_up = 5 * 10**16  # at the bound: deposited
         mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, max_payment=5 * 10**16
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=5 * 10**16,
+            top_up_budget=None,
         )
         assert len(fake_w3.eth.sent) == 1
 
@@ -4930,7 +5181,12 @@ class TestMech:
         patched_mech.top_up = ratio_cap + 1
         with pytest.raises(MechRefused, match=f"above the {ratio_cap} "):
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, max_payment=10**18
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=10**18,
+                top_up_budget=None,
             )
         assert not fake_w3.eth.sent
         (allowance,) = [
@@ -4961,7 +5217,7 @@ class TestMech:
         priced = PricedMech(OTHER, 42, 10**16, NATIVE_PAYMENT_TYPE)
         deposit = bytes.fromhex(DEPOSIT_SELECTOR) + abi_encode(["uint256"], [7])
         with allowances.auto_deposit_armed(
-            "testchain", priced, auto_deposit=True, max_payment=6
+            "testchain", priced, auto_deposit=True, max_payment=6, budget=None
         ):
             for to, data in (
                 (OTHER, exec_transaction_calldata(TRACKER, data=deposit)),
@@ -5051,7 +5307,9 @@ class TestMech:
             "deposit reverted", request_id="0x01", nonce=5, unsent=[]
         )
         with pytest.raises(MechRefused, match="auto top-up for nonce 5 failed"):
-            mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert refusal["rule"] == "mech-request-rejected"
         nonces = mech_service._nonces  # pylint: disable=protected-access
@@ -5082,7 +5340,12 @@ class TestMech:
         )
         with pytest.raises(MechError, match="rule 'mech-answer-unknown'") as raised:
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r9"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r9",
+                top_up_budget=None,
             )
         assert not isinstance(raised.value, MechNotSent)
         kinds = audit_kinds(store_path)
@@ -5099,7 +5362,12 @@ class TestMech:
         patched_mech.raises = None
         with pytest.raises(MechError, match=f"{held}.*cannot tell whether it was paid"):
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r9"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r9",
+                top_up_budget=None,
             )
 
         async def _watch(
@@ -5130,7 +5398,12 @@ class TestMech:
         )
         with pytest.raises(MechAnswerUnknown) as raised:
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r3"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r3",
+                top_up_budget=None,
             )
         assert raised.value.deposited == 7
         (deposit,) = [
@@ -5151,7 +5424,12 @@ class TestMech:
             MechAnswerUnknown, match="cause is in Connect's log"
         ) as raised:
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r7"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r7",
+                top_up_budget=None,
             )
         (held,) = raised.value.pending_request_ids
         (failed,) = [
@@ -5193,7 +5471,9 @@ class TestMech:
     @staticmethod
     def _stall(mech_service: MechService, for_seconds: float) -> None:
         """Hold one accepted slot, then stall the queue `for_seconds` ago."""
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         nonces = mech_service._nonces  # pylint: disable=protected-access
         with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
             slot.answered("taken", mech=OTHER, salt="")  # another signer took it
@@ -5348,7 +5628,12 @@ class TestMech:
         mech_service.queue.close()
         with pytest.raises(MechNotSent, match="rule 'mech-queue-closed'"):
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
             )
         assert patched_mech.calls == []
         assert not guard._allowed_digests  # pylint: disable=protected-access
@@ -5668,7 +5953,9 @@ class TestMech:
         )
         nonces = mech_service._nonces  # pylint: disable=protected-access
         patched_mech.result["deliveries"] = {}  # the answer is still pending
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
             slot.answered("taken", mech=OTHER, salt="")  # another signer took it
         assert nonces.stalled("testchain", SAFE)
@@ -5683,7 +5970,9 @@ class TestMech:
             unsent=[],
         )
         with pytest.raises(MechError, match="mech_queue_stalled"):
-            mech_service.request("q2", "tool", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q2", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
 
     def test_an_on_chain_request_waits_for_held_offchain_slots(
         self,
@@ -5692,7 +5981,9 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """An on-chain request would take mapNonces, which a held slot claims."""
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         monkeypatch.setattr(mech_nonces_module, "POLL_SECONDS", 0.01, raising=True)
         with pytest.raises(MechError, match="rule 'mech-in-flight'"):
             mech_service.request(
@@ -5702,10 +5993,16 @@ class TestMech:
                 priority_mech=OTHER,
                 legacy_on_chain=True,
                 timeout=1,
+                top_up_budget=None,
             )
         patched_mech.contract.nonce += 1  # the off-chain one settled
         mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, legacy_on_chain=True
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            legacy_on_chain=True,
+            top_up_budget=None,
         )
         assert "nonces" not in patched_mech.calls[-1]
 
@@ -5717,7 +6014,9 @@ class TestMech:
     ) -> None:
         """The allocator learns which held nonce was delivered, and when."""
         patched_mech.result["nonces"] = [patched_mech.contract.nonce]
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         nonces = mech_service._nonces  # pylint: disable=protected-access
         queue = nonces._queue(  # pylint: disable=protected-access
             nonces.key("testchain", SAFE)
@@ -5759,7 +6058,9 @@ class TestMech:
                 for key, data in deliveries.items()
             },
         }
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         nonces = mech_service._nonces  # pylint: disable=protected-access
         queue = nonces._queue(  # pylint: disable=protected-access
             nonces.key("testchain", SAFE)
@@ -5774,7 +6075,11 @@ class TestMech:
             "ab": DeliveryResult(request_id="ab", data={"content": "Hi"}, url=None)
         }
         report = mech_service.request(
-            "plain question", "tool", chain="testchain", priority_mech=OTHER
+            "plain question",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert "completion" not in report
 
@@ -5795,6 +6100,7 @@ class TestMech:
             "chat",
             chain="testchain",
             priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert report["delivery_results"] == {"ab": {"answer": "42"}}
         assert "maximum recursion" in report["chat_error"]
@@ -5813,7 +6119,12 @@ class TestMech:
 
         monkeypatch.setattr(mech_service, "result", unreadable)
         report = mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            request_id="r1",
+            top_up_budget=None,
         )
         assert report["pending_request_ids"] == ["ab"]
         assert report["watch_errors"] == {"ab": "the gateway timed out"}
@@ -5838,7 +6149,12 @@ class TestMech:
 
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         report = mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, timeout=30
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=30,
+            top_up_budget=None,
         )
         assert report["delivery_urls"] == {"ab": "ipfs://later"}
         if readable:
@@ -5855,7 +6171,9 @@ class TestMech:
         store_path: Path,
     ) -> None:
         """Nothing reached the mech, so the same id may be sent again."""
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         monkeypatch.setattr(mech_nonces_module, "POLL_SECONDS", 0.01, raising=True)
         on_chain: dict[str, t.Any] = {
             "chain": "testchain",
@@ -5865,10 +6183,12 @@ class TestMech:
             "timeout": 1,
         }
         with pytest.raises(MechNotSent, match="rule 'mech-in-flight'"):
-            mech_service.request("q", "tool", **on_chain)
+            mech_service.request("q", "tool", **on_chain, top_up_budget=None)
         assert "mech_request_uncertain" not in audit_kinds(store_path)
         patched_mech.contract.nonce += 1  # the off-chain one settled
-        mech_service.request("q", "tool", **on_chain)  # same id, not refused
+        mech_service.request(
+            "q", "tool", **on_chain, top_up_budget=None
+        )  # same id, not refused
 
     @pytest.mark.parametrize("legacy_on_chain", [True, False])
     def test_every_mech_send_path_record_carries_the_message_s_redaction(  # pylint: disable=too-many-arguments
@@ -5895,6 +6215,7 @@ class TestMech:
                 chain="testchain",
                 priority_mech=OTHER,
                 legacy_on_chain=legacy_on_chain,
+                top_up_budget=None,
             )
         assert UNSAID in str(e.value)
         records = audit_entries(store_path)
@@ -5916,7 +6237,12 @@ class TestMech:
         patched_mech.raises = ConnectionError("the RPC is down")
         with pytest.raises(MechNotSent, match="cause is in Connect's log"):
             mech_service.request(
-                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r2"
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r2",
+                top_up_budget=None,
             )
         assert "mech_request_not_sent" in audit_kinds(store_path)
         # the log says which request failed, so two concurrent ones differ
@@ -5928,7 +6254,12 @@ class TestMech:
         assert f"mech request to {OTHER} on testchain (tool tool" in logged.getMessage()
         patched_mech.raises = None
         mech_service.request(
-            "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r2"
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            request_id="r2",
+            top_up_budget=None,
         )
         # the same nonce: the failed attempt held nothing
         assert patched_mech.calls[-1]["nonces"] == [patched_mech.contract.nonce]
@@ -5955,6 +6286,7 @@ class TestMech:
                     chain="testchain",
                     priority_mech=OTHER,
                     legacy_on_chain=legacy_on_chain,
+                    top_up_budget=None,
                 )
         monkeypatch.setattr(patched_mech, "marketplace_contract", down)
         with pytest.raises(MechNotSent, match="could not read the marketplace"):
@@ -5964,6 +6296,7 @@ class TestMech:
                 chain="testchain",
                 priority_mech=OTHER,
                 legacy_on_chain=True,
+                top_up_budget=None,
             )
         assert patched_mech.calls == []
 
@@ -5993,6 +6326,7 @@ class TestMech:
             priority_mech=OTHER,
             legacy_on_chain=True,
             timeout=30,
+            top_up_budget=None,
         )
         assert patched_mech.calls[-1]["timeout"] == mech_module.ACK_WAIT_SECONDS
         assert held == [False]
@@ -6938,7 +7272,9 @@ def test_the_marketplace_takes_a_safe_call_only_from_the_server_built_mech_flow(
     assert reason is not None
     assert "mech marketplace" in reason
     assert not fake_w3.eth.sent
-    MechSigner(test_signer, "testchain").send_transaction({"to": SAFE, "data": wrapped})
+    MechSigner(test_signer, "testchain", _admit_every_transaction).send_transaction(
+        {"to": SAFE, "data": wrapped}
+    )
     assert len(fake_w3.eth.sent) == 1
 
 

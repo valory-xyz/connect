@@ -56,7 +56,7 @@ class _TopUp(t.NamedTuple):
 
     tracker: str
     cap: int  # max_payment, within mech-client's ratio of the mech's rate
-    budget: TopUpBudget | None
+    budget: TopUpBudget | None  # None: a caller with no token, nothing to draw on
 
 
 def deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
@@ -159,7 +159,7 @@ class MechAllowances:
         *,
         auto_deposit: bool,
         max_payment: int,
-        budget: TopUpBudget | None = None,
+        budget: TopUpBudget | None,
     ) -> t.Iterator[None]:
         """Pre-authorize the one 402 top-up of the send this wraps, then withdraw it.
 
