@@ -34,6 +34,8 @@ from connect.config import AppConfig, FundRequirement, NATIVE_ASSET
 from connect.signer import Signer
 
 logger = logging.getLogger("agent")
+# what a failed balance read reports; the RPC library's text goes to the log
+BALANCE_READ_FAILED = "balance read failed (the cause is in Connect's log)"
 
 ERC20_ABI = [
     {
@@ -208,8 +210,10 @@ def wallet_overview(config: AppConfig, signer: Signer) -> dict:
                 balances["safe"] = str(
                     w3.eth.get_balance(Web3.to_checksum_address(safe))
                 )
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            balances = {"error": str(e)}
+        except Exception:  # pylint: disable=broad-exception-caught
+            # the RPC library's text may name the RPC URL and its key
+            logger.warning("balance read on %s failed", chain, exc_info=True)
+            balances = {"error": BALANCE_READ_FAILED}
         reason = _not_actionable_because(safe, balances)
         entry: dict = {
             "rpc": chain_config.rpc_url,

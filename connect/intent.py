@@ -17,48 +17,33 @@
 #
 # ------------------------------------------------------------------------------
 
-"""The intent gate: simulate a send and check it against its intent.
+"""The intent gate: simulate a send at head and check it against its intent.
 
-A model can report success on a transaction
-that moved the wrong amount. So every agent-originated value-moving send
-carries an *intent* (what it may spend, the least it must receive, who may
-receive and what may be approved),
-and the transaction is simulated at head with `eth_simulateV1` before it is
-signed. The asset diff comes from the simulated logs: ERC-20/721 `Transfer`,
-`Approval`, `ApprovalForAll`, ERC-1155 `TransferSingle`/`TransferBatch`, WETH
-`Deposit`/`Withdrawal`, and the synthetic `Transfer` logs `traceTransfers`
-emits from `0xeeee...eeee` for native value (with the `Transfer` logs of a
-native ERC-20 face, Celo's CELO; its other logs count as any token's). There is
-no fork and no trace,
-so "contracts touched" is the target plus every contract that emitted
-a log; a contract called without emitting one is not listed.
-
-The rules (`Rule` is the full list):
-`reverts`, `bad-intent`, `overspend`, `receive-min`, `undeclared-recipient`
-(EOAs only, an EIP-7702 delegated EOA counted as one; burns to the zero
-address are skipped) and `undeclared-approval` (a 0 approval, a revoke, is
-not checked; `setApprovalForAll` counts as a maximum approval, even when
-revoking). The intent is required: `missing-intent` refuses a value-moving
-call that carries none, and `simulation-unavailable` refuses anything an RPC
-cannot simulate — nothing falls back to signing unchecked. Under a
-value-capped token (`Capped`) `token-cap-positions` refuses any ERC-721/1155
-position leaving the sender, which no cap can bound. Three are raised by the
-signer before anything is simulated: `bad-calldata` (calldata that is not
-strictly hex), `approve-hash` (any EOA send of the safe's approveHash,
-whatever its target) and `bad-exec-transaction` (an EOA's execTransaction
-to the safe); see `connect/signer.py`.
+The rules, what the asset diff is read from and what it cannot see are in
+the README, "Intent gate"; `Rule` is the full list of rule names.
 """
 
+import re
 import typing as t
 
 from connect.chains import NATIVE_ERC20_FACES as _FACES
-from connect.safe import ZERO_ADDRESS
+from connect.safe import ZERO_ADDRESS, calldata_hex
 
 TokenKey = str  # an ERC-20 address, lower-case, or "native"
 NATIVE = "native"
 MAX_UINT256 = 2**256 - 1
 # traceTransfers reports native value as Transfer logs from this address
 NATIVE_LOG_ADDRESS = "0x" + "ee" * 20
+# a native transfer simulated beside every call, whose log proves the RPC
+# honoured traceTransfers: without it no call's native moves can be seen
+TRACE_CANARY_FROM = "0x" + "00" * 18 + "c0de"
+TRACE_CANARY_TO = "0x" + "00" * 18 + "c0df"
+TRACE_CANARY_VALUE = 1
+# mapRequesterBalances(address), a mech balance tracker's prepaid balance of a
+# requester (the pinned mech-client's tracker ABIs); read before and after the
+# call in the same simulated block, from this address
+REQUESTER_BALANCE_SELECTOR = "0x6aeeffa8"
+PREPAID_READER = "0x" + "00" * 18 + "c0e0"
 
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 APPROVAL = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
@@ -141,13 +126,38 @@ class Problem(t.TypedDict):
     detail: str
 
 
+# strict: bytes.fromhex would skip whitespace, and the raw string goes on
+_HEX_CALLDATA = re.compile(r"(0[xX])?[0-9a-fA-F]*")
+
+
+def calldata_problem(data: str) -> Problem | None:
+    """Return the bad-calldata problem for calldata that is not hex, else None.
+
+    Checked before anything reaches the RPC, so a caller's typo is refused as
+    one rather than as the RPC failing to simulate it.
+    """
+    raw = data or ""
+    if _HEX_CALLDATA.fullmatch(raw) and len(calldata_hex(raw)) % 2 == 0:
+        return None
+    return Problem(
+        rule="bad-calldata",
+        detail="cannot decode the calldata: it must be hex of whole bytes, "
+        "0x-prefixed or bare, with nothing else in it (no spaces)",
+    )
+
+
 class AssetDiff(t.TypedDict):
-    """What a simulated transaction does to the sender's assets."""
+    """What a simulated transaction does to the sender's assets.
+
+    `native` and `tokens` include what `prepaid` lists: each fall of the
+    sender's prepaid balance at a mech balance tracker, in that tracker's asset.
+    """
 
     ok: bool
     revert: str | None
     native: str
     tokens: dict[str, dict[str, str]]
+    prepaid: list[dict[str, str]]
     recipients: list[dict[str, t.Any]]
     approvals: list[dict[str, t.Any]]
     positions: list[dict[str, str]]
@@ -160,10 +170,6 @@ class SimulationUnavailable(Exception):
 
 
 Rpc = t.Callable[[str, list], t.Any]
-
-
-def _hex(value: int) -> str:
-    return hex(value)
 
 
 def _word(data: str, index: int) -> int:
@@ -206,23 +212,43 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
     value: int,
     data: str,
     get_code: t.Callable[[str], bytes],
+    prepaid: t.Mapping[str, TokenKey] | None = None,
 ) -> AssetDiff:
     """Simulate one call at head and return what it does to `sender`'s assets.
 
     `rpc(method, params)` returns the JSON-RPC result or raises
     SimulationUnavailable; `get_code(address)` tells an EOA from a contract.
+    `prepaid` maps each mech balance tracker to the asset its balance is in:
+    the sender's balance there is read before and after the call, in the
+    same simulated block, and a fall is spent of that asset.
     """
+    assets = dict(prepaid or {})
+    trackers = sorted(assets)
+    reads = [
+        {"from": PREPAID_READER, "to": tracker, "data": _balance_read(sender)}
+        for tracker in trackers
+    ]
     payload = {
         "blockStateCalls": [
             {
+                "stateOverrides": {
+                    TRACE_CANARY_FROM: {"balance": hex(TRACE_CANARY_VALUE)}
+                },
                 "calls": [
+                    *reads,
                     {
                         "from": sender,
                         "to": to,
-                        "value": _hex(value),
+                        "value": hex(value),
                         "data": data or "0x",
-                    }
-                ]
+                    },
+                    {
+                        "from": TRACE_CANARY_FROM,
+                        "to": TRACE_CANARY_TO,
+                        "value": hex(TRACE_CANARY_VALUE),
+                    },
+                    *reads,
+                ],
             }
         ],
         "traceTransfers": True,
@@ -230,24 +256,47 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
     }
     result = rpc("eth_simulateV1", [payload, "latest"])
     try:
-        call = result[0]["calls"][0]
+        answered = list(result[0]["calls"])
+        before = answered[: len(reads)]
+        call, canary = answered[len(reads) : len(reads) + 2]
+        after = answered[len(reads) + 2 :]
         ok = str(call.get("status", "0x0")) in ("0x1", "1")
         logs = list(call.get("logs") or [])
-    except (IndexError, KeyError, TypeError, AttributeError) as e:
+        canary_logs = list(canary.get("logs") or [])
+    except (IndexError, KeyError, TypeError, AttributeError, ValueError) as e:
         raise SimulationUnavailable(f"unexpected eth_simulateV1 answer: {e}") from e
     try:
+        falls = _prepaid_falls(trackers, before, after)
         diff = _diff(sender.lower(), logs, get_code)
         gas_used = int(str(call.get("gasUsed", "0x0")), 16)
+        traced = (
+            TRACE_CANARY_FROM,
+            TRACE_CANARY_TO,
+            TRACE_CANARY_VALUE,
+        ) in _native_moves(canary_logs)
     except (TypeError, ValueError, AttributeError) as e:
         raise SimulationUnavailable(f"unreadable eth_simulateV1 answer: {e}") from e
+    if not traced:
+        # an RPC that ignores traceTransfers logs no native move at all, so a
+        # call moving native internally, at any value, would look like none
+        raise SimulationUnavailable(
+            "the RPC did not trace a native transfer (traceTransfers), so the "
+            "call's native moves cannot be checked"
+        )
     if ok and value > 0:
         sent = sum(a for src, _, a in _native_moves(logs) if src == sender.lower())
         if sent < value:
-            # an RPC that ignores traceTransfers logs no native move at all,
-            # and a value send would then look like it moves nothing
+            # traced, yet short of the value sent: an answer not to trust
             raise SimulationUnavailable(
                 "the RPC did not trace the call's native transfer "
                 "(traceTransfers), so its native moves cannot be checked"
+            )
+    for tracker, fall in falls.items():
+        if assets[tracker] == NATIVE:
+            diff["native"] -= fall
+        else:
+            diff["tokens"][assets[tracker]] = (
+                diff["tokens"].get(assets[tracker], 0) - fall
             )
     called = [to.lower()]
     for log in logs:
@@ -267,6 +316,10 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
             for token, delta in sorted(diff["tokens"].items())
             if delta
         },
+        prepaid=[
+            {"tracker": tracker, "token": assets[tracker], "delta": str(-fall)}
+            for tracker, fall in falls.items()
+        ],
         recipients=diff["recipients"],
         approvals=[
             entry
@@ -277,6 +330,36 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
         called=called,
         gas_used=gas_used,
     )
+
+
+def _balance_read(holder: str) -> str:
+    """Return the calldata of mapRequesterBalances(holder)."""
+    return REQUESTER_BALANCE_SELECTOR + holder.lower().removeprefix("0x").rjust(64, "0")
+
+
+def _prepaid_falls(
+    trackers: list[str], before: list[dict], after: list[dict]
+) -> dict[str, int]:
+    """Return how far the prepaid balance fell at each tracker, where it fell.
+
+    A read that did not answer one whole word fails the simulation: a fall
+    it hides would be a spend the gate cannot see.
+    """
+    if len(before) != len(trackers) or len(after) != len(trackers):
+        raise SimulationUnavailable("the prepaid mech balance reads went unanswered")
+    falls: dict[str, int] = {}
+    for tracker, was, now in zip(trackers, before, after):
+        balances = []
+        for read in (was, now):
+            raw = str(read.get("returnData") or "").removeprefix("0x")
+            if str(read.get("status")) not in ("0x1", "1") or len(raw) != 64:
+                raise SimulationUnavailable(
+                    f"could not read the prepaid mech balance at {tracker}"
+                )
+            balances.append(int(raw, 16))
+        if balances[1] < balances[0]:
+            falls[tracker] = balances[0] - balances[1]
+    return falls
 
 
 ALLOWANCE_SELECTOR = "0xdd62ed3e"  # allowance(address,address)
@@ -346,8 +429,13 @@ def _native_moves(logs: list[dict]) -> list[tuple[str, str, int]]:
     return [
         (src, dst, _word(data, 0))
         for address, src, dst, data in _erc20_transfers(logs)
-        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES
+        if _is_native_log(address)
     ]
+
+
+def _is_native_log(address: str) -> bool:
+    """Whether a `Transfer` log from `address` moves native value, not a token."""
+    return address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES
 
 
 def _erc20_transfers(logs: list[dict]) -> t.Iterator[tuple[str, str, str, str]]:
@@ -386,7 +474,7 @@ def _diff(  # pylint: disable=too-many-locals,too-many-branches,too-many-stateme
             native += amount
 
     for address, src, dst, data in _erc20_transfers(logs):
-        if address == NATIVE_LOG_ADDRESS or address in NATIVE_ERC20_FACES:
+        if _is_native_log(address):
             continue  # native moves, counted above
         amount = _word(data, 0)
         if src == holder:
@@ -622,6 +710,50 @@ def parse_amount(value: t.Any) -> int:
     return parsed
 
 
+# the largest integer a JSON number carries exactly (an IEEE-754 double's):
+# 2^53 + 1 is the first a double cannot hold, and it rounds to 2^53
+MAX_EXACT_JSON_INT = 2**53 - 1
+
+
+def parse_tool_amount(value: t.Any) -> int:
+    """Parse a base-unit amount from the agent tool surface, where it is a string.
+
+    A decimal or 0x-hex string, read as `parse_amount` reads it. A JSON
+    integer is taken up to 2^53 - 1, the most a JSON number carries exactly;
+    a float, or an integer past that, is refused: a client may already have
+    rounded it (2^53 + 1 arrives as 2^53).
+
+    :raises TypeError: not a whole number, or past 2^53 - 1. :raises ValueError:
+        negative, or a string that is not a number.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value > MAX_EXACT_JSON_INT:
+            raise TypeError(
+                "a JSON number is exact only up to 2^53 - 1; pass a larger amount "
+                "as a decimal or 0x-hex string"
+            )
+    return parse_amount(value)
+
+
+def intent_amounts(raw: t.Any) -> list[tuple[str, t.Any]]:
+    """Return each base-unit amount a raw intent declares, named by where it sits.
+
+    Only what has an intent's shape is read: `parse_intent` refuses the rest.
+    """
+    if not isinstance(raw, dict):
+        return []
+    found: list[tuple[str, t.Any]] = []
+    for where in ("spend", "receive_min"):
+        entries = raw.get(where)
+        if isinstance(entries, dict):
+            found += [(f"intent.{where}.{token}", v) for token, v in entries.items()]
+    approvals = raw.get("approvals")
+    for index, approval in enumerate(approvals if isinstance(approvals, list) else []):
+        if isinstance(approval, dict) and "amount" in approval:
+            found.append((f"intent.approvals[{index}].amount", approval["amount"]))
+    return found
+
+
 def balance_key(key: t.Any) -> TokenKey:
     """Return the key a balance change of `key` is booked under in a diff.
 
@@ -648,6 +780,9 @@ def _amounts(raw: t.Any, where: str) -> dict[TokenKey, int]:
 def _approval(raw: t.Any) -> IntentApproval:
     if not isinstance(raw, dict):
         raise TypeError("each intent approval must be {token, spender, amount}")
+    unknown = sorted(set(raw) - {"token", "spender", "amount"})
+    if unknown:
+        raise ValueError(f"unknown intent approval keys {unknown}")
     return IntentApproval(
         token=_token(raw["token"]),
         spender=_address(raw["spender"]),

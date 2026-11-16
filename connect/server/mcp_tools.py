@@ -31,6 +31,8 @@ import typing as t
 from hexbytes import HexBytes
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BeforeValidator, ConfigDict, Field, with_config
+from typing_extensions import TypedDict
 from web3.exceptions import TransactionNotFound
 
 from connect import chain_read
@@ -39,8 +41,9 @@ from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.intent import AgentIntent
+from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
+from connect.mech_allowances import TopUpBudget
 from connect.server.auth import (
     GrantRefused,
     GrantStore,
@@ -55,6 +58,50 @@ from connect.signer import Signer
 # tools that read and never sign, broadcast or pay: harnesses may run them
 # without asking the operator
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
+
+
+def _amount_text(value: t.Any) -> str:
+    """Read a base-unit amount as `intent.parse_tool_amount` reads it, as a string.
+
+    :raises ValueError: naming the rule, `bad-value`, for anything else.
+    """
+    try:
+        return str(parse_tool_amount(value))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"rule 'bad-value': {e}; pass a decimal or 0x-hex string of base "
+            f"units (got {value!r})"
+        ) from e
+
+
+# a base-unit amount on the tool surface: declared a string, so a client
+# that cannot hold the number exactly can still pass it exactly
+Amount = t.Annotated[
+    str,
+    BeforeValidator(_amount_text),
+    Field(description="base units, as a decimal or 0x-hex string"),
+]
+
+
+# Extra keys are kept for `intent.parse_intent`, the one judge of an intent's
+# shape, which refuses them by name; these types only declare the amounts.
+@with_config(ConfigDict(extra="allow"))
+class ToolApproval(TypedDict, total=False):
+    """One approval an intent allows the call to grant."""
+
+    token: str
+    spender: str
+    amount: Amount
+
+
+@with_config(ConfigDict(extra="allow"))
+class ToolIntent(TypedDict, total=False):
+    """What a call may do; tokens are addresses or "native", amounts `Amount`s."""
+
+    spend: dict[str, Amount] | None
+    receive_min: dict[str, Amount] | None
+    recipients: list[str] | None
+    approvals: list[ToolApproval] | None
 
 
 def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-locals
@@ -105,10 +152,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def safe_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         target: str,
-        value: int = 0,
+        value: Amount = "0",
         data: str = "0x",
         *,
-        intent: dict | None = None,
+        intent: ToolIntent | None = None,
         ctx: Context | None = None,
         request_id: str | None = None,
         wait_for_receipt: bool = False,
@@ -117,7 +164,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         """Make the service safe call `target` — the normal way to act on-chain.
 
         `target`/`value`/`data` are the call the safe makes; any value carried
-        leaves the safe, not the EOA. Returns {tx_hash}, plus a top-level
+        leaves the safe, not the EOA. `value` is base units as a decimal or
+        0x-hex string. Returns {tx_hash}, plus a top-level
         `status` (mined / reverted / pending) and the receipt when
         wait_for_receipt. Reusing a request_id replays the original tx_hash
         instead of spending twice.
@@ -125,8 +173,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         anything of the safe's, or grants an approval): {spend: {token: max},
         receive_min: {token: min}, recipients: [eoa, ...], approvals: [{token,
         spender, amount}]}, tokens as addresses (any case) or "native", amounts
-        in base units. The call is simulated before it is signed and refused,
-        naming the rule, if it would do more than the intent allows.
+        in base units as decimal or 0x-hex strings, like `value`. The call is
+        simulated before it is signed and refused, naming the rule, if it would
+        do more than the intent allows.
         """
         return await _dispatch(
             signer.send_via_safe,
@@ -146,10 +195,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def send_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         to: str,
-        value: int = 0,
+        value: Amount = "0",
         data: str = "0x",
         *,
-        intent: dict | None = None,
+        intent: ToolIntent | None = None,
         ctx: Context | None = None,
         request_id: str | None = None,
         wait_for_receipt: bool = False,
@@ -179,11 +228,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def preflight_transaction(
         chain: str,
         target: str,
-        value: int = 0,
+        value: Amount = "0",
         data: str = "0x",
         *,
         via_safe: bool = True,
-        intent: dict | None = None,
+        intent: ToolIntent | None = None,
         ctx: Context | None = None,
     ) -> dict:
         """Ask whether a call would be permitted, before you build on it.
@@ -216,7 +265,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             signer.check,
             chain,
             target,
-            value=value,
+            value=parse_amount(value),
             data=data,
             via_safe=via_safe,
             intent=_for_token(grants, ctx, intent),
@@ -232,17 +281,18 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def simulate_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         target: str,
-        value: int = 0,
+        value: Amount = "0",
         data: str = "0x",
         *,
         via_safe: bool = True,
-        intent: dict | None = None,
+        intent: ToolIntent | None = None,
         ctx: Context | None = None,
     ) -> dict:
         """Simulate a call at head and say what it does to the safe's assets.
 
         Returns the asset diff — `native` and `tokens` deltas (each token with
-        its `symbol`, display only), `recipients`
+        its `symbol`, display only; both count `prepaid`, any fall of the
+        safe's prepaid mech balance), `recipients`
         (each with `contract`), `approvals`, ERC-721/1155 `positions`,
         `called` (the target plus every contract that emitted a log; one
         called without emitting is not listed), `revert`, `gas_used` — with
@@ -254,7 +304,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             signer.simulate,
             chain,
             target,
-            value=value,
+            value=parse_amount(value),
             data=data,
             via_safe=via_safe,
             intent=_for_token(grants, ctx, intent),
@@ -338,9 +388,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         priority_mech: str | None = None,
         auto_deposit: bool = True,
         timeout: float = 300,
-        max_payment: int | None = None,
+        max_payment: Amount | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
+        ctx: Context | None = None,
     ) -> dict:
         """Send a request to an Olas mech (AI service) and wait for its delivery.
 
@@ -352,7 +403,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         `delivery`, `payment` and `benchmarks`, decided before paying.
         Refused before paying if the mech's price exceeds max_payment
         (base units of the mech's payment asset, default 0.1 of that asset;
-        mech_tools reports the asset as payment_token).
+        mech_tools reports the asset as payment_token). An automatic top-up
+        of the safe's prepaid balance (`auto_deposit`, on a mech's HTTP 402)
+        deposits at most max_payment too, and draws on the same session
+        budget as the price.
         On timeout the ids come back as `pending_request_ids` for mech_result.
         `request_id` is an id you invent before sending (not one of the
         `request_ids` that come back): repeating it never sends again — it
@@ -379,9 +433,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             priority_mech=priority_mech,
             auto_deposit=auto_deposit,
             timeout=timeout,
-            max_payment=max_payment,
+            max_payment=None if max_payment is None else parse_amount(max_payment),
             request_id=request_id,
             request_context=request_context,
+            top_up_budget=_top_up_budget(grants, ctx),
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -452,14 +507,34 @@ def _ctx_token(ctx: Context | None) -> str | None:
 
 
 def _for_token(
-    grants: GrantStore, ctx: Context | None, intent: dict | None
+    grants: GrantStore, ctx: Context | None, intent: ToolIntent | None
 ) -> AgentIntent:
     """Return the intent the gate holds this call to, for the calling token.
 
     The MCP mount stamps the token on the request; `GrantStore.intent_for`
     decides, and treats a call that reached a tool without one as capped.
     """
-    return grants.intent_for(_ctx_token(ctx), intent)
+    return grants.intent_for(_ctx_token(ctx), None if intent is None else dict(intent))
+
+
+def _top_up_budget(grants: GrantStore, ctx: Context | None) -> TopUpBudget | None:
+    """Return the session budget a mech request's top-up draws on, for its token.
+
+    None for a call with no token: it never reached the mount, which
+    authorizes every real call.
+    """
+    token = _ctx_token(ctx)
+    if token is None:
+        return None
+
+    def draw(amount: int) -> str | None:
+        try:
+            grants.draw_mech_top_up(token, amount)
+        except GrantRefused as e:
+            return e.message
+        return None
+
+    return draw
 
 
 def _token_refusal(
@@ -487,7 +562,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     *,
     chain: str,
     address: str,
-    value: int,
+    value: str | int,
     data: str,
     intent: AgentIntent,
     request_id: str | None,
@@ -501,14 +576,16 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     address means (EOA recipient vs. the safe's call target); everything else —
     the value guard, the worker-thread offload, the settle — is shared here.
     """
-    if value < 0:
-        raise ValueError("value must be a non-negative amount in wei")
+    try:
+        amount = parse_amount(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"value must be a non-negative amount in wei: {e}") from e
 
     def _run() -> dict:
         tx_hash = method(
             chain,
             address,
-            value=value,
+            value=amount,
             data=data,
             request_id=request_id,
             intent=intent,

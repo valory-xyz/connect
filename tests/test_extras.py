@@ -34,8 +34,10 @@ from aea_ledger_ethereum import rpc_rotation
 from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client import NonceAllocator
 from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 
 from connect import __main__ as main_module
 from connect import signer as signer_module
@@ -446,6 +448,21 @@ class TestMain:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
         assert main_module.main(["--password", "x"]) == 1
+
+    def test_main_exits_with_a_reason_when_another_connect_holds_the_store(
+        self,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A second Connect on one STORE_PATH: logged for Pearl's log.txt, exit 1."""
+        holder = NonceAllocator(boot_env, settle_timeout=1, gap_retries=0)
+        try:
+            assert main_module.main(["--password", TEST_PASSWORD]) == 1
+        finally:
+            holder.close()
+        assert not served
+        assert "mech queue store is locked" in caplog.text
 
     def test_main_happy_path(
         self,
@@ -1370,7 +1387,7 @@ class TestSignerExtras:
         """A gas-estimation revert surfaces as SignerError, not a raw exception."""
 
         def reverting_estimate(tx: dict) -> int:
-            raise RuntimeError("execution reverted: not enough funds")
+            raise ContractLogicError("execution reverted: not enough funds")
 
         fake_w3.eth.estimate_gas = reverting_estimate  # type: ignore[method-assign]
         with pytest.raises(SignerError, match="execution reverted"):
@@ -1567,9 +1584,9 @@ class TestWalletExtras:
         )
         overview = wallet.wallet_overview(app_config, test_signer)
         entry = overview["chains"]["testchain"]
-        assert entry["balances"] == {"error": "down"}
+        assert entry["balances"] == {"error": wallet.BALANCE_READ_FAILED}
         assert entry["actionable"] is False
-        assert "down" in entry["not_actionable_because"]
+        assert "balances unreadable" in entry["not_actionable_because"]
         assert overview["actionable_chains"] == []
 
     def test_overview_separates_undeployed_from_unfunded_chains(

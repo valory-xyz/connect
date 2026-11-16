@@ -20,12 +20,18 @@
 """The intent gate at the signing choke point, and the read tools."""
 
 import json
+import logging
 import typing as t
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from web3 import Web3
+from web3.exceptions import Web3RPCError
 
 from connect import chain_read
+from connect import intent as intent_module
+from connect import signer as signer_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
@@ -33,6 +39,13 @@ from connect.mech import MechService
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import SERVER_BUILT, Signer, SignerError
+from connect.signer_errors import (
+    SEND_FAILED,
+    SEND_UNKNOWN,
+    SendUnknown,
+    cause_of,
+    logged_cause,
+)
 
 from tests.conftest import FakeW3, audit_entries, grant_store, pay
 
@@ -111,6 +124,24 @@ class TestSignerGate:
         """send() checks the EOA's own call."""
         test_signer.send("testchain", EOA, value=3, intent=pay(EOA, 3))
         assert fake_w3.provider.simulated[0]["from"] == test_signer.address
+
+    @pytest.mark.parametrize("via_safe", [True, False])
+    def test_one_call_gets_the_same_verdict_whatever_its_hex_prefix_case(
+        self, test_signer: Signer, fake_w3: FakeW3, via_safe: bool
+    ) -> None:
+        """The simulation carries the bytes the guard read, whatever the prefix."""
+        spellings = (TOKEN_CALL, "0X" + TOKEN_CALL[2:])
+        verdicts = [
+            test_signer.simulate("testchain", TOKEN, data=data, via_safe=via_safe)
+            for data in spellings
+        ]
+        assert verdicts[0] == verdicts[1]
+        assert verdicts[0]["problems"] == []
+        send = test_signer.send_via_safe if via_safe else test_signer.send
+        for data in spellings:
+            send("testchain", TOKEN, data=data)
+        assert len(fake_w3.eth.sent) == 2
+        assert {call["data"] for call in fake_w3.provider.simulated} == {TOKEN_CALL}
 
     def test_overspend_and_undeclared_recipient_are_refused(
         self, test_signer: Signer, fake_w3: FakeW3
@@ -205,7 +236,7 @@ class TestSignerGate:
         with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
         (record,) = [r for r in caplog.records if "cannot simulate" in r.message]
-        assert record.exc_info is not None
+        assert "SimulationUnavailable: " in record.message  # and why
         assert record.levelname == "ERROR"
         assert EOA in record.message  # which call it could not simulate
 
@@ -266,8 +297,9 @@ class TestSignerGate:
             raise ConnectionError("rpc down")
 
         monkeypatch.setattr(fake_w3.provider, "make_request", boom)
-        with pytest.raises(SignerError, match="rpc down"):
+        with pytest.raises(SignerError, match="'simulation-unavailable'") as refused:
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
+        assert "rpc down" not in str(refused.value)  # the RPC's text: log only
 
     def test_an_unreachable_rpc_is_simulation_unavailable(
         self, test_signer: Signer, monkeypatch: pytest.MonkeyPatch
@@ -545,10 +577,10 @@ class TestSignerGate:
             raise ConnectionError("getCode timed out")
 
         monkeypatch.setattr(fake_w3.eth, "get_code", no_code)
-        with pytest.raises(SignerError, match="'simulation-unavailable'.*getCode"):
+        with pytest.raises(SignerError, match="'simulation-unavailable'"):
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
         monkeypatch.setattr(fake_w3.provider, "make_request", lambda m, p: {})
-        with pytest.raises(SignerError, match="no result in the answer"):
+        with pytest.raises(SignerError, match="'simulation-unavailable'"):
             test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
 
     def test_a_garbled_answer_building_the_client_is_the_rpcs_fault(
@@ -567,6 +599,269 @@ class TestSignerGate:
         assert problems[0]["rule"] == "simulation-unavailable"
         with pytest.raises(ValueError, match="mystery"):  # an unknown chain is
             test_signer.simulate("mystery", EOA, via_safe=False)
+
+
+@pytest.mark.parametrize(
+    ("stage", "error", "said"),
+    [
+        ("broadcast", ConnectionError("read timed out"), SEND_UNKNOWN),
+        ("broadcast", TimeoutError("read timed out"), SEND_UNKNOWN),
+        ("broadcast", ValueError("nonce too low"), SEND_FAILED),  # the RPC answered
+        # web3 7's node rejection, which is not a ValueError
+        ("broadcast", Web3RPCError("replacement transaction underpriced"), SEND_FAILED),
+        ("estimate", ConnectionError("rpc down"), SEND_FAILED),  # nothing signed
+    ],
+)
+def test_a_failed_send_says_whether_it_may_have_been_broadcast(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error: Exception,
+    said: str,
+) -> None:
+    """Only a broadcast the RPC never answered is possibly sent; retrying it pays twice."""
+
+    def broken(*_args: t.Any) -> t.Any:
+        raise error
+
+    name = {"broadcast": "send_raw_transaction", "estimate": "estimate_gas"}[stage]
+    monkeypatch.setattr(fake_w3.eth, name, broken)
+    with pytest.raises(SignerError) as failed:
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
+    assert str(failed.value).startswith(said)
+
+
+# an RPC key in a URL's path, as a provider puts it there
+RPC_KEY = "k3y" + "0f9a" * 16
+
+
+def test_a_failed_send_s_record_and_log_carry_the_message_s_redaction(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    store_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The caller's message, the send_failed record and the log keep no RPC key."""
+
+    def broken(*_args: t.Any) -> t.Any:
+        raise ValueError(f"rejected by https://rpc.example/v2/{RPC_KEY}?x=1")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", broken)
+    with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError) as e:
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
+    assert str(e.value) == SEND_FAILED
+    (failed,) = [r for r in audit_entries(store_path) if r["kind"] == "send_failed"]
+    assert failed["error"] == "ValueError: rejected by https://rpc.example/..."
+    assert RPC_KEY not in json.dumps(audit_entries(store_path))
+    assert "https://rpc.example/..." in caplog.text
+    assert RPC_KEY not in caplog.text
+
+
+def _raise_chained(link: str) -> None:
+    """Raise a RuntimeError whose `link` (__cause__ or __context__) names an RPC key."""
+    try:
+        raise ConnectionError(f"https://rpc.example/v2/{RPC_KEY}?x=1 refused")
+    except ConnectionError as inner:
+        if link == "__cause__":
+            raise RuntimeError("the read failed") from inner
+        raise RuntimeError("the read failed")  # pylint: disable=raise-missing-from
+
+
+@pytest.mark.parametrize("link", ["__cause__", "__context__"])
+def test_a_cause_s_url_is_redacted_wherever_it_sits_in_the_chain(link: str) -> None:
+    """A URL only in an inner link is cut to scheme and host, in the record and the log."""
+    with pytest.raises(RuntimeError) as raised:
+        _raise_chained(link)
+    assert getattr(raised.value, link) is not None
+    said = cause_of(raised.value)
+    assert said == (
+        "RuntimeError: the read failed <- "
+        "ConnectionError: https://rpc.example/... refused"
+    )
+    assert RPC_KEY not in logged_cause(raised.value)
+
+
+def test_a_logged_cause_says_where_each_link_was_raised() -> None:
+    """Each link's frames name its file, line and function, so our own bug is found."""
+    with pytest.raises(RuntimeError) as raised:
+        _raise_chained("__cause__")
+    logged = logged_cause(raised.value)
+    assert logged.startswith(cause_of(raised.value) + "\n")
+    assert "RuntimeError raised at:" in logged
+    assert "ConnectionError raised at:" in logged
+    assert f'"{__file__}", line ' in logged
+    assert "in _raise_chained" in logged
+    assert RPC_KEY not in logged
+
+
+def test_a_failed_send_s_log_locates_the_code_that_failed(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed send logs the frames it was raised from, never the RPC's key."""
+
+    def refused_broadcast(*_args: t.Any) -> t.Any:
+        raise ValueError(f"rejected by https://rpc.example/v2/{RPC_KEY}?x=1")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", refused_broadcast)
+    with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
+    (record,) = [r for r in caplog.records if r.message.startswith("send on ")]
+    assert "ValueError raised at:" in record.message
+    assert "in refused_broadcast" in record.message
+    assert RPC_KEY not in record.message
+
+
+def test_an_unavailable_simulation_s_log_locates_the_code_that_failed(
+    test_signer: Signer,
+    monkeypatch: pytest.MonkeyPatch,
+    store_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bug under the gate's simulation logs its frames, never a library's text."""
+
+    def buggy_simulate(*_args: t.Any, **_kwargs: t.Any) -> t.Any:
+        try:
+            raise TypeError(f"bad log from https://rpc.example/v2/{RPC_KEY}")
+        except TypeError as e:
+            raise intent_module.SimulationUnavailable(str(e)) from e
+
+    monkeypatch.setattr(intent_module, "simulate", buggy_simulate)
+    with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
+        test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
+    (record,) = [r for r in caplog.records if "cannot simulate" in r.message]
+    assert "in buggy_simulate" in record.message
+    assert "TypeError raised at:" in record.message
+    assert RPC_KEY not in record.message
+    assert RPC_KEY not in json.dumps(audit_entries(store_path))
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_an_unreadable_prepaid_tracker_table_refuses_every_send_unsimulated(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    value: int,
+) -> None:
+    """A prepaid fall the gate could not see is spend: no table, no signature."""
+
+    def unreadable(_chain: str) -> dict[str, str]:
+        raise ValueError("invalid literal for int() with base 10: 'not-a-number'")
+
+    monkeypatch.setattr(signer_module, "prepaid_balance_trackers", unreadable)
+    with caplog.at_level("WARNING", logger="agent"):
+        with pytest.raises(SignerError, match="'simulation-unavailable'"):
+            test_signer.send_via_safe(
+                "testchain", EOA, value=value, intent=pay(EOA, value)
+            )
+        verdict = test_signer.simulate("testchain", EOA, value=value)
+    assert not fake_w3.eth.sent
+    assert not fake_w3.provider.simulated
+    assert [p["rule"] for p in verdict["problems"]] == ["simulation-unavailable"]
+    record, _ = [r for r in caplog.records if "cannot simulate" in r.message]
+    assert "ValueError raised at:" in record.message
+    assert "in unreadable" in record.message
+
+
+def test_a_possibly_sent_broadcast_with_no_request_id_promises_no_replay(
+    test_signer: Signer, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no request_id nothing is held: the caller gets the hash to look up."""
+
+    def timed_out(_raw: bytes) -> t.Any:
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
+    with pytest.raises(SendUnknown) as failed:
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1))
+    said = str(failed.value)
+    assert failed.value.tx_hash in said
+    assert "request_id" not in said
+    assert "or the account's nonce before sending again" in said
+
+
+def test_a_possibly_sent_broadcast_names_its_hash_nonce_and_id_for_the_operator(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    store_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning and the send_failed record both say where to look on chain."""
+    fake_w3.eth.pending_nonce = nonce = 7
+
+    def timed_out(_raw: bytes) -> t.Any:
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
+    with caplog.at_level(logging.WARNING, logger="agent"):
+        with pytest.raises(SendUnknown) as failed:
+            test_signer.send(
+                "testchain", EOA, value=1, intent=pay(EOA, 1), request_id="op-1"
+            )
+    tx_hash = failed.value.tx_hash
+    (record,) = [e for e in audit_entries(store_path) if e["kind"] == "send_failed"]
+    assert (record["tx_hash"], record["nonce"], record["request_id"]) == (
+        tx_hash,
+        nonce,
+        "op-1",
+    )
+    (warning,) = [r for r in caplog.records if "may have landed" in r.getMessage()]
+    for named in (tx_hash, f"'nonce': {nonce}", "'request_id': 'op-1'"):
+        assert named in warning.getMessage()
+
+
+@pytest.mark.parametrize("via_safe", [False, True])
+def test_a_retry_of_a_possibly_sent_broadcast_replays_its_hash(
+    test_signer: Signer,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    via_safe: bool,
+) -> None:
+    """The node took the transaction but the answer timed out: a retry sends nothing."""
+    taken: list[bytes] = []
+
+    def timed_out(raw: bytes) -> t.Any:
+        taken.append(bytes(raw))  # the node has it
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
+    send = test_signer.send_via_safe if via_safe else test_signer.send
+    target = TOKEN if via_safe else EOA
+    with pytest.raises(SendUnknown) as failed:
+        send("testchain", target, value=1, intent=pay(target, 1), request_id="x")
+    assert "its request_id stays held with that hash" in str(failed.value)
+    assert test_signer.holds_request("x", via_safe)
+    with pytest.raises(SendUnknown) as replayed:  # never as a confirmed send
+        send("testchain", target, value=1, intent=pay(target, 1), request_id="x")
+    (raw,) = taken  # one broadcast, never a second at the next nonce
+    assert replayed.value.tx_hash == Web3.keccak(raw).to_0x_hex()
+    assert str(replayed.value) == str(failed.value)
+    # a different call under the held id is refused as one, never handed the
+    # possibly-sent hash of a transaction it did not ask for
+    with pytest.raises(SignerError, match="already used for a different call") as other:
+        send("testchain", target, value=2, intent=pay(target, 2), request_id="x")
+    assert not isinstance(other.value, SendUnknown)
+    assert len(taken) == 1
+    assert not fake_w3.eth.sent
+
+
+def test_a_send_that_failed_before_broadcasting_frees_its_request_id(
+    test_signer: Signer, fake_w3: FakeW3
+) -> None:
+    """A node rejection sent nothing: the same request id may send again."""
+    fake_w3.eth.fail_broadcast = True
+    with pytest.raises(SignerError, match="the RPC could not take"):
+        test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1), request_id="y")
+    assert not test_signer.holds_request("y", via_safe=False)
+    fake_w3.eth.fail_broadcast = False
+    test_signer.send("testchain", EOA, value=1, intent=pay(EOA, 1), request_id="y")
+    assert len(fake_w3.eth.sent) == 1
 
 
 class TestSimulate:

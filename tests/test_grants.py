@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from connect import intent as intent_module
+from connect import signer as signer_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server import auth as auth_module
@@ -46,7 +47,14 @@ from connect.server.auth import (
 )
 from connect.signer import Signer
 
-from tests.conftest import FakeW3, audit_entries, grant_store, pay
+from tests.conftest import (
+    FakeW3,
+    TOKEN_EXPIRES_AT,
+    advance_token_clock,
+    audit_entries,
+    grant_store,
+    pay,
+)
 
 WORKSPACE = "workspace-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
@@ -54,9 +62,19 @@ USDC = "0x" + "c0" * 20
 ROBINHOOD_ROUTER = "0x8876789976decbfcbbbe364623c63652db8c0904"
 
 
+LIVE = {"expires_at": TOKEN_EXPIRES_AT}  # what every minted body needs
+
+
 def grant(**kwargs: t.Any) -> TokenGrant:
-    """Return a grant with every scope unless told otherwise."""
-    return TokenGrant(**{"scopes": ["read", "mech", "tx"], **kwargs})
+    """Return a mintable grant with every scope unless told otherwise."""
+    return TokenGrant(
+        **{
+            "scopes": ["read", "mech", "tx"],
+            "max_mech_payment_per_session": 10**30,
+            **LIVE,
+            **kwargs,
+        }
+    )
 
 
 def test_the_workspace_token_can_do_what_a_session_always_could() -> None:
@@ -106,6 +124,14 @@ def test_narrower_is_a_partial_order_on_every_field() -> None:
     assert narrower(grant(**_capped(1, 1, 1, 1)), WORKSPACE_GRANT)
 
 
+def test_narrower_holds_the_mech_session_budget() -> None:
+    """A child may not report a wider mech session budget than its parent's."""
+    parent = grant(max_mech_payment_per_session=100)
+    assert narrower(grant(max_mech_payment_per_session=100), parent)
+    for wider in (101, None):
+        assert not narrower(grant(max_mech_payment_per_session=wider), parent)
+
+
 def _capped(per_tx: int, session: int, mech: int, expiry: int) -> dict:
     return {
         "max_value_per_tx": {"native": per_tx},
@@ -151,13 +177,90 @@ def test_a_read_token_reads_and_does_nothing_else() -> None:
         assert refused.value.rule == "token-scope"
 
 
-def test_an_expired_token_is_refused() -> None:
+def test_an_expired_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     """Past expires_at the token answers nothing, and mints nothing."""
     store = grant_store(WORKSPACE)
-    old = store.mint(WORKSPACE, grant(expires_at=int(time.time()) - 1))
+    old = store.mint(WORKSPACE, grant(expires_at=int(time.time()) + 60))
+    advance_token_clock(monkeypatch, 120)
+    for call in (
+        lambda: store.authorize(old, "wallet_info", {}),
+        lambda: store.mint(old, grant(scopes=["read"])),
+    ):
+        with pytest.raises(GrantRefused) as refused:
+            call()
+        assert (refused.value.rule, refused.value.status) == ("token-expired", 401)
+
+
+def test_a_token_pruned_after_its_lookup_is_refused_as_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Looked up, then pruned by another caller's mint: a 401, not a KeyError."""
+    store = grant_store(WORKSPACE)
+    soon = store.mint(WORKSPACE, grant(expires_at=int(time.time()) + 60))
+    assert store.lookup(f"Bearer {soon}") == soon
+    advance_token_clock(monkeypatch, 120)
+    store.mint(WORKSPACE, grant(scopes=["read"]))  # prunes it
+    for call in (
+        lambda: store.authorize(soon, "wallet_info", {}),
+        lambda: store.grant(soon),
+    ):
+        with pytest.raises(GrantRefused) as refused:
+            call()
+        assert (refused.value.rule, refused.value.status) == ("token-expired", 401)
+
+
+@pytest.mark.parametrize(
+    ("action", "arguments"),
+    [
+        ("mech_request", {"max_payment": 1}),
+        ("safe_transaction", {"value": 1, "request_id": "r1"}),
+    ],
+)
+def test_a_token_pruned_while_its_caps_are_read_is_refused_as_expired(
+    monkeypatch: pytest.MonkeyPatch, action: str, arguments: dict
+) -> None:
+    """Live when checked, pruned before its session budgets are read: a 401."""
+    store = grant_store(WORKSPACE)
+    soon = store.mint(
+        WORKSPACE,
+        grant(expires_at=int(time.time()) + 60, max_value_per_session={"native": 5}),
+    )
+    live = store._live  # pylint: disable=protected-access
+
+    def pruned_after(token: str) -> TokenGrant:
+        checked = live(token)
+        if token == soon:  # the mint below checks its own parent here too
+            advance_token_clock(monkeypatch, 120)
+            store.mint(WORKSPACE, grant(scopes=["read"]))  # another caller's mint
+        return checked
+
+    monkeypatch.setattr(store, "_live", pruned_after)
     with pytest.raises(GrantRefused) as refused:
-        store.authorize(old, "wallet_info", {})
+        store.authorize(soon, action, arguments)
     assert (refused.value.rule, refused.value.status) == ("token-expired", 401)
+
+
+def test_http_a_token_pruned_after_its_lookup_is_a_401(
+    client: TestClient, store_path: t.Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route answers the README's 401 and audits it, never a 500."""
+    body = {"scopes": ["read"], "expires_at": int(time.time()) + 60}
+    token = client.post("/tokens", json=body, headers=_bearer(WORKSPACE))
+    store = client.app.state.grants  # type: ignore[attr-defined]
+    lookup = store.lookup
+
+    def pruned_after(header: str | None) -> str | None:
+        found = lookup(header)
+        advance_token_clock(monkeypatch, 120)
+        store.mint(WORKSPACE, grant(scopes=["read"]))  # another caller's mint
+        return found
+
+    monkeypatch.setattr(store, "lookup", pruned_after)
+    refused = client.get("/wallet", headers=_bearer(token.json()["token"]))
+    assert refused.status_code == 401
+    assert "token-expired" in refused.json()["detail"]
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert (entry["rule"], entry["path"]) == ("token-expired", "/wallet")
 
 
 def test_mech_payment_cap() -> None:
@@ -165,10 +268,15 @@ def test_mech_payment_cap() -> None:
     store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_mech_payment=100))
     store.authorize(capped, "mech_request", {"max_payment": 100})
-    for asked in (None, 101, True):
+    store.authorize(capped, "mech_request", {"max_payment": "0x64"})
+    for asked in (None, 101, "101"):
         with pytest.raises(GrantRefused) as refused:
             store.authorize(capped, "mech_request", {"max_payment": asked})
         assert refused.value.rule == "token-mech-payment-cap"
+    for malformed in (True, -1, 1.0, "1.5"):  # not a whole number of base units
+        with pytest.raises(GrantRefused) as refused:
+            store.authorize(capped, "mech_request", {"max_payment": malformed})
+        assert refused.value.rule == "bad-value"
 
 
 def test_value_caps_per_tx_and_per_session() -> None:
@@ -359,14 +467,15 @@ def test_an_asset_a_cap_does_not_name_may_not_be_spent(cap: str) -> None:
     )
 
 
-def test_an_integral_float_value_is_taken_and_a_fraction_refused() -> None:
-    """5.0 is what the tool's int field takes too; 0.5 and inf are not amounts."""
+def test_a_value_is_a_whole_number_of_base_units_never_a_float() -> None:
+    """A decimal or hex string or an integer is an amount; no float is, 5.0 included."""
     store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_tx={"native": 5}))
-    store.authorize(capped, "safe_transaction", {"value": 5.0})
-    for value in (0.5, float("inf")):
+    for value in (5, "5", "0x5"):
+        store.authorize(capped, "safe_transaction", {"value": value})
+    for not_whole in (5.0, 0.5, float("inf")):
         with pytest.raises(GrantRefused) as refused:
-            store.authorize(capped, "safe_transaction", {"value": value})
+            store.authorize(capped, "safe_transaction", {"value": not_whole})
         assert refused.value.rule == "bad-value"
 
 
@@ -482,7 +591,7 @@ def test_http_mint_and_use_a_read_token(
 ) -> None:
     """POST /tokens mints a narrower token; it reads, and its sends are refused."""
     minted = client.post(
-        "/tokens", json={"scopes": ["read"]}, headers=_bearer(WORKSPACE)
+        "/tokens", json={"scopes": ["read"], **LIVE}, headers=_bearer(WORKSPACE)
     )
     assert minted.status_code == 200
     reader = minted.json()["token"]
@@ -507,7 +616,7 @@ def test_http_mint_and_use_a_read_token(
         assert client.post(path, json=body, headers=_bearer(reader)).status_code == 403
     assert not fake_w3.eth.sent
     wider = client.post(
-        "/tokens", json={"scopes": ["read", "tx"]}, headers=_bearer(reader)
+        "/tokens", json={"scopes": ["read", "tx"], **LIVE}, headers=_bearer(reader)
     )
     assert wider.status_code == 403
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
@@ -518,19 +627,24 @@ def test_http_mint_and_use_a_read_token(
     ("grant_body", "status", "rule"),
     [
         ({"scopes": ["tx"]}, 403, "token-scope"),
-        ({"scopes": ["read"], "expires_at": 1}, 401, "token-expired"),
+        ({"scopes": ["read"], "expires_in": 60}, 401, "token-expired"),
     ],
 )
-def test_http_wallet_needs_a_live_read_token(
+def test_http_wallet_needs_a_live_read_token(  # pylint: disable=too-many-arguments
     client: TestClient,
     store_path: t.Any,
+    monkeypatch: pytest.MonkeyPatch,
     grant_body: dict,
     status: int,
     rule: str,
 ) -> None:
     """GET /wallet is held to the token's grant, and its refusal audited."""
-    token = client.post("/tokens", json=grant_body, headers=_bearer(WORKSPACE))
+    body = {**LIVE, **grant_body}
+    if "expires_in" in body:  # at run time: a collection-time expiry goes stale
+        body["expires_at"] = int(time.time()) + body.pop("expires_in")
+    token = client.post("/tokens", json=body, headers=_bearer(WORKSPACE))
     assert token.status_code == 200
+    advance_token_clock(monkeypatch, 120)
     refused = client.get("/wallet", headers=_bearer(token.json()["token"]))
     assert refused.status_code == status
     assert rule in refused.json()["detail"]
@@ -544,7 +658,7 @@ def test_http_capped_token_is_refused_above_its_cap(
     """A capped tx token sends within its cap and is refused, by rule, above it."""
     capped = client.post(
         "/tokens",
-        json={"scopes": ["tx"], "max_value_per_tx": {"native": 5}},
+        json={"scopes": ["tx"], "max_value_per_tx": {"native": 5}, **LIVE},
         headers=_bearer(WORKSPACE),
     ).json()["token"]
     ok = client.post(
@@ -571,6 +685,38 @@ def test_http_capped_token_is_refused_above_its_cap(
     assert over.status_code == 403
     assert "token-cap-per-tx" in over.json()["detail"]
     assert len(fake_w3.eth.sent) == 1
+
+
+def test_http_a_fall_of_the_prepaid_mech_balance_is_held_to_the_intent_and_caps(
+    client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A safe call that spends the prepaid mech balance needs an intent, within caps.
+
+    No intent is `missing-intent`, an intent short of the fall `overspend`,
+    and one that declares it past the token's cap `token-cap-per-tx`.
+    """
+    tracker = "0x" + "7e" * 20
+    monkeypatch.setattr(
+        signer_module, "prepaid_balance_trackers", lambda chain: {tracker: "native"}
+    )
+    fake_w3.provider.prepaid = {tracker: (10, 4)}  # the call spends 6 of it
+    capped = _mint_capped(client)  # at most 5 native per transaction
+    body = {"chain": "testchain", "target": "0x" + "c4" * 20}
+
+    def send(token: str, intent: dict | None) -> t.Any:
+        return client.post(
+            "/safe-transaction", json={**body, "intent": intent}, headers=_bearer(token)
+        )
+
+    assert "missing-intent" in send(capped, None).json()["detail"]
+    assert "overspend" in send(capped, {"spend": {"native": 5}}).json()["detail"]
+    over = send(capped, {"spend": {"native": 6}})
+    assert (over.status_code, "token-cap-per-tx" in over.json()["detail"]) == (
+        403,
+        True,
+    )
+    assert not fake_w3.eth.sent
+    assert send(WORKSPACE, {"spend": {"native": 6}}).status_code == 200
 
 
 class TestMcpMiddleware:
@@ -725,7 +871,7 @@ def _position_out_log(holder: str = SAFE) -> dict:
 def _mint_capped(client: TestClient) -> str:
     minted = client.post(
         "/tokens",
-        json={"scopes": ["tx"], "max_value_per_tx": {"native": 5}},
+        json={"scopes": ["tx"], "max_value_per_tx": {"native": 5}, **LIVE},
         headers=_bearer(WORKSPACE),
     )
     assert minted.status_code == 200
@@ -807,7 +953,7 @@ def test_mcp_dry_runs_hold_a_capped_token_as_the_send_would(
     headers = {"Accept": "application/json, text/event-stream"}
     capped = client.post(
         "/tokens",
-        json={"scopes": ["read", "tx"], "max_value_per_tx": {"native": 5}},
+        json={"scopes": ["read", "tx"], "max_value_per_tx": {"native": 5}, **LIVE},
         headers=_bearer(WORKSPACE),
     ).json()["token"]
     refused = client.post("/mcp/", json=call, headers={**headers, **_bearer(capped)})
@@ -860,6 +1006,63 @@ def test_mcp_value_that_is_not_finite_is_a_bad_value_refusal(
     assert rules == ["bad-value"]
 
 
+@pytest.mark.parametrize("tool", sorted(auth_module.TOOL_AMOUNTS))
+def test_mcp_an_amount_from_2_53_on_is_refused_at_the_mount_before_any_draw(
+    client: TestClient, fake_w3: FakeW3, store_path: t.Any, tool: str
+) -> None:
+    """A JSON number from 2^53 on may already be rounded: refused, naming the rule."""
+    (name,) = auth_module.TOOL_AMOUNTS[tool]
+    arguments = (
+        {"prompt": "q", "tool": "t"}
+        if tool == "mech_request"
+        else {"chain": "testchain", "target": RECIPIENT}
+    )
+    refused = _mcp_call(client, WORKSPACE, tool, {**arguments, name: 2**53})
+    assert _refused_rule(refused) == "bad-value"
+    assert "2^53 - 1" in refused.json()["error"]["message"]
+    rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert rules == ["bad-value"]
+    assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize(
+    ("intent", "where"),
+    [
+        ({"spend": {"native": 2**53}}, "intent.spend.native"),
+        ({"receive_min": {"native": 1.5}}, "intent.receive_min.native"),
+        (
+            {
+                "approvals": [
+                    {"token": RECIPIENT, "spender": RECIPIENT, "amount": 2**53}
+                ]
+            },
+            "intent.approvals[0].amount",
+        ),
+    ],
+)
+@pytest.mark.parametrize("tool", ["safe_transaction", "simulate_transaction"])
+def test_mcp_an_intent_amount_a_json_number_may_have_rounded_is_refused_at_the_mount(  # pylint: disable=too-many-arguments
+    client: TestClient,
+    fake_w3: FakeW3,
+    store_path: t.Any,
+    tool: str,
+    intent: dict,
+    where: str,
+) -> None:
+    """Every amount inside an intent follows the value rule, named by where it sits."""
+    refused = _mcp_call(
+        client,
+        WORKSPACE,
+        tool,
+        {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+    )
+    assert _refused_rule(refused) == "bad-value"
+    assert refused.json()["error"]["message"].startswith(f"rule 'bad-value': {where}:")
+    rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert rules == ["bad-value"]
+    assert not fake_w3.eth.sent
+
+
 def test_http_mint_refuses_an_unknown_field_by_name(
     client: TestClient, store_path: t.Any
 ) -> None:
@@ -878,7 +1081,11 @@ def test_http_mint_refuses_an_unknown_field_by_name(
 def _session_capped(client: TestClient) -> str:
     minted = client.post(
         "/tokens",
-        json={"scopes": ["read", "tx"], "max_value_per_session": {"native": 10}},
+        json={
+            "scopes": ["read", "tx"],
+            "max_value_per_session": {"native": 10},
+            **LIVE,
+        },
         headers=_bearer(WORKSPACE),
     )
     assert minted.status_code == 200
@@ -1053,7 +1260,7 @@ def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(  # pylint:
         first.join(10)
         first_done.set()
         retry.join(10)
-    assert "nonce too low" in answers["first"].text
+    assert "the RPC could not take the transaction" in answers["first"].text
     assert "nothing was sent for this retry" in answers["retry"].text
     assert len(broadcasts) == 1  # the retry broadcast nothing
     assert "token-cap-per-session" in post().text  # not held now: drawn in full
@@ -1162,6 +1369,7 @@ def test_mcp_preflight_answers_with_the_token_s_cap_and_draws_nothing(
             "scopes": ["read", "tx"],
             "max_value_per_tx": {"native": 5},
             "max_value_per_session": {"native": 5},
+            **LIVE,
         },
         headers=_bearer(WORKSPACE),
     ).json()["token"]
@@ -1203,7 +1411,7 @@ def test_mcp_preflight_answers_a_read_only_token_as_its_send_would(
 ) -> None:
     """A read token may preflight, and is told its send would be refused by scope."""
     reader = client.post(
-        "/tokens", json={"scopes": ["read"]}, headers=_bearer(WORKSPACE)
+        "/tokens", json={"scopes": ["read"], **LIVE}, headers=_bearer(WORKSPACE)
     ).json()["token"]
     body = {
         "jsonrpc": "2.0",
@@ -1222,3 +1430,239 @@ def test_mcp_preflight_answers_a_read_only_token_as_its_send_would(
     assert "token-scope" in checked["reason"]
     assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert fake_w3.provider.simulated == []
+
+
+def _mcp_call(client: TestClient, token: str, tool: str, arguments: dict) -> t.Any:
+    """Call one MCP tool through the real mount; return the raw response."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    }
+    headers = {"Accept": "application/json, text/event-stream", **_bearer(token)}
+    return client.post("/mcp/", json=body, headers=headers)
+
+
+def _refused_rule(response: t.Any) -> str | None:
+    """Return the rule of a JSON-RPC -32001 refusal, or None if not refused."""
+    if not response.headers["content-type"].startswith("application/json"):
+        return None
+    error = response.json().get("error") or {}
+    if error.get("code") != -32001:
+        return None
+    return error["message"].split("'")[1]
+
+
+def test_mcp_mech_request_is_held_to_the_token_s_mech_caps(
+    client: TestClient,
+    mech_service: t.Any,
+    monkeypatch: pytest.MonkeyPatch,
+    store_path: t.Any,
+) -> None:
+    """Over /mcp: per request and per session, and nothing reaches the mech when refused."""
+    asked: list[t.Any] = []
+
+    def request(*_args: t.Any, **kwargs: t.Any) -> dict:
+        asked.append(kwargs["max_payment"])
+        return {"request_ids": []}
+
+    monkeypatch.setattr(mech_service, "request", request)
+    capped = client.post(
+        "/tokens",
+        json={
+            "scopes": ["mech"],
+            "max_mech_payment": 100,
+            "max_mech_payment_per_session": 150,
+            **LIVE,
+        },
+        headers=_bearer(WORKSPACE),
+    ).json()["token"]
+
+    def pay_mech(**max_payment: t.Any) -> str | None:
+        return _refused_rule(
+            _mcp_call(
+                client,
+                capped,
+                "mech_request",
+                {"prompt": "q", "tool": "t", **max_payment},
+            )
+        )
+
+    assert pay_mech(max_payment="101") == "token-mech-payment-cap"
+    assert pay_mech() == "token-mech-payment-cap"  # omitted: the default is no cap
+    assert pay_mech(max_payment=1.5) == "bad-value"
+    assert pay_mech(max_payment="100") is None
+    assert pay_mech(max_payment="100") == "token-mech-session-cap"  # 200 > 150
+    assert pay_mech(max_payment=50) is None
+    assert asked == [100, 50]
+    rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert rules == ["token-mech-payment-cap"] * 2 + [
+        "bad-value",
+        "token-mech-session-cap",
+    ]
+
+
+def test_mcp_a_mech_top_up_draws_on_the_token_s_mech_session_budget(
+    client: TestClient, mech_service: t.Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over /mcp: the request's top-up draws on the session budget of its token."""
+    drawn: list[str | None] = []
+
+    def request(*_args: t.Any, **kwargs: t.Any) -> dict:
+        budget = kwargs["top_up_budget"]
+        drawn.extend([budget(120), budget(100)])  # after the price's 50 of 150
+        return {"request_ids": []}
+
+    monkeypatch.setattr(mech_service, "request", request)
+    capped = client.post(
+        "/tokens",
+        json={"scopes": ["mech"], "max_mech_payment_per_session": 150, **LIVE},
+        headers=_bearer(WORKSPACE),
+    ).json()["token"]
+    response = _mcp_call(
+        client, capped, "mech_request", {"prompt": "q", "tool": "t", "max_payment": 50}
+    )
+    assert _refused_rule(response) is None
+    refused, allowed = drawn
+    assert refused is not None
+    assert refused.startswith("rule 'token-mech-session-cap'")
+    assert allowed is None
+    assert (
+        _refused_rule(
+            _mcp_call(
+                client,
+                capped,
+                "mech_request",
+                {"prompt": "q", "tool": "t", "max_payment": 1},
+            )
+        )
+        == "token-mech-session-cap"
+    )  # 50 + 100 drawn: the budget is spent
+
+
+def test_mcp_an_expired_token_is_refused_on_a_tool_call(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, store_path: t.Any
+) -> None:
+    """Expiry holds on the MCP mount as on HTTP: a -32001 naming token-expired."""
+    reader = client.post(
+        "/tokens",
+        json={"scopes": ["read"], "expires_at": int(time.time()) + 60},
+        headers=_bearer(WORKSPACE),
+    ).json()["token"]
+    assert _refused_rule(_mcp_call(client, reader, "wallet_info", {})) is None
+    advance_token_clock(monkeypatch, 120)
+    assert (
+        _refused_rule(_mcp_call(client, reader, "wallet_info", {})) == "token-expired"
+    )
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert (entry["rule"], entry["tool"]) == ("token-expired", "wallet_info")
+
+
+def test_mech_payments_draw_on_every_ancestor_s_session_budget() -> None:
+    """Minting more children never multiplies a parent's mech budget."""
+    store = grant_store(WORKSPACE)
+    parent = store.mint(WORKSPACE, grant(max_mech_payment_per_session=100))
+    children = [
+        store.mint(parent, grant(max_mech_payment_per_session=100)) for _ in range(2)
+    ]
+    store.authorize(children[0], "mech_request", {"max_payment": 60})
+    with pytest.raises(GrantRefused) as refused:
+        store.authorize(children[1], "mech_request", {"max_payment": 60})
+    assert refused.value.rule == "token-mech-session-cap"
+    store.authorize(children[1], "mech_request", {"max_payment": 40})
+    with pytest.raises(GrantRefused) as refused:  # a budget is drawn by an amount
+        store.authorize(children[1], "mech_request", {"max_payment": None})
+    assert refused.value.rule == "token-mech-session-cap"
+    for asked in (-1, True):  # and only by a whole number of base units
+        with pytest.raises(GrantRefused) as refused:
+            store.authorize(children[1], "mech_request", {"max_payment": asked})
+        assert refused.value.rule == "bad-value"
+    # the workspace token has no mech budget of its own, so it is never drawn
+    store.authorize(WORKSPACE, "mech_request", {"max_payment": 10**30})
+
+
+@pytest.mark.parametrize(
+    ("body", "rule"),
+    [
+        ({"scopes": ["read"]}, "token-expiry-required"),
+        ({"scopes": ["read"], "expires_at": 1}, "token-expiry-required"),
+        ({"scopes": ["mech"], **LIVE}, "token-mech-cap-required"),
+    ],
+)
+def test_http_mint_needs_a_future_expiry_and_a_mech_session_cap(
+    client: TestClient, store_path: t.Any, body: dict, rule: str
+) -> None:
+    """A minted token is never immortal, nor a mech payer without a session budget."""
+    refused = client.post("/tokens", json=body, headers=_bearer(WORKSPACE))
+    assert refused.status_code == 400
+    assert f"rule '{rule}'" in refused.json()["detail"]
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert entry["rule"] == rule
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"expires_at": 0},
+        {"expires_at": -5},
+        {"max_mech_payment": -1},
+        {"max_mech_payment_per_session": -1},
+    ],
+)
+def test_a_grant_out_of_range_is_invalid(field: dict) -> None:
+    """An expiry before 1970 or a negative mech cap is not a grant at all."""
+    with pytest.raises(ValidationError):
+        grant(**field)
+
+
+def test_scopes_are_immutable() -> None:
+    """The workspace grant cannot gain a scope in place."""
+    assert isinstance(WORKSPACE_GRANT.scopes, tuple)
+    assert isinstance(grant(scopes=["read"]).scopes, tuple)
+
+
+def test_tokens_are_stored_by_hash_and_found_by_one_lookup() -> None:
+    """The store keeps no token in the clear, and still finds every one."""
+    store = grant_store(WORKSPACE)
+    child = store.mint(WORKSPACE, grant(scopes=["read"]))
+    keys = set(store._grants)  # pylint: disable=protected-access
+    assert WORKSPACE not in keys
+    assert child not in keys
+    assert store.lookup(f"Bearer {child}") == child
+    assert store.lookup(f"Bearer {child}x") is None
+
+
+def test_one_token_mints_a_bounded_number_of_live_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the cap a mint is refused until some expire; expired ones are dropped."""
+    monkeypatch.setattr(auth_module, "MAX_CHILDREN_PER_TOKEN", 2)
+    store = grant_store(WORKSPACE)
+    soon = int(time.time()) + 60
+    short = [
+        store.mint(
+            WORKSPACE, grant(expires_at=soon, max_value_per_session={"native": 5})
+        )
+    ]
+    store.authorize(short[0], "safe_transaction", {"value": 1, "request_id": "r1"})
+    store.mint(WORKSPACE, grant(scopes=["read"]))
+    with pytest.raises(GrantRefused) as refused:
+        store.mint(WORKSPACE, grant(scopes=["read"]))
+    assert refused.value.rule == "token-limit"
+    advance_token_clock(monkeypatch, 120)
+    store.mint(WORKSPACE, grant(scopes=["read"]))  # the expired one made room
+    assert store.lookup(f"Bearer {short[0]}") is None  # and is forgotten
+
+
+def test_the_store_holds_a_bounded_number_of_live_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grandchildren count too: a tree of tokens cannot grow without bound."""
+    monkeypatch.setattr(auth_module, "MAX_LIVE_TOKENS", 3)  # the root included
+    store = grant_store(WORKSPACE)
+    child = store.mint(WORKSPACE, grant())
+    store.mint(child, grant())
+    with pytest.raises(GrantRefused) as refused:
+        store.mint(child, grant())
+    assert refused.value.rule == "token-limit"

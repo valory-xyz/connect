@@ -34,19 +34,24 @@ import logging
 import time
 
 from fastapi import APIRouter, HTTPException, Request
-from mech_client import MechPriceExceeded, NonceRefused
+from mech_client import MechPriceExceeded, NonceRefused, RULE_QUEUE_CLOSED
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from connect.keystore import KeystoreError, load_account
-from connect.mech_types import MechError
+from connect.mech_queue import HardCancelFailed, HardCancelRefused
 from connect.server.strict import StrictBody
 from connect.settings import SettingsPersistError
+from connect.signer import SignerError
 
 logger = logging.getLogger("agent")
 
 router = APIRouter()
 
 WRONG_PASSWORD_DELAY_SECONDS = 1.0
+HARD_CANCEL_FAILED = (
+    "the hard cancel's on-chain request failed (the cause is in Connect's log); "
+    "check the safe before trying again"
+)
 WHITELIST_FROZEN = "whitelist editing via the API is not supported yet"
 
 
@@ -190,37 +195,44 @@ class HardCancelRequest(StrictBody):
 @router.get("/mech-queue")
 def mech_queue(request: Request) -> dict:
     """Report each safe's mech queue per chain: stalled, since when, cancellable."""
-    return request.app.state.mech.queue_status()
+    return request.app.state.mech.queue.status()
 
 
 @router.post("/mech-queue/hard-cancel")
 def hard_cancel(body: HardCancelRequest, request: Request) -> dict:
-    """Consume a long-stalled queue's stuck nonce with one on-chain request (D27).
+    """Run the operator's hard cancel (README, "One payer per safe").
 
     Operator-only: the password, never a bearer token, authorizes it, since
-    it pays a mech from the safe. Refused (409, the allocator's rule) unless
-    the queue has been stalled for MECH_HARD_CANCEL_AFTER.
+    it pays a mech from the safe.
     """
     require_password(request, body.password, "a hard cancel")
     state = request.app.state
+
+    def refuse(status: int, rule: str, detail: str) -> HTTPException:
+        state.activity.record(
+            "refusal", rule=rule, path=request.url.path, reason=detail
+        )
+        return HTTPException(status_code=status, detail=f"rule '{rule}': {detail}")
+
     try:
         state.config.chain(body.chain)
     except ValueError as e:  # Connect's own words: an unknown chain
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        raise refuse(400, "unknown-chain", str(e)) from e
     try:
         return state.mech.hard_cancel(body.chain)
-    except NonceRefused as e:
-        state.activity.record(
-            "refusal", rule=e.rule, path=request.url.path, reason=str(e)
-        )
-        raise HTTPException(status_code=409, detail=f"rule '{e.rule}': {e}") from e
-    except (MechError, MechPriceExceeded) as e:  # Connect's and the cap's words
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    except NonceRefused as e:  # closed: Connect is shutting down, not a conflict
+        raise refuse(503 if e.rule == RULE_QUEUE_CLOSED else 409, e.rule, str(e)) from e
+    except HardCancelRefused as e:
+        raise refuse(400, e.rule, str(e)) from e
+    except MechPriceExceeded as e:  # mech-client's own cap, before anything paid
+        raise refuse(400, "over-max-payment", str(e)) from e
+    except SignerError as e:  # the guard refused the request: its words
+        raise refuse(400, "guardrail", str(e)) from e
+    except HardCancelFailed as e:  # audited with its nonce and mech
+        raise HTTPException(status_code=502, detail=HARD_CANCEL_FAILED) from e
     except Exception as e:  # a library's or an RPC's: its text stays in the log
         logger.exception("the hard cancel on %s failed", body.chain)
-        state.activity.record("mech_hard_cancel_failed", chain=body.chain)
-        raise HTTPException(
-            status_code=502,
-            detail="the hard cancel's on-chain request failed (the cause is in "
-            "Connect's log); check the safe before trying again",
-        ) from e
+        state.activity.record(
+            "mech_hard_cancel_failed", chain=body.chain, error=type(e).__name__
+        )
+        raise HTTPException(status_code=502, detail=HARD_CANCEL_FAILED) from e

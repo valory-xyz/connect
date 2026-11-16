@@ -19,6 +19,7 @@
 
 """Unknown parameters are refused by name on both surfaces."""
 
+import json
 import typing as t
 
 import pytest
@@ -29,7 +30,9 @@ from mcp.server.fastmcp.exceptions import ToolError
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
+from connect.intent import parse_intent
 from connect.mech import MechService
+from connect.server.auth import TOOL_AMOUNTS
 from connect.server.mcp_tools import build_mcp
 from connect.server.strict import (
     audit_unknown_parameters,
@@ -107,6 +110,57 @@ async def test_mcp_tool_refuses_to_on_safe_transaction(
     assert not fake_w3.eth.sent
     (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert entry == {**entry, "rule": "unknown-parameter", "tool": "safe_transaction"}
+
+
+def _placeholder(schema: dict) -> t.Any:
+    """Return a value of the JSON schema's type, so only the unknown name fails."""
+    kinds = {schema.get("type")} | {o.get("type") for o in schema.get("anyOf", [])}
+    for kind, value in (
+        ("integer", 1),
+        ("number", 1),
+        ("boolean", False),
+        ("object", {}),
+        ("array", []),
+    ):
+        if kind in kinds:
+            return value
+    return "testchain"
+
+
+async def test_every_mcp_tool_refuses_an_unknown_parameter(
+    mcp: FastMCP, fake_w3: FakeW3, store_path: t.Any
+) -> None:
+    """A tool that skipped the strict wrapper would drop the name silently."""
+    tools = await mcp.list_tools()
+    assert len(tools) > 10
+    for tool in tools:
+        properties = tool.inputSchema.get("properties", {})
+        required = {
+            name: _placeholder(properties[name])
+            for name in tool.inputSchema.get("required", [])
+        }
+        with pytest.raises(ToolError, match="unknown parameter 'zzz'"):
+            await mcp.call_tool(tool.name, {**required, "zzz": 1})
+    assert not fake_w3.eth.sent
+    refused = [
+        e["tool"]
+        for e in audit_entries(store_path)
+        if e["kind"] == "refusal" and e["rule"] == "unknown-parameter"
+    ]
+    assert sorted(refused) == sorted(tool.name for tool in tools)
+
+
+async def test_a_misspelled_max_payment_is_refused_not_uncapped(
+    mcp: FastMCP, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mech_request's cap dropped silently would pay the default; it is named instead."""
+    monkeypatch.setattr(mech_service, "request", lambda *a, **k: pytest.fail("sent"))
+    with pytest.raises(
+        ToolError, match=r"'max_paymnet' \(did you mean 'max_payment'\?\)"
+    ):
+        await mcp.call_tool(
+            "mech_request", {"prompt": "q", "tool": "t", "max_paymnet": 10}
+        )
 
 
 async def test_send_transaction_hints_the_other_way(mcp: FastMCP) -> None:
@@ -196,3 +250,259 @@ def test_a_non_mapping_body_is_left_to_pydantic() -> None:
 
     with pytest.raises(ValidationError, match="model_type"):
         SignMessageRequest.model_validate("not a body")
+
+
+async def test_the_tool_schema_declares_base_unit_amounts_as_strings(
+    mcp: FastMCP,
+) -> None:
+    """Every value and max_payment is a string in the published schema.
+
+    The mount reads exactly these (`TOOL_AMOUNTS`), so no amount is missed.
+    """
+    declared: dict[str, list[str]] = {}
+    for tool in await mcp.list_tools():
+        for name, schema in tool.inputSchema.get("properties", {}).items():
+            if name in ("value", "max_payment"):
+                kinds = {schema.get("type")} | {
+                    o.get("type") for o in schema.get("anyOf", [])
+                }
+                assert "string" in kinds, (tool.name, name, schema)
+                assert not kinds & {"integer", "number"}, (tool.name, name, schema)
+                declared.setdefault(tool.name, []).append(name)
+    assert declared == {tool: list(names) for tool, names in TOOL_AMOUNTS.items()}
+
+
+@pytest.mark.parametrize("amount", [1.5, 1.0, 2**53, 2**53 + 1, "1e18", -1, True])
+async def test_a_tool_refuses_an_amount_a_json_number_may_have_rounded(
+    mcp: FastMCP, fake_w3: FakeW3, amount: t.Any
+) -> None:
+    """A float, a number from 2^53 on or a non-amount is refused naming the rule."""
+    for tool, arguments in (
+        ("safe_transaction", {"chain": "testchain", "target": RECIPIENT}),
+        ("simulate_transaction", {"chain": "testchain", "target": RECIPIENT}),
+    ):
+        with pytest.raises(ToolError, match="rule 'bad-value'"):
+            await mcp.call_tool(tool, {**arguments, "value": amount})
+    with pytest.raises(ToolError, match="rule 'bad-value'"):
+        await mcp.call_tool(
+            "mech_request", {"prompt": "q", "tool": "t", "max_payment": amount}
+        )
+    assert not fake_w3.eth.sent
+
+
+async def test_a_decimal_string_amount_reaches_the_signer_exactly(
+    mcp: FastMCP,
+    test_signer: Signer,
+    mech_service: MechService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """10^18 + 1, past what a JSON number holds, arrives as that exact integer."""
+    exact = 10**18 + 1
+    seen: list[t.Any] = []
+
+    def send_via_safe(*_args: t.Any, **kwargs: t.Any) -> str:
+        seen.append(kwargs["value"])
+        return "0x" + "11" * 32
+
+    def request(*_args: t.Any, **kwargs: t.Any) -> dict:
+        seen.append(kwargs["max_payment"])
+        return {}
+
+    monkeypatch.setattr(test_signer, "send_via_safe", send_via_safe)
+    monkeypatch.setattr(mech_service, "request", request)
+    await mcp.call_tool(
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "value": str(exact)},
+    )
+    await mcp.call_tool(
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "value": hex(exact)},
+    )
+    await mcp.call_tool(
+        "mech_request", {"prompt": "q", "tool": "t", "max_payment": str(exact)}
+    )
+    await mcp.call_tool(
+        "safe_transaction", {"chain": "testchain", "target": RECIPIENT, "value": 5}
+    )
+    assert seen == [exact, exact, exact, 5]
+
+
+def _schema_types(schema: dict, defs: dict) -> set[t.Any]:
+    """Return the JSON types a property schema allows, following $ref and anyOf."""
+    if "$ref" in schema:
+        schema = defs[schema["$ref"].rsplit("/", 1)[-1]]
+    kinds = {schema.get("type")} - {None}
+    for option in schema.get("anyOf", []):
+        kinds |= _schema_types(option, defs)
+    return kinds
+
+
+def _resolved(schema: dict, defs: dict) -> dict:
+    """Return the object schema behind a nullable or referenced property."""
+    for option in [schema, *schema.get("anyOf", [])]:
+        if "$ref" in option:
+            return defs[option["$ref"].rsplit("/", 1)[-1]]
+        if option.get("type") in ("object", "array"):
+            return option
+    raise AssertionError(schema)
+
+
+async def test_the_tool_schema_declares_every_intent_amount_as_a_string(
+    mcp: FastMCP,
+) -> None:
+    """spend, receive_min and each approval's amount are strings, on every tool."""
+    with_intent = []
+    for tool in await mcp.list_tools():
+        schema = tool.inputSchema
+        if "intent" not in schema.get("properties", {}):
+            continue
+        with_intent.append(tool.name)
+        defs = schema.get("$defs", {})
+        intent = _resolved(schema["properties"]["intent"], defs)
+        for where in ("spend", "receive_min"):
+            per_token = _resolved(intent["properties"][where], defs)
+            kinds = _schema_types(per_token["additionalProperties"], defs)
+            assert kinds == {"string"}, (tool.name, where, per_token)
+        approvals = _resolved(intent["properties"]["approvals"], defs)
+        approval = _resolved(approvals["items"], defs)
+        kinds = _schema_types(approval["properties"]["amount"], defs)
+        assert kinds == {"string"}, (tool.name, approval)
+    assert sorted(with_intent) == sorted(TOOL_AMOUNTS.keys() - {"mech_request"})
+
+
+def _intent_with(where: str, amount: t.Any) -> dict:
+    """Return an intent declaring `amount` at `where`."""
+    if where == "approvals":
+        return {
+            "approvals": [{"token": RECIPIENT, "spender": RECIPIENT, "amount": amount}]
+        }
+    return {where: {"native": amount}}
+
+
+@pytest.mark.parametrize("where", ["spend", "receive_min", "approvals"])
+@pytest.mark.parametrize("amount", [1.5, 2**53, -1])
+async def test_a_tool_refuses_an_intent_amount_a_json_number_may_have_rounded(
+    mcp: FastMCP, fake_w3: FakeW3, where: str, amount: t.Any
+) -> None:
+    """An intent's amount follows the value rule: a float or 2^53 is refused by name."""
+    for tool in ("safe_transaction", "simulate_transaction"):
+        with pytest.raises(ToolError, match="rule 'bad-value'"):
+            await mcp.call_tool(
+                tool,
+                {
+                    "chain": "testchain",
+                    "target": RECIPIENT,
+                    "intent": _intent_with(where, amount),
+                },
+            )
+    assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize("where", ["spend", "receive_min", "approvals"])
+async def test_a_decimal_string_intent_amount_reaches_the_gate_exactly(
+    mcp: FastMCP,
+    test_signer: Signer,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+) -> None:
+    """10^18 + 1 in an intent, past what a JSON number holds, arrives exact."""
+    exact = 10**18 + 1
+    seen: list[t.Any] = []
+
+    def send_via_safe(*_args: t.Any, **kwargs: t.Any) -> str:
+        seen.append(kwargs["intent"])
+        return "0x" + "11" * 32
+
+    monkeypatch.setattr(test_signer, "send_via_safe", send_via_safe)
+    for spelling in (str(exact), hex(exact)):
+        await mcp.call_tool(
+            "safe_transaction",
+            {
+                "chain": "testchain",
+                "target": RECIPIENT,
+                "intent": _intent_with(where, spelling),
+            },
+        )
+    for intent in seen:
+        parsed, problems = parse_intent(intent)
+        assert not problems
+        assert parsed is not None
+        if where == "approvals":
+            assert parsed["approvals"][0]["amount"] == exact
+        else:
+            assert parsed[where] == {"native": exact}  # type: ignore[literal-required]
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("where", ["spend", "receive_min", "approvals"])
+@pytest.mark.parametrize("amount", [5, 2**53 - 1])
+async def test_a_json_integer_intent_amount_reaches_the_gate_exactly(
+    mcp: FastMCP,
+    test_signer: Signer,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+    amount: int,
+) -> None:
+    """An intent amount sent as a JSON integer up to 2^53 - 1 arrives as itself."""
+    seen: list[t.Any] = []
+
+    def send_via_safe(*_args: t.Any, **kwargs: t.Any) -> str:
+        seen.append(kwargs["intent"])
+        return "0x" + "11" * 32
+
+    monkeypatch.setattr(test_signer, "send_via_safe", send_via_safe)
+    await mcp.call_tool(
+        "safe_transaction",
+        {
+            "chain": "testchain",
+            "target": RECIPIENT,
+            "intent": _intent_with(where, amount),
+        },
+    )
+    (intent,) = seen
+    parsed, problems = parse_intent(intent)
+    assert not problems
+    assert parsed is not None
+    if where == "approvals":
+        assert parsed["approvals"][0]["amount"] == amount
+    else:
+        assert parsed[where] == {"native": amount}  # type: ignore[literal-required]
+
+
+@pytest.mark.parametrize(
+    ("intent", "unknown"),
+    [
+        ({"receive_minimum": {"native": "1000"}}, "receive_minimum"),
+        (
+            {
+                "approvals": [
+                    {
+                        "token": RECIPIENT,
+                        "spender": RECIPIENT,
+                        "amount": "1",
+                        "amout": "1",
+                    }
+                ]
+            },
+            "amout",
+        ),
+    ],
+)
+async def test_a_misspelled_intent_key_on_a_tool_is_refused_not_dropped(
+    mcp: FastMCP, fake_w3: FakeW3, intent: dict, unknown: str
+) -> None:
+    """A key the intent does not know reaches the gate, which refuses it by name."""
+    with pytest.raises(ToolError, match="rule 'bad-intent'") as refused:
+        await mcp.call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+        )
+    assert unknown in str(refused.value)
+    (content,) = await mcp.call_tool(
+        "simulate_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+    )
+    (problem,) = json.loads(content.text)["problems"]  # type: ignore[union-attr]
+    assert problem["rule"] == "bad-intent"
+    assert unknown in problem["detail"]
+    assert not fake_w3.eth.sent

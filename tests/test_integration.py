@@ -714,6 +714,7 @@ def test_offchain_preflight_refuses_an_unreachable_mech_on_fork(
             priority_mech=mech_address,
             timeout=30,
             max_payment=10**18,
+            top_up_budget=None,
         )
     # refused before payment: nothing was broadcast, so no nonce was consumed
     assert w3.eth.get_transaction_count(eoa) == nonce_before
@@ -761,7 +762,8 @@ def test_mech_request_on_fork_restricted_mode(
         legacy_on_chain=True,
         priority_mech=mech_address,
         timeout=30,  # no delivery will come on a fork; don't wait the default 5m
-        max_payment=10**18,  # live mech prices vary; the cap itself is unit-tested
+        max_payment=10**18,
+        top_up_budget=None,  # live mech prices vary; the cap itself is unit-tested
     )
     assert result["tx_hash"], result
     assert result["request_ids"], result
@@ -1006,7 +1008,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
         monkeypatch.setattr(
             service.tool_manager,
             "read_tools_metadata",
-            lambda sid: MetadataRead({"tools": [tool], "url": url}, None),
+            lambda sid: MetadataRead.ok({"tools": [tool], "url": url}),
         )
         monkeypatch.setattr(service.tool_manager, "get_offchain_url", lambda sid: url)
         first = mech_service.request(
@@ -1016,6 +1018,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
             priority_mech=mech_address,
             timeout=60,
             max_payment=10**18,
+            top_up_budget=None,
         )
         second = mech_service.request(
             f"integration offchain {secrets.token_hex(4)}",
@@ -1024,6 +1027,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
             priority_mech=mech_address,
             timeout=60,
             max_payment=10**18,
+            top_up_budget=None,
         )
 
     # the mech-side validation a real mech performs all passed

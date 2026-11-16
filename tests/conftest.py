@@ -23,9 +23,11 @@ import io
 import json
 import sys
 import threading
+import time
 import typing as t
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from eth_abi import decode as abi_decode
@@ -35,12 +37,13 @@ from eth_account.signers.local import LocalAccount
 from eth_utils import to_checksum_address
 from hexbytes import HexBytes
 from web3 import Web3
-from web3.exceptions import TimeExhausted, TransactionNotFound
+from web3.exceptions import TimeExhausted, TransactionNotFound, Web3RPCError
 
 from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechService
+from connect.server import auth as auth_module
 from connect.server.app import create_app
 from connect.server.auth import GrantStore
 from connect.settings import (
@@ -404,7 +407,8 @@ class FakeEth:
     def send_raw_transaction(self, raw: bytes) -> HexBytes:
         """Record the raw tx and return its keccak hash."""
         if self.fail_broadcast:
-            raise ValueError("nonce too low")
+            # what web3 7 raises for a node's rejection: not a ValueError
+            raise Web3RPCError("nonce too low")
         with self._lock:
             self.sent.append(bytes(raw))
         return HexBytes(Web3.keccak(bytes(raw)))
@@ -444,6 +448,8 @@ class FakeProvider:
 
     `logs` adds logs to every simulation; `status` and `error` make it revert;
     `unavailable` makes the RPC refuse the method, as forno.celo.org does.
+    `prepaid` answers the gate's prepaid balance reads: tracker -> (balance
+    before the call, balance after it).
     """
 
     def __init__(self) -> None:
@@ -453,7 +459,9 @@ class FakeProvider:
         self.status = "0x1"
         self.error: dict | str | None = None
         self.unavailable = False
+        self.traced = True  # False: an RPC that ignores traceTransfers
         self.symbols: dict[str, str] = {}  # token -> symbol() answer, 0x-hex
+        self.prepaid: dict[str, tuple[int, int]] = {}
 
     def make_request(self, method: str, params: list) -> dict:
         """Answer eth_simulateV1, and a token's symbol() read with no answer."""
@@ -468,11 +476,15 @@ class FakeProvider:
         assert params[1] == "latest"
         if self.unavailable:
             return {"error": {"code": -32601, "message": "method not whitelisted"}}
-        call = params[0]["blockStateCalls"][0]["calls"][0]
+        calls = params[0]["blockStateCalls"][0]["calls"]
+        reads = (len(calls) - 2) // 2  # a prepaid read before and after the call
+        call, canary = calls[reads : reads + 2]
+        if not call["data"].startswith("0x"):  # as a node does: `0X` is not hex
+            return {"error": {"code": -32602, "message": "invalid hex prefix"}}
         self.simulated.append(call)
         logs = list(self.logs)
         value = int(call["value"], 16)
-        if value:
+        if value and self.traced:
             logs.insert(0, native_transfer_log(call["from"], call["to"], value))
         result: dict[str, t.Any] = {
             "status": self.status,
@@ -482,7 +494,36 @@ class FakeProvider:
         result["logs"] = logs
         if self.error is not None:
             result["error"] = self.error
-        return {"result": [{"calls": [result]}]}
+        block = {**params[0]["blockStateCalls"][0], "calls": [call, canary]}
+        before = [self._prepaid(read, 0) for read in calls[:reads]]
+        after = [self._prepaid(read, 1) for read in calls[reads + 2 :]]
+        answered = [*before, result, canary_result(block, self.traced), *after]
+        return {"result": [{"calls": answered}]}
+
+    def _prepaid(self, read: dict, when: int) -> dict:
+        """Answer one prepaid balance read, before (0) or after (1) the call."""
+        balance = self.prepaid[read["to"]][when]
+        data = "0x" + hex(balance)[2:].rjust(64, "0")
+        return {"status": "0x1", "returnData": data, "gasUsed": "0x5208", "logs": []}
+
+
+def canary_result(block: dict, traced: bool = True) -> dict:
+    """Answer the gate's traceTransfers canary as a node would, or would not.
+
+    `block` is the simulated block, whose second call is the canary. A real
+    node moves the canary's value only if the block's state override funds
+    its sender: unfunded, the transfer fails and logs nothing.
+    """
+    canary = block["calls"][1]
+    value = int(canary["value"], 16)
+    overrides = {
+        address.lower(): state for address, state in block["stateOverrides"].items()
+    }
+    balance = int(overrides.get(canary["from"].lower(), {}).get("balance", "0x0"), 16)
+    if not traced or balance < value:
+        return {"status": "0x0", "returnData": "0x", "gasUsed": "0x5208", "logs": []}
+    logs = [native_transfer_log(canary["from"], canary["to"], value)]
+    return {"status": "0x1", "returnData": "0x", "gasUsed": "0x5208", "logs": logs}
 
 
 class FakeW3:
@@ -550,9 +591,14 @@ def guard(
 @pytest.fixture
 def mech_service(
     test_signer: Signer, app_config: AppConfig, activity: ActivityLog, guard: Guard
-) -> MechService:
-    """Mech service over the fake-backed signer (never contacts a chain)."""
-    return MechService(test_signer, app_config, activity, guard)
+) -> t.Iterator[MechService]:
+    """Mech service over the fake-backed signer (never contacts a chain).
+
+    Closed after the test: it holds STORE_PATH's queue store.
+    """
+    service = MechService(test_signer, app_config, activity, guard)
+    yield service
+    service.queue.close()
 
 
 @pytest.fixture
@@ -703,6 +749,20 @@ def _no_handed_token() -> t.Iterator[None]:
 def grant_store(token: str) -> GrantStore:
     """Return a GrantStore over a signer that holds no request id."""
     return GrantStore(token, held=lambda request_id, via_safe: False)
+
+
+# a minted token's expiry, far enough out never to pass during a test
+TOKEN_EXPIRES_AT = 4_000_000_000
+
+
+def advance_token_clock(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Move the clock the grant store reads expiries by, and nothing else."""
+    real = time.time
+    monkeypatch.setattr(
+        auth_module,
+        "time",
+        SimpleNamespace(time=lambda: real() + seconds, monotonic=time.monotonic),
+    )
 
 
 def pay(to: str, value: int) -> dict:

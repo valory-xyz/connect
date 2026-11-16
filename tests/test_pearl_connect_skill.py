@@ -33,6 +33,7 @@ answered from a table, and the signer's own HTTP surface is stubbed.
 import io
 import json
 import sys
+import time
 import urllib.error
 from email.message import Message
 from pathlib import Path
@@ -50,7 +51,7 @@ from connect.config import AGENT_HTTP_PORT, BIND_HOST, ChainConfig
 from connect.server.auth import MAX_AUTH_FAILURES
 from connect.settings import MODE_RESTRICTED, Protected, Settings
 
-from tests.conftest import evm
+from tests.conftest import TOKEN_EXPIRES_AT, advance_token_clock, evm
 
 # The skill ships as bundled assets, not an installed package; put its scripts
 # dir on the path so we can import the client under test.
@@ -308,7 +309,7 @@ def test_mint_token_mints_a_narrower_token_the_server_honours(
 
         monkeypatch.setattr(signer_client.SignerClient, "_post", post)
         root = signer_client.SignerClient("http://127.0.0.1:8716", "tok", "testchain")
-        child = root.mint_token({"scopes": ["read"]})
+        child = root.mint_token({"scopes": ["read"], "expires_at": TOKEN_EXPIRES_AT})
         assert child != "tok"  # nosec B105
         bearer = {"Authorization": f"Bearer {child}"}
         assert client.get("/wallet", headers=bearer).status_code == 200
@@ -418,14 +419,22 @@ def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
         send(value=1)  # moves value with no intent: the intent gate refuses
         capped = client.post(
             "/tokens",
-            json={"scopes": ["tx"], "max_value_per_tx": {"native": 1}},
+            json={
+                "scopes": ["tx"],
+                "max_value_per_tx": {"native": 1},
+                "expires_at": TOKEN_EXPIRES_AT,
+            },
             headers=good,
         ).json()["token"]
         send(value=2, headers={"Authorization": f"Bearer {capped}"})
         expired = client.post(
-            "/tokens", json={"scopes": ["tx"], "expires_at": 1}, headers=good
+            "/tokens",
+            json={"scopes": ["tx"], "expires_at": int(time.time()) + 60},
+            headers=good,
         ).json()["token"]
-        send(headers={"Authorization": f"Bearer {expired}"})
+        with monkeypatch.context() as later:
+            advance_token_clock(later, 120)
+            send(headers={"Authorization": f"Bearer {expired}"})
         send(to="0x1234")
         send(data="0xzz")  # not hex: refused before the RPC, as bad-calldata
         send(to=safe)
@@ -486,8 +495,76 @@ def test_send_transaction_forwards_the_intent(monkeypatch) -> None:
     client.send_transaction(  # the argument wins over the tx's own key
         {"to": ADDR_A, "intent": {"spend": {"native": 1}}}, intent={}
     )
-    assert sent[0]["intent"] == {"spend": {"native": 1}}
+    assert sent[0]["intent"] == {"spend": {"native": "1"}}
     assert sent[1]["intent"] == {"recipients": [ADDR_B]}
     assert "intent" not in sent[2]
     assert sent[3]["intent"] == {}
     assert sent[4]["intent"] == {}
+
+
+def test_send_transaction_passes_its_value_as_an_exact_decimal_string(
+    make_app, test_signer, app_config, activity, monkeypatch
+) -> None:
+    """Base units go as a decimal string, and the server reads that exact integer."""
+    exact = 10**18 + 1
+    seen: list = []
+    app = make_app(test_signer, app_config, activity, token="tok")  # nosec B106
+    monkeypatch.setattr(
+        test_signer,
+        "send_via_safe",
+        lambda *_args, **kwargs: seen.append(kwargs["value"]) or "0x" + "ab" * 32,
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        posted: list = []
+
+        def post(self, path, payload):
+            posted.append(payload)
+            response = client.post(
+                path, json=payload, headers={"Authorization": f"Bearer {self._token}"}
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        monkeypatch.setattr(signer_client.SignerClient, "_post", post)
+        signer = signer_client.SignerClient("http://127.0.0.1:8716", "tok", "testchain")
+        signer.send_transaction({"to": ADDR_A, "value": exact})
+        signer.send_transaction({"to": ADDR_A, "value": hex(exact)})
+    assert [p["value"] for p in posted] == [str(exact), str(exact)]
+    assert seen == [exact, exact]
+
+
+def test_send_transaction_passes_its_intent_amounts_as_exact_decimal_strings(
+    monkeypatch,
+) -> None:
+    """spend, receive_min and approval amounts go as strings, like value.
+
+    Anything that is not an int is the server's to judge, so it goes as given.
+    """
+    exact = 10**18 + 1
+    sent: list = []
+    monkeypatch.setattr(
+        signer_client.SignerClient,
+        "_post",
+        lambda self, path, payload: sent.append(payload)
+        or {"tx_hash": "0x" + "ab" * 32},
+    )
+    client = signer_client.SignerClient(
+        "http://127.0.0.1:9", "tok", chain="polygon"  # nosec B106
+    )
+    intent = {
+        "spend": {"native": exact},
+        "receive_min": {ADDR_B: exact, ADDR_A: "0x10"},
+        "recipients": [ADDR_B],
+        "approvals": [{"token": ADDR_A, "spender": ADDR_B, "amount": exact}, "odd"],
+    }
+    client.send_transaction({"to": ADDR_A}, intent=intent)
+    assert sent[0]["intent"] == {
+        "spend": {"native": str(exact)},
+        "receive_min": {ADDR_B: str(exact), ADDR_A: "0x10"},
+        "recipients": [ADDR_B],
+        "approvals": [
+            {"token": ADDR_A, "spender": ADDR_B, "amount": str(exact)},
+            "odd",
+        ],
+    }
+    assert intent["spend"] == {"native": exact}  # the caller's own dict is untouched

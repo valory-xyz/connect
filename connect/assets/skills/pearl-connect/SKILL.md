@@ -38,6 +38,10 @@ cannot tell you is which to reach for:
   address.
 - `send_transaction` — the same call made by the **EOA**, whose funds are for
   gas. Rarely what you want.
+- Amounts in base units — `value`, every amount in an `intent`, and
+  `max_payment` on `mech_request` — go as a decimal or 0x-hex **string** (`"1000000000000000001"`): a JSON number
+  is exact only up to 2^53 - 1, so a float, or a number past that, is refused
+  (`bad-value`).
 - For either — and for `mech_request` — **choose a `request_id` before you
   send**: it is what lets you retry safely if you never learn whether the call
   landed, and it cannot be added afterwards. Invent it; it is not one of the
@@ -66,10 +70,10 @@ or sends anything (native coin, a token, an NFT position) or grants an
 approval — needs an `intent`, saying what it may do:
 
 ```json
-{"spend": {"native": 10000, "0xtoken...": 500},
- "receive_min": {"0xother...": 490},
+{"spend": {"native": "10000", "0xtoken...": "500"},
+ "receive_min": {"0xother...": "490"},
  "recipients": ["0xeoa..."],
- "approvals": [{"token": "0xtoken...", "spender": "0xrouter...", "amount": 500}]}
+ "approvals": [{"token": "0xtoken...", "spender": "0xrouter...", "amount": "500"}]}
 ```
 
 The call is simulated before signing and refused, naming the rule, if it does
@@ -81,7 +85,7 @@ more than that. What a refusal won't tell you:
   always declared as an approval of the token to its spender, even within an
   existing allowance.
 - A call that moves nothing (a claim, a vote) needs no intent.
-- `simulation-unavailable` means that chain's RPC cannot simulate: no
+- `simulation-unavailable` means Connect cannot simulate on that chain: no
   value-moving call can be sent there.
 
 The bundled skills attach the intents of the calls they build.
@@ -125,7 +129,9 @@ mint a token with fewer scopes or an expiry, but no value caps.
 Scopes are `read`, `mech` and `tx`; caps are per token (`"native"` or a
 token address) in base units, checked against the spend and the approvals the
 call's intent declares; `max_mech_payment` caps `mech_request`'s
-`max_payment`. A token with a value cap cannot do what a cap
+`max_payment`, and `max_mech_payment_per_session` caps their sum. A minted
+token needs an `expires_at` in the future, and a `mech` one a
+`max_mech_payment_per_session`. A token with a value cap cannot do what a cap
 cannot bound: sign a raw digest, approve more than its cap, or move an NFT or
 outcome-token position out of the safe. A token can only mint a narrower one.
 
@@ -186,7 +192,8 @@ composing a prompt:
 - `legacy_on_chain=false` (default): no transaction; it signs a request
   digest and draws on prepaid balance held by the mech BalanceTracker. With
   `auto_deposit=true` (the default) an insufficient balance is topped up from
-  the safe once and the request retried.
+  the safe once, by at most `max_payment`, and the request retried; the
+  top-up counts against your token's mech session budget like the price.
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
   via the service safe.
 - `timeout` (seconds, default 300, max 900) bounds each phase of the wait —

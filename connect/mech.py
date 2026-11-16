@@ -44,6 +44,7 @@ from mech_client import (
     MechPriceExceeded,
     NonceRefused,
     PreSignHook,
+    RULE_ANSWER_UNKNOWN,
     chat_report,
     is_chat_prompt,
     offchain_blocker,
@@ -55,7 +56,6 @@ from mech_client.domain.delivery import (
 )
 from mech_client.infrastructure.config.payment_config import PaymentType
 from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
-from mech_client.nonces import REJECTION_RULES, UNKNOWN
 from mech_client.services.marketplace_service import MarketplaceService
 from safe_eth.eth import EthereumClient
 
@@ -63,21 +63,31 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
-from connect.mech_allowances import Armed, MechAllowances, read_map_nonces
-from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
-from connect.mech_queue import MechQueue
+from connect.mech_allowances import Armed, MechAllowances, TopUpBudget, read_map_nonces
+from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report, price_mech
+from connect.mech_queue import HardCancelRefused, MechQueue
 from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
 from connect.mech_types import (
     MechAnswerUnknown,
+    MechDepositUnknown,
     MechError,
     MechNotSent,
+    MechRefused,
     MechUnknownRequest,
     PendingDelivery,
     PricedMech,
     SPEND_UNCERTAIN,
+    answer_lost,
+    not_bought,
+    published_tools,
+    refusal,
+    request_key,
+    request_label,
+    said,
 )
 from connect.signer import Signer, SignerError
+from connect.signer_errors import cause_of
 
 logger = logging.getLogger("agent")
 
@@ -117,6 +127,7 @@ class _RequestPlan(t.NamedTuple):
     max_payment: int
     terms: dict  # mech-client's mech report, merged into the request's report
     armed: Armed  # the guard grants this request armed, revoked if nothing is sent
+    top_up_budget: TopUpBudget | None  # the session budget a top-up draws on
 
     @property
     def legacy_on_chain(self) -> bool:
@@ -127,11 +138,6 @@ class _RequestPlan(t.NamedTuple):
 def _clamp_timeout(timeout: float) -> float:
     """Clamp a caller-supplied wait to [1, MAX_DELIVERY_TIMEOUT] seconds."""
     return min(max(float(timeout), 1.0), MAX_DELIVERY_TIMEOUT)
-
-
-def _request_key(request_id: object) -> str:
-    """Normalize a caller's request id: mech-client's are bare lowercase hex."""
-    return str(request_id).lower().removeprefix("0x")
 
 
 class MechService:  # pylint: disable=too-many-instance-attributes
@@ -152,17 +158,18 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         # mech_result can resume the watch a paid-for request deserves
         self._pending: dict[str, PendingDelivery] = {}
         self._requests = RequestLedger()
-        self._queue = MechQueue(config, activity)
-        self._nonces = self._queue.allocator
+        # the one allocator on STORE_PATH: the app's lifespan closes it
+        self.queue = MechQueue(config, activity)
+        self._nonces = self.queue.allocator
 
     def hard_cancel(self, chain: str) -> dict:
-        """Run the operator's hard cancel on the safe's queue on `chain` (D27)."""
+        """Run the operator's hard cancel on `chain`; a chain with no safe is `no-safe`."""
         chain = chain.lower()
-        return self._queue.hard_cancel(self._service(chain), chain)
-
-    def queue_status(self) -> dict:
-        """Report every safe's queue, per chain, for the operator's UI."""
-        return self._queue.status()
+        if self._config.chain(chain).safe_address is None:
+            raise HardCancelRefused(
+                "no-safe", f"no service safe is configured for chain '{chain}'"
+            )
+        return self.queue.hard_cancel(self._service(chain), chain)
 
     def _resolve_chain(self, chain: str | None, *, needs_safe: bool = True) -> str:
         """Resolve the chain: an explicit one wins, else one that has a safe.
@@ -221,7 +228,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     agent_mode=True,
                     safe_address=safe,
                     ethereum_client=EthereumClient(URI(chain_config.rpc_url)),
-                    signer=MechSigner(self._signer, chain),
+                    signer=MechSigner(
+                        self._signer, chain, self._allowances.check_top_up
+                    ),
                     rpc_url=chain_config.rpc_url,
                 )
                 self._services[chain] = service
@@ -264,17 +273,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             "max_delivery_rate": str(max_delivery_rate),
         }
         read = service.tool_manager.read_tools_metadata(service_id)
-        # The document is published by the mech operator, so neither its shape
-        # nor its contents are ours to assume. A `tools` that is not a list
-        # must not be iterated (a bare string yields one "tool" per character),
-        # and an entry that is not a name must not be stringified into one:
-        # both invent plausible-looking tools that no mech serves.
-        raw_tools = (read.document or {}).get("tools")
-        tool_names = (
-            [n for n in raw_tools if isinstance(n, str) and n.strip()]
-            if isinstance(raw_tools, list)
-            else []
-        )
+        tool_names = published_tools(read.document)
         if tool_names:
             info["tools"] = tool_names
         elif read.document is None:
@@ -312,7 +311,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 for m in mechs[offset : offset + limit]
             ]
         except Exception as e:
-            raise MechError(f"could not list mechs for '{chain}': {e}") from e
+            what = f"could not list mechs for '{chain}'"
+            raise MechError(f"{what}: {said(e, what)}") from e
         return {
             "chain": chain,
             "mechs": page,
@@ -339,6 +339,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         max_payment: int | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
+        top_up_budget: TopUpBudget | None,
     ) -> dict:
         """Send one mech request and wait for its delivery.
 
@@ -346,6 +347,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         ``True`` sends the request on-chain through the marketplace. The
         mech's per-request price must not exceed ``max_payment``, in the
         mech's payment asset base units; left out, it is 0.1 of that asset.
+        A 402 top-up deposits at most ``max_payment`` too, and draws on the
+        required ``top_up_budget`` (the calling token's mech session budget;
+        None only for a caller with no token) as it is sent.
 
         Pass a ``request_id`` to make an attempt replayable — see README,
         "Mech requests", for what that covers and what it deliberately does
@@ -364,6 +368,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 auto_deposit=auto_deposit,
                 max_payment=max_payment,
                 request_context=request_context,
+                top_up_budget=top_up_budget,
             )
             # past this point a failure cannot be reported as "nothing was spent"
             planned = plan
@@ -403,7 +408,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 return merged
             payload = attempt()
         except Exception as e:
-            if planned is not None and not isinstance(e, MechNotSent):
+            if planned is not None and not isinstance(e, (MechNotSent, MechRefused)):
                 self._requests.complete(
                     request_id,
                     self._uncertain(planned, e, request_id),
@@ -509,6 +514,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         auto_deposit: bool,
         max_payment: int | None,
         request_context: dict | None,
+        top_up_budget: TopUpBudget | None,
     ) -> _RequestPlan:
         """Settle everything a request needs before any payment can happen.
 
@@ -555,7 +561,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             extra_attributes = metadata_extras(request_context)
             offchain = True
             if auto_deposit:
-                auto_deposit = self._allowances.arm_auto_deposit(chain, priced, armed)
+                auto_deposit = self._allowances.keeps_auto_deposit(chain, priced)
         else:
             # nothing reads the document on-chain, so no operator link here
             terms = service.tool_manager.terms_report(priority_mech, None)
@@ -576,6 +582,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             max_payment=max_payment,
             terms=terms,
             armed=armed,
+            top_up_budget=top_up_budget,
         )
 
     def _dispatch(  # pylint: disable=too-many-locals,too-many-statements
@@ -602,7 +609,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 service_id=plan.priced.service_id,
                 offchain=not plan.legacy_on_chain,
             )
-            self._record_deposit(plan, request_id, e.deposited)
+            self._allowances.record_deposit(plan.chain, request_id, e.deposited)
             self._activity.record(
                 "mech_request_failed",
                 chain=plan.chain,
@@ -613,7 +620,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             )
             raise
         except MechPriceExceeded as e:  # mech-client's cap: nothing was paid
-            self._allowances.revoke(plan.armed)
             self._blocked(plan.chain, plan.tool, "over-max-payment", str(e))
             raise MechNotSent(
                 f"mech {plan.priced.mech} charges {e.price} per request (in its "
@@ -621,9 +627,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 "pass a higher max_payment to accept that price"
             ) from e
         except NonceRefused as e:
-            self._allowances.revoke(plan.armed)
-            note = self._queue.note(plan.chain)
-            self._record_deposit(plan, request_id, getattr(e.__cause__, "deposited", 0))
+            note = self.queue.note(plan.chain)
+            deposited = getattr(e.__cause__, "deposited", 0)
+            self._allowances.record_deposit(plan.chain, request_id, deposited)
             self._activity.record(
                 "refusal",
                 rule=e.rule,
@@ -632,11 +638,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 request_id=request_id,
                 reason=str(e),
             )
-            raise MechNotSent(f"rule '{e.rule}': {e}{note}") from e
-        except MechNotSent as e:  # failed before reaching the mech: nothing paid
-            self._allowances.revoke(plan.armed)
+            raise refusal(e, note) from e
+        except (MechNotSent, MechRefused) as e:  # nothing was paid
+            refused = isinstance(e, MechRefused)
             self._activity.record(
-                "mech_request_not_sent",
+                "mech_request_rejected" if refused else "mech_request_not_sent",
                 chain=plan.chain,
                 tool=plan.tool,
                 request_id=request_id,
@@ -651,9 +657,12 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 chain=plan.chain,
                 tool=plan.tool,
                 request_id=request_id,
-                error=str(e),
+                error=cause_of(e),
             )
-            raise MechError(f"mech request failed: {e}") from e
+            what = request_label(plan.chain, plan.priced.mech, plan.tool, request_id)
+            raise MechError(f"mech request failed: {said(e, what)}") from e
+        finally:  # nothing more is signed for this request, sent or not
+            self._allowances.revoke(plan.armed)
         self._activity.record(
             "mech_request",
             chain=plan.chain,
@@ -680,7 +689,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # deadline): it can settle whenever the mech delivers it, or the
             # operator's hard cancel consumes its nonce
             payload["expires"] = None
-            payload.update(self._queue.report(plan.chain))
+            payload.update(self.queue.report(plan.chain))
         self._resume_watch(payload, deadline)
         if plan.offchain:  # a delivery starts the settle clock
             by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
@@ -753,13 +762,17 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         try:
             contract = plan.service.marketplace_contract()
         except Exception as e:
-            raise MechNotSent(f"could not read the marketplace: {e}") from e
+            what = f"could not read the marketplace on {plan.chain}"
+            raise MechNotSent(f"could not read the marketplace: {said(e, what)}") from e
 
         def read_map() -> int:
             try:
                 return read_map_nonces(contract, safe)
             except Exception as e:
-                raise MechNotSent(f"could not read the marketplace nonce: {e}") from e
+                what = f"could not read the marketplace nonce on {plan.chain}"
+                raise MechNotSent(
+                    f"could not read the marketplace nonce: {said(e, what)}"
+                ) from e
 
         if not plan.offchain:  # on-chain takes mapNonces itself: none held
             with self._nonces.exclusive(plan.chain, safe, read_map, timeout=timeout):
@@ -782,7 +795,15 @@ class MechService:  # pylint: disable=too-many-instance-attributes
 
         def send_one(nonce: int, hook: PreSignHook) -> dict:
             sent.append((nonce, hook))
-            return send(nonces=[nonce], on_request_id=hook)
+            # under the queue's lock: no other request's top-up can spend it
+            with self._allowances.auto_deposit_armed(
+                plan.chain,
+                plan.priced,
+                auto_deposit=plan.auto_deposit,
+                max_payment=plan.max_payment,
+                budget=plan.top_up_budget,
+            ):
+                return send(nonces=[nonce], on_request_id=hook)
 
         try:
             return send_with_nonce(
@@ -793,24 +814,28 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 salt=str((plan.extra_attributes or {})["nonce"]),
                 read_map_nonces=read_map,
                 send=send_one,
-                not_sent=(MechNotSent, SignerError),
+                not_sent=(MechNotSent, SignerError, MechDepositUnknown),
                 timeout=timeout,
                 on_request_id=arm,
             )
         except MechPriceExceeded:
             raise
         except NonceRefused as e:
-            if e.rule != REJECTION_RULES[UNKNOWN]:
+            if e.rule != RULE_ANSWER_UNKNOWN:
                 raise
             raise self._lost(plan, sent, armed, e) from e
         except Exception as e:
-            if sent and sent[-1][1].posting:  # signed and POSTed: maybe stored
-                raise self._lost(plan, sent, armed, e) from e
-            if isinstance(e, MechNotSent):  # the mapNonces read: nothing sent
+            # mech-client holds the nonce of a posted request whatever failed
+            # (a SignerError after the POST is the 402 top-up's); a deposit
+            # that may have landed is its own error
+            if isinstance(e, (MechNotSent, MechDepositUnknown)):
                 raise
-            # Connect's own refusals (the guard, the signer) keep their words
-            detail = str(e) if isinstance(e, (MechError, SignerError)) else e
-            raise MechNotSent(f"mech request not sent: {detail}") from e
+            posted = bool(sent) and sent[-1][1].posting
+            if posted and not isinstance(e, SignerError):
+                raise self._lost(plan, sent, armed, e) from e
+            what = request_label(plan.chain, plan.priced.mech, plan.tool, None)
+            note = self.queue.note(plan.chain)
+            raise not_bought(e, what, posted=posted, note=note) from e
 
     def _lost(
         self,
@@ -820,21 +845,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         error: Exception,
     ) -> MechAnswerUnknown:
         """Describe a signed request whose answer was lost, its armed id pending."""
-        held = [armed[sent[-1][0]].hex()]
-        return MechAnswerUnknown(
-            f"rule '{REJECTION_RULES[UNKNOWN]}': {error}{self._queue.note(plan.chain)}; "
-            f"pending_request_ids: {held} (mech_result collects it if the mech "
-            "delivers it)",
-            held,
-            getattr(error.__cause__, "deposited", 0),
-        )
-
-    def _record_deposit(self, plan: _RequestPlan, rid: str | None, amount: int) -> None:
-        """Audit what a top-up deposited before the mech refused or lost it."""
-        if amount:
-            self._activity.record(
-                "mech_deposit", chain=plan.chain, request_id=rid, amount=str(amount)
-            )
+        held = armed[sent[-1][0]].hex()
+        what = request_label(plan.chain, plan.priced.mech, plan.tool, held)
+        return answer_lost(error, held, what, self.queue.note(plan.chain))
 
     def _with_pending(  # pylint: disable=too-many-locals
         self,
@@ -888,7 +901,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         right place, and none of that survives a restart.
         """
         timeout = _clamp_timeout(timeout)
-        key = _request_key(request_id)
+        key = request_key(request_id)
         with self._lock:
             pending = self._pending.get(key)
         if pending is None:
@@ -901,8 +914,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         try:
             delivered = asyncio.run(self._watch(service, pending, key, timeout))
         except Exception as e:
-            raise MechError(f"could not read delivery for request {key}: {e}") from e
-        split = {_request_key(k): v for k, v in (delivered or {}).items()}
+            what = f"could not read delivery for request {key}"
+            raise MechError(f"{what}: {said(e, f'{what} on {pending.chain}')}") from e
+        split = {request_key(k): v for k, v in (delivered or {}).items()}
         data = {k: d.data for k, d in split.items() if d.data is not None}
         report = {
             "request_id": key,
@@ -911,7 +925,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             "delivered": key in data,
         }
         if pending.offchain:
-            report.update(self._queue.report(pending.chain))
+            report.update(self.queue.report(pending.chain))
         if key not in data:
             unreadable = split.get(key)
             if unreadable is None:
@@ -970,31 +984,15 @@ class MechService:  # pylint: disable=too-many-instance-attributes
     def _priced_mech(
         self, service: MarketplaceService, chain: str, priority_mech: str | None
     ) -> PricedMech:
-        """Resolve the target mech, its service id and per-request price (wei).
+        """Resolve the target mech and its price (`mech_budget.price_mech`).
 
         Without an explicit mech, the most active listed mech is used: the
         price cap must bind the mech that is actually paid, so the selection
-        happens here instead of inside mech-client's send path. The service id
-        comes back with it because every later check — reachability, metadata
-        — is keyed by service rather than by mech address.
-
-        Named rather than a bare tuple because two of the three fields are
-        ints of wholly different kinds: transposing a service id and a wei
-        price would corrupt the `max_payment` cap silently, and no type
-        checker would object.
+        happens here instead of inside mech-client's send path.
         """
         if priority_mech is None:
             listing = self._list_mechs(chain, limit=1, offset=0)
             if not listing["mechs"]:
                 raise MechError(f"no live mechs found for '{chain}'")
             priority_mech = str(listing["mechs"][0]["address"])
-        try:
-            info = service.mech_info(priority_mech)
-        except Exception as e:
-            raise MechError(f"could not price mech {priority_mech}: {e}") from e
-        return PricedMech(
-            mech=priority_mech,
-            service_id=int(info.service_id),
-            rate=int(info.max_delivery_rate),
-            payment_type=str(info.payment_type.value),
-        )
+        return price_mech(service, chain, priority_mech)

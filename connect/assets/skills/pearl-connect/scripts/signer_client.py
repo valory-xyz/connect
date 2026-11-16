@@ -96,6 +96,33 @@ def _to_int(value: object) -> int:
     return int(value)  # type: ignore[call-overload]
 
 
+def _exact_amounts(intent: dict) -> dict:
+    """Return `intent` with each base-unit amount an int names as a decimal string.
+
+    The same rule as `value`: exact past what a JSON number holds. Anything
+    else is passed as given, for the server to judge.
+    """
+
+    def exact(amount: object) -> object:
+        is_int = isinstance(amount, int) and not isinstance(amount, bool)
+        return str(amount) if is_int else amount
+
+    sent = dict(intent)
+    for where in ("spend", "receive_min"):
+        if isinstance(sent.get(where), dict):
+            sent[where] = {k: exact(v) for k, v in sent[where].items()}
+    if isinstance(sent.get("approvals"), list):
+        sent["approvals"] = [
+            (
+                {**a, "amount": exact(a["amount"])}
+                if isinstance(a, dict) and "amount" in a
+                else a
+            )
+            for a in sent["approvals"]
+        ]
+    return sent
+
+
 class SignerClient:
     """SignerClient."""
 
@@ -141,7 +168,8 @@ class SignerClient:
         payload = {
             "chain": self.chain,
             "target": tx["to"],
-            "value": _to_int(tx.get("value", 0)),
+            # base units as a decimal string: exact past what a JSON number holds
+            "value": str(_to_int(tx.get("value", 0))),
             "data": tx.get("data", "0x"),
             "request_id": request_id,
         }
@@ -149,7 +177,7 @@ class SignerClient:
         # one, after simulating it (see "Intents" in SKILL.md)
         intent = intent if intent is not None else tx.get("intent")
         if intent is not None:
-            payload["intent"] = intent
+            payload["intent"] = _exact_amounts(intent)
         # tx["gas"], if the caller set it, was estimated against this inner call;
         # the server wraps it in an execTransaction whose gas is larger (safe
         # dispatch, signature check, nonce write). Forwarding the inner estimate
@@ -173,7 +201,8 @@ class SignerClient:
         """Mint a token no wider than this client's, and return it.
 
         `grant` is POST /tokens' body: scopes, value caps, max_mech_payment,
-        expires_at. connect() reads /wallet, so a script's token needs `read`.
+        max_mech_payment_per_session (required with `mech`), expires_at
+        (required). connect() reads /wallet, so a script's token needs `read`.
         """
         return self._post("/tokens", grant)["token"]
 
