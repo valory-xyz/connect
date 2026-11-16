@@ -30,14 +30,19 @@ other non-aea agent. It:
    - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its
-     editing semantics are specced — while the `harness` preference needs none)
+     editing semantics are specced — while the `harness` preference needs none).
+     Both answer with `harnesses` too: every harness in display order as
+     `{id, available, unavailable_reason?}`, and a harness that is not
+     available is refused with a 400 (see [OCB](#ocb))
    - `POST /session` (origin-gated, no token): opens an agent session in the
      configured harness (`claude_code_cli` →
      `claude-cli://open?cwd=…`, `codex_desktop` →
      `codex://threads/new?path=…`, `claude_code_desktop` →
-     `claude://code/new?folder=…`, see [Codex](#codex)) and answers
-     `{launched, harness, requested, error?}` — `harness` is the one that
-     opened, `requested` the one it aimed for. An optional `{"harness": …}`
+     `claude://code/new?folder=…`, see [Codex](#codex) and [OCB](#ocb)) and
+     answers `{launched, harness, requested, reason?, error?}` — `harness` is
+     the one that opened, `requested` the one it aimed for, and `reason`
+     (only when nothing opened) is `not_installed`, or `install_failed` /
+     `launch_failed` for OCB. An optional `{"harness": …}`
      body overrides the saved preference for that launch alone, without
      rewriting what the operator chose
    - a bearer-authed signing surface: `POST /safe-transaction`,
@@ -57,7 +62,8 @@ guess, the Claude Code CLI — and fall back through the other harnesses in
 the order `DEEP_LINKS` then `TERMINAL_COMMANDS` declare them
 (`claude_code_cli`, `codex_desktop`, `claude_code_desktop`, `codex_cli`),
 rather than leave them with no session at all. A launch that *does* name one
-opens there or not at all: naming a harness is a choice.
+opens there or not at all: naming a harness is a choice. `ocb_cli` never
+falls back and is never a fallback ([OCB](#ocb)).
 
 What the session must *not* inherit is our own packaging. We ship as a
 PyInstaller one-file binary, whose bootloader puts its extraction directory at
@@ -167,6 +173,54 @@ list would differ per operator. Two differences from Claude Code remain. Every M
 for approval, as Claude Code's do without an allow rule. And there is no
 equivalent of the `Read` deny rule: the token in `.codex/config.toml` is
 gitignored, not kept out of transcripts.
+
+## OCB
+
+`ocb_cli` opens [OCB](https://github.com/valory-xyz/olas-ocb-agent)'s
+`ocb-agent` CLI. OCB finds the workspace's `.mcp.json` itself and writes its
+own shim, with the bearer token, under `ocb-agent/` — so Connect writes no OCB
+config, and only adds `ocb-agent/` to the workspace's `.gitignore` and the
+Claude `Read` deny rules.
+
+**Availability.** `GET /settings` reports `ocb_cli` unavailable with
+`windows_unsupported` on native Windows, where OCB runs unsandboxed and a
+session could read the keys in `~/.operate`. Elsewhere it is unavailable with
+`model_unavailable` unless the instance's chain (the one chain carrying the
+safe) has a confirmed chat mech in `OCB_CHAT_MECHS` (`connect/settings.py`).
+None is confirmed yet, so every entry is `None` and "OCB CLI" is offered
+nowhere until a release fills them in. `PATCH /settings` and `POST /session`
+refuse an unavailable harness with a 400, and a saved `ocb_cli` that has
+become unavailable (a settings file copied between machines) loads as the
+default.
+
+**Install.** Connect bundles OCB's `install.sh` and a built `ocb_agent` wheel
+under `connect/assets/ocb/` (from `olas-ocb-agent`, committed as given;
+`VERSION` names the tag to install from once that repo is public). Selecting
+`ocb_cli` in `PATCH /settings` starts the install in the background and
+returns. `POST /session` with `ocb_cli` waits for an install already running,
+or runs one when the path it stored is gone. The script runs as `sh install.sh`
+in STORE_PATH, with stdin closed, `harness_env()` plus `OCB_AGENT_SPEC=<the
+bundled wheel>`, and a 10-minute timeout. It brings uv and a Python of its own,
+prints the absolute path of `ocb-agent` on success, and a one-line reason on
+stderr otherwise; that line becomes `/session`'s `error`. Connect keeps the
+path in `STORE_PATH/.ocb-agent-path`. One install runs at a time. Nothing is
+installed for an operator who never selects `ocb_cli`.
+
+**Launch.** A terminal opens, the same way as for `codex_cli`, running
+
+```sh
+<stored path> --model 'mech:chat@<the chain's chat mech>' --model-budget 1
+```
+
+by absolute path, without a PATH probe: uv's tool directory is not always on
+the login shell's PATH. OCB's REPL takes no opening prompt, so the session
+opens empty. Its model calls go through the `mech_request` MCP tool with that
+mech as `priority_mech`, so they are paid like any other mech request and pass
+the same guard. OCB's own guardrails apply unchanged. A failed install answers
+`reason: install_failed`; a terminal that would not open answers
+`reason: launch_failed`. Neither falls back to another harness: OCB is chosen
+for its spending guardrails, and landing in a tool without them must not
+happen unnoticed.
 
 ## Guardrail
 
