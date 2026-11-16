@@ -50,7 +50,9 @@ from mech_client import (
     RequestIdMismatch,
     RequestIdRpcError,
 )
+from mech_client import balance_tracker as mech_balance_tracker
 from mech_client import nonces as mech_nonces_module
+from mech_client import payment_token as mech_payment_token
 from mech_client.domain import identification
 from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
@@ -64,6 +66,7 @@ from mech_client.infrastructure.subgraph.queries import MechRecord
 from web3 import Web3
 from web3.datastructures import AttributeDict
 
+from connect import guard as guard_module
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
@@ -117,6 +120,8 @@ from connect.settings import (
     default_whitelist,
     defaults,
     derive_mac_key,
+    mech_marketplace,
+    prepaid_balance_trackers,
     token_approve_targets,
 )
 from connect.signer import Signer, SignerError, _ChainState
@@ -6644,3 +6649,78 @@ class TestMcpGuardrailTools:
         monkeypatch.setattr(mech_service, "result", fake_result)
         assert await tools["mech_result"]("ab", timeout=5) == {"delivered": True}
         assert calls[0] == {"request_id": "ab", "timeout": 5}
+
+
+MARKETPLACE = "0x" + "4d" * 20
+# a marketplace call no mech flow composed: request(...) with arbitrary words
+AGENT_COMPOSED = bytes.fromhex("12345678") + b"\x00" * 32
+
+
+@pytest.mark.parametrize("mode", [MODE_RESTRICTED, MODE_UNRESTRICTED])
+def test_the_marketplace_takes_a_safe_call_only_from_the_server_built_mech_flow(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    guard: Guard,
+    settings_store: SettingsStore,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Every agent-facing send path is refused at the marketplace, in every mode.
+
+    Whitelisted or not, the marketplace takes only what the mech flow
+    composes: the safe's call, an EOA execTransaction carrying it, an EOA
+    call to it and the dry run are refused, while the mech flow's own
+    request goes through on the same settings.
+    """
+    monkeypatch.setattr(
+        guard_module,
+        "mech_marketplace",
+        lambda chain: MARKETPLACE if chain == "testchain" else None,
+    )
+    settings_store.save(
+        Settings(
+            protected=Protected(mode=mode, whitelist={"testchain": (MARKETPLACE,)})
+        )
+    )
+    test_signer.set_guard(guard)
+    wrapped = exec_transaction_calldata(MARKETPLACE, data=AGENT_COMPOSED)
+    agent_sends = (
+        lambda: test_signer.send_via_safe(
+            "testchain", MARKETPLACE, data="0x" + AGENT_COMPOSED.hex(), intent={}
+        ),
+        lambda: test_signer.send("testchain", SAFE, data=wrapped, intent={}),
+        lambda: test_signer.send(
+            "testchain", MARKETPLACE, data="0x" + AGENT_COMPOSED.hex(), intent={}
+        ),
+    )
+    for agent_send in agent_sends:
+        with pytest.raises(SignerError, match="mech marketplace"):
+            agent_send()
+    reason = test_signer.refusal_reason(
+        "testchain", MARKETPLACE, data="0x" + AGENT_COMPOSED.hex()
+    )
+    assert reason is not None
+    assert "mech marketplace" in reason
+    assert not fake_w3.eth.sent
+    MechSigner(test_signer, "testchain").send_transaction({"to": SAFE, "data": wrapped})
+    assert len(fake_w3.eth.sent) == 1
+
+
+def test_the_marketplace_is_the_one_mech_client_names_for_the_chain() -> None:
+    """Connect's chain names map onto mech-client's, as the whitelist reads them."""
+    assert mech_marketplace("gnosis") == GNOSIS_MARKETPLACE
+    assert mech_marketplace("Gnosis") == GNOSIS_MARKETPLACE
+    assert mech_marketplace("arbitrum_one") == mech_marketplace("arbitrum")
+    assert mech_marketplace("testchain") is None
+
+
+def test_the_prepaid_balance_trackers_are_mech_client_s_deposit_trackers() -> None:
+    """Each tracker a top-up pays, with its asset; none where it deploys none."""
+    gnosis = prepaid_balance_trackers("gnosis")
+    native = str(mech_balance_tracker("gnosis", PaymentType.NATIVE)).lower()
+    olas = str(mech_balance_tracker("gnosis", PaymentType.OLAS_TOKEN)).lower()
+    assert gnosis == {
+        native: "native",
+        olas: str(mech_payment_token(PaymentType.OLAS_TOKEN, "gnosis")).lower(),
+    }
+    assert prepaid_balance_trackers("testchain") == {}

@@ -50,6 +50,7 @@ from eth_account.signers.local import LocalAccount
 from web3 import Web3
 
 from connect.activity import ActivityLog
+from connect.chains import MECH_CLIENT_CHAIN_NAMES
 from connect.safe import ZERO_ADDRESS
 
 logger = logging.getLogger("agent")
@@ -213,7 +214,12 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     The marketplace is the only contract the safe CALLs to *submit* a mech
     request (`request`/`requestBatch`; native payment rides as the inner
     value); token-paid mechs additionally `approve` the payment token, see
-    token_approve_targets(). Balance trackers are deliberately NOT whitelisted —
+    token_approve_targets(). Its whitelist entry admits the calls the
+    server's own mech flow composes, bounded by `max_payment` and the
+    session's mech budget, and nothing else: the guard refuses a call to it
+    from any agent-facing send path in every mode (`mech_marketplace`), since
+    such a call could spend the safe's prepaid balance outside both. Balance
+    trackers are deliberately NOT whitelisted —
     the safe only calls them for prepaid deposits, which restricted mode
     admits through the guard's one-shot capped deposit allowances (armed per
     off-chain request by the mech flow). Payment token contracts
@@ -248,6 +254,42 @@ def _mech_system_addresses() -> dict[str, list[str]]:
         # loads defaults. Fail closed to an empty whitelist instead.
         logger.warning("could not load mech marketplace addresses: %s", e)
         return {}
+
+
+def mech_marketplace(chain: str) -> str | None:
+    """Return the marketplace the mech flow calls on `chain`, lowercase, or None.
+
+    `chain` is Connect's name for it; mech-client names a few chains
+    differently (`MECH_CLIENT_CHAIN_NAMES`).
+    """
+    name = chain.lower()
+    addresses = _mech_system_addresses().get(MECH_CLIENT_CHAIN_NAMES.get(name, name))
+    return addresses[0] if addresses else None
+
+
+def prepaid_balance_trackers(chain: str) -> dict[str, str]:
+    """Return each mech balance tracker on `chain` -> the asset its balance is in.
+
+    The asset is a payment token's lowercase address, or "native". From the
+    pinned mech-client (`balance_tracker`, `payment_token`); a payment type
+    with no tracker deployed on the chain is left out, and so is every one on
+    a chain mech-client does not know.
+    """
+    # pylint: disable=import-outside-toplevel
+    from mech_client import balance_tracker, payment_token
+    from mech_client.infrastructure.config import PaymentType
+
+    name = MECH_CLIENT_CHAIN_NAMES.get(chain.lower(), chain.lower())
+    trackers: dict[str, str] = {}
+    for payment_type in PaymentType:
+        try:
+            tracker = balance_tracker(name, payment_type)
+            token = payment_token(payment_type, name)
+        except ValueError:  # not deployed there, or a chain it does not know
+            continue
+        if tracker is not None:
+            trackers[tracker.lower()] = (token or "native").lower()
+    return trackers
 
 
 def token_approve_targets(chain: str) -> dict[str, str]:

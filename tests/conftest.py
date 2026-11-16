@@ -448,6 +448,8 @@ class FakeProvider:
 
     `logs` adds logs to every simulation; `status` and `error` make it revert;
     `unavailable` makes the RPC refuse the method, as forno.celo.org does.
+    `prepaid` answers the gate's prepaid balance reads: tracker -> (balance
+    before the call, balance after it).
     """
 
     def __init__(self) -> None:
@@ -459,6 +461,7 @@ class FakeProvider:
         self.unavailable = False
         self.traced = True  # False: an RPC that ignores traceTransfers
         self.symbols: dict[str, str] = {}  # token -> symbol() answer, 0x-hex
+        self.prepaid: dict[str, tuple[int, int]] = {}
 
     def make_request(self, method: str, params: list) -> dict:
         """Answer eth_simulateV1, and a token's symbol() read with no answer."""
@@ -473,7 +476,9 @@ class FakeProvider:
         assert params[1] == "latest"
         if self.unavailable:
             return {"error": {"code": -32601, "message": "method not whitelisted"}}
-        call, _ = params[0]["blockStateCalls"][0]["calls"]
+        calls = params[0]["blockStateCalls"][0]["calls"]
+        reads = (len(calls) - 2) // 2  # a prepaid read before and after the call
+        call, canary = calls[reads : reads + 2]
         self.simulated.append(call)
         logs = list(self.logs)
         value = int(call["value"], 16)
@@ -487,8 +492,17 @@ class FakeProvider:
         result["logs"] = logs
         if self.error is not None:
             result["error"] = self.error
-        block = params[0]["blockStateCalls"][0]
-        return {"result": [{"calls": [result, canary_result(block, self.traced)]}]}
+        block = {**params[0]["blockStateCalls"][0], "calls": [call, canary]}
+        before = [self._prepaid(read, 0) for read in calls[:reads]]
+        after = [self._prepaid(read, 1) for read in calls[reads + 2 :]]
+        answered = [*before, result, canary_result(block, self.traced), *after]
+        return {"result": [{"calls": answered}]}
+
+    def _prepaid(self, read: dict, when: int) -> dict:
+        """Answer one prepaid balance read, before (0) or after (1) the call."""
+        balance = self.prepaid[read["to"]][when]
+        data = "0x" + hex(balance)[2:].rjust(64, "0")
+        return {"status": "0x1", "returnData": data, "gasUsed": "0x5208", "logs": []}
 
 
 def canary_result(block: dict, traced: bool = True) -> dict:

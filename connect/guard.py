@@ -31,6 +31,11 @@ restricted mode, which is the one thing an operator flipping that switch is
 relying on. For the safe's own configuration, unrestricted is meant to be a
 wider gate, not a one-way door.
 
+A third holds in every mode: only the server's own mech flow may call the
+mech marketplace (`check_transaction(server_built=True)`). Its calls are
+bounded by `max_payment` and the session's mech budget; one composed by the
+agent could spend the safe's prepaid mech balance outside both.
+
 That guarantee is scoped to the safe itself. State granted on *other*
 contracts while unrestricted — an ERC-20 allowance above all — persists until
 explicitly revoked, and an unlimited approve lets its spender drain the safe
@@ -82,7 +87,12 @@ from connect.safe import (
     decode_approve,
     decode_deposit,
 )
-from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
+from connect.settings import (
+    MODE_RESTRICTED,
+    SettingsStore,
+    mech_marketplace,
+    token_approve_targets,
+)
 
 logger = logging.getLogger("agent")
 
@@ -267,8 +277,15 @@ class Guard:
             f"settings; {_ASK_OPERATOR}"
         )
 
-    def check_transaction(
-        self, chain: str, to: str, value: int, data: str, *, consume: bool = True
+    def check_transaction(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        to: str,
+        value: int,
+        data: str,
+        *,
+        consume: bool = True,
+        server_built: bool = False,
     ) -> None:
         """Raise unless the EOA transaction is allowed.
 
@@ -276,6 +293,8 @@ class Guard:
         mode. Decoding happens once, here, so both answer the same bytes.
         `consume=False` answers without spending a single-use allowance, so
         asking whether a call would pass cannot break the call that follows.
+        `server_built` marks a transaction the server composed itself (the
+        signer's SERVER_BUILT), the only kind that may call the marketplace.
         """
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
@@ -293,6 +312,8 @@ class Guard:
                 # is refused rather than waved through
                 raise GuardError(str(e)) from e
             self._check_floor(to, exec_call)
+        if not server_built:
+            self._check_marketplace(chain, to, exec_call)
         if self._store.load().protected.mode == MODE_RESTRICTED:
             self._check_restricted(
                 chain,
@@ -320,6 +341,21 @@ class Guard:
             raise GuardError(
                 "the safe may not call itself (owner, module and guard changes "
                 "are made that way) — the guardrail never allows it"
+            )
+
+    @staticmethod
+    def _check_marketplace(chain: str, to: str, exec_call: "SafeExec | None") -> None:
+        """Refuse a call to the mech marketplace, by the EOA or by the safe.
+
+        In every mode: the marketplace takes only the requests the server's
+        mech flow composes; see the module docstring.
+        """
+        marketplace = mech_marketplace(chain)
+        called = {to.lower()} | ({exec_call.to.lower()} if exec_call else set())
+        if marketplace is not None and marketplace in called:
+            raise GuardError(
+                f"the mech marketplace {marketplace} on {chain} takes only the "
+                "requests Connect composes; send a mech request with mech_request"
             )
 
     def _check_restricted(  # pylint: disable=too-many-arguments

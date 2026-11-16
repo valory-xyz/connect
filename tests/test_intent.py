@@ -19,9 +19,12 @@
 
 """Tests for the intent gate."""
 
+import json
 import typing as t
+from importlib import resources
 
 import pytest
+from web3 import Web3
 
 from connect import intent
 
@@ -422,6 +425,7 @@ def _diff(**overrides: t.Any) -> intent.AssetDiff:
         revert=None,
         native="0",
         tokens={},
+        prepaid=[],
         recipients=[],
         approvals=[],
         positions=[],
@@ -797,3 +801,124 @@ def test_an_approval_is_covered_only_by_the_same_token_spender_and_enough() -> N
     assert rules(
         intent.check_intent(all_diff, t.cast(intent.Intent, {"approvals": [below_max]}))
     ) == ["undeclared-approval"]
+
+
+TRACKER = "0x" + "7e" * 20
+OLAS_TRACKER = "0x" + "7f" * 20
+
+
+def _prepaid_rpc(
+    balances: dict[str, tuple[int, int]], read_status: str = "0x1"
+) -> intent.Rpc:
+    """Answer eth_simulateV1 with each tracker's prepaid balance before and after."""
+
+    def answer(read: dict, when: int) -> dict:
+        balance = balances[read["to"]][when]
+        return {"status": read_status, "returnData": "0x" + _word(balance), "logs": []}
+
+    def rpc(method: str, params: list) -> t.Any:
+        if method == "eth_call":
+            return "0x"
+        calls = params[0]["blockStateCalls"][0]["calls"]
+        reads = (len(calls) - 2) // 2
+        call, canary = calls[reads : reads + 2]
+        block = {**params[0]["blockStateCalls"][0], "calls": [call, canary]}
+        return [
+            {
+                "calls": [
+                    *[answer(read, 0) for read in calls[:reads]],
+                    {"status": "0x1", "gasUsed": "0x10", "logs": []},
+                    canary_result(block),
+                    *[answer(read, 1) for read in calls[reads + 2 :]],
+                ]
+            }
+        ]
+
+    return rpc
+
+
+def _simulate_prepaid(rpc: intent.Rpc) -> intent.AssetDiff:
+    return intent.simulate(
+        rpc,
+        sender=SAFE,
+        to=CONTRACT,
+        value=0,
+        data="0x",
+        get_code=lambda a: b"\x01",
+        prepaid={TRACKER: intent.NATIVE, OLAS_TRACKER: TOKEN},
+    )
+
+
+def test_a_fall_of_the_prepaid_mech_balance_is_spent_of_its_asset() -> None:
+    """A call that lowers the safe's prepaid balance moves value: it needs an intent.
+
+    The fall is spent of the tracker's asset, held to the intent's spend; a
+    rise (a deposit) is no spend of its own.
+    """
+    diff = _simulate_prepaid(_prepaid_rpc({TRACKER: (100, 40), OLAS_TRACKER: (5, 9)}))
+    assert diff["native"] == "-60"
+    assert TOKEN not in diff["tokens"]
+    assert diff["prepaid"] == [
+        {"tracker": TRACKER, "token": intent.NATIVE, "delta": "-60"}
+    ]
+    assert intent.is_value_moving(diff)
+    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert rules(intent.check_intent(diff, {"spend": {"native": 59}})) == ["overspend"]
+    assert intent.check_intent(diff, {"spend": {"native": 60}}) == []
+    token = _simulate_prepaid(_prepaid_rpc({TRACKER: (1, 1), OLAS_TRACKER: (9, 2)}))
+    assert token["tokens"][TOKEN]["delta"] == "-7"
+    assert rules(intent.check_intent(token, {"spend": {TOKEN: 6}})) == ["overspend"]
+
+
+def test_the_prepaid_balance_is_read_around_the_call_in_one_block() -> None:
+    """Each tracker is read before and after the call, beside it, for the sender."""
+    seen: list[dict] = []
+    rpc = _prepaid_rpc({TRACKER: (1, 1), OLAS_TRACKER: (1, 1)})
+
+    def recording(method: str, params: list) -> t.Any:
+        if method == "eth_simulateV1":
+            seen.extend(params[0]["blockStateCalls"][0]["calls"])
+        return rpc(method, params)
+
+    _simulate_prepaid(recording)
+    read = intent.REQUESTER_BALANCE_SELECTOR + SAFE[2:].rjust(64, "0")
+    assert [(c["to"], c.get("data")) for c in seen[:2]] == [
+        (TRACKER, read),
+        (OLAS_TRACKER, read),
+    ]
+    assert seen[2]["to"] == CONTRACT
+    assert [(c["to"], c.get("data")) for c in seen[4:]] == [
+        (TRACKER, read),
+        (OLAS_TRACKER, read),
+    ]
+
+
+@pytest.mark.parametrize("unanswered", ["status", "short"])
+def test_an_unreadable_prepaid_balance_fails_the_simulation(unanswered: str) -> None:
+    """A fall the gate cannot read is a spend it cannot see: it fails closed."""
+    rpc = _prepaid_rpc(
+        {TRACKER: (1, 1), OLAS_TRACKER: (1, 1)},
+        read_status="0x0" if unanswered == "status" else "0x1",
+    )
+
+    def short(method: str, params: list) -> t.Any:
+        answered = rpc(method, params)
+        answered[0]["calls"] = answered[0]["calls"][:-1]
+        return answered
+
+    with pytest.raises(intent.SimulationUnavailable, match="prepaid mech balance"):
+        _simulate_prepaid(rpc if unanswered == "status" else short)
+
+
+def test_the_prepaid_read_is_mech_client_s_tracker_view() -> None:
+    """The selector read is mapRequesterBalances(address) on every deposit tracker."""
+    selector = Web3.keccak(text="mapRequesterBalances(address)").hex()
+    assert intent.REQUESTER_BALANCE_SELECTOR == "0x" + selector.removeprefix("0x")[:8]
+    for name in ("BalanceTrackerFixedPriceNative", "BalanceTrackerFixedPriceToken"):
+        abi = json.loads(
+            (resources.files("mech_client") / "abis" / f"{name}.json").read_text()
+        )
+        entries = abi["abi"] if isinstance(abi, dict) else abi
+        (view,) = [e for e in entries if e.get("name") == "mapRequesterBalances"]
+        assert [i["type"] for i in view["inputs"]] == ["address"]
+        assert [o["type"] for o in view["outputs"]] == ["uint256"]

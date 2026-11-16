@@ -242,7 +242,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         """Simulate a call at head and say what it does to the safe's assets.
 
         Returns the asset diff — `native` and `tokens` deltas (each token with
-        its `symbol`, display only), `recipients`
+        its `symbol`, display only; both count `prepaid`, any fall of the
+        safe's prepaid mech balance), `recipients`
         (each with `contract`), `approvals`, ERC-721/1155 `positions`,
         `called` (the target plus every contract that emitted a log; one
         called without emitting is not listed), `revert`, `gas_used` — with

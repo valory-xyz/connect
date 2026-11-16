@@ -46,6 +46,7 @@ from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
+from connect.settings import prepaid_balance_trackers
 from connect.signer_errors import SEND_UNKNOWN, SendUnknown, SignerError, send_failure
 
 logger = logging.getLogger("agent")
@@ -399,7 +400,14 @@ class Signer:
                 return cached
             if replay_only:
                 self._refuse_lost_replay(request_id)
-        self._check_transaction(chain=chain, to=to, value=value, data=data, audit=audit)
+        self._check_transaction(
+            chain=chain,
+            to=to,
+            value=value,
+            data=data,
+            audit=audit,
+            server_built=intent is SERVER_BUILT,
+        )
         if intent is not SERVER_BUILT:
             # after the guard, so the cheap static rules answer first and the
             # simulation only ever runs on a call the guard already permits
@@ -623,6 +631,7 @@ class Signer:
             value=call.value,
             data=call.data or "0x",
             get_code=get_code,
+            prepaid=prepaid_balance_trackers(chain),
         )
 
     def _evaluate(
@@ -926,13 +935,22 @@ class Signer:
         return tx
 
     def _check_transaction(  # pylint: disable=too-many-arguments
-        self, *, chain: str, to: str, value: int, data: str, audit: bool
+        self,
+        *,
+        chain: str,
+        to: str,
+        value: int,
+        data: str,
+        audit: bool,
+        server_built: bool,
     ) -> None:
         """Consult the guardrail; a denial is audited and surfaced as SignerError."""
         if self._guard is None:
             return
         try:
-            self._guard.check_transaction(chain, to, value, data)
+            self._guard.check_transaction(
+                chain, to, value, data, server_built=server_built
+            )
         except GuardError as e:
             if audit:
                 self._activity.record(

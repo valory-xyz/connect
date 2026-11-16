@@ -253,7 +253,15 @@ move native internally. So does a call whose simulation logs less native out
 than the value it sends. The diff sees only what the logs say: a balance that
 changes without a `Transfer` log (a rebasing token's shares, some non-standard
 ERC-20s) shows no spend, so `overspend`, `receive-min` and the token caps
-("Scoped tokens") do not see it. Permit2's own grants (its `Approval` from
+("Scoped tokens") do not see it. The one balance read rather than logged is
+the sender's prepaid mech balance: on a chain where mech-client deploys
+balance trackers, the simulation reads `mapRequesterBalances(sender)` at each
+tracker before and after the call, in the same simulated block, and a fall is
+spent of the tracker's asset (`"native"`, or its payment token), listed under
+`prepaid` and counted in `native`/`tokens`, so it needs an intent whose
+`spend` covers it and draws on the token's caps; a rise (a deposit) is no
+spend of its own, and a read that does not answer fails closed as
+`simulation-unavailable`. Permit2's own grants (its `Approval` from
 `approve()` and its `Permit` from a signed permit, from the canonical Permit2
 address) are approvals of the token to their spender, declared and capped like
 an ERC-20 approval, and always declared: the allowance exemption above reads
@@ -280,6 +288,13 @@ Two rules hold in **every** mode, and no setting lifts them: the safe may not
 `addOwnerWithThreshold`, `setGuard` — the ways a Safe changes what it *is*).
 Both would outlive a switch back to restricted mode, so the guardrail refuses
 them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
+A third holds in every mode too: the mech marketplace takes only the calls the
+server's own mech flow composes (`mech_request`, bounded by `max_payment` and
+the token's mech budget). A call to the chain's marketplace (mech-client's
+`mech_marketplace_contract`) through any agent-facing send path —
+`safe_transaction`, `send_transaction` (to the marketplace, or an
+`execTransaction` carrying a call to it) and their HTTP routes — is refused,
+and `preflight_transaction` answers the same.
 
 On that floor, the signer enforces one of two persistent modes. The modes are
 an operator concept only: agent-facing surfaces (the MCP tools, `GET /wallet`,
@@ -313,7 +328,7 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   EOA. The MechMarketplace contract per chain
   (imported from the pinned mech-client) is whitelisted by default — the only
   contract the safe calls in the on-chain mech flow — so mech requests work out
-  of the box. Balance trackers and payment tokens are deliberately not
+  of the box; the entry admits only the mech flow's own calls (above). Balance trackers and payment tokens are deliberately not
   whitelisted: the whitelist is address-level (any calldata), so a token entry
   would permit arbitrary transfers, and the safe only calls trackers for prepaid
   deposits, which restricted mode admits only through the one-shot capped

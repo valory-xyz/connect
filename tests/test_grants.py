@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from connect import intent as intent_module
+from connect import signer as signer_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server import auth as auth_module
@@ -678,6 +679,38 @@ def test_http_capped_token_is_refused_above_its_cap(
     assert over.status_code == 403
     assert "token-cap-per-tx" in over.json()["detail"]
     assert len(fake_w3.eth.sent) == 1
+
+
+def test_http_a_fall_of_the_prepaid_mech_balance_is_held_to_the_intent_and_caps(
+    client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A safe call that spends the prepaid mech balance needs an intent, within caps.
+
+    No intent is `missing-intent`, an intent short of the fall `overspend`,
+    and one that declares it past the token's cap `token-cap-per-tx`.
+    """
+    tracker = "0x" + "7e" * 20
+    monkeypatch.setattr(
+        signer_module, "prepaid_balance_trackers", lambda chain: {tracker: "native"}
+    )
+    fake_w3.provider.prepaid = {tracker: (10, 4)}  # the call spends 6 of it
+    capped = _mint_capped(client)  # at most 5 native per transaction
+    body = {"chain": "testchain", "target": "0x" + "c4" * 20}
+
+    def send(token: str, intent: dict | None) -> t.Any:
+        return client.post(
+            "/safe-transaction", json={**body, "intent": intent}, headers=_bearer(token)
+        )
+
+    assert "missing-intent" in send(capped, None).json()["detail"]
+    assert "overspend" in send(capped, {"spend": {"native": 5}}).json()["detail"]
+    over = send(capped, {"spend": {"native": 6}})
+    assert (over.status_code, "token-cap-per-tx" in over.json()["detail"]) == (
+        403,
+        True,
+    )
+    assert not fake_w3.eth.sent
+    assert send(WORKSPACE, {"spend": {"native": 6}}).status_code == 200
 
 
 class TestMcpMiddleware:

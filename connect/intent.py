@@ -38,6 +38,11 @@ NATIVE_LOG_ADDRESS = "0x" + "ee" * 20
 TRACE_CANARY_FROM = "0x" + "00" * 18 + "c0de"
 TRACE_CANARY_TO = "0x" + "00" * 18 + "c0df"
 TRACE_CANARY_VALUE = 1
+# mapRequesterBalances(address), a mech balance tracker's prepaid balance of a
+# requester (the pinned mech-client's tracker ABIs); read before and after the
+# call in the same simulated block, from this address
+REQUESTER_BALANCE_SELECTOR = "0x6aeeffa8"
+PREPAID_READER = "0x" + "00" * 18 + "c0e0"
 
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 APPROVAL = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
@@ -121,12 +126,17 @@ class Problem(t.TypedDict):
 
 
 class AssetDiff(t.TypedDict):
-    """What a simulated transaction does to the sender's assets."""
+    """What a simulated transaction does to the sender's assets.
+
+    `native` and `tokens` include what `prepaid` lists: each fall of the
+    sender's prepaid balance at a mech balance tracker, in that tracker's asset.
+    """
 
     ok: bool
     revert: str | None
     native: str
     tokens: dict[str, dict[str, str]]
+    prepaid: list[dict[str, str]]
     recipients: list[dict[str, t.Any]]
     approvals: list[dict[str, t.Any]]
     positions: list[dict[str, str]]
@@ -181,12 +191,22 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
     value: int,
     data: str,
     get_code: t.Callable[[str], bytes],
+    prepaid: t.Mapping[str, TokenKey] | None = None,
 ) -> AssetDiff:
     """Simulate one call at head and return what it does to `sender`'s assets.
 
     `rpc(method, params)` returns the JSON-RPC result or raises
     SimulationUnavailable; `get_code(address)` tells an EOA from a contract.
+    `prepaid` maps each mech balance tracker to the asset its balance is in:
+    the sender's balance there is read before and after the call, in the
+    same simulated block, and a fall is spent of that asset.
     """
+    assets = dict(prepaid or {})
+    trackers = sorted(assets)
+    reads = [
+        {"from": PREPAID_READER, "to": tracker, "data": _balance_read(sender)}
+        for tracker in trackers
+    ]
     payload = {
         "blockStateCalls": [
             {
@@ -194,6 +214,7 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
                     TRACE_CANARY_FROM: {"balance": hex(TRACE_CANARY_VALUE)}
                 },
                 "calls": [
+                    *reads,
                     {
                         "from": sender,
                         "to": to,
@@ -205,6 +226,7 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
                         "to": TRACE_CANARY_TO,
                         "value": hex(TRACE_CANARY_VALUE),
                     },
+                    *reads,
                 ],
             }
         ],
@@ -213,13 +235,17 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
     }
     result = rpc("eth_simulateV1", [payload, "latest"])
     try:
-        call, canary = result[0]["calls"][:2]
+        answered = list(result[0]["calls"])
+        before = answered[: len(reads)]
+        call, canary = answered[len(reads) : len(reads) + 2]
+        after = answered[len(reads) + 2 :]
         ok = str(call.get("status", "0x0")) in ("0x1", "1")
         logs = list(call.get("logs") or [])
         canary_logs = list(canary.get("logs") or [])
     except (IndexError, KeyError, TypeError, AttributeError, ValueError) as e:
         raise SimulationUnavailable(f"unexpected eth_simulateV1 answer: {e}") from e
     try:
+        falls = _prepaid_falls(trackers, before, after)
         diff = _diff(sender.lower(), logs, get_code)
         gas_used = int(str(call.get("gasUsed", "0x0")), 16)
         traced = (
@@ -244,6 +270,13 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
                 "the RPC did not trace the call's native transfer "
                 "(traceTransfers), so its native moves cannot be checked"
             )
+    for tracker, fall in falls.items():
+        if assets[tracker] == NATIVE:
+            diff["native"] -= fall
+        else:
+            diff["tokens"][assets[tracker]] = (
+                diff["tokens"].get(assets[tracker], 0) - fall
+            )
     called = [to.lower()]
     for log in logs:
         address = str(log.get("address", "")).lower()
@@ -262,6 +295,10 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
             for token, delta in sorted(diff["tokens"].items())
             if delta
         },
+        prepaid=[
+            {"tracker": tracker, "token": assets[tracker], "delta": str(-fall)}
+            for tracker, fall in falls.items()
+        ],
         recipients=diff["recipients"],
         approvals=[
             entry
@@ -272,6 +309,36 @@ def simulate(  # pylint: disable=too-many-arguments,too-many-locals
         called=called,
         gas_used=gas_used,
     )
+
+
+def _balance_read(holder: str) -> str:
+    """Return the calldata of mapRequesterBalances(holder)."""
+    return REQUESTER_BALANCE_SELECTOR + holder.lower().removeprefix("0x").rjust(64, "0")
+
+
+def _prepaid_falls(
+    trackers: list[str], before: list[dict], after: list[dict]
+) -> dict[str, int]:
+    """Return how far the prepaid balance fell at each tracker, where it fell.
+
+    A read that did not answer one whole word fails the simulation: a fall
+    it hides would be a spend the gate cannot see.
+    """
+    if len(before) != len(trackers) or len(after) != len(trackers):
+        raise SimulationUnavailable("the prepaid mech balance reads went unanswered")
+    falls: dict[str, int] = {}
+    for tracker, was, now in zip(trackers, before, after):
+        balances = []
+        for read in (was, now):
+            raw = str(read.get("returnData") or "").removeprefix("0x")
+            if str(read.get("status")) not in ("0x1", "1") or len(raw) != 64:
+                raise SimulationUnavailable(
+                    f"could not read the prepaid mech balance at {tracker}"
+                )
+            balances.append(int(raw, 16))
+        if balances[1] < balances[0]:
+            falls[tracker] = balances[0] - balances[1]
+    return falls
 
 
 ALLOWANCE_SELECTOR = "0xdd62ed3e"  # allowance(address,address)
