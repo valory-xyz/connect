@@ -91,12 +91,13 @@ HARNESS_CLAUDE_CODE_DESKTOP = "claude_code_desktop"
 HARNESS_CODEX_CLI = "codex_cli"
 HARNESS_CODEX_DESKTOP = "codex_desktop"
 HARNESS_OCB_CLI = "ocb_cli"
-# display order: the UI lists GET /settings' `harnesses` in this order
+# display order: the UI lists GET /settings' `harnesses` in this order,
+# desktop before CLI within each tool
 HARNESSES = (
-    HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CLAUDE_CODE_DESKTOP,
-    HARNESS_CODEX_CLI,
+    HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CODEX_DESKTOP,
+    HARNESS_CODEX_CLI,
     HARNESS_OCB_CLI,
 )
 DEFAULT_HARNESS = HARNESS_CLAUDE_CODE_CLI

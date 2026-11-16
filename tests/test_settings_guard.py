@@ -4416,10 +4416,10 @@ class TestSettingsEndpoints:
             "protected": {"mode": "unrestricted", "whitelist": {}},
             "harness": "claude_code_cli",
             "harnesses": [
-                {"id": "claude_code_cli", "available": True},
                 {"id": "claude_code_desktop", "available": True},
-                {"id": "codex_cli", "available": True},
+                {"id": "claude_code_cli", "available": True},
                 {"id": "codex_desktop", "available": True},
+                {"id": "codex_cli", "available": True},
                 {"id": "ocb_cli", "available": True},
             ],
         }
