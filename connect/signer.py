@@ -635,7 +635,9 @@ class Signer:
             sender=call.sender,
             to=call.to,
             value=call.value,
-            data=call.data or "0x",
+            # the bytes the guard read, in the one spelling every node takes:
+            # a `0X` prefix is the same calldata, so it simulates the same way
+            data="0x" + safe_module.calldata_hex(call.data),
             get_code=get_code,
             prepaid=prepaid_balance_trackers(chain),
         )

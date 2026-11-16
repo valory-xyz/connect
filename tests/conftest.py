@@ -479,6 +479,8 @@ class FakeProvider:
         calls = params[0]["blockStateCalls"][0]["calls"]
         reads = (len(calls) - 2) // 2  # a prepaid read before and after the call
         call, canary = calls[reads : reads + 2]
+        if not call["data"].startswith("0x"):  # as a node does: `0X` is not hex
+            return {"error": {"code": -32602, "message": "invalid hex prefix"}}
         self.simulated.append(call)
         logs = list(self.logs)
         value = int(call["value"], 16)

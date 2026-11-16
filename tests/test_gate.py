@@ -117,6 +117,24 @@ class TestSignerGate:
         test_signer.send("testchain", EOA, value=3, intent=pay(EOA, 3))
         assert fake_w3.provider.simulated[0]["from"] == test_signer.address
 
+    @pytest.mark.parametrize("via_safe", [True, False])
+    def test_one_call_gets_the_same_verdict_whatever_its_hex_prefix_case(
+        self, test_signer: Signer, fake_w3: FakeW3, via_safe: bool
+    ) -> None:
+        """The simulation carries the bytes the guard read, whatever the prefix."""
+        spellings = (TOKEN_CALL, "0X" + TOKEN_CALL[2:])
+        verdicts = [
+            test_signer.simulate("testchain", TOKEN, data=data, via_safe=via_safe)
+            for data in spellings
+        ]
+        assert verdicts[0] == verdicts[1]
+        assert verdicts[0]["problems"] == []
+        send = test_signer.send_via_safe if via_safe else test_signer.send
+        for data in spellings:
+            send("testchain", TOKEN, data=data)
+        assert len(fake_w3.eth.sent) == 2
+        assert {call["data"] for call in fake_w3.provider.simulated} == {TOKEN_CALL}
+
     def test_overspend_and_undeclared_recipient_are_refused(
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
