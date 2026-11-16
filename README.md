@@ -323,7 +323,8 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   the one safe→balance-tracker payment a 402 top-up would send, single-use,
   shape-checked (bare native transfer or `deposit(uint256)` with no inner
   value) and capped at the same bound mech-client itself enforces on the
-  shortfall (10× the mech's per-request rate). The
+  shortfall (the request's `max_payment`, within 10× the mech's per-request
+  rate). The
   [agent top-up](#agent-top-up) arms the same bare native shape for the agent
   EOA. The MechMarketplace contract per chain
   (imported from the pinned mech-client) is whitelisted by default — the only
@@ -512,9 +513,13 @@ held as capped is decided from the token in one place (`GrantStore.intent_for`)
 for both surfaces, and a call with no known token is treated as capped. A mech
 payment never draws on `max_value_per_session`: its asset is the mech's,
 known only once the mech is read, so it has its own session budget. The
-workspace token has none, and a 402 top-up's deposit into the balance
-tracker (the safe's own prepaid balance) is bounded by mech-client's ratio,
-not by these caps.
+workspace token has none. A 402 top-up's deposit into the balance tracker
+(the safe's prepaid balance) draws on that budget too, as it is sent: a
+request's price is drawn at its `max_payment` when it is authorized and its
+top-up at the amount deposited, so what leaves the safe for mechs, prices
+and top-ups together, stays within `max_mech_payment_per_session`; the
+top-up that would pass it is refused before it is deposited, naming
+`token-mech-session-cap`.
 
 Out of scope for v1: SSH port forwarding or running on a shared/remote
 machine voids the loopback assumption entirely, and same-user local malware
@@ -651,7 +656,12 @@ collide.
 Each request carries a spending budget, `max_payment`, which goes to
 mech-client as `send_request(max_price=...)`: a mech pricing above it is
 refused (`MechPriceExceeded`, reported as `over-max-payment`) before any
-deposit, signature or POST. A request withdraws every guard allowance it
+deposit, signature or POST. It bounds the request's 402 top-up as well: a
+shortfall above `max_payment` (or above 10× the mech's price) is refused
+before anything is deposited, by mech-client and, in every mode, by Connect,
+which reads each transaction the flow sends and audits the refused deposit
+as `mech_deposit_refused`; the top-up then draws on the calling token's mech
+session budget ("Scoped tokens"). A request withdraws every guard allowance it
 armed (the ERC-1271 digest, the capped top-up) once its send ends, whether it
 was refused, failed or sent, so none outlives it. The top-up's grant is armed
 only inside the send, while the request holds the safe's queue, and withdrawn

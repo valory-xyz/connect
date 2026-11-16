@@ -1437,6 +1437,44 @@ def test_mcp_mech_request_is_held_to_the_token_s_mech_caps(
     assert rules == ["token-mech-payment-cap"] * 3 + ["token-mech-session-cap"]
 
 
+def test_mcp_a_mech_top_up_draws_on_the_token_s_mech_session_budget(
+    client: TestClient, mech_service: t.Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over /mcp: the request's top-up draws on the session budget of its token."""
+    drawn: list[str | None] = []
+
+    def request(*_args: t.Any, **kwargs: t.Any) -> dict:
+        budget = kwargs["top_up_budget"]
+        drawn.extend([budget(120), budget(100)])  # after the price's 50 of 150
+        return {"request_ids": []}
+
+    monkeypatch.setattr(mech_service, "request", request)
+    capped = client.post(
+        "/tokens",
+        json={"scopes": ["mech"], "max_mech_payment_per_session": 150, **LIVE},
+        headers=_bearer(WORKSPACE),
+    ).json()["token"]
+    response = _mcp_call(
+        client, capped, "mech_request", {"prompt": "q", "tool": "t", "max_payment": 50}
+    )
+    assert _refused_rule(response) is None
+    refused, allowed = drawn
+    assert refused is not None
+    assert refused.startswith("rule 'token-mech-session-cap'")
+    assert allowed is None
+    assert (
+        _refused_rule(
+            _mcp_call(
+                client,
+                capped,
+                "mech_request",
+                {"prompt": "q", "tool": "t", "max_payment": 1},
+            )
+        )
+        == "token-mech-session-cap"
+    )  # 50 + 100 drawn: the budget is spent
+
+
 def test_mcp_an_expired_token_is_refused_on_a_tool_call(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, store_path: t.Any
 ) -> None:

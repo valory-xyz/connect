@@ -442,7 +442,11 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
         *,
         draw: bool,
     ) -> None:
-        """Hold a mech payment to the per-request cap and every session cap."""
+        """Hold a mech payment to the per-request cap and every session cap.
+
+        The request's price is drawn here, up to `max_payment`; a prepaid
+        top-up it sends is drawn as it is sent (`draw_mech_top_up`).
+        """
         asked = arguments.get("max_payment")
         whole = isinstance(asked, int) and not isinstance(asked, bool) and asked >= 0
         cap = grant.max_mech_payment
@@ -453,33 +457,55 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
                 f"max_payment no higher than that (got {asked})",
             )
         with self._lock:
-            capped = [
-                (holder, t.cast(int, held.max_mech_payment_per_session))
-                for holder, held in self._lineage(key)
-                if held.max_mech_payment_per_session is not None
-            ]
-            if not capped:
-                return
-            if not whole:
+            if not whole and self._mech_caps(key):
                 raise GrantRefused(
                     "token-mech-session-cap",
                     "this token's mech payments draw on a session budget; pass "
                     f"max_payment as a whole number of base units (got {asked})",
                 )
-            for holder, per_session in capped:
-                spent = self._mech_spent.get(holder, 0)
-                if spent + t.cast(int, asked) > per_session:
-                    raise GrantRefused(
-                        "token-mech-session-cap",
-                        f"this token pays mechs at most {per_session} base units "
-                        f"in all (with every token minted from it); {spent} is "
-                        f"drawn and this asks up to {asked}",
-                    )
-            if draw:
-                for holder, _ in capped:
-                    self._mech_spent[holder] = self._mech_spent.get(holder, 0) + t.cast(
-                        int, asked
-                    )
+            if whole:
+                self._draw_mech(key, t.cast(int, asked), "asks up to", draw=draw)
+
+    def draw_mech_top_up(self, token: str, amount: int) -> None:
+        """Draw a mech request's prepaid top-up on every session cap, as it is sent.
+
+        A top-up's amount is known only once the mech asks for it (HTTP 402),
+        so it is drawn then, beside the request's price drawn at authorize:
+        what leaves the safe for mechs, prices and top-ups together, stays
+        within each session cap.
+
+        :raises GrantRefused: `token-mech-session-cap`, before it is sent.
+        """
+        with self._lock:
+            self._draw_mech(_key(token), amount, "top-up deposits", draw=True)
+
+    def _mech_caps(self, key: str) -> list[tuple[str, int]]:
+        """Return each mech session cap binding `key`; the caller holds the lock."""
+        return [
+            (holder, t.cast(int, held.max_mech_payment_per_session))
+            for holder, held in self._lineage(key)
+            if held.max_mech_payment_per_session is not None
+        ]
+
+    def _draw_mech(self, key: str, amount: int, what: str, *, draw: bool) -> None:
+        """Hold `amount` to every mech session cap; draw it unless a dry run.
+
+        The caller holds the lock. `what` words the amount in the refusal.
+        """
+        capped = self._mech_caps(key)
+        for holder, per_session in capped:
+            spent = self._mech_spent.get(holder, 0)
+            if spent + amount > per_session:
+                raise GrantRefused(
+                    "token-mech-session-cap",
+                    f"this token pays mechs at most {per_session} base units "
+                    "in all, request prices and top-ups together (with every "
+                    f"token minted from it); {spent} is drawn and this {what} "
+                    f"{amount}",
+                )
+        if draw:
+            for holder, _ in capped:
+                self._mech_spent[holder] = self._mech_spent.get(holder, 0) + amount
 
     def _check_value(  # pylint: disable=too-many-arguments,too-many-locals
         self,

@@ -63,8 +63,8 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
-from connect.mech_allowances import Armed, MechAllowances, read_map_nonces
-from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report
+from connect.mech_allowances import Armed, MechAllowances, TopUpBudget, read_map_nonces
+from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report, price_mech
 from connect.mech_queue import HardCancelRefused, MechQueue
 from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
@@ -126,6 +126,7 @@ class _RequestPlan(t.NamedTuple):
     max_payment: int
     terms: dict  # mech-client's mech report, merged into the request's report
     armed: Armed  # the guard grants this request armed, revoked if nothing is sent
+    top_up_budget: TopUpBudget | None  # the session budget a top-up draws on
 
     @property
     def legacy_on_chain(self) -> bool:
@@ -226,7 +227,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     agent_mode=True,
                     safe_address=safe,
                     ethereum_client=EthereumClient(URI(chain_config.rpc_url)),
-                    signer=MechSigner(self._signer, chain),
+                    signer=MechSigner(
+                        self._signer, chain, self._allowances.check_top_up
+                    ),
                     rpc_url=chain_config.rpc_url,
                 )
                 self._services[chain] = service
@@ -335,6 +338,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         max_payment: int | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
+        top_up_budget: TopUpBudget | None = None,
     ) -> dict:
         """Send one mech request and wait for its delivery.
 
@@ -342,6 +346,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         ``True`` sends the request on-chain through the marketplace. The
         mech's per-request price must not exceed ``max_payment``, in the
         mech's payment asset base units; left out, it is 0.1 of that asset.
+        A 402 top-up deposits at most ``max_payment`` too, and draws on
+        ``top_up_budget`` (the calling token's mech session budget) as it is
+        sent.
 
         Pass a ``request_id`` to make an attempt replayable — see README,
         "Mech requests", for what that covers and what it deliberately does
@@ -360,6 +367,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 auto_deposit=auto_deposit,
                 max_payment=max_payment,
                 request_context=request_context,
+                top_up_budget=top_up_budget,
             )
             # past this point a failure cannot be reported as "nothing was spent"
             planned = plan
@@ -505,6 +513,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         auto_deposit: bool,
         max_payment: int | None,
         request_context: dict | None,
+        top_up_budget: TopUpBudget | None,
     ) -> _RequestPlan:
         """Settle everything a request needs before any payment can happen.
 
@@ -572,6 +581,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             max_payment=max_payment,
             terms=terms,
             armed=armed,
+            top_up_budget=top_up_budget,
         )
 
     def _dispatch(  # pylint: disable=too-many-locals,too-many-statements
@@ -786,7 +796,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             sent.append((nonce, hook))
             # under the queue's lock: no other request's top-up can spend it
             with self._allowances.auto_deposit_armed(
-                plan.chain, plan.priced, auto_deposit=plan.auto_deposit
+                plan.chain,
+                plan.priced,
+                auto_deposit=plan.auto_deposit,
+                max_payment=plan.max_payment,
+                budget=plan.top_up_budget,
             ):
                 return send(nonces=[nonce], on_request_id=hook)
 
@@ -969,32 +983,15 @@ class MechService:  # pylint: disable=too-many-instance-attributes
     def _priced_mech(
         self, service: MarketplaceService, chain: str, priority_mech: str | None
     ) -> PricedMech:
-        """Resolve the target mech, its service id and per-request price (wei).
+        """Resolve the target mech and its price (`mech_budget.price_mech`).
 
         Without an explicit mech, the most active listed mech is used: the
         price cap must bind the mech that is actually paid, so the selection
-        happens here instead of inside mech-client's send path. The service id
-        comes back with it because every later check — reachability, metadata
-        — is keyed by service rather than by mech address.
-
-        Named rather than a bare tuple because two of the three fields are
-        ints of wholly different kinds: transposing a service id and a wei
-        price would corrupt the `max_payment` cap silently, and no type
-        checker would object.
+        happens here instead of inside mech-client's send path.
         """
         if priority_mech is None:
             listing = self._list_mechs(chain, limit=1, offset=0)
             if not listing["mechs"]:
                 raise MechError(f"no live mechs found for '{chain}'")
             priority_mech = str(listing["mechs"][0]["address"])
-        try:
-            info = service.mech_info(priority_mech)
-        except Exception as e:
-            what = f"could not price mech {priority_mech}"
-            raise MechError(f"{what}: {said(e, f'{what} on {chain}')}") from e
-        return PricedMech(
-            mech=priority_mech,
-            service_id=int(info.service_id),
-            rate=int(info.max_delivery_rate),
-            payment_type=str(info.payment_type.value),
-        )
+        return price_mech(service, chain, priority_mech)

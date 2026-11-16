@@ -33,13 +33,30 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech_types import MechDepositUnknown, PricedMech, top_up_failure
-from connect.safe import safe_message_hash
+from connect.safe import (
+    SafeExec,
+    decode_deposit,
+    is_exec_transaction,
+    safe_message_hash,
+)
 from connect.settings import MODE_RESTRICTED
+from connect.signer_errors import SignerError
 
 logger = logging.getLogger("agent")
 
 # what one request armed, each entry withdrawing one grant (MechAllowances.revoke)
 Armed = list[t.Callable[[], None]]
+# draws a top-up's amount on the calling token's mech session budget: the
+# refusal, naming its rule, or None once drawn
+TopUpBudget = t.Callable[[int], str | None]
+
+
+class _TopUp(t.NamedTuple):
+    """The one 402 top-up a send may make: its tracker, bound and budget."""
+
+    tracker: str
+    cap: int  # max_payment, within mech-client's ratio of the mech's rate
+    budget: TopUpBudget | None
 
 
 def deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
@@ -78,6 +95,8 @@ class MechAllowances:
         self._config = config
         self._guard = guard
         self._activity = activity
+        # chain -> the top-up the send under its queue's lock may make
+        self._top_ups: dict[str, _TopUp] = {}
 
     def arm(  # pylint: disable=too-many-arguments
         self,
@@ -133,15 +152,24 @@ class MechAllowances:
         return False
 
     @contextlib.contextmanager
-    def auto_deposit_armed(
-        self, chain: str, priced: PricedMech, *, auto_deposit: bool
+    def auto_deposit_armed(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        priced: PricedMech,
+        *,
+        auto_deposit: bool,
+        max_payment: int,
+        budget: TopUpBudget | None = None,
     ) -> t.Iterator[None]:
         """Pre-authorize the one 402 top-up of the send this wraps, then withdraw it.
 
-        The deposit pays the balance tracker from the safe, which restricted
-        mode only allows through a one-shot allowance bounded by the same cap
-        mech-client itself enforces on the shortfall (ratio x the mech's
-        per-request rate). The guard consumes a grant by its shape, not by who
+        The deposit pays the balance tracker from the safe. It is bounded by
+        the same cap mech-client itself enforces on the shortfall: the
+        request's `max_payment`, within ratio x the mech's per-request rate;
+        `check_top_up` holds it to that cap and draws it on `budget` before
+        it is signed, in every mode, and restricted mode allows it only
+        through a one-shot allowance of that cap. The guard consumes a grant
+        by its shape, not by who
         armed it, so it is armed only inside the send, under the queue's
         lock, and withdrawn before that lock is released: one request at a
         time holds one, and a top-up cannot spend another request's grant.
@@ -153,7 +181,9 @@ class MechAllowances:
         """
         armed: Armed = []
         if auto_deposit:
-            self._arm_deposit(chain, priced, armed)
+            self._arm_deposit(
+                chain, priced, armed, max_payment=max_payment, budget=budget
+            )
         try:
             yield
         except Exception as e:
@@ -174,12 +204,22 @@ class MechAllowances:
         finally:
             self.revoke(armed)
 
-    def _arm_deposit(self, chain: str, priced: PricedMech, armed: Armed) -> None:
-        """Arm the top-up's grant (restricted only) and audit it (every mode)."""
+    def _arm_deposit(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        priced: PricedMech,
+        armed: Armed,
+        *,
+        max_payment: int,
+        budget: TopUpBudget | None,
+    ) -> None:
+        """Arm the top-up's bound (every mode) and grant (restricted only), audited."""
         tracker, is_token = deposit_tracker(chain, priced.payment_type)
         if tracker is None:  # restricted already disarmed it; unrestricted needs none
             return
-        amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate
+        amount_cap = min(_MAX_AUTO_DEPOSIT_RATIO * priced.rate, max_payment)
+        self._top_ups[chain] = _TopUp(tracker, amount_cap, budget)
+        armed.append(functools.partial(self._disarm_top_up, chain))
         if self._guard.mode() == MODE_RESTRICTED:
             grant = self._guard.allow_safe_deposit_once(
                 chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
@@ -192,6 +232,50 @@ class MechAllowances:
             amount_cap=str(amount_cap),
             is_token=is_token,
         )
+
+    def _disarm_top_up(self, chain: str) -> None:
+        """Forget the top-up armed on `chain`: its send has ended."""
+        self._top_ups.pop(chain, None)
+
+    def check_top_up(self, chain: str, to: str, data: str) -> None:
+        """Hold a top-up to its cap and draw it on its budget, before it is signed.
+
+        `MechSigner` calls this on every transaction the mech flow sends; one
+        is a top-up when a top-up is armed on `chain` and it is the safe's call
+        to that tracker, which moves its value plus any `deposit(uint256)`.
+
+        :raises SignerError: past the cap or the budget, naming which.
+        """
+        top_up = self._top_ups.get(chain)
+        safe = str(self._config.chain(chain).safe_address).lower()
+        if top_up is None or to.lower() != safe or not is_exec_transaction(data):
+            return
+        try:
+            call = SafeExec.decode(data)
+        except ValueError:  # the guard refuses what it cannot decode
+            return
+        if call.to.lower() != top_up.tracker:
+            return
+        amount = call.value + (decode_deposit(call.data) or 0)
+        refusal = None
+        if amount > top_up.cap:
+            refusal = (
+                f"the top-up of {amount} is above the {top_up.cap} this request "
+                "may deposit (its max_payment, and at most "
+                f"{_MAX_AUTO_DEPOSIT_RATIO}x the mech's price); deposit it "
+                "yourself or raise max_payment"
+            )
+        elif top_up.budget is not None:
+            refusal = top_up.budget(amount)
+        if refusal is not None:
+            self._activity.record(
+                "mech_deposit_refused",
+                chain=chain,
+                tracker=top_up.tracker,
+                amount=str(amount),
+                reason=refusal,
+            )
+            raise SignerError(refusal)
 
     def record_deposit(self, chain: str, request_id: str | None, amount: int) -> None:
         """Audit what a top-up deposited before the mech refused or lost it."""

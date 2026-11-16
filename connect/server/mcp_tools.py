@@ -41,6 +41,7 @@ from connect.config import AppConfig
 from connect.guard import Guard
 from connect.intent import AgentIntent
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
+from connect.mech_allowances import TopUpBudget
 from connect.server.auth import (
     GrantRefused,
     GrantStore,
@@ -342,6 +343,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         max_payment: int | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
+        ctx: Context | None = None,
     ) -> dict:
         """Send a request to an Olas mech (AI service) and wait for its delivery.
 
@@ -353,7 +355,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         `delivery`, `payment` and `benchmarks`, decided before paying.
         Refused before paying if the mech's price exceeds max_payment
         (base units of the mech's payment asset, default 0.1 of that asset;
-        mech_tools reports the asset as payment_token).
+        mech_tools reports the asset as payment_token). An automatic top-up
+        of the safe's prepaid balance (`auto_deposit`, on a mech's HTTP 402)
+        deposits at most max_payment too, and draws on the same session
+        budget as the price.
         On timeout the ids come back as `pending_request_ids` for mech_result.
         `request_id` is an id you invent before sending (not one of the
         `request_ids` that come back): repeating it never sends again — it
@@ -383,6 +388,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             max_payment=max_payment,
             request_id=request_id,
             request_context=request_context,
+            top_up_budget=_top_up_budget(grants, ctx),
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -461,6 +467,26 @@ def _for_token(
     decides, and treats a call that reached a tool without one as capped.
     """
     return grants.intent_for(_ctx_token(ctx), intent)
+
+
+def _top_up_budget(grants: GrantStore, ctx: Context | None) -> TopUpBudget | None:
+    """Return the session budget a mech request's top-up draws on, for its token.
+
+    None for a call with no token: it never reached the mount, which
+    authorizes every real call.
+    """
+    token = _ctx_token(ctx)
+    if token is None:
+        return None
+
+    def draw(amount: int) -> str | None:
+        try:
+            grants.draw_mech_top_up(token, amount)
+        except GrantRefused as e:
+            return e.message
+        return None
+
+    return draw
 
 
 def _token_refusal(

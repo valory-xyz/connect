@@ -23,8 +23,14 @@ Split out of ``mech.py``, which was at pylint's 1000-line limit; ``from
 connect.mech import MechSigner`` still resolves.
 """
 
+import typing as t
+
 from connect.safe import safe_message_hash
 from connect.signer import SERVER_BUILT, Signer
+
+# checks one transaction (chain, to, data) before it is signed; raises to
+# refuse it
+SendCheck = t.Callable[[str, str, str], None]
 
 
 class MechSigner:
@@ -33,13 +39,17 @@ class MechSigner:
     Every transaction goes through Signer.send() and every digest through
     Signer.sign_digest(), both guardrail-checked. Transactions go as
     SERVER_BUILT and skip the intent gate: the mech flow builds them itself,
-    bounded by max_payment and its single-use allowances.
+    bounded by max_payment and its single-use allowances. `check` sees each
+    transaction first (`MechAllowances.check_top_up`).
     """
 
-    def __init__(self, signer: Signer, chain: str) -> None:
+    def __init__(
+        self, signer: Signer, chain: str, check: SendCheck | None = None
+    ) -> None:
         """Initialize."""
         self._signer = signer
         self._chain = chain
+        self._check = check
 
     @property
     def address(self) -> str:
@@ -51,10 +61,13 @@ class MechSigner:
         data = unsigned_tx.get("data") or "0x"
         if isinstance(data, (bytes, bytearray)):
             data = "0x" + bytes(data).hex()
+        value = int(unsigned_tx.get("value") or 0)
+        if self._check is not None:
+            self._check(self._chain, unsigned_tx["to"], data)
         return self._signer.send(
             chain=self._chain,
             to=unsigned_tx["to"],
-            value=int(unsigned_tx.get("value") or 0),
+            value=value,
             data=data,
             gas=unsigned_tx.get("gas"),
             # the mech flow builds these itself, bounded by max_payment and,

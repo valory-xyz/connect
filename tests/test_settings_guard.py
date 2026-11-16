@@ -90,7 +90,12 @@ from connect.mech import (
     PendingDelivery,
 )
 from connect.mech_allowances import _MAX_AUTO_DEPOSIT_RATIO, deposit_tracker
-from connect.mech_types import MechAnswerUnknown, MechDepositUnknown, UNSAID
+from connect.mech_types import (
+    MechAnswerUnknown,
+    MechDepositUnknown,
+    PricedMech,
+    UNSAID,
+)
 from connect.safe import (
     APPROVE_SELECTOR,
     DEPOSIT_SELECTOR,
@@ -130,6 +135,7 @@ from connect.signer_errors import SEND_FAILED, SendUnknown
 from tests.conftest import (
     FakeW3,
     TEST_PASSWORD,
+    TOKEN_EXPIRES_AT,
     audit_entries,
     audit_kinds,
     grant_store,
@@ -1899,6 +1905,9 @@ class FakeMarketplaceService:
         self.raises: Exception | None = None
         # raised once the request is signed: the POST may have reached the mech
         self.raises_after_signing: Exception | None = None
+        # the shortfall the mech answers the POST with (HTTP 402): deposited
+        # into TRACKER through the signer, as the auto-deposit sends it
+        self.top_up: int | None = None
         self.info = native_mech_info(10**16)
         # A mech that publishes both a tool list and an off-chain endpoint —
         # the rare healthy case; tests that need a blocker override `metadata`.
@@ -2027,6 +2036,14 @@ class FakeMarketplaceService:
                 hook.mark_posting()  # signed: the POST is next
             if answered:
                 raise t.cast(Exception, self.raises)
+            if self.top_up is not None and kwargs.get("auto_deposit"):
+                deposit = exec_transaction_calldata(TRACKER, value=self.top_up)
+                try:
+                    self.signer.send_transaction(
+                        {"to": self.safe_address, "data": deposit}
+                    )
+                except SignerError as e:
+                    raise _executor_wrapped(e) from e
             if self.raises_after_signing is not None:
                 raise self.raises_after_signing
         return self.result
@@ -3481,6 +3498,7 @@ class TestMech:
             auto_deposit=True,
             max_payment=None,
             request_context=None,
+            top_up_budget=None,
         )
         service.request("a", "tool", chain="testchain", priority_mech=OTHER)
         service._dispatch(  # pylint: disable=protected-access
@@ -4840,6 +4858,153 @@ class TestMech:
         assert deposit["amount"] == "7"
         assert deposit["chain"] == "testchain"
         assert deposit["request_id"] == "r1"
+
+    def test_a_top_up_above_max_payment_is_refused_before_any_deposit(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One request deposits at most its max_payment, within mech-client's ratio.
+
+        The mech asks for more than max_payment (yet within 10x its price):
+        nothing is deposited, the audit shows no deposit, and the mech's
+        refusal names the bound.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        patched_mech.top_up = 6 * 10**16  # the mech's price is 10**16
+        with pytest.raises(MechRefused, match="above the 50000000000000000"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=5 * 10**16,
+            )
+        assert not fake_w3.eth.sent
+        kinds = audit_kinds(store_path)
+        assert "transaction" not in kinds
+        assert "mech_deposit" not in kinds
+        (allowance,) = [
+            e
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_deposit_allowance"
+        ]
+        assert allowance["amount_cap"] == str(5 * 10**16)
+        (refused,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_deposit_refused"
+        ]
+        assert refused["amount"] == str(6 * 10**16)
+        patched_mech.top_up = 5 * 10**16  # at the bound: deposited
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, max_payment=5 * 10**16
+        )
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_only_the_safe_s_call_to_the_tracker_is_held_as_a_top_up(
+        self,
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every other transaction the flow sends passes the top-up's bound untouched.
+
+        A token's top-up is its deposit(uint256) amount; an approve of the
+        token, a call that is not the safe's, and bytes that do not decode
+        are not top-ups (the guard judges those).
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, True),
+        )
+        allowances = mech_service._allowances  # pylint: disable=protected-access
+        priced = PricedMech(OTHER, 42, 10**16, NATIVE_PAYMENT_TYPE)
+        deposit = bytes.fromhex(DEPOSIT_SELECTOR) + abi_encode(["uint256"], [7])
+        with allowances.auto_deposit_armed(
+            "testchain", priced, auto_deposit=True, max_payment=6
+        ):
+            for to, data in (
+                (OTHER, exec_transaction_calldata(TRACKER, data=deposit)),
+                (SAFE, "0x"),
+                (SAFE, "0x" + EXEC_TRANSACTION_SELECTOR + "00"),
+                (
+                    SAFE,
+                    exec_transaction_calldata(
+                        PAYMENT_TOKEN, data=approve_data(TRACKER)
+                    ),
+                ),
+            ):
+                allowances.check_top_up("testchain", to, data)
+            with pytest.raises(SignerError, match="the top-up of 7 is above the 6"):
+                allowances.check_top_up(
+                    "testchain", SAFE, exec_transaction_calldata(TRACKER, data=deposit)
+                )
+        # disarmed once the send ends: nothing is held as a top-up
+        allowances.check_top_up(
+            "testchain", SAFE, exec_transaction_calldata(TRACKER, data=deposit)
+        )
+
+    def test_prices_and_top_ups_stay_within_the_mech_session_cap(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A session's mech payments, request prices and top-ups together, stay capped.
+
+        Each request draws its max_payment as it is authorized, and its 402
+        top-up as it is sent: the top-up that would pass the session cap is
+        refused, naming it, before anything is deposited.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        grants = grant_store("root")
+        token = grants.mint(
+            "root",
+            auth_module.TokenGrant(
+                scopes=("mech",),
+                max_mech_payment_per_session=9 * 10**16,
+                expires_at=TOKEN_EXPIRES_AT,
+            ),
+        )
+
+        def budget(amount: int) -> str | None:
+            try:
+                grants.draw_mech_top_up(token, amount)
+            except auth_module.GrantRefused as e:
+                return e.message
+            return None
+
+        patched_mech.top_up = 2 * 10**16
+        price = 3 * 10**16
+
+        def request() -> dict:
+            # as the mount does
+            grants.authorize(token, "mech_request", {"max_payment": price})
+            return mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=price,
+                top_up_budget=budget,
+            )
+
+        request()  # 3 drawn for the price, 2 for the top-up: 5 of 9
+        with pytest.raises(MechRefused, match="rule 'token-mech-session-cap'") as e:
+            request()  # 8 for the price, and the top-up would make it 10
+        assert "request prices and top-ups together" in str(e.value)
+        assert len(fake_w3.eth.sent) == 1  # the first top-up only
 
     def test_a_failed_top_up_after_the_post_keeps_the_nonce_held(
         self,

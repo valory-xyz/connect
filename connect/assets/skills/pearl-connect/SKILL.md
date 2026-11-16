@@ -188,7 +188,8 @@ composing a prompt:
 - `legacy_on_chain=false` (default): no transaction; it signs a request
   digest and draws on prepaid balance held by the mech BalanceTracker. With
   `auto_deposit=true` (the default) an insufficient balance is topped up from
-  the safe once and the request retried.
+  the safe once, by at most `max_payment`, and the request retried; the
+  top-up counts against your token's mech session budget like the price.
 - `legacy_on_chain=true`: classic on-chain request through the MechMarketplace
   via the service safe.
 - `timeout` (seconds, default 300, max 900) bounds each phase of the wait —

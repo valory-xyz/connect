@@ -23,6 +23,9 @@ import typing as t
 
 from mech_client import payment_token
 from mech_client.infrastructure.config.payment_config import PaymentType
+from mech_client.services.marketplace_service import MarketplaceService
+
+from connect.mech_types import MechError, PricedMech, said
 
 # The agent's per-request spending budget, not a guardrail: the caller picks
 # max_payment per call and the server does not clamp it — the guardrail only
@@ -51,6 +54,28 @@ def _payment_token(payment_type: PaymentType, chain: str) -> str | None:
         return payment_token(payment_type, chain)
     except ValueError:
         return None
+
+
+def price_mech(service: MarketplaceService, chain: str, mech: str) -> PricedMech:
+    """Read the mech a request will pay: its service id and per-request price.
+
+    The service id comes back with it because every later check —
+    reachability, metadata — is keyed by service rather than by mech address.
+    Named rather than a bare tuple because two of the three fields are ints
+    of wholly different kinds: transposing a service id and a wei price would
+    corrupt the `max_payment` cap silently, and no type checker would object.
+    """
+    try:
+        info = service.mech_info(mech)
+    except Exception as e:
+        what = f"could not price mech {mech}"
+        raise MechError(f"{what}: {said(e, f'{what} on {chain}')}") from e
+    return PricedMech(
+        mech=mech,
+        service_id=int(info.service_id),
+        rate=int(info.max_delivery_rate),
+        payment_type=str(info.payment_type.value),
+    )
 
 
 def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
