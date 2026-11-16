@@ -39,7 +39,7 @@ from connect.mech_allowances import read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT
 from connect.mech_types import MechError, published_tools
 from connect.signer import SignerError
-from connect.signer_errors import cause_of
+from connect.signer_errors import logged_cause
 
 logger = logging.getLogger("agent")
 
@@ -233,7 +233,7 @@ class MechQueue:
             chain,
             nonce,
             mech,
-            cause_of(failure),
+            logged_cause(failure),
         )
         self._activity.record(
             "mech_hard_cancel_failed",

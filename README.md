@@ -70,7 +70,9 @@ other non-aea agent. It:
      a mech request, the hard cancel) it is redacted there and in the
      activity record as in the message: each link of the cause chain is
      mech-client's `redacted_cause`, its class and its text with every URL
-     cut to scheme and host and every path or query cut. Every body and
+     cut to scheme and host and every path or query cut. The `log.txt` line
+     also says where each link was raised (file, line and function, never
+     its text), so a bug in Connect's own code is located. Every body and
      every MCP tool refuses a parameter it does not take, with an error naming
      the ones it does (`to` on the safe path is pointed at `target`); read-only
      tools carry `readOnlyHint`

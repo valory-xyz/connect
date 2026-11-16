@@ -23,6 +23,8 @@ Split out of connect/signer.py for pylint's line limit; `from connect.signer
 import SignerError` still resolves.
 """
 
+import traceback
+
 from mech_client.utils.redaction import redacted_cause
 from web3.exceptions import ContractLogicError, Web3RPCError
 
@@ -79,22 +81,42 @@ def _send_unknown_words(tx_hash: str, *, held: bool) -> str:
     )
 
 
+def _cause_chain(error: BaseException) -> list[BaseException]:
+    """Return `error` and what caused it, link by link, at most MAX_CAUSES."""
+    links: list[BaseException] = []
+    link: BaseException | None = error
+    while (
+        link is not None
+        and all(link is not seen for seen in links)
+        and len(links) < MAX_CAUSES
+    ):
+        links.append(link)
+        link = link.__cause__ or link.__context__
+    return links
+
+
 def cause_of(error: BaseException) -> str:
     """Describe a failure and what caused it, as the log and audit trail keep it.
 
     Each link is mech-client's `redacted_cause`: its class and its text with
-    every URL cut to scheme and host and every path or query cut, where an
-    RPC key rides. So a record keeps no library text the caller's message
-    leaves out.
+    every URL cut to scheme and host, so no URL path or query, where an RPC
+    key rides, is kept.
     """
-    causes: list[str] = []
-    seen: set[int] = set()
-    link: BaseException | None = error
-    while link is not None and id(link) not in seen and len(causes) < MAX_CAUSES:
-        seen.add(id(link))
-        causes.append(redacted_cause(link))
-        link = link.__cause__ or link.__context__
-    return " <- ".join(causes)
+    return " <- ".join(redacted_cause(link) for link in _cause_chain(error))
+
+
+def logged_cause(error: BaseException) -> str:
+    """Return `cause_of(error)`, then where each of its links was raised, for log.txt.
+
+    The frames name file, line and function, never an exception's text, so a
+    bug in Connect's own code is located without keeping a library's words.
+    """
+    frames = [
+        f"{type(link).__name__} raised at:\n"
+        + "".join(traceback.format_tb(link.__traceback__))
+        for link in _cause_chain(error)
+    ]
+    return "\n".join([cause_of(error), *frames]).rstrip("\n")
 
 
 def send_failure(error: Exception, *, broadcasting: bool) -> str:

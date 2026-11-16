@@ -30,6 +30,7 @@ from web3 import Web3
 from web3.exceptions import Web3RPCError
 
 from connect import chain_read
+from connect import intent as intent_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
@@ -37,7 +38,13 @@ from connect.mech import MechService
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import SERVER_BUILT, Signer, SignerError
-from connect.signer_errors import SEND_FAILED, SEND_UNKNOWN, SendUnknown
+from connect.signer_errors import (
+    SEND_FAILED,
+    SEND_UNKNOWN,
+    SendUnknown,
+    cause_of,
+    logged_cause,
+)
 
 from tests.conftest import FakeW3, audit_entries, grant_store, pay
 
@@ -649,6 +656,67 @@ def test_a_failed_send_s_record_and_log_carry_the_message_s_redaction(
     assert RPC_KEY not in json.dumps(audit_entries(store_path))
     assert "https://rpc.example/..." in caplog.text
     assert RPC_KEY not in caplog.text
+
+
+def _raise_chained(link: str) -> None:
+    """Raise a RuntimeError whose `link` (__cause__ or __context__) names an RPC key."""
+    try:
+        raise ConnectionError(f"https://rpc.example/v2/{RPC_KEY}?x=1 refused")
+    except ConnectionError as inner:
+        if link == "__cause__":
+            raise RuntimeError("the read failed") from inner
+        raise RuntimeError("the read failed")  # pylint: disable=raise-missing-from
+
+
+@pytest.mark.parametrize("link", ["__cause__", "__context__"])
+def test_a_cause_s_url_is_redacted_wherever_it_sits_in_the_chain(link: str) -> None:
+    """A URL only in an inner link is cut to scheme and host, in the record and the log."""
+    with pytest.raises(RuntimeError) as raised:
+        _raise_chained(link)
+    assert getattr(raised.value, link) is not None
+    said = cause_of(raised.value)
+    assert said == (
+        "RuntimeError: the read failed <- "
+        "ConnectionError: https://rpc.example/... refused"
+    )
+    assert RPC_KEY not in logged_cause(raised.value)
+
+
+def test_a_logged_cause_says_where_each_link_was_raised() -> None:
+    """Each link's frames name its file, line and function, so our own bug is found."""
+    with pytest.raises(RuntimeError) as raised:
+        _raise_chained("__cause__")
+    logged = logged_cause(raised.value)
+    assert logged.startswith(cause_of(raised.value) + "\n")
+    assert "RuntimeError raised at:" in logged
+    assert "ConnectionError raised at:" in logged
+    assert f'"{__file__}", line ' in logged
+    assert "in _raise_chained" in logged
+    assert RPC_KEY not in logged
+
+
+def test_an_unavailable_simulation_s_log_locates_the_code_that_failed(
+    test_signer: Signer,
+    monkeypatch: pytest.MonkeyPatch,
+    store_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bug under the gate's simulation logs its frames, never a library's text."""
+
+    def buggy_simulate(*_args: t.Any, **_kwargs: t.Any) -> t.Any:
+        try:
+            raise TypeError(f"bad log from https://rpc.example/v2/{RPC_KEY}")
+        except TypeError as e:
+            raise intent_module.SimulationUnavailable(str(e)) from e
+
+    monkeypatch.setattr(intent_module, "simulate", buggy_simulate)
+    with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
+        test_signer.send_via_safe("testchain", EOA, value=1, intent=pay(EOA, 1))
+    (record,) = [r for r in caplog.records if "cannot simulate" in r.message]
+    assert "in buggy_simulate" in record.message
+    assert "TypeError raised at:" in record.message
+    assert RPC_KEY not in record.message
+    assert RPC_KEY not in json.dumps(audit_entries(store_path))
 
 
 def test_a_possibly_sent_broadcast_with_no_request_id_promises_no_replay(

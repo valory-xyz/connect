@@ -52,6 +52,7 @@ from connect.signer_errors import (
     SendUnknown,
     SignerError,
     cause_of,
+    logged_cause,
     send_failure,
 )
 
@@ -666,7 +667,7 @@ class Signer:
                 chain,
                 call.sender,
                 call.to,
-                cause_of(e),
+                logged_cause(e),
             )
             return (
                 None,
@@ -908,7 +909,7 @@ class Signer:
             chain,
             to,
             f"; it may have landed: {landed}" if landed else "",
-            cause_of(error),
+            logged_cause(error),
         )
 
     def _fill_transaction(
