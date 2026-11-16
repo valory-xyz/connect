@@ -29,6 +29,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
+from connect.intent import parse_intent
 from connect.mech import MechService
 from connect.server.auth import TOOL_AMOUNTS
 from connect.server.mcp_tools import build_mcp
@@ -323,3 +324,110 @@ async def test_a_decimal_string_amount_reaches_the_signer_exactly(
         "safe_transaction", {"chain": "testchain", "target": RECIPIENT, "value": 5}
     )
     assert seen == [exact, exact, exact, 5]
+
+
+def _schema_types(schema: dict, defs: dict) -> set[t.Any]:
+    """Return the JSON types a property schema allows, following $ref and anyOf."""
+    if "$ref" in schema:
+        schema = defs[schema["$ref"].rsplit("/", 1)[-1]]
+    kinds = {schema.get("type")} - {None}
+    for option in schema.get("anyOf", []):
+        kinds |= _schema_types(option, defs)
+    return kinds
+
+
+def _resolved(schema: dict, defs: dict) -> dict:
+    """Return the object schema behind a nullable or referenced property."""
+    for option in [schema, *schema.get("anyOf", [])]:
+        if "$ref" in option:
+            return defs[option["$ref"].rsplit("/", 1)[-1]]
+        if option.get("type") in ("object", "array"):
+            return option
+    raise AssertionError(schema)
+
+
+async def test_the_tool_schema_declares_every_intent_amount_as_a_string(
+    mcp: FastMCP,
+) -> None:
+    """spend, receive_min and each approval's amount are strings, on every tool."""
+    with_intent = []
+    for tool in await mcp.list_tools():
+        schema = tool.inputSchema
+        if "intent" not in schema.get("properties", {}):
+            continue
+        with_intent.append(tool.name)
+        defs = schema.get("$defs", {})
+        intent = _resolved(schema["properties"]["intent"], defs)
+        for where in ("spend", "receive_min"):
+            per_token = _resolved(intent["properties"][where], defs)
+            kinds = _schema_types(per_token["additionalProperties"], defs)
+            assert kinds == {"string"}, (tool.name, where, per_token)
+        approvals = _resolved(intent["properties"]["approvals"], defs)
+        approval = _resolved(approvals["items"], defs)
+        kinds = _schema_types(approval["properties"]["amount"], defs)
+        assert kinds == {"string"}, (tool.name, approval)
+    assert sorted(with_intent) == sorted(TOOL_AMOUNTS.keys() - {"mech_request"})
+
+
+def _intent_with(where: str, amount: t.Any) -> dict:
+    """Return an intent declaring `amount` at `where`."""
+    if where == "approvals":
+        return {
+            "approvals": [{"token": RECIPIENT, "spender": RECIPIENT, "amount": amount}]
+        }
+    return {where: {"native": amount}}
+
+
+@pytest.mark.parametrize("where", ["spend", "receive_min", "approvals"])
+@pytest.mark.parametrize("amount", [1.5, 2**53, -1])
+async def test_a_tool_refuses_an_intent_amount_a_json_number_may_have_rounded(
+    mcp: FastMCP, fake_w3: FakeW3, where: str, amount: t.Any
+) -> None:
+    """An intent's amount follows the value rule: a float or 2^53 is refused by name."""
+    for tool in ("safe_transaction", "simulate_transaction"):
+        with pytest.raises(ToolError, match="rule 'bad-value'"):
+            await mcp.call_tool(
+                tool,
+                {
+                    "chain": "testchain",
+                    "target": RECIPIENT,
+                    "intent": _intent_with(where, amount),
+                },
+            )
+    assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize("where", ["spend", "receive_min", "approvals"])
+async def test_a_decimal_string_intent_amount_reaches_the_gate_exactly(
+    mcp: FastMCP,
+    test_signer: Signer,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+) -> None:
+    """10^18 + 1 in an intent, past what a JSON number holds, arrives exact."""
+    exact = 10**18 + 1
+    seen: list[t.Any] = []
+
+    def send_via_safe(*_args: t.Any, **kwargs: t.Any) -> str:
+        seen.append(kwargs["intent"])
+        return "0x" + "11" * 32
+
+    monkeypatch.setattr(test_signer, "send_via_safe", send_via_safe)
+    for spelling in (str(exact), hex(exact)):
+        await mcp.call_tool(
+            "safe_transaction",
+            {
+                "chain": "testchain",
+                "target": RECIPIENT,
+                "intent": _intent_with(where, spelling),
+            },
+        )
+    for intent in seen:
+        parsed, problems = parse_intent(intent)
+        assert not problems
+        assert parsed is not None
+        if where == "approvals":
+            assert parsed["approvals"][0]["amount"] == exact
+        else:
+            assert parsed[where] == {"native": exact}  # type: ignore[literal-required]
+    assert len(seen) == 2

@@ -95,7 +95,8 @@ ACTION_SCOPES: dict[str, Scope] = {
 
 
 # the base-unit amounts each MCP tool takes, declared as strings in its schema
-# (`mcp_tools.Amount`) and read by `intent.parse_tool_amount` at the mount
+# (`mcp_tools.Amount`) and read by `intent.parse_tool_amount` at the mount;
+# those inside an `intent` (`mcp_tools.ToolIntent`) are read the same way
 TOOL_AMOUNTS: dict[str, tuple[str, ...]] = {
     "safe_transaction": ("value",),
     "send_transaction": ("value",),
@@ -108,17 +109,35 @@ TOOL_AMOUNTS: dict[str, tuple[str, ...]] = {
 def check_tool_amounts(tool: str, arguments: t.Mapping[str, t.Any]) -> None:
     """Refuse a tool call whose amount a JSON number may already have rounded.
 
+    Every amount `TOOL_AMOUNTS` names, and every one inside the `intent`.
+
     :raises GrantRefused: `bad-value`, naming the argument, before any
         budget is drawn on.
     """
-    for name in TOOL_AMOUNTS.get(tool, ()):
-        raw = arguments.get(name)
+    amounts = [(name, arguments.get(name)) for name in TOOL_AMOUNTS.get(tool, ())]
+    amounts += intent_module.intent_amounts(_intent_argument(arguments))
+    for name, raw in amounts:
         if raw is None:
             continue
         try:
             intent_module.parse_tool_amount(raw)
         except (TypeError, ValueError) as e:
             raise GrantRefused("bad-value", f"{name}: {e} (got {raw!r})") from e
+
+
+def _intent_argument(arguments: t.Mapping[str, t.Any]) -> t.Any:
+    """Return a call's `intent` as its tool reads it: a JSON string decoded first.
+
+    FastMCP decodes it the same way before validating; a string that is not
+    JSON is left as it is, for `parse_intent` to refuse.
+    """
+    raw = arguments.get("intent")
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
+    return raw
 
 
 class TokenGrant(StrictBody):
@@ -246,13 +265,7 @@ def _declared(
     :raises GrantRefused: a malformed intent or a value that is not a whole
         number >= 0, before any budget is drawn on.
     """
-    raw = arguments.get("intent")
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except ValueError:
-            pass  # left as a string: parse_intent refuses it below
-    parsed, problems = intent_module.parse_intent(raw)
+    parsed, problems = intent_module.parse_intent(_intent_argument(arguments))
     if problems:
         raise GrantRefused("bad-intent", problems[0]["detail"])
     declared = dict((parsed or {}).get("spend", {}))

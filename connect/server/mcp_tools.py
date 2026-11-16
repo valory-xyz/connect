@@ -31,7 +31,8 @@ import typing as t
 from hexbytes import HexBytes
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import BeforeValidator, Field
+from pydantic import BeforeValidator, ConfigDict, Field, with_config
+from typing_extensions import TypedDict
 from web3.exceptions import TransactionNotFound
 
 from connect import chain_read
@@ -80,6 +81,27 @@ Amount = t.Annotated[
     BeforeValidator(_amount_text),
     Field(description="base units, as a decimal or 0x-hex string"),
 ]
+
+
+# Extra keys are kept for `intent.parse_intent`, the one judge of an intent's
+# shape, which refuses them by name; these types only declare the amounts.
+@with_config(ConfigDict(extra="allow"))
+class ToolApproval(TypedDict, total=False):
+    """One approval an intent allows the call to grant."""
+
+    token: str
+    spender: str
+    amount: Amount
+
+
+@with_config(ConfigDict(extra="allow"))
+class ToolIntent(TypedDict, total=False):
+    """What a call may do; tokens are addresses or "native", amounts `Amount`s."""
+
+    spend: dict[str, Amount] | None
+    receive_min: dict[str, Amount] | None
+    recipients: list[str] | None
+    approvals: list[ToolApproval] | None
 
 
 def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-locals
@@ -133,7 +155,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         value: Amount = "0",
         data: str = "0x",
         *,
-        intent: dict | None = None,
+        intent: ToolIntent | None = None,
         ctx: Context | None = None,
         request_id: str | None = None,
         wait_for_receipt: bool = False,
@@ -151,8 +173,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         anything of the safe's, or grants an approval): {spend: {token: max},
         receive_min: {token: min}, recipients: [eoa, ...], approvals: [{token,
         spender, amount}]}, tokens as addresses (any case) or "native", amounts
-        in base units. The call is simulated before it is signed and refused,
-        naming the rule, if it would do more than the intent allows.
+        in base units as decimal or 0x-hex strings, like `value`. The call is
+        simulated before it is signed and refused, naming the rule, if it would
+        do more than the intent allows.
         """
         return await _dispatch(
             signer.send_via_safe,
@@ -175,7 +198,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         value: Amount = "0",
         data: str = "0x",
         *,
-        intent: dict | None = None,
+        intent: ToolIntent | None = None,
         ctx: Context | None = None,
         request_id: str | None = None,
         wait_for_receipt: bool = False,
@@ -209,7 +232,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         data: str = "0x",
         *,
         via_safe: bool = True,
-        intent: dict | None = None,
+        intent: ToolIntent | None = None,
         ctx: Context | None = None,
     ) -> dict:
         """Ask whether a call would be permitted, before you build on it.
@@ -262,7 +285,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         data: str = "0x",
         *,
         via_safe: bool = True,
-        intent: dict | None = None,
+        intent: ToolIntent | None = None,
         ctx: Context | None = None,
     ) -> dict:
         """Simulate a call at head and say what it does to the safe's assets.
@@ -484,14 +507,14 @@ def _ctx_token(ctx: Context | None) -> str | None:
 
 
 def _for_token(
-    grants: GrantStore, ctx: Context | None, intent: dict | None
+    grants: GrantStore, ctx: Context | None, intent: ToolIntent | None
 ) -> AgentIntent:
     """Return the intent the gate holds this call to, for the calling token.
 
     The MCP mount stamps the token on the request; `GrantStore.intent_for`
     decides, and treats a call that reached a tool without one as capped.
     """
-    return grants.intent_for(_ctx_token(ctx), intent)
+    return grants.intent_for(_ctx_token(ctx), None if intent is None else dict(intent))
 
 
 def _top_up_budget(grants: GrantStore, ctx: Context | None) -> TopUpBudget | None:

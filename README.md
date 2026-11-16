@@ -80,8 +80,10 @@ other non-aea agent. It:
      `decode_calldata`,
      `sign_message`, `mech_tools`, `mech_request`, `mech_result` (plus a
      read-only `settings` tool when `EXPOSE_MODE_TO_AGENT` is on). Every
-     base-unit amount the tools take (`value` on the four transaction tools,
-     `max_payment` on `mech_request`) is declared a string in the published
+     base-unit amount the tools take (`value` on the four transaction tools
+     and every amount in their `intent` — `spend`, `receive_min` and each
+     approval's `amount` — and `max_payment` on `mech_request`) is declared a
+     string in the published
      schema and read as a decimal or 0x-hex string, as the HTTP routes read
      `value`, so a client that cannot hold the number exactly passes it
      exactly; a JSON integer up to 2^53 - 1 is still taken, and a float, or
@@ -251,7 +253,9 @@ RPC (`bad-calldata`), on a send, `preflight_transaction`
 and `simulate_transaction` alike, rather than reading as an RPC that cannot
 simulate. An RPC that cannot simulate is also logged to `log.txt` with the
 cause, since every agent send on that chain is refused until it can. An amount in an intent is a whole number
-of base units: a float or a bool is `bad-intent`, never truncated. An ERC-20
+of base units: a float or a bool is `bad-intent`, never truncated. On the MCP
+tools it follows the `value` rule as well (a decimal or 0x-hex string, or a
+JSON integer up to 2^53 - 1, else `bad-value`). An ERC-20
 `Approval` whose amount is no higher than the spender's allowance before the
 call (read at head; OpenZeppelin 4.x tokens emit one from `transferFrom` as
 they spend an allowance down) is no new grant and needs no declaring; a read

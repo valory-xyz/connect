@@ -4766,7 +4766,7 @@ def test_the_connect_signer_sends_the_intent_it_is_given(monkeypatch) -> None:
     )
     cs.safe_transaction(pm.PUSD, "0x", intent={"spend": {"native": 0}})
     cs.safe_transaction(pm.PUSD, "0x", intent={})
-    assert [p["intent"] for p in sent] == [{"spend": {"native": 0}}, {}]
+    assert [p["intent"] for p in sent] == [{"spend": {"native": "0"}}, {}]
 
 
 # A resolved binary V2 market, as the data API lists the safe's sides of it.

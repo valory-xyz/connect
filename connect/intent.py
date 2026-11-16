@@ -714,6 +714,25 @@ def parse_tool_amount(value: t.Any) -> int:
     return parse_amount(value)
 
 
+def intent_amounts(raw: t.Any) -> list[tuple[str, t.Any]]:
+    """Return each base-unit amount a raw intent declares, named by where it sits.
+
+    Only what has an intent's shape is read: `parse_intent` refuses the rest.
+    """
+    if not isinstance(raw, dict):
+        return []
+    found: list[tuple[str, t.Any]] = []
+    for where in ("spend", "receive_min"):
+        entries = raw.get(where)
+        if isinstance(entries, dict):
+            found += [(f"intent.{where}.{token}", v) for token, v in entries.items()]
+    approvals = raw.get("approvals")
+    for index, approval in enumerate(approvals if isinstance(approvals, list) else []):
+        if isinstance(approval, dict) and "amount" in approval:
+            found.append((f"intent.approvals[{index}].amount", approval["amount"]))
+    return found
+
+
 def balance_key(key: t.Any) -> TokenKey:
     """Return the key a balance change of `key` is booked under in a diff.
 

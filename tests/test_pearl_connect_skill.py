@@ -495,7 +495,7 @@ def test_send_transaction_forwards_the_intent(monkeypatch) -> None:
     client.send_transaction(  # the argument wins over the tx's own key
         {"to": ADDR_A, "intent": {"spend": {"native": 1}}}, intent={}
     )
-    assert sent[0]["intent"] == {"spend": {"native": 1}}
+    assert sent[0]["intent"] == {"spend": {"native": "1"}}
     assert sent[1]["intent"] == {"recipients": [ADDR_B]}
     assert "intent" not in sent[2]
     assert sent[3]["intent"] == {}
@@ -531,3 +531,40 @@ def test_send_transaction_passes_its_value_as_an_exact_decimal_string(
         signer.send_transaction({"to": ADDR_A, "value": hex(exact)})
     assert [p["value"] for p in posted] == [str(exact), str(exact)]
     assert seen == [exact, exact]
+
+
+def test_send_transaction_passes_its_intent_amounts_as_exact_decimal_strings(
+    monkeypatch,
+) -> None:
+    """spend, receive_min and approval amounts go as strings, like value.
+
+    Anything that is not an int is the server's to judge, so it goes as given.
+    """
+    exact = 10**18 + 1
+    sent: list = []
+    monkeypatch.setattr(
+        signer_client.SignerClient,
+        "_post",
+        lambda self, path, payload: sent.append(payload)
+        or {"tx_hash": "0x" + "ab" * 32},
+    )
+    client = signer_client.SignerClient(
+        "http://127.0.0.1:9", "tok", chain="polygon"  # nosec B106
+    )
+    intent = {
+        "spend": {"native": exact},
+        "receive_min": {ADDR_B: exact, ADDR_A: "0x10"},
+        "recipients": [ADDR_B],
+        "approvals": [{"token": ADDR_A, "spender": ADDR_B, "amount": exact}, "odd"],
+    }
+    client.send_transaction({"to": ADDR_A}, intent=intent)
+    assert sent[0]["intent"] == {
+        "spend": {"native": str(exact)},
+        "receive_min": {ADDR_B: str(exact), ADDR_A: "0x10"},
+        "recipients": [ADDR_B],
+        "approvals": [
+            {"token": ADDR_A, "spender": ADDR_B, "amount": str(exact)},
+            "odd",
+        ],
+    }
+    assert intent["spend"] == {"native": exact}  # the caller's own dict is untouched

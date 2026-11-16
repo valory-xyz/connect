@@ -38,8 +38,8 @@ cannot tell you is which to reach for:
   address.
 - `send_transaction` — the same call made by the **EOA**, whose funds are for
   gas. Rarely what you want.
-- Amounts in base units — `value`, and `max_payment` on `mech_request` — go
-  as a decimal or 0x-hex **string** (`"1000000000000000001"`): a JSON number
+- Amounts in base units — `value`, every amount in an `intent`, and
+  `max_payment` on `mech_request` — go as a decimal or 0x-hex **string** (`"1000000000000000001"`): a JSON number
   is exact only up to 2^53 - 1, so a float, or a number past that, is refused
   (`bad-value`).
 - For either — and for `mech_request` — **choose a `request_id` before you
@@ -70,10 +70,10 @@ or sends anything (native coin, a token, an NFT position) or grants an
 approval — needs an `intent`, saying what it may do:
 
 ```json
-{"spend": {"native": 10000, "0xtoken...": 500},
- "receive_min": {"0xother...": 490},
+{"spend": {"native": "10000", "0xtoken...": "500"},
+ "receive_min": {"0xother...": "490"},
  "recipients": ["0xeoa..."],
- "approvals": [{"token": "0xtoken...", "spender": "0xrouter...", "amount": 500}]}
+ "approvals": [{"token": "0xtoken...", "spender": "0xrouter...", "amount": "500"}]}
 ```
 
 The call is simulated before signing and refused, naming the rule, if it does

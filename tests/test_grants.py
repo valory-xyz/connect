@@ -1025,6 +1025,44 @@ def test_mcp_an_amount_from_2_53_on_is_refused_at_the_mount_before_any_draw(
     assert not fake_w3.eth.sent
 
 
+@pytest.mark.parametrize(
+    ("intent", "where"),
+    [
+        ({"spend": {"native": 2**53}}, "intent.spend.native"),
+        ({"receive_min": {"native": 1.5}}, "intent.receive_min.native"),
+        (
+            {
+                "approvals": [
+                    {"token": RECIPIENT, "spender": RECIPIENT, "amount": 2**53}
+                ]
+            },
+            "intent.approvals[0].amount",
+        ),
+    ],
+)
+@pytest.mark.parametrize("tool", ["safe_transaction", "simulate_transaction"])
+def test_mcp_an_intent_amount_a_json_number_may_have_rounded_is_refused_at_the_mount(  # pylint: disable=too-many-arguments
+    client: TestClient,
+    fake_w3: FakeW3,
+    store_path: t.Any,
+    tool: str,
+    intent: dict,
+    where: str,
+) -> None:
+    """Every amount inside an intent follows the value rule, named by where it sits."""
+    refused = _mcp_call(
+        client,
+        WORKSPACE,
+        tool,
+        {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+    )
+    assert _refused_rule(refused) == "bad-value"
+    assert refused.json()["error"]["message"].startswith(f"rule 'bad-value': {where}:")
+    rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert rules == ["bad-value"]
+    assert not fake_w3.eth.sent
+
+
 def test_http_mint_refuses_an_unknown_field_by_name(
     client: TestClient, store_path: t.Any
 ) -> None:
