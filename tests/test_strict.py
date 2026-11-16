@@ -30,6 +30,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
+from connect.server.auth import TOOL_AMOUNTS
 from connect.server.mcp_tools import build_mcp
 from connect.server.strict import (
     audit_unknown_parameters,
@@ -247,3 +248,78 @@ def test_a_non_mapping_body_is_left_to_pydantic() -> None:
 
     with pytest.raises(ValidationError, match="model_type"):
         SignMessageRequest.model_validate("not a body")
+
+
+async def test_the_tool_schema_declares_base_unit_amounts_as_strings(
+    mcp: FastMCP,
+) -> None:
+    """Every value and max_payment is a string in the published schema.
+
+    The mount reads exactly these (`TOOL_AMOUNTS`), so no amount is missed.
+    """
+    declared: dict[str, list[str]] = {}
+    for tool in await mcp.list_tools():
+        for name, schema in tool.inputSchema.get("properties", {}).items():
+            if name in ("value", "max_payment"):
+                kinds = {schema.get("type")} | {
+                    o.get("type") for o in schema.get("anyOf", [])
+                }
+                assert "string" in kinds, (tool.name, name, schema)
+                assert not kinds & {"integer", "number"}, (tool.name, name, schema)
+                declared.setdefault(tool.name, []).append(name)
+    assert declared == {tool: list(names) for tool, names in TOOL_AMOUNTS.items()}
+
+
+@pytest.mark.parametrize("amount", [1.5, 1.0, 2**53 + 1, "1e18", -1, True])
+async def test_a_tool_refuses_an_amount_a_json_number_may_have_rounded(
+    mcp: FastMCP, fake_w3: FakeW3, amount: t.Any
+) -> None:
+    """A float, a number past 2^53 or a non-amount is refused naming the rule."""
+    for tool, arguments in (
+        ("safe_transaction", {"chain": "testchain", "target": RECIPIENT}),
+        ("simulate_transaction", {"chain": "testchain", "target": RECIPIENT}),
+    ):
+        with pytest.raises(ToolError, match="rule 'bad-value'"):
+            await mcp.call_tool(tool, {**arguments, "value": amount})
+    with pytest.raises(ToolError, match="rule 'bad-value'"):
+        await mcp.call_tool(
+            "mech_request", {"prompt": "q", "tool": "t", "max_payment": amount}
+        )
+    assert not fake_w3.eth.sent
+
+
+async def test_a_decimal_string_amount_reaches_the_signer_exactly(
+    mcp: FastMCP,
+    test_signer: Signer,
+    mech_service: MechService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """10^18 + 1, past what a JSON number holds, arrives as that exact integer."""
+    exact = 10**18 + 1
+    seen: list[t.Any] = []
+
+    def send_via_safe(*_args: t.Any, **kwargs: t.Any) -> str:
+        seen.append(kwargs["value"])
+        return "0x" + "11" * 32
+
+    def request(*_args: t.Any, **kwargs: t.Any) -> dict:
+        seen.append(kwargs["max_payment"])
+        return {}
+
+    monkeypatch.setattr(test_signer, "send_via_safe", send_via_safe)
+    monkeypatch.setattr(mech_service, "request", request)
+    await mcp.call_tool(
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "value": str(exact)},
+    )
+    await mcp.call_tool(
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "value": hex(exact)},
+    )
+    await mcp.call_tool(
+        "mech_request", {"prompt": "q", "tool": "t", "max_payment": str(exact)}
+    )
+    await mcp.call_tool(
+        "safe_transaction", {"chain": "testchain", "target": RECIPIENT, "value": 5}
+    )
+    assert seen == [exact, exact, exact, 5]

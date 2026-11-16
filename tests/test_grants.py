@@ -268,10 +268,15 @@ def test_mech_payment_cap() -> None:
     store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_mech_payment=100))
     store.authorize(capped, "mech_request", {"max_payment": 100})
-    for asked in (None, 101, True):
+    store.authorize(capped, "mech_request", {"max_payment": "0x64"})
+    for asked in (None, 101, "101"):
         with pytest.raises(GrantRefused) as refused:
             store.authorize(capped, "mech_request", {"max_payment": asked})
         assert refused.value.rule == "token-mech-payment-cap"
+    for malformed in (True, -1, 1.0, "1.5"):  # not a whole number of base units
+        with pytest.raises(GrantRefused) as refused:
+            store.authorize(capped, "mech_request", {"max_payment": malformed})
+        assert refused.value.rule == "bad-value"
 
 
 def test_value_caps_per_tx_and_per_session() -> None:
@@ -462,14 +467,15 @@ def test_an_asset_a_cap_does_not_name_may_not_be_spent(cap: str) -> None:
     )
 
 
-def test_an_integral_float_value_is_taken_and_a_fraction_refused() -> None:
-    """5.0 is what the tool's int field takes too; 0.5 and inf are not amounts."""
+def test_a_value_is_a_whole_number_of_base_units_never_a_float() -> None:
+    """A decimal or hex string or an integer is an amount; no float is, 5.0 included."""
     store = grant_store(WORKSPACE)
     capped = store.mint(WORKSPACE, grant(max_value_per_tx={"native": 5}))
-    store.authorize(capped, "safe_transaction", {"value": 5.0})
-    for value in (0.5, float("inf")):
+    for value in (5, "5", "0x5"):
+        store.authorize(capped, "safe_transaction", {"value": value})
+    for not_whole in (5.0, 0.5, float("inf")):
         with pytest.raises(GrantRefused) as refused:
-            store.authorize(capped, "safe_transaction", {"value": value})
+            store.authorize(capped, "safe_transaction", {"value": not_whole})
         assert refused.value.rule == "bad-value"
 
 
@@ -1000,6 +1006,25 @@ def test_mcp_value_that_is_not_finite_is_a_bad_value_refusal(
     assert rules == ["bad-value"]
 
 
+@pytest.mark.parametrize("tool", sorted(auth_module.TOOL_AMOUNTS))
+def test_mcp_an_amount_past_2_53_is_refused_at_the_mount_before_any_draw(
+    client: TestClient, fake_w3: FakeW3, store_path: t.Any, tool: str
+) -> None:
+    """A JSON number past 2^53 may already be rounded: refused, naming the rule."""
+    (name,) = auth_module.TOOL_AMOUNTS[tool]
+    arguments = (
+        {"prompt": "q", "tool": "t"}
+        if tool == "mech_request"
+        else {"chain": "testchain", "target": RECIPIENT}
+    )
+    refused = _mcp_call(client, WORKSPACE, tool, {**arguments, name: 2**53 + 1})
+    assert _refused_rule(refused) == "bad-value"
+    assert "2^53" in refused.json()["error"]["message"]
+    rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert rules == ["bad-value"]
+    assert not fake_w3.eth.sent
+
+
 def test_http_mint_refuses_an_unknown_field_by_name(
     client: TestClient, store_path: t.Any
 ) -> None:
@@ -1426,15 +1451,18 @@ def test_mcp_mech_request_is_held_to_the_token_s_mech_caps(
             )
         )
 
-    assert pay_mech(max_payment=101) == "token-mech-payment-cap"
+    assert pay_mech(max_payment="101") == "token-mech-payment-cap"
     assert pay_mech() == "token-mech-payment-cap"  # omitted: the default is no cap
-    assert pay_mech(max_payment="100") == "token-mech-payment-cap"
-    assert pay_mech(max_payment=100) is None
-    assert pay_mech(max_payment=100) == "token-mech-session-cap"  # 200 > 150
+    assert pay_mech(max_payment=1.5) == "bad-value"
+    assert pay_mech(max_payment="100") is None
+    assert pay_mech(max_payment="100") == "token-mech-session-cap"  # 200 > 150
     assert pay_mech(max_payment=50) is None
     assert asked == [100, 50]
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-    assert rules == ["token-mech-payment-cap"] * 3 + ["token-mech-session-cap"]
+    assert rules == ["token-mech-payment-cap"] * 2 + [
+        "bad-value",
+        "token-mech-session-cap",
+    ]
 
 
 def test_mcp_a_mech_top_up_draws_on_the_token_s_mech_session_budget(
@@ -1505,10 +1533,13 @@ def test_mech_payments_draw_on_every_ancestor_s_session_budget() -> None:
         store.authorize(children[1], "mech_request", {"max_payment": 60})
     assert refused.value.rule == "token-mech-session-cap"
     store.authorize(children[1], "mech_request", {"max_payment": 40})
-    for asked in (None, "1", -1, True):  # a budget is drawn by a whole amount only
+    with pytest.raises(GrantRefused) as refused:  # a budget is drawn by an amount
+        store.authorize(children[1], "mech_request", {"max_payment": None})
+    assert refused.value.rule == "token-mech-session-cap"
+    for asked in (-1, True):  # and only by a whole number of base units
         with pytest.raises(GrantRefused) as refused:
             store.authorize(children[1], "mech_request", {"max_payment": asked})
-        assert refused.value.rule == "token-mech-session-cap"
+        assert refused.value.rule == "bad-value"
     # the workspace token has no mech budget of its own, so it is never drawn
     store.authorize(WORKSPACE, "mech_request", {"max_payment": 10**30})
 

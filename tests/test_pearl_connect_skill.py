@@ -500,3 +500,34 @@ def test_send_transaction_forwards_the_intent(monkeypatch) -> None:
     assert "intent" not in sent[2]
     assert sent[3]["intent"] == {}
     assert sent[4]["intent"] == {}
+
+
+def test_send_transaction_passes_its_value_as_an_exact_decimal_string(
+    make_app, test_signer, app_config, activity, monkeypatch
+) -> None:
+    """Base units go as a decimal string, and the server reads that exact integer."""
+    exact = 10**18 + 1
+    seen: list = []
+    app = make_app(test_signer, app_config, activity, token="tok")  # nosec B106
+    monkeypatch.setattr(
+        test_signer,
+        "send_via_safe",
+        lambda *_args, **kwargs: seen.append(kwargs["value"]) or "0x" + "ab" * 32,
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        posted: list = []
+
+        def post(self, path, payload):
+            posted.append(payload)
+            response = client.post(
+                path, json=payload, headers={"Authorization": f"Bearer {self._token}"}
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        monkeypatch.setattr(signer_client.SignerClient, "_post", post)
+        signer = signer_client.SignerClient("http://127.0.0.1:8716", "tok", "testchain")
+        signer.send_transaction({"to": ADDR_A, "value": exact})
+        signer.send_transaction({"to": ADDR_A, "value": hex(exact)})
+    assert [p["value"] for p in posted] == [str(exact), str(exact)]
+    assert seen == [exact, exact]

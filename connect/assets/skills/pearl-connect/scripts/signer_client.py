@@ -141,7 +141,8 @@ class SignerClient:
         payload = {
             "chain": self.chain,
             "target": tx["to"],
-            "value": _to_int(tx.get("value", 0)),
+            # base units as a decimal string: exact past what a JSON number holds
+            "value": str(_to_int(tx.get("value", 0))),
             "data": tx.get("data", "0x"),
             "request_id": request_id,
         }

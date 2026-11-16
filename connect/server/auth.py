@@ -36,7 +36,6 @@ loud and slow, not silent.
 
 import hashlib
 import json
-import math
 import secrets
 import threading
 import time
@@ -93,6 +92,33 @@ ACTION_SCOPES: dict[str, Scope] = {
     "send_transaction": "tx",
     "sign_message": "tx",
 }
+
+
+# the base-unit amounts each MCP tool takes, declared as strings in its schema
+# (`mcp_tools.Amount`) and read by `intent.parse_tool_amount` at the mount
+TOOL_AMOUNTS: dict[str, tuple[str, ...]] = {
+    "safe_transaction": ("value",),
+    "send_transaction": ("value",),
+    "preflight_transaction": ("value",),
+    "simulate_transaction": ("value",),
+    "mech_request": ("max_payment",),
+}
+
+
+def check_tool_amounts(tool: str, arguments: t.Mapping[str, t.Any]) -> None:
+    """Refuse a tool call whose amount a JSON number may already have rounded.
+
+    :raises GrantRefused: `bad-value`, naming the argument, before any
+        budget is drawn on.
+    """
+    for name in TOOL_AMOUNTS.get(tool, ()):
+        raw = arguments.get(name)
+        if raw is None:
+            continue
+        try:
+            intent_module.parse_tool_amount(raw)
+        except (TypeError, ValueError) as e:
+            raise GrantRefused("bad-value", f"{name}: {e} (got {raw!r})") from e
 
 
 class TokenGrant(StrictBody):
@@ -230,13 +256,11 @@ def _declared(
     if problems:
         raise GrantRefused("bad-intent", problems[0]["detail"])
     declared = dict((parsed or {}).get("spend", {}))
-    value = arguments.get("value") or 0
-    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
-        value = int(value)  # a JSON 5.0, which the tool's int field takes too
-    try:
-        value = intent_module.parse_amount(value)  # the gate's own amount rule
+    raw_value = arguments.get("value")
+    try:  # the tool's own amount rule
+        value = intent_module.parse_amount(0 if raw_value is None else raw_value)
     except (TypeError, ValueError) as e:
-        raise GrantRefused("bad-value", f"value: {e} (got {value!r})") from e
+        raise GrantRefused("bad-value", f"value: {e} (got {raw_value!r})") from e
     declared[intent_module.NATIVE] = max(declared.get(intent_module.NATIVE, 0), value)
     return declared, list((parsed or {}).get("approvals", []))
 
@@ -447,24 +471,27 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
         The request's price is drawn here, up to `max_payment`; a prepaid
         top-up it sends is drawn as it is sent (`draw_mech_top_up`).
         """
-        asked = arguments.get("max_payment")
-        whole = isinstance(asked, int) and not isinstance(asked, bool) and asked >= 0
+        raw = arguments.get("max_payment")
+        try:  # the tool's own amount rule
+            asked = None if raw is None else intent_module.parse_amount(raw)
+        except (TypeError, ValueError) as e:
+            raise GrantRefused("bad-value", f"max_payment: {e} (got {raw!r})") from e
         cap = grant.max_mech_payment
-        if cap is not None and (not whole or t.cast(int, asked) > cap):
+        if cap is not None and (asked is None or asked > cap):
             raise GrantRefused(
                 "token-mech-payment-cap",
                 f"this token pays a mech at most {cap} base units; pass a "
                 f"max_payment no higher than that (got {asked})",
             )
         with self._lock:
-            if not whole and self._mech_caps(key):
+            if asked is not None:
+                self._draw_mech(key, asked, "asks up to", draw=draw)
+            elif self._mech_caps(key):
                 raise GrantRefused(
                     "token-mech-session-cap",
                     "this token's mech payments draw on a session budget; pass "
-                    f"max_payment as a whole number of base units (got {asked})",
+                    "a max_payment in base units",
                 )
-            if whole:
-                self._draw_mech(key, t.cast(int, asked), "asks up to", draw=draw)
 
     def draw_mech_top_up(self, token: str, amount: int) -> None:
         """Draw a mech request's prepaid top-up on every session cap, as it is sent.
@@ -810,6 +837,7 @@ class AuthMiddleware:
             arguments = arguments if isinstance(arguments, dict) else {}
             name = str(params.get("name"))
             try:
+                check_tool_amounts(name, arguments)
                 if self._grants.authorize(token, name, arguments):
                     replays.add((name, str(arguments["request_id"])))
             except GrantRefused as e:

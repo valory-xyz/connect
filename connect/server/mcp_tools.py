@@ -31,6 +31,7 @@ import typing as t
 from hexbytes import HexBytes
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BeforeValidator, Field
 from web3.exceptions import TransactionNotFound
 
 from connect import chain_read
@@ -39,7 +40,7 @@ from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.intent import AgentIntent
+from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
 from connect.mech_allowances import TopUpBudget
 from connect.server.auth import (
@@ -56,6 +57,29 @@ from connect.signer import Signer
 # tools that read and never sign, broadcast or pay: harnesses may run them
 # without asking the operator
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
+
+
+def _amount_text(value: t.Any) -> str:
+    """Read a base-unit amount as `intent.parse_tool_amount` reads it, as a string.
+
+    :raises ValueError: naming the rule, `bad-value`, for anything else.
+    """
+    try:
+        return str(parse_tool_amount(value))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"rule 'bad-value': {e}; pass a decimal or 0x-hex string of base "
+            f"units (got {value!r})"
+        ) from e
+
+
+# a base-unit amount on the tool surface: declared a string, so a client
+# that cannot hold the number exactly can still pass it exactly
+Amount = t.Annotated[
+    str,
+    BeforeValidator(_amount_text),
+    Field(description="base units, as a decimal or 0x-hex string"),
+]
 
 
 def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-locals
@@ -106,7 +130,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def safe_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         target: str,
-        value: int = 0,
+        value: Amount = "0",
         data: str = "0x",
         *,
         intent: dict | None = None,
@@ -118,7 +142,8 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         """Make the service safe call `target` — the normal way to act on-chain.
 
         `target`/`value`/`data` are the call the safe makes; any value carried
-        leaves the safe, not the EOA. Returns {tx_hash}, plus a top-level
+        leaves the safe, not the EOA. `value` is base units as a decimal or
+        0x-hex string. Returns {tx_hash}, plus a top-level
         `status` (mined / reverted / pending) and the receipt when
         wait_for_receipt. Reusing a request_id replays the original tx_hash
         instead of spending twice.
@@ -147,7 +172,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def send_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         to: str,
-        value: int = 0,
+        value: Amount = "0",
         data: str = "0x",
         *,
         intent: dict | None = None,
@@ -180,7 +205,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def preflight_transaction(
         chain: str,
         target: str,
-        value: int = 0,
+        value: Amount = "0",
         data: str = "0x",
         *,
         via_safe: bool = True,
@@ -217,7 +242,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             signer.check,
             chain,
             target,
-            value=value,
+            value=parse_amount(value),
             data=data,
             via_safe=via_safe,
             intent=_for_token(grants, ctx, intent),
@@ -233,7 +258,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def simulate_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         target: str,
-        value: int = 0,
+        value: Amount = "0",
         data: str = "0x",
         *,
         via_safe: bool = True,
@@ -256,7 +281,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             signer.simulate,
             chain,
             target,
-            value=value,
+            value=parse_amount(value),
             data=data,
             via_safe=via_safe,
             intent=_for_token(grants, ctx, intent),
@@ -340,7 +365,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         priority_mech: str | None = None,
         auto_deposit: bool = True,
         timeout: float = 300,
-        max_payment: int | None = None,
+        max_payment: Amount | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
         ctx: Context | None = None,
@@ -385,7 +410,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             priority_mech=priority_mech,
             auto_deposit=auto_deposit,
             timeout=timeout,
-            max_payment=max_payment,
+            max_payment=None if max_payment is None else parse_amount(max_payment),
             request_id=request_id,
             request_context=request_context,
             top_up_budget=_top_up_budget(grants, ctx),
@@ -514,7 +539,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     *,
     chain: str,
     address: str,
-    value: int,
+    value: str | int,
     data: str,
     intent: AgentIntent,
     request_id: str | None,
@@ -528,14 +553,16 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     address means (EOA recipient vs. the safe's call target); everything else —
     the value guard, the worker-thread offload, the settle — is shared here.
     """
-    if value < 0:
-        raise ValueError("value must be a non-negative amount in wei")
+    try:
+        amount = parse_amount(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"value must be a non-negative amount in wei: {e}") from e
 
     def _run() -> dict:
         tx_hash = method(
             chain,
             address,
-            value=value,
+            value=amount,
             data=data,
             request_id=request_id,
             intent=intent,

@@ -79,7 +79,14 @@ other non-aea agent. It:
      `simulate_transaction`, `transaction_status`, `chain_call`, `get_abi`,
      `decode_calldata`,
      `sign_message`, `mech_tools`, `mech_request`, `mech_result` (plus a
-     read-only `settings` tool when `EXPOSE_MODE_TO_AGENT` is on).
+     read-only `settings` tool when `EXPOSE_MODE_TO_AGENT` is on). Every
+     base-unit amount the tools take (`value` on the four transaction tools,
+     `max_payment` on `mech_request`) is declared a string in the published
+     schema and read as a decimal or 0x-hex string, as the HTTP routes read
+     `value`, so a client that cannot hold the number exactly passes it
+     exactly; a JSON integer up to 2^53 is still taken, and a float, or an
+     integer past 2^53, is refused (`bad-value`) at the mount, before any
+     budget is drawn on.
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)
