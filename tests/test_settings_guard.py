@@ -3813,7 +3813,7 @@ class TestMech:
             "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
         ) as slot:
             assert slot.nonce == patched_mech.contract.nonce + 1  # the POST holds n
-            slot.answered("not_accepted", mech=OTHER, salt="")
+            slot.answered("not_accepted", mech=OTHER, salt="", posted=False)
         if request_id is None:
             return
         sent = len(patched_mech.calls)
@@ -5503,7 +5503,8 @@ class TestMech:
         )
         nonces = mech_service._nonces  # pylint: disable=protected-access
         with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
-            slot.answered("taken", mech=OTHER, salt="")  # another signer took it
+            # another signer took it
+            slot.answered("taken", mech=OTHER, salt="", posted=True)
         queue = nonces._queue(  # pylint: disable=protected-access
             nonces.key("testchain", SAFE)
         )
@@ -5678,7 +5679,7 @@ class TestMech:
         with nonces.reserve(
             "testchain", SAFE, WHITELISTED, lambda: 5, timeout=1
         ) as slot:
-            slot.answered("taken", mech=WHITELISTED, salt="")
+            slot.answered("taken", mech=WHITELISTED, salt="", posted=True)
         queue = nonces._queue(  # pylint: disable=protected-access
             nonces.key("testchain", SAFE)
         )
@@ -5890,7 +5891,7 @@ class TestMech:
         nonces = mech_service._nonces  # pylint: disable=protected-access
         for mech in (OTHER, OTHER, mech_b):  # slots 4, 5 and 6
             with nonces.reserve("testchain", SAFE, OTHER, lambda: 4, timeout=1) as slot:
-                slot.answered("accepted", mech=mech, salt="")
+                slot.answered("accepted", mech=mech, salt="", posted=True)
         queue = nonces._queue(  # pylint: disable=protected-access
             nonces.key("testchain", SAFE)
         )
@@ -5919,7 +5920,7 @@ class TestMech:
         nonces = mech_service._nonces  # pylint: disable=protected-access
         for mech in (OTHER, mech_a):  # slots 5 and 6
             with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
-                slot.answered("accepted", mech=mech, salt="")
+                slot.answered("accepted", mech=mech, salt="", posted=True)
         queue = nonces._queue(  # pylint: disable=protected-access
             nonces.key("testchain", SAFE)
         )
@@ -5954,7 +5955,7 @@ class TestMech:
             with nonces.reserve(
                 "testchain", SAFE, mech_a, lambda: 6, timeout=1
             ) as slot:
-                slot.answered("accepted", mech=mech, salt="")
+                slot.answered("accepted", mech=mech, salt="", posted=True)
         queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
         done = operator.post(
             "/mech-queue/hard-cancel",
@@ -5984,7 +5985,8 @@ class TestMech:
             "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
         )
         with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
-            slot.answered("taken", mech=OTHER, salt="")  # another signer took it
+            # another signer took it
+            slot.answered("taken", mech=OTHER, salt="", posted=True)
         assert nonces.stalled("testchain", SAFE)
         assert mech_service.result("ab", timeout=1)["mech_queue_stalled"] is True
         # the probe at mapNonces is refused outright, so the stall stands
