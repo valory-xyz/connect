@@ -31,10 +31,8 @@ restricted mode, which is the one thing an operator flipping that switch is
 relying on. For the safe's own configuration, unrestricted is meant to be a
 wider gate, not a one-way door.
 
-A third holds in every mode: only the server's own mech flow may call the
-mech marketplace (`check_transaction(server_built=True)`). Its calls are
-bounded by `max_payment` and the session's mech budget; one composed by the
-agent could spend the safe's prepaid mech balance outside both. The
+A third holds in every mode: a marketplace takes only the requests the
+server's mech flow composes (`check_transaction(server_built=True)`). The
 marketplaces are Connect's own table (`chains.MECH_MARKETPLACES`), so the
 rule holds whether or not mech-client's configuration can be read.
 

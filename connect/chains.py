@@ -71,8 +71,8 @@ NATIVE_ERC20_FACES: dict[str, str] = {
 # chain name: the guard refuses an agent-facing call to any of them. Connect's
 # own table rather than a read of mech-client's file, so a mech-client install
 # that cannot be read leaves the rule whole, and an address a pin bump moves
-# away from stays refused while a persisted whitelist still holds it. A test
-# fails on a pinned mech-client naming one this table does not hold.
+# away from stays refused while a persisted whitelist still holds it. It is
+# append-only: a test fails on a pinned mech-client naming one it does not hold.
 MECH_MARKETPLACES: dict[str, frozenset[str]] = {
     "base": frozenset({"0xf24ee42eda0fc9b33b7d41b06ee8ccd2ef7c5020"}),
     "gnosis": frozenset({"0x735faab1c4ec41128c367afb5c3bac73509f70bb"}),

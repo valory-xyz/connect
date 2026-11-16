@@ -214,12 +214,10 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     The marketplace is the only contract the safe CALLs to *submit* a mech
     request (`request`/`requestBatch`; native payment rides as the inner
     value); token-paid mechs additionally `approve` the payment token, see
-    token_approve_targets(). Its whitelist entry admits the calls the
-    server's own mech flow composes, bounded by `max_payment` and the
-    session's mech budget, and nothing else: the guard refuses a call to it
-    from any agent-facing send path in every mode (from Connect's own
-    `chains.MECH_MARKETPLACES`, not from this read), since such a call could
-    spend the safe's prepaid balance outside both. Balance
+    token_approve_targets(). A marketplace takes only the requests the
+    server's mech flow composes, in every mode; the guard reads the
+    marketplaces from Connect's own `chains.MECH_MARKETPLACES`, not from
+    this read. Balance
     trackers are deliberately NOT whitelisted —
     the safe only calls them for prepaid deposits, which restricted mode
     admits through the guard's one-shot capped deposit allowances (armed per
