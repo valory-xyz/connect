@@ -35,7 +35,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from connect.keystore import KeystoreError, load_account
-from connect.settings import SettingsPersistError
+from connect.settings import HARNESS_OCB_CLI, SettingsPersistError, SettingsStore
 
 logger = logging.getLogger("agent")
 
@@ -82,10 +82,15 @@ class SettingsPatch(BaseModel):
     harness: str | None = None
 
 
+def _settings_view(store: SettingsStore) -> dict:
+    """Return the enforced settings, plus which harnesses this instance can use."""
+    return {**store.load().to_dict(), "harnesses": store.harnesses()}
+
+
 @router.get("/settings")
 def get_settings(request: Request) -> dict:
     """Return the enforced settings (post-verification)."""
-    return request.app.state.settings_store.load().to_dict()
+    return _settings_view(request.app.state.settings_store)
 
 
 def _reject_password(request: Request) -> HTTPException:
@@ -160,4 +165,7 @@ def patch_settings(body: SettingsPatch, request: Request) -> dict:
     if settings.harness != previous.harness:
         state.activity.record("harness_changed", harness=settings.harness)
         logger.info("harness updated: %s", settings.harness)
-    return settings.to_dict()
+    if body.harness == HARNESS_OCB_CLI:
+        # installed on selection, so the next session need not wait for it
+        state.workspace.ocb.start()
+    return _settings_view(state.settings_store)

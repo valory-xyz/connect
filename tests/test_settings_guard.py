@@ -4415,6 +4415,13 @@ class TestSettingsEndpoints:
         assert body == {
             "protected": {"mode": "unrestricted", "whitelist": {}},
             "harness": "claude_code_cli",
+            "harnesses": [
+                {"id": "claude_code_cli", "available": True},
+                {"id": "claude_code_desktop", "available": True},
+                {"id": "codex_cli", "available": True},
+                {"id": "codex_desktop", "available": True},
+                {"id": "ocb_cli", "available": True},
+            ],
         }
 
     def test_wrong_password_is_throttled_401(
@@ -4581,6 +4588,7 @@ class TestSettingsEndpoints:
             "launched": False,
             "harness": "claude_code_cli",
             "requested": "claude_code_cli",
+            "reason": "not_installed",
             "error": "could not open claude_code_cli",
         }
         # the trail carries both harnesses on this outcome too

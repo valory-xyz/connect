@@ -90,13 +90,29 @@ HARNESS_CLAUDE_CODE_CLI = "claude_code_cli"
 HARNESS_CLAUDE_CODE_DESKTOP = "claude_code_desktop"
 HARNESS_CODEX_CLI = "codex_cli"
 HARNESS_CODEX_DESKTOP = "codex_desktop"
+HARNESS_OCB_CLI = "ocb_cli"
+# display order: the UI lists GET /settings' `harnesses` in this order
 HARNESSES = (
     HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CLAUDE_CODE_DESKTOP,
     HARNESS_CODEX_CLI,
     HARNESS_CODEX_DESKTOP,
+    HARNESS_OCB_CLI,
 )
 DEFAULT_HARNESS = HARNESS_CLAUDE_CODE_CLI
+
+# OCB's model is a chat mech paid per request through mech_request; the
+# budget matches OCB's own per-session cap on mech spending
+OCB_MODEL_BUDGET_USD = 1
+# chain -> OCB's chat mech; None until that mech is deployed and confirmed,
+# which leaves "OCB CLI" unavailable there rather than unable to think
+OCB_CHAT_MECHS: dict[str, str | None] = {
+    "gnosis": None,
+    "polygon": None,
+    "robinhood": None,
+}
+UNAVAILABLE_WINDOWS = "windows_unsupported"
+UNAVAILABLE_MODEL = "model_unavailable"
 
 _MAC_KEY_INFO = b"pearl-connect settings hmac v1"
 
@@ -148,6 +164,35 @@ def validate_harness(value: object) -> str:
     if value not in HARNESSES:
         raise ValueError(f"harness must be one of {list(HARNESSES)}")
     return str(value)
+
+
+def harness_unavailable_reason(
+    harness: str, chain: str | None, platform: str
+) -> str | None:
+    """Why `harness` cannot be used on this instance, or None when it can.
+
+    OCB runs unsandboxed on native Windows, where a session could read the
+    keys under ~/.operate, so Windows is ruled out before the chain is asked.
+    """
+    if harness != HARNESS_OCB_CLI:
+        return None
+    if platform == "win32":
+        return UNAVAILABLE_WINDOWS
+    if chain is None or OCB_CHAT_MECHS.get(chain) is None:
+        return UNAVAILABLE_MODEL
+    return None
+
+
+def harness_options(unavailable: t.Callable[[str], str | None]) -> list[dict]:
+    """GET /settings' `harnesses`: each harness and why it is unavailable, if so."""
+    options = []
+    for harness in HARNESSES:
+        reason = unavailable(harness)
+        option: dict[str, object] = {"id": harness, "available": reason is None}
+        if reason is not None:
+            option["unavailable_reason"] = reason
+        options.append(option)
+    return options
 
 
 def _harness_or_default(value: object) -> str:
@@ -345,11 +390,23 @@ class SettingsStore:
     with a valid MAC.
     """
 
-    def __init__(self, path: Path, mac_key: bytes, activity: ActivityLog) -> None:
-        """Initialize."""
+    def __init__(
+        self,
+        path: Path,
+        mac_key: bytes,
+        activity: ActivityLog,
+        unavailable: t.Callable[[str], str | None] = lambda _: None,
+    ) -> None:
+        """Initialize.
+
+        `unavailable` names why a harness cannot be used on this instance, or
+        None when it can: a saved one that cannot loads as DEFAULT_HARNESS,
+        and a patch to one is refused.
+        """
         self._path = path
         self._mac_key = mac_key
         self._activity = activity
+        self._unavailable = unavailable
         self._lock = threading.Lock()
         self._expected_mac: str | None = None
         self._degraded: str | None = None
@@ -357,7 +414,32 @@ class SettingsStore:
     def load(self) -> Settings:
         """Return the verified settings, restoring defaults on any problem."""
         with self._lock:
-            return self._load()
+            return self._usable(self._load())
+
+    def unavailable_reason(self, harness: str) -> str | None:
+        """Why this instance cannot use `harness`, or None when it can."""
+        return self._unavailable(harness)
+
+    def harnesses(self) -> list[dict]:
+        """Every harness with its availability on this instance."""
+        return harness_options(self._unavailable)
+
+    def _usable(self, settings: Settings) -> Settings:
+        """Swap a saved harness this instance cannot use for the default.
+
+        A settings file copied from another machine or chain is the usual
+        cause. The file keeps its value, so it applies again where it can.
+        """
+        reason = self.unavailable_reason(settings.harness)
+        if reason is None:
+            return settings
+        logger.warning(
+            "saved harness %s is unavailable here (%s); using %s",
+            settings.harness,
+            reason,
+            DEFAULT_HARNESS,
+        )
+        return Settings(protected=settings.protected, harness=DEFAULT_HARNESS)
 
     def patch(self, patch: t.Mapping) -> PatchResult:
         """Merge a partial canonical-shaped patch and persist the result.
@@ -366,13 +448,19 @@ class SettingsStore:
         independent protected and harness forms) must not lose an update.
         Returns both sides of the change, so a caller can audit what actually
         moved rather than what was submitted.
-        :raises ValueError: on invalid replacements;
+        :raises ValueError: on invalid replacements, or a harness this
+        instance cannot use;
         :raises SettingsPersistError: when the merged settings cannot be
         persisted — an explicit change must never claim success while the disk
         disagrees (unlike the load path, which degrades to its in-memory value).
         """
+        harness = patch.get("harness")
+        if harness is not None:
+            reason = self.unavailable_reason(validate_harness(harness))
+            if reason is not None:
+                raise ValueError(f"harness {harness} is unavailable: {reason}")
         with self._lock:
-            previous = self._load()
+            previous = self._usable(self._load())
             updated = previous.merged(patch)
             try:
                 self._save(updated)

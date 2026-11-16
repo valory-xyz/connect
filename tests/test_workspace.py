@@ -421,10 +421,13 @@ def test_every_choosable_harness_can_be_opened() -> None:
     second is a dead end the operator only meets when a session refuses to
     start — so the two are pinned to each other here rather than left to drift.
     """
-    assert set(workspace.DEEP_LINKS) | set(workspace.TERMINAL_COMMANDS) == set(
-        HARNESSES
+    launchers = (
+        set(workspace.DEEP_LINKS),
+        set(workspace.TERMINAL_COMMANDS),
+        set(workspace.INSTALLED_HARNESSES),
     )
-    assert not set(workspace.DEEP_LINKS) & set(workspace.TERMINAL_COMMANDS)
+    assert set().union(*launchers) == set(HARNESSES)
+    assert sum(map(len, launchers)) == len(HARNESSES)  # each in one table only
 
 
 def test_the_fallback_order_is_the_one_that_was_decided() -> None:

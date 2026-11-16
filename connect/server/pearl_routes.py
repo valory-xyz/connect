@@ -94,8 +94,10 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
 
     A deep link that will not open is the operator's environment, not a server
     fault, so it answers 200 with {launched: false, harness, requested, error}
-    for the UI to show — where a bad request does not: 503 before the workspace
-    is ready, 400 on an unknown harness, 403 cross-origin.
+    for the UI to show, with a `reason`: `install_failed` and `launch_failed`
+    for OCB, `not_installed` for the rest. A bad request does not: 503 before
+    the workspace is ready, 400 on an unknown harness or one this instance
+    cannot use, 403 cross-origin.
 
     An explicit `harness` overrides the saved preference for this launch only:
     the session opens where the caller asked — and only there — without
@@ -118,6 +120,9 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
             if override is not None
             else state.settings_store.load().harness
         )
+        unavailable = state.settings_store.unavailable_reason(requested)
+        if unavailable is not None:
+            raise ValueError(f"harness {requested} is unavailable: {unavailable}")
         # a harness the operator may choose but nobody can open is a bug, not a
         # server fault to 500 over: answer the caller the same way as any other
         # unusable harness (a test pins DEEP_LINKS against HARNESSES so this
@@ -133,6 +138,7 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
             "session_launch_failed",
             harness=requested,
             requested=requested,
+            reason=e.reason,
             error=str(e),
         )
         # the same harness under both names: nothing opened, and a caller
@@ -141,6 +147,7 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
             "launched": False,
             "harness": requested,
             "requested": requested,
+            "reason": e.reason,
             "error": str(e),
         }
     # both: a trail naming only the harness that opened cannot show the

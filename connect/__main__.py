@@ -47,7 +47,12 @@ from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
 from connect.run_goal import RunGoal
 from connect.server.app import create_app
-from connect.settings import SETTINGS_FILE, SettingsStore, derive_mac_key
+from connect.settings import (
+    SETTINGS_FILE,
+    SettingsStore,
+    derive_mac_key,
+    harness_unavailable_reason,
+)
 from connect.signer import Signer
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [agent] %(message)s"
@@ -192,7 +197,12 @@ def main(argv: list[str] | None = None) -> int:
 
     activity = ActivityLog(config.store_path, RunGoal(config.minutes_per_run))
     settings_store = SettingsStore(
-        config.store_path / SETTINGS_FILE, derive_mac_key(account), activity
+        config.store_path / SETTINGS_FILE,
+        derive_mac_key(account),
+        activity,
+        unavailable=lambda harness: harness_unavailable_reason(
+            harness, config.instance_chain, sys.platform
+        ),
     )
     guard = Guard(settings_store, config, agent_signer=account.address)
     signer = Signer(account=account, config=config, activity=activity, guard=guard)
@@ -208,7 +218,9 @@ def main(argv: list[str] | None = None) -> int:
     # beats a crash loop the middleware just keeps restarting); the workspace
     # re-attempts its own population on every /healthcheck, so a condition that
     # clears by itself heals without a restart.
-    agent_workspace = workspace.Workspace(config.store_path, token)
+    agent_workspace = workspace.Workspace(
+        config.store_path, token, config.instance_chain
+    )
     agent_workspace.ensure()
 
     # Pearl reads it whatever our health, so write it even on a degraded boot.
