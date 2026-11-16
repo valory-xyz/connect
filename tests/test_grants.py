@@ -1007,19 +1007,19 @@ def test_mcp_value_that_is_not_finite_is_a_bad_value_refusal(
 
 
 @pytest.mark.parametrize("tool", sorted(auth_module.TOOL_AMOUNTS))
-def test_mcp_an_amount_past_2_53_is_refused_at_the_mount_before_any_draw(
+def test_mcp_an_amount_from_2_53_on_is_refused_at_the_mount_before_any_draw(
     client: TestClient, fake_w3: FakeW3, store_path: t.Any, tool: str
 ) -> None:
-    """A JSON number past 2^53 may already be rounded: refused, naming the rule."""
+    """A JSON number from 2^53 on may already be rounded: refused, naming the rule."""
     (name,) = auth_module.TOOL_AMOUNTS[tool]
     arguments = (
         {"prompt": "q", "tool": "t"}
         if tool == "mech_request"
         else {"chain": "testchain", "target": RECIPIENT}
     )
-    refused = _mcp_call(client, WORKSPACE, tool, {**arguments, name: 2**53 + 1})
+    refused = _mcp_call(client, WORKSPACE, tool, {**arguments, name: 2**53})
     assert _refused_rule(refused) == "bad-value"
-    assert "2^53" in refused.json()["error"]["message"]
+    assert "2^53 - 1" in refused.json()["error"]["message"]
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert rules == ["bad-value"]
     assert not fake_w3.eth.sent

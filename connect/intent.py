@@ -689,25 +689,26 @@ def parse_amount(value: t.Any) -> int:
     return parsed
 
 
-# the largest integer a JSON number carries exactly (an IEEE-754 double's)
-MAX_EXACT_JSON_INT = 2**53
+# the largest integer a JSON number carries exactly (an IEEE-754 double's):
+# 2^53 + 1 is the first a double cannot hold, and it rounds to 2^53
+MAX_EXACT_JSON_INT = 2**53 - 1
 
 
 def parse_tool_amount(value: t.Any) -> int:
     """Parse a base-unit amount from the agent tool surface, where it is a string.
 
     A decimal or 0x-hex string, read as `parse_amount` reads it. A JSON
-    integer is taken up to 2^53, the most a JSON number carries exactly; a
-    float, or an integer past that, is refused: a client may already have
-    rounded it.
+    integer is taken up to 2^53 - 1, the most a JSON number carries exactly;
+    a float, or an integer past that, is refused: a client may already have
+    rounded it (2^53 + 1 arrives as 2^53).
 
-    :raises TypeError: not a whole number, or past 2^53. :raises ValueError:
+    :raises TypeError: not a whole number, or past 2^53 - 1. :raises ValueError:
         negative, or a string that is not a number.
     """
     if isinstance(value, int) and not isinstance(value, bool):
         if value > MAX_EXACT_JSON_INT:
             raise TypeError(
-                "a JSON number is exact only up to 2^53; pass a larger amount "
+                "a JSON number is exact only up to 2^53 - 1; pass a larger amount "
                 "as a decimal or 0x-hex string"
             )
     return parse_amount(value)

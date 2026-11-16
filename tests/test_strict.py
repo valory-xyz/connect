@@ -270,11 +270,11 @@ async def test_the_tool_schema_declares_base_unit_amounts_as_strings(
     assert declared == {tool: list(names) for tool, names in TOOL_AMOUNTS.items()}
 
 
-@pytest.mark.parametrize("amount", [1.5, 1.0, 2**53 + 1, "1e18", -1, True])
+@pytest.mark.parametrize("amount", [1.5, 1.0, 2**53, 2**53 + 1, "1e18", -1, True])
 async def test_a_tool_refuses_an_amount_a_json_number_may_have_rounded(
     mcp: FastMCP, fake_w3: FakeW3, amount: t.Any
 ) -> None:
-    """A float, a number past 2^53 or a non-amount is refused naming the rule."""
+    """A float, a number from 2^53 on or a non-amount is refused naming the rule."""
     for tool, arguments in (
         ("safe_transaction", {"chain": "testchain", "target": RECIPIENT}),
         ("simulate_transaction", {"chain": "testchain", "target": RECIPIENT}),

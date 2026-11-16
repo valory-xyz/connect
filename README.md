@@ -84,8 +84,8 @@ other non-aea agent. It:
      `max_payment` on `mech_request`) is declared a string in the published
      schema and read as a decimal or 0x-hex string, as the HTTP routes read
      `value`, so a client that cannot hold the number exactly passes it
-     exactly; a JSON integer up to 2^53 is still taken, and a float, or an
-     integer past 2^53, is refused (`bad-value`) at the mount, before any
+     exactly; a JSON integer up to 2^53 - 1 is still taken, and a float, or
+     an integer from 2^53 on, is refused (`bad-value`) at the mount, before any
      budget is drawn on.
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls

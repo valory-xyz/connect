@@ -497,6 +497,19 @@ def test_a_token_symbol_is_read_for_the_report_only(answer: t.Any, symbol: str) 
     assert intent._symbol(rpc, TOKEN) == symbol  # pylint: disable=protected-access
 
 
+def test_a_tool_amount_is_a_json_integer_only_while_a_double_holds_it_exactly() -> None:
+    """2^53 - 1 is taken; from 2^53 on a client may have rounded it, so it is refused.
+
+    2^53 + 1 arrives as 2^53, so 2^53 itself cannot be trusted either; the
+    same amounts as strings are exact.
+    """
+    assert intent.parse_tool_amount(2**53 - 1) == 2**53 - 1
+    for rounded in (2**53, 2**53 + 1):
+        with pytest.raises(TypeError, match="2\\^53 - 1"):
+            intent.parse_tool_amount(rounded)
+        assert intent.parse_tool_amount(str(rounded)) == rounded
+
+
 @pytest.mark.parametrize("raw", [0.9, 1.0, True])
 def test_an_amount_is_never_truncated(raw: t.Any) -> None:
     """A float minimum of 0.9 must not become 0: floats and bools are refused."""

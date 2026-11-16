@@ -40,7 +40,7 @@ cannot tell you is which to reach for:
   gas. Rarely what you want.
 - Amounts in base units — `value`, and `max_payment` on `mech_request` — go
   as a decimal or 0x-hex **string** (`"1000000000000000001"`): a JSON number
-  is exact only up to 2^53, so a float, or a number past that, is refused
+  is exact only up to 2^53 - 1, so a float, or a number past that, is refused
   (`bad-value`).
 - For either — and for `mech_request` — **choose a `request_id` before you
   send**: it is what lets you retry safely if you never learn whether the call
