@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""Open a real terminal for the codex_cli harness, running a stand-in codex."""
+"""Open a real terminal for the terminal harnesses, running stand-in binaries."""
 
 import os
 import shlex
@@ -89,3 +89,33 @@ def test_codex_cli_launches_in_the_workspace(
     assert marker.exists(), f"no terminal ran codex; tried {tried}"
     ran_in = Path(marker.read_text(encoding="utf-8").strip())
     assert ran_in.samefile(store_path)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="OCB is not offered on Windows")
+def test_ocb_cli_launches_the_installed_agent_with_its_model(
+    store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ocb_cli session is a terminal running the installed ocb-agent by path."""
+    mech = "0x" + "ab" * 20
+    monkeypatch.setitem(workspace.OCB_CHAT_MECHS, "testchain", mech)
+    agent = tmp_path / "uv tools" / "ocb-agent"  # a space: the path must be quoted
+    agent.parent.mkdir()
+    agent.write_text(
+        '#!/bin/sh\necho "$PWD $*" > launched.tmp && mv launched.tmp ocb-launched\n',
+        encoding="utf-8",
+    )
+    agent.chmod(0o755)
+    store_path.mkdir(parents=True, exist_ok=True)
+    (store_path / workspace.OCB_PATH_FILE).write_text(str(agent), encoding="utf-8")
+
+    agent_workspace = Workspace(store_path, "tok", "testchain")  # nosec B106
+    assert agent_workspace.open_session("ocb_cli") == "ocb_cli"
+
+    marker = store_path / "ocb-launched"
+    deadline = time.monotonic() + LAUNCH_TIMEOUT_SECONDS
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.5)
+    assert marker.exists(), "no terminal ran ocb-agent"
+    ran_in, args = marker.read_text(encoding="utf-8").strip().split(" ", 1)
+    assert Path(ran_in).samefile(store_path)
+    assert args == f"--model mech:chat@{mech} --model-budget 1"
