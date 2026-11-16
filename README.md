@@ -540,18 +540,22 @@ and the queue's settings. The mech's answer decides the slot: 200 holds it;
 (`mech-nonce-taken`), and when no slot of the safe's is at that nonce the mech
 that answered stays in flight there until `mapNonces` passes it; any other 401
 holds the nonce like a 5xx, since it may be the same answer reworded; any
-other 4xx, a 402 after the top-up retry included,
-frees it (`mech-request-rejected`), as does mech-client's auto top-up failing
-on the safe's side (`OffchainTopUpFailed`). When that top-up landed and the mech
+other 4xx, a 402 after the top-up retry included, is
+refused as `mech-request-rejected`, as is mech-client's auto top-up failing
+on the safe's side (`OffchainTopUpFailed`). A request that was posted keeps
+its nonce held until `mapNonces` passes it, whatever the mech answered. When
+that top-up landed and the mech
 still answered 402, the amount it deposited into the balance tracker is
 audited as `mech_deposit`; any other 5xx or a transport error after the request
-was posted holds the nonce, since the mech may have stored the request. A
+was posted is possibly paid for, since the mech may have stored the request. A
 failure before the POST (an RPC or gateway error assembling the request, a
-signer or guard refusal) never reached the mech, so it frees the nonce too, as
-does a signer or guard refusal of the 402 top-up (mech-client's agent executor
-wraps it in a bare exception; Connect unwraps it). A top-up deposit the RPC
-never answered may have landed: the mech answered 402 and holds nothing, so
-its nonce is freed, but the request fails with an error naming the deposit's
+signer or guard refusal) never reached the mech, so it frees the nonce. A
+signer or guard refusal of the 402 top-up (mech-client's agent executor
+wraps it in a bare exception; Connect unwraps it) is the mech's refusal of a
+posted request: its nonce stays held, and it is audited as
+`mech_request_rejected`. A top-up deposit the RPC
+never answered may have landed: its nonce stays held, and the request fails
+with an error naming the deposit's
 hash and promising no replay, the deposit is audited as
 `mech_deposit_unconfirmed`, and a caller's `request_id` is held as possibly
 paid for rather than freed for a resend that could top up again. A
@@ -599,7 +603,8 @@ STORE_PATH — is refused (`mech-queue-locked`; that Connect logs it and exits
 shutdown, after which a request still arriving is refused
 (`mech-queue-closed`). Every refusal above is recorded as an activity
 `refusal` with its `rule`, and leaves a caller's `request_id` free to send
-again, since nothing reached the mech; only `mech-answer-unknown` is recorded
+again, since nothing was bought: the request never reached the mech, or the
+mech refused it; only `mech-answer-unknown` is recorded
 as possibly paid for — a 5xx, or a transport error after the request was
 posted. Its request id, the one Connect's pre-sign hook was handed, is named in
 the error and the `mech_request_failed` entry as `pending_request_ids` and

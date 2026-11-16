@@ -81,6 +81,7 @@ from connect.mech import (
     MAX_DELIVERY_TIMEOUT,
     MechError,
     MechNotSent,
+    MechRefused,
     MechService,
     MechSigner,
     PendingDelivery,
@@ -3535,7 +3536,9 @@ class TestMech:
         if case == "sent":
             service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         else:
-            expected = MechAnswerUnknown if case == "lost" else MechNotSent
+            expected = {"lost": MechAnswerUnknown, "rejected": MechRefused}.get(
+                case, MechNotSent
+            )
             with pytest.raises(expected):
                 service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         deposit = exec_transaction_calldata(TRACKER, value=10**16)
@@ -3543,7 +3546,7 @@ class TestMech:
             guard.check_transaction("testchain", SAFE, 0, deposit)
 
     @pytest.mark.parametrize("wrapped", [False, True])
-    def test_a_refused_top_up_after_the_402_is_not_sent(  # pylint: disable=too-many-arguments
+    def test_a_refused_top_up_after_the_402_keeps_the_posted_nonce_held(  # pylint: disable=too-many-arguments
         self,
         account: LocalAccount,
         app_config: AppConfig,
@@ -3553,11 +3556,11 @@ class TestMech:
         monkeypatch: pytest.MonkeyPatch,
         wrapped: bool,
     ) -> None:
-        """The mech answered 402 and the signer refused the top-up: nothing stands.
+        """The mech answered 402 and the signer refused the top-up: nothing was bought.
 
-        mech-client frees the nonce of a SignerError (Connect names it in
-        not_sent) though the POST went out; Connect reports it not sent too,
-        keeps no id pending, and withdraws what it armed. Its agent-mode
+        The request was posted, so its nonce stays held and the next request
+        takes the next one; Connect reports the mech's refusal, keeps no id
+        pending, and withdraws what it armed. mech-client's agent-mode
         executor wraps the refusal in a bare Exception, which Connect unwraps.
         """
         monkeypatch.setattr(
@@ -3572,8 +3575,10 @@ class TestMech:
         patched_mech.raises_after_signing = (
             _executor_wrapped(refusal) if wrapped else refusal
         )
-        with pytest.raises(MechNotSent, match="guardrail"):
+        with pytest.raises(MechRefused, match="guardrail") as refused:
             service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        assert "nonce stays held" in str(refused.value)
+        assert "mech_request_rejected" in audit_kinds(app_config.store_path)
         assert not service._pending  # pylint: disable=protected-access
         deposit = exec_transaction_calldata(TRACKER, value=10**16)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
@@ -3582,9 +3587,7 @@ class TestMech:
         with nonces.reserve(
             "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
         ) as slot:
-            assert (
-                slot.nonce == patched_mech.contract.nonce
-            )  # freed, as mech-client did
+            assert slot.nonce == patched_mech.contract.nonce + 1  # n stays held
 
     @pytest.mark.parametrize("request_id", [None, "dep-1"])
     def test_a_top_up_deposit_that_may_have_landed_is_spend_uncertain(  # pylint: disable=too-many-arguments
@@ -3597,10 +3600,10 @@ class TestMech:
     ) -> None:
         """The 402 top-up's broadcast went unanswered: audited, never "not sent".
 
-        The mech answered 402, so it holds nothing and the nonce is freed;
-        the deposit may have landed, so the error names its hash and makes no
-        replay promise, and a caller's request_id is held as spend-uncertain
-        rather than freed for a resend that could top up again.
+        The request was posted, so its nonce stays held; the deposit may have
+        landed, so the error names its hash and makes no replay promise, and
+        a caller's request_id is held as spend-uncertain rather than freed for
+        a resend that could top up again.
         """
         monkeypatch.setattr(
             allowances_module,
@@ -3632,7 +3635,7 @@ class TestMech:
         with nonces.reserve(
             "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
         ) as slot:
-            assert slot.nonce == patched_mech.contract.nonce  # no POST holds it
+            assert slot.nonce == patched_mech.contract.nonce + 1  # the POST holds n
             slot.answered("not_accepted", mech=OTHER, salt="")
         if request_id is None:
             return
@@ -4781,7 +4784,10 @@ class TestMech:
         patched_mech: FakeMarketplaceService,
         store_path: Path,
     ) -> None:
-        """The mech's answer becomes a refusal naming the nonce rule."""
+        """The mech's answer becomes a refusal naming the nonce rule.
+
+        It bought nothing, so the caller's request_id is free to send again.
+        """
         patched_mech.raises = OffchainRequestRejected(
             "HTTP 402",
             request_id="0x01",
@@ -4790,11 +4796,18 @@ class TestMech:
             reason="Payment Required",
             unsent=[],
         )
-        with pytest.raises(MechNotSent, match="rule 'mech-request-rejected'"):
-            mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        with pytest.raises(MechRefused, match="rule 'mech-request-rejected'"):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+            )
         (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert refusal["rule"] == "mech-request-rejected"
         assert "mech_deposit" not in audit_kinds(store_path)  # nothing was deposited
+        patched_mech.raises = None
+        report = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
+        )
+        assert report.get("replayed") is None
 
     def test_a_deposit_before_a_second_402_is_audited(
         self,
@@ -4812,7 +4825,7 @@ class TestMech:
             unsent=[],
             deposited=7,
         )
-        with pytest.raises(MechNotSent, match="rule 'mech-request-rejected'"):
+        with pytest.raises(MechRefused, match="rule 'mech-request-rejected'"):
             mech_service.request(
                 "q", "tool", chain="testchain", priority_mech=OTHER, request_id="r1"
             )
@@ -4823,23 +4836,23 @@ class TestMech:
         assert deposit["chain"] == "testchain"
         assert deposit["request_id"] == "r1"
 
-    def test_a_failed_top_up_frees_the_nonce(
+    def test_a_failed_top_up_after_the_post_keeps_the_nonce_held(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         store_path: Path,
     ) -> None:
-        """mech-client's top-up failed on our side: not accepted, so nothing is held."""
+        """mech-client's top-up failed after the POST: refused, its nonce held."""
         patched_mech.raises = OffchainTopUpFailed(
             "deposit reverted", request_id="0x01", nonce=5, unsent=[]
         )
-        with pytest.raises(MechNotSent, match="auto top-up for nonce 5 failed"):
+        with pytest.raises(MechRefused, match="auto top-up for nonce 5 failed"):
             mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
         (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert refusal["rule"] == "mech-request-rejected"
         nonces = mech_service._nonces  # pylint: disable=protected-access
         with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
-            assert slot.nonce == 5  # freed, not held as unknown
+            assert slot.nonce == 6  # held until it settles
 
     @pytest.mark.parametrize(
         ("status", "reason"),

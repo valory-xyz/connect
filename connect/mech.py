@@ -73,11 +73,15 @@ from connect.mech_types import (
     MechDepositUnknown,
     MechError,
     MechNotSent,
+    MechRefused,
     MechUnknownRequest,
     PendingDelivery,
     PricedMech,
     SPEND_UNCERTAIN,
+    answer_lost,
+    not_bought,
     published_tools,
+    refusal,
     request_key,
     request_label,
     said,
@@ -395,7 +399,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 return merged
             payload = attempt()
         except Exception as e:
-            if planned is not None and not isinstance(e, MechNotSent):
+            if planned is not None and not isinstance(e, (MechNotSent, MechRefused)):
                 self._requests.complete(
                     request_id,
                     self._uncertain(planned, e, request_id),
@@ -623,10 +627,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 request_id=request_id,
                 reason=str(e),
             )
-            raise MechNotSent(f"rule '{e.rule}': {e}{note}") from e
-        except MechNotSent as e:  # failed before reaching the mech: nothing paid
+            raise refusal(e, note) from e
+        except (MechNotSent, MechRefused) as e:  # nothing was paid
+            refused = isinstance(e, MechRefused)
             self._activity.record(
-                "mech_request_not_sent",
+                "mech_request_rejected" if refused else "mech_request_not_sent",
                 chain=plan.chain,
                 tool=plan.tool,
                 request_id=request_id,
@@ -805,15 +810,17 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 raise
             raise self._lost(plan, sent, armed, e) from e
         except Exception as e:
-            # mech-client frees the nonce of what not_sent names, posting or not
-            # (a SignerError after the POST is the 402 top-up's): so does Connect;
-            # a deposit that may have landed is no POST, but it may be a spend
+            # mech-client holds the nonce of a posted request whatever failed
+            # (a SignerError after the POST is the 402 top-up's); a deposit
+            # that may have landed is its own error
             if isinstance(e, (MechNotSent, MechDepositUnknown)):
                 raise
-            if sent and sent[-1][1].posting and not isinstance(e, SignerError):
+            posted = bool(sent) and sent[-1][1].posting
+            if posted and not isinstance(e, SignerError):
                 raise self._lost(plan, sent, armed, e) from e
             what = request_label(plan.chain, plan.priced.mech, plan.tool, None)
-            raise MechNotSent(f"mech request not sent: {said(e, what)}") from e
+            note = self.queue.note(plan.chain)
+            raise not_bought(e, what, posted=posted, note=note) from e
 
     def _lost(
         self,
@@ -823,16 +830,9 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         error: Exception,
     ) -> MechAnswerUnknown:
         """Describe a signed request whose answer was lost, its armed id pending."""
-        held = [armed[sent[-1][0]].hex()]
-        what = request_label(plan.chain, plan.priced.mech, plan.tool, held[0])
-        return MechAnswerUnknown(
-            f"rule '{RULE_ANSWER_UNKNOWN}': {said(error, what)}"
-            f"{self.queue.note(plan.chain)}; "
-            f"pending_request_ids: {held} (mech_result collects it if the mech "
-            "delivers it)",
-            held,
-            getattr(error.__cause__, "deposited", 0),
-        )
+        held = armed[sent[-1][0]].hex()
+        what = request_label(plan.chain, plan.priced.mech, plan.tool, held)
+        return answer_lost(error, held, what, self.queue.note(plan.chain))
 
     def _with_pending(  # pylint: disable=too-many-locals
         self,

@@ -11,7 +11,7 @@ dependencies = [
     "web3==7.16.0",
     "eth-account==0.13.7",
     "mcp==1.28.1",
-    "mech-client @ git+https://github.com/valory-xyz/mech-client.git@0023b3919724bbaa42408b93444864cca41100ce",
+    "mech-client @ git+https://github.com/valory-xyz/mech-client.git@b8f5fb67fa9d3bbeb367c1e6f0a57dccf2c086e6",
     "open-aea-ledger-ethereum==2.2.9",
     "tomli-w==1.2.0",
 ]
@@ -40,9 +40,10 @@ build-backend = "hatchling.build"
 packages = ["connect"]
 
 # mech-client is pinned to a commit of valory-xyz/mech-client#274
-# (the allocator, its store lock and closed/taken rules, id derivation and
-# price cap Connect now uses), until it is released; this goes away with the
-# bump to that release.
+# (the allocator, its store lock and closed/taken rules, the held slot of a
+# posted request, id derivation, and the price cap on a request and on its
+# 402 auto-deposit), until it is released; this goes away with the bump to
+# that release.
 [tool.hatch.metadata]
 allow-direct-references = true
 
