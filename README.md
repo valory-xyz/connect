@@ -258,9 +258,10 @@ cause, since every agent send on that chain is refused until it can. A key
 an intent does not know, at its top level or in an approval, is `bad-intent`,
 naming the key, on every surface: a misspelled `receive_min` is refused, never
 dropped. An amount in an intent is a whole number
-of base units: a float or a bool is `bad-intent`, never truncated. On the MCP
-tools it follows the `value` rule as well (a decimal or 0x-hex string, or a
-JSON integer up to 2^53 - 1, else `bad-value`). An ERC-20
+of base units, never truncated. On the HTTP routes a float or a bool there is
+`bad-intent`. The MCP tools hold it to the `value` rule (a decimal or 0x-hex
+string, or a JSON integer up to 2^53 - 1) and refuse anything else as
+`bad-value`, before the intent is parsed. An ERC-20
 `Approval` whose amount is no higher than the spender's allowance before the
 call (read at head; OpenZeppelin 4.x tokens emit one from `transferFrom` as
 they spend an allowance down) is no new grant and needs no declaring; a read
@@ -530,8 +531,9 @@ gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
 `token-expired`, `token-expiry-required`, `token-mech-cap-required`,
 `token-limit`, `token-cap-per-tx`, `token-cap-per-session`, `token-cap-sign`
 (a raw digest refused to a value-capped token),
-`token-mech-payment-cap`, `token-mech-session-cap`, and `bad-intent` or `bad-value` for an amount that is
-not a whole number >= 0), come back as the HTTP 403/401 detail or the MCP tool
+`token-mech-payment-cap`, `token-mech-session-cap`, and `bad-value` for an
+amount that is not a whole number >= 0, which the HTTP routes name `bad-intent`
+when it sits in an intent), come back as the HTTP 403/401 detail or the MCP tool
 error, and are recorded as activity `refusal` entries. MCP calls are authorized
 in the mount's middleware, which reads each JSON-RPC `tools/call` before the
 MCP server does, and stamps the token on the request; whether its intent is
