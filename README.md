@@ -95,7 +95,10 @@ other non-aea agent. It:
      `value`, so a client that cannot hold the number exactly passes it
      exactly; a JSON integer up to 2^53 - 1 is still taken, and a float, or
      an integer from 2^53 on, is refused (`bad-value`) at the mount, before any
-     budget is drawn on.
+     budget is drawn on. `max_payment` is the one exception: it is a cap on a
+     price that is checked exactly, never an amount that is spent, so it takes
+     a whole JSON integer of any size too (OCB sends its model budget that
+     way).
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)

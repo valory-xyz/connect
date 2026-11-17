@@ -83,6 +83,31 @@ Amount = t.Annotated[
 ]
 
 
+def _cap_text(value: t.Any) -> str:
+    """Read a base-unit cap as `intent.parse_amount` reads it, as a string.
+
+    A cap bounds a price that is checked exactly and is never itself spent,
+    so a JSON integer of any size is taken.
+
+    :raises ValueError: naming the rule, `bad-value`, for anything else.
+    """
+    try:
+        return str(parse_amount(value))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"rule 'bad-value': {e}; pass a whole number of base units, as an "
+            f"integer or a decimal or 0x-hex string (got {value!r})"
+        ) from e
+
+
+# a base-unit cap on the tool surface: a string or any whole JSON integer
+Cap = t.Annotated[
+    str,
+    BeforeValidator(_cap_text),
+    Field(description="base units, as an integer or a decimal or 0x-hex string"),
+]
+
+
 # Extra keys are kept for `intent.parse_intent`, the one judge of an intent's
 # shape, which refuses them by name; these types only declare the amounts.
 @with_config(ConfigDict(extra="allow"))
@@ -388,7 +413,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         priority_mech: str | None = None,
         auto_deposit: bool = True,
         timeout: float = 300,
-        max_payment: Amount | None = None,
+        max_payment: Cap | None = None,
         request_id: str | None = None,
         request_context: dict | None = None,
         ctx: Context | None = None,

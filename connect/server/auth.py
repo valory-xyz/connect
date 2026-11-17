@@ -102,6 +102,11 @@ TOOL_AMOUNTS: dict[str, tuple[str, ...]] = {
     "send_transaction": ("value",),
     "preflight_transaction": ("value",),
     "simulate_transaction": ("value",),
+}
+# the base-unit caps: a bound the mech's exact price is checked against, never
+# itself spent, so a JSON integer of any size is taken (`mcp_tools.Cap`,
+# `intent.parse_amount`); a float, a bool or a negative is still refused
+TOOL_CAPS: dict[str, tuple[str, ...]] = {
     "mech_request": ("max_payment",),
 }
 
@@ -109,20 +114,26 @@ TOOL_AMOUNTS: dict[str, tuple[str, ...]] = {
 def check_tool_amounts(tool: str, arguments: t.Mapping[str, t.Any]) -> None:
     """Refuse a tool call whose amount a JSON number may already have rounded.
 
-    Every amount `TOOL_AMOUNTS` names, and every one inside the `intent`.
+    Every amount `TOOL_AMOUNTS` names, and every one inside the `intent`; a
+    cap `TOOL_CAPS` names need only be a whole number of base units.
 
     :raises GrantRefused: `bad-value`, naming the argument, before any
         budget is drawn on.
     """
     amounts = [(name, arguments.get(name)) for name in TOOL_AMOUNTS.get(tool, ())]
     amounts += intent_module.intent_amounts(_intent_argument(arguments))
-    for name, raw in amounts:
-        if raw is None:
-            continue
-        try:
-            intent_module.parse_tool_amount(raw)
-        except (TypeError, ValueError) as e:
-            raise GrantRefused("bad-value", f"{name}: {e} (got {raw!r})") from e
+    caps = [(name, arguments.get(name)) for name in TOOL_CAPS.get(tool, ())]
+    for reader, named in (
+        (intent_module.parse_tool_amount, amounts),
+        (intent_module.parse_amount, caps),
+    ):
+        for name, raw in named:
+            if raw is None:
+                continue
+            try:
+                reader(raw)
+            except (TypeError, ValueError) as e:
+                raise GrantRefused("bad-value", f"{name}: {e} (got {raw!r})") from e
 
 
 def _intent_argument(arguments: t.Mapping[str, t.Any]) -> t.Any:

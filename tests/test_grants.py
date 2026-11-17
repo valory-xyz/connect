@@ -1025,6 +1025,32 @@ def test_mcp_an_amount_from_2_53_on_is_refused_at_the_mount_before_any_draw(
     assert not fake_w3.eth.sent
 
 
+def test_mcp_a_mech_cap_from_2_53_on_reaches_the_flow_exactly(
+    client: TestClient,
+    mech_service: t.Any,
+    monkeypatch: pytest.MonkeyPatch,
+    store_path: t.Any,
+) -> None:
+    """A cap bounds a price checked exactly and is never spent: any whole integer."""
+    asked: list[t.Any] = []
+
+    def request(*_args: t.Any, **kwargs: t.Any) -> dict:
+        asked.append(kwargs["max_payment"])
+        return {"request_ids": []}
+
+    monkeypatch.setattr(mech_service, "request", request)
+    for cap in (2**53, 10**18):
+        answer = _mcp_call(
+            client,
+            WORKSPACE,
+            "mech_request",
+            {"prompt": "q", "tool": "t", "max_payment": cap},
+        )
+        assert _refused_rule(answer) is None
+    assert asked == [2**53, 10**18]
+    assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+
+
 @pytest.mark.parametrize(
     ("intent", "where"),
     [
