@@ -125,8 +125,37 @@ def test_a_gate_refusal_ends_not_sent_through_the_transport(
             "intent": {"spend": {"native": "5"}},
         },
     )
-    assert text.startswith("intent gate: rule '")
-    assert text.endswith(texts.NOT_SENT_SUFFIX)
+    assert text == (
+        f"intent gate: rule 'undeclared-recipient' ({RECIPIENT}){texts.NOT_SENT_SUFFIX}"
+    )
+    assert not fake_w3.eth.sent
+
+
+def test_a_no_intent_send_is_held_to_strict_through_the_transport(
+    client: TestClient, fake_w3: FakeW3
+) -> None:
+    """Pearl's strict policy: a no-intent call that grants an approval is refused."""
+    token, spender = "0x" + "70" * 20, "0x" + "5e" * 20
+    fake_w3.provider.logs = [
+        {
+            "address": token,
+            "topics": [
+                "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
+                "0x" + SAFE[2:].rjust(64, "0"),
+                "0x" + spender[2:].rjust(64, "0"),
+            ],
+            "data": "0x" + hex(10)[2:].rjust(64, "0"),
+        }
+    ]
+    text = _tool_error(
+        client,
+        "safe_transaction",
+        {"chain": "testchain", "target": token, "data": "0x12345678"},
+    )
+    assert text == (
+        f"intent gate: rule 'undeclared-approval' ({token} to {spender}, 10)"
+        f"{texts.NOT_SENT_SUFFIX}"
+    )
     assert not fake_w3.eth.sent
 
 
@@ -213,7 +242,6 @@ def test_initialize_reports_the_reference_s_server_info(client: TestClient) -> N
 async def test_every_published_description_is_the_reference_s(mcp: FastMCP) -> None:
     """Every tool publishes the texts module's description, get_abi aside."""
     tools = await mcp.list_tools()
-    # get_abi keeps Connect's own text until its answers match the reference's
     assert {tool.name: tool.description for tool in tools} == {
         **texts.TOOL_DESCRIPTIONS,
         "get_abi": GET_ABI_DESCRIPTION,
@@ -307,3 +335,43 @@ async def test_a_library_value_error_is_not_forwarded(
     with pytest.raises(ToolError) as raised:
         await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
     assert str(raised.value) == TOOL_FAILED.format(tool="safe_transaction")
+
+
+def test_an_app_built_at_the_test_interface_gates_at_its_positions(
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    make_app: t.Callable,
+    fake_w3: FakeW3,
+) -> None:
+    """One switch set per build: the app's signer runs the bench's simulate-only."""
+    token, spender = "0x" + "70" * 20, "0x" + "5e" * 20
+    fake_w3.provider.logs = [
+        {
+            "address": token,
+            "topics": [
+                "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
+                "0x" + SAFE[2:].rjust(64, "0"),
+                "0x" + spender[2:].rjust(64, "0"),
+            ],
+            "data": "0x" + hex(10)[2:].rjust(64, "0"),
+        }
+    ]
+    app = make_app(
+        test_signer, app_config, activity, token=TOKEN, switches=TEST_INTERFACE
+    )
+    assert app.state.signer.switches is app.state.switches is TEST_INTERFACE
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        answer = client.post(
+            "/safe-transaction",
+            json={"chain": "testchain", "target": token, "data": "0x12345678"},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+    assert answer.status_code == 200, answer.text
+    assert len(fake_w3.eth.sent) == 1
+
+
+def test_an_unknown_no_intent_policy_is_refused() -> None:
+    """A typo is an error, never read as the permissive position."""
+    with pytest.raises(ValueError, match="no_intent_policy 'Strict' is unknown"):
+        Switches(no_intent_policy="Strict")  # type: ignore[arg-type]

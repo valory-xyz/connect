@@ -324,7 +324,9 @@ class TestMain:
         """Pearl's entrypoint passes no switches, so it serves PRODUCTION."""
         monkeypatch.setattr("sys.stdin", io.StringIO(TEST_PASSWORD + "\n"))
         assert main_module.main(["--password-stdin"]) == 0
-        assert served[0].config.app.state.switches == PRODUCTION
+        app = served[0].config.app
+        assert app.state.switches == PRODUCTION
+        assert app.state.signer.switches is app.state.switches  # one source
         assert PRODUCTION == Switches()
 
     def test_the_binary_excludes_the_test_interface(self) -> None:

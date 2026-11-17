@@ -66,9 +66,9 @@ take `to`.
 
 ## Intents
 
-Every `safe_transaction` or `send_transaction` that **moves value** — spends
-or sends anything (native coin, a token, an NFT position) or grants an
-approval — needs an `intent`, saying what it may do:
+A `safe_transaction` or `send_transaction` that does more than send its own
+`value` to its own target — spends a token or an NFT position, pays anyone
+else, or grants an approval — needs an `intent`, saying what it may do:
 
 ```json
 {"spend": {"native": "10000", "0xtoken...": "500"},
@@ -85,7 +85,9 @@ more than that. What a refusal won't tell you:
 - A Permit2 grant (`approve` on Permit2, or a permit the router carries) is
   always declared as an approval of the token to its spender, even within an
   existing allowance.
-- A call that moves nothing (a claim, a vote) needs no intent.
+- A call with no intent may spend only its own `value`, pay only its target
+  and grant no approval; a call that moves nothing (a claim, a vote) needs
+  none.
 - `simulation-unavailable` means Connect cannot simulate on that chain: no
   value-moving call can be sent there.
 

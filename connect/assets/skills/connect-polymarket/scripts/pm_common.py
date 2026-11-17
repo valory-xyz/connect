@@ -361,7 +361,7 @@ class ConnectSigner(signer_client.SignerClient):
         Thin wrapper over the inherited idempotent send: the sibling client
         fills nonce/gas, signs, broadcasts, and replays the same request_id
         on a lost response so a retry never double-spends. `intent` is what
-        the call may do; the server refuses a value-moving call without one.
+        the call may do; without one the server holds it to its own value.
         """
         return self.send_transaction(
             {"to": to_checksum_address(to), "value": value, "data": data},

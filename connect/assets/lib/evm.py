@@ -66,7 +66,8 @@ class Call(t.TypedDict):
     """One call the safe makes, as the signer expects it.
 
     `intent` is what the call may do (spend caps, the least it must receive,
-    recipients, approvals); the signer refuses a value-moving call without one.
+    recipients, approvals); with none, the signer holds the call to its own
+    value and target, with no approval.
     """
 
     to: str
@@ -548,7 +549,7 @@ SIGNER_REFUSALS: dict[int, tuple[str, ...]] = {
         "unknown chain '",
         "no service safe is configured for chain '",
         "cannot compose the safe call: ",
-        # every guardrail refusal, whichever rule it names
+        # every guardrail and intent-gate refusal, whichever rule it names
         "guardrail: rule ",
         "intent gate: rule ",
     ),

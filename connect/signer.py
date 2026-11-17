@@ -294,6 +294,11 @@ class Signer:
         self._requests = _IdempotencyCache()
         self._guard = guard
 
+    @property
+    def switches(self) -> Switches:
+        """Return the switch set this build runs, the one source of it."""
+        return self._switches
+
     def set_guard(self, guard: Guard) -> None:
         """Attach the guardrail; the boot path passes it to the constructor."""
         self._guard = guard
@@ -337,8 +342,8 @@ class Signer:
         With a request_id the call is idempotent: repeating a completed send
         returns the original tx hash without rebroadcasting. audit=False is for
         a caller that audits the outcome itself, under its own kind. `intent`
-        is what the transaction may do; a value-moving one without it is
-        refused (`SERVER_BUILT` is for the server's own transactions).
+        is what the transaction may do; without one, the `no_intent_policy`
+        switch decides (`SERVER_BUILT` is for the server's own transactions).
         `replay_only` answers only from the request id's completed send (see
         `_send_guarded`).
         """
@@ -636,10 +641,11 @@ class Signer:
     def _evaluate(
         self, chain: str, call: _GateCall, raw_intent: t.Any
     ) -> tuple[intent_module.AssetDiff | None, intent_module.Intent | None, list]:
-        """Simulate a call and check it: (diff, parsed intent, problems).
+        """Simulate a call and check it: (diff, intent it was held to, problems).
 
         The one path the send-time gate and simulate_transaction share, so the
-        two cannot answer differently about the same call.
+        two cannot answer differently about the same call. The intent is None
+        for a no-intent call the policy checks for a revert alone.
         """
         problem = intent_module.calldata_problem(call.data)
         if problem is not None:
@@ -647,13 +653,12 @@ class Signer:
         parsed, problems = intent_module.parse_intent(raw_intent)
         if problems:
             return None, None, problems
+        locked = intent_module.locks_positions(raw_intent)
         held_to = parsed
-        if parsed is None and self._switches.no_intent_policy == "strict":
-            # what the call says it does is all it may do
+        # fails closed: any position but simulate-only is held to the call
+        if parsed is None and self._switches.no_intent_policy != "simulate-only":
             held_to = intent_module.implied_intent(
-                call.value,
-                call.to,
-                positions_locked=isinstance(raw_intent, intent_module.Capped),
+                call.value, call.to, positions_locked=locked
             )
         try:
             diff = self._simulate(chain, call)
@@ -669,7 +674,7 @@ class Signer:
             )
             return (
                 None,
-                parsed,
+                held_to,
                 [
                     intent_module.Problem(
                         rule="simulation-unavailable",
@@ -678,7 +683,10 @@ class Signer:
                     )
                 ],
             )
-        return diff, parsed, intent_module.check_intent(diff, held_to)
+        problems = intent_module.check_intent(diff, held_to)
+        if held_to is None and locked:  # a capped token moves no position
+            problems += intent_module.position_lock_problems(diff)
+        return diff, held_to, problems
 
     def _gate_problems(
         self, chain: str, call: _GateCall, raw_intent: t.Any
@@ -708,14 +716,7 @@ class Signer:
                     "fits_intent": False,
                     "problems": [intent_module.problem_text(e.problem)],
                 }
-        diff, parsed, problems = self._evaluate(chain, call, intent)
-        texts = [intent_module.problem_text(p) for p in problems]
-        if diff is None:
-            return {"fits_intent": False, "problems": texts}
-        if parsed is None:  # no intent: no verdict and no problems, as the
-            # reference answers; a revert shows in the diff's ok and revert
-            return {**diff, "fits_intent": None, "problems": []}
-        return {**diff, "fits_intent": not problems, "problems": texts}
+        return intent_module.simulation_answer(*self._evaluate(chain, call, intent))
 
     def _sender(self, chain: str, via_safe: bool) -> str:
         """Whose call it is: the chain's safe, or the agent EOA."""

@@ -619,8 +619,28 @@ def mech_service(
 
 
 @pytest.fixture
-def make_mcp(  # pylint: disable=too-many-arguments
+def signer_with(
     test_signer: Signer,
+    account: LocalAccount,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    fake_w3: "FakeW3",
+) -> t.Callable[[Switches], Signer]:
+    """Return a factory for the test signer at a switch set, the set's one source."""
+
+    def _with(switches: Switches) -> Signer:
+        if switches == test_signer.switches:
+            return test_signer
+        return on_fake_chain(
+            Signer(account, app_config, activity, switches=switches), fake_w3
+        )
+
+    return _with
+
+
+@pytest.fixture
+def make_mcp(  # pylint: disable=too-many-arguments
+    signer_with: t.Callable[[Switches], Signer],
     app_config: AppConfig,
     activity: ActivityLog,
     guard: Guard,
@@ -631,14 +651,13 @@ def make_mcp(  # pylint: disable=too-many-arguments
 
     def _make(switches: Switches = PRODUCTION) -> FastMCP:
         return build_mcp(
-            test_signer,
+            signer_with(switches),
             app_config,
             activity,
             guard=guard,
             mech=mech_service,
             settings_store=settings_store,
             grants=grant_store("workspace-token"),
-            switches=switches,
         )
 
     return _make
@@ -646,17 +665,26 @@ def make_mcp(  # pylint: disable=too-many-arguments
 
 @pytest.fixture
 def make_app(
-    guard: Guard, settings_store: SettingsStore, mech_service: MechService
+    guard: Guard,
+    settings_store: SettingsStore,
+    mech_service: MechService,
+    signer_with: t.Callable[[Switches], Signer],
 ) -> t.Callable:
-    """Return an app factory threading the guard/settings/mech wiring."""
+    """Return an app factory threading the guard/settings/mech wiring.
 
-    def _make(
+    `switches` other than the signer's own builds the test signer at that set,
+    since the signer is the one source of a build's switches.
+    """
+
+    def _make(  # pylint: disable=too-many-arguments
         signer: Signer,
         config: AppConfig,
         activity: ActivityLog,
         token: str = "tok",  # nosec B107
-        switches: Switches = PRODUCTION,
+        switches: Switches | None = None,
     ) -> t.Any:
+        if switches is not None and switches != signer.switches:
+            signer = signer_with(switches)
         # the app's signing endpoints must honor the same guard the app serves
         signer.set_guard(guard)
         return create_app(
@@ -671,7 +699,6 @@ def make_app(
             # populates it — so a test that needs it broken breaks populate(),
             # rather than reaching into the app's state to fake a flag
             workspace=Workspace(config.store_path, token, record_key=b"k" * 32),
-            switches=switches,
         )
 
     return _make

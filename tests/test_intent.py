@@ -475,10 +475,14 @@ def test_the_implied_intent_allows_the_call_s_own_value_and_target() -> None:
     assert intent.check_intent(diff, implied) == []
     assert implied["positions_locked"] is True
     moved = _diff(positions=[{"token": TOKEN, "id": "7", "delta": "-1"}])
-    (problem,) = [
-        p for p in intent.check_intent(moved, implied) if p["rule"] == "overspend"
-    ]
-    assert problem["detail"] == f"{TOKEN} #7: spends 1, intent allows 0"
+    # one report per position: a capped token's lock names it, not overspend
+    assert rules(intent.check_intent(moved, implied)) == ["token-cap-positions"]
+    unlocked = intent.implied_intent(0, EOA, positions_locked=False)
+    (problem,) = intent.check_intent(moved, unlocked)
+    assert problem == {
+        "rule": "overspend",
+        "detail": f"{TOKEN} #7: spends 1, intent allows 0",
+    }
 
 
 def test_a_token_the_spend_does_not_name_may_not_be_spent_at_all() -> None:
@@ -893,7 +897,7 @@ def _simulate_prepaid(rpc: intent.Rpc) -> intent.AssetDiff:
 
 
 def test_a_fall_of_the_prepaid_mech_balance_is_spent_of_its_asset() -> None:
-    """A call that lowers the safe's prepaid balance moves value: it needs an intent.
+    """A call that lowers the safe's prepaid balance spends it: an intent must cover it.
 
     The fall is spent of the tracker's asset, held to the intent's spend; a
     rise (a deposit) is no spend of its own.

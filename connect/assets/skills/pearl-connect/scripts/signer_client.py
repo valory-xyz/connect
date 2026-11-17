@@ -174,8 +174,8 @@ class SignerClient:
             "data": tx.get("data", "0x"),
             "request_id": request_id,
         }
-        # what the call may do; the server refuses a value-moving call without
-        # one, after simulating it (see "Intents" in SKILL.md)
+        # what the call may do; with none, the server holds the call to its own
+        # value and target, after simulating it (see "Intents" in SKILL.md)
         intent = intent if intent is not None else tx.get("intent")
         if intent is not None:
             payload["intent"] = _exact_amounts(intent)

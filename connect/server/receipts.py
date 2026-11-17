@@ -27,7 +27,7 @@ import logging
 import typing as t
 
 from hexbytes import HexBytes
-from web3.exceptions import TimeExhausted
+from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from connect.signer import Signer
 
@@ -35,7 +35,8 @@ RECEIPT_POLL_SECONDS = 2
 MAX_RECEIPT_TIMEOUT = 300
 RECEIPT_ERROR = (
     "the transaction was sent, but its receipt could not be read (the cause is "
-    "in Connect's log); check it with transaction_status before resending"
+    "in Connect's log); check it with transaction_status: not_found does not "
+    "prove it was not sent, so resend only under the same request_id"
 )
 
 # how a transaction settled, as the send tools and transaction_status say it
@@ -93,6 +94,19 @@ def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
         "block": info["block_number"],
         "receipt": info,
     }
+
+
+def settlement(w3: t.Any, tx_hash: str) -> dict:
+    """Return how a hash settled: mined, held unmined (`pending`) or unknown."""
+    try:
+        receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
+    except TransactionNotFound:
+        try:
+            w3.eth.get_transaction(HexBytes(tx_hash))
+        except TransactionNotFound:
+            return not_found(tx_hash)
+        return pending(tx_hash)
+    return mined_result(tx_hash, receipt)
 
 
 def pending(tx_hash: str) -> dict:

@@ -643,10 +643,9 @@ def _erc1155_items(kind: str, data: str) -> list[tuple[int, int]]:
 
 
 def implied_intent(value: int, target: str, *, positions_locked: bool) -> Intent:
-    """Return what a call with no intent may do under the strict policy.
+    """Return what a no-intent call is held to under strict: its value to its target.
 
-    No spend beyond the call's own value, no approvals and no recipient but the
-    call's target.
+    Nothing else: a position leaving is an overspend.
     """
     return Intent(
         spend={NATIVE: value} if value else {},
@@ -865,29 +864,62 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
                     ),
                 )
             )
-    for position in diff["positions"]:
-        if int(position["delta"]) < 0 and intent.get("implied"):
-            problems.append(
-                Problem(
-                    rule="overspend",
-                    detail=gate_overspend(
-                        f"{position['token']} #{position['id']}",
-                        -int(position["delta"]),
-                        0,
-                    ),
-                )
-            )
-    if intent.get("positions_locked"):
+    if intent.get("positions_locked"):  # one report per position: the cap's
+        problems += position_lock_problems(diff)
+    elif intent.get("implied"):
         for position in diff["positions"]:
             if int(position["delta"]) < 0:
                 problems.append(
                     Problem(
-                        rule="token-cap-positions",
-                        detail=f"moves {position['token']} #{position['id']} out, "
-                        "and a value-capped token may not move positions",
+                        rule="overspend",
+                        detail=gate_overspend(
+                            f"{position['token']} #{position['id']}",
+                            -int(position["delta"]),
+                            0,
+                        ),
                     )
                 )
     return problems
+
+
+def locks_positions(raw: t.Any) -> bool:
+    """Whether a caller's intent comes under a capped token, which moves no position."""
+    return isinstance(raw, Capped)
+
+
+def position_lock_problems(diff: AssetDiff) -> list[Problem]:
+    """Return a `token-cap-positions` problem per position leaving the sender."""
+    return [
+        Problem(
+            rule="token-cap-positions",
+            detail=f"moves {position['token']} #{position['id']} out, "
+            "and a value-capped token may not move positions",
+        )
+        for position in diff["positions"]
+        if int(position["delta"]) < 0
+    ]
+
+
+def simulation_answer(
+    diff: AssetDiff | None, held_to: Intent | None, problems: list[Problem]
+) -> dict:
+    """Return what `simulate_transaction` answers: the diff, and its verdict.
+
+    A call held to nothing (`held_to` None) answers no verdict and no
+    problems, as the reference does: a revert shows in the diff's own `ok`
+    and `revert`, not as a problem.
+    """
+    if diff is None:
+        return {"fits_intent": False, "problems": [problem_text(p) for p in problems]}
+    if held_to is None:
+        problems = [p for p in problems if p["rule"] != "reverts"]
+        if not problems:
+            return {**diff, "fits_intent": None, "problems": []}
+    return {
+        **diff,
+        "fits_intent": not problems,
+        "problems": [problem_text(p) for p in problems],
+    }
 
 
 def problem_text(problem: Problem) -> str:

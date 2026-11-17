@@ -29,13 +29,11 @@ import asyncio
 import logging
 import typing as t
 
-from hexbytes import HexBytes
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator, ConfigDict, Field, ValidationError, with_config
 from typing_extensions import TypedDict
-from web3.exceptions import TransactionNotFound
 
 from connect import chain_read
 from connect import settings as settings_config
@@ -54,12 +52,11 @@ from connect.server.auth import (
     is_replay,
     request_token,
 )
-from connect.server.receipts import mined_result, not_found, pending, settled
+from connect.server.receipts import not_found, settled, settlement
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
 from connect.signer_errors import logged_cause
-from connect.switches import PRODUCTION, Switches
 from connect.texts import SERVER_INFO, TOOL_DESCRIPTIONS, UNKNOWN_TOOL
 
 # tools that read and never sign, broadcast or pay: harnesses may run them
@@ -230,7 +227,6 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     mech: MechService,
     settings_store: SettingsStore,
     grants: GrantStore,
-    switches: Switches = PRODUCTION,
 ) -> ConnectMCP:
     """Build mcp."""
     # Read once per build: tool registration happens here while wallet_info's
@@ -325,7 +321,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         via_safe: bool = True,
         ctx: Context | None = None,
     ) -> dict:
-        """Answer the guardrail's verdict on a call; nothing is simulated."""
+        """Answer whether the token and the guardrail permit a call; nothing is simulated."""
         refused = _token_refusal(
             grants,
             ctx,
@@ -408,20 +404,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             valid = False
         if not valid:  # a hash that can never resolve is simply not found
             return not_found(tx_hash)
-
-        def _run() -> dict:
-            w3 = signer.w3(chain)
-            try:
-                receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
-            except TransactionNotFound:  # unknown, or not mined yet
-                try:
-                    w3.eth.get_transaction(HexBytes(tx_hash))
-                except TransactionNotFound:
-                    return not_found(tx_hash)
-                return pending(tx_hash)
-            return mined_result(tx_hash, receipt)
-
-        return await asyncio.to_thread(_run)
+        return await asyncio.to_thread(lambda: settlement(signer.w3(chain), tx_hash))
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["sign_message"])
     async def sign_message(digest: str) -> dict:
@@ -501,7 +484,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             """
             return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 
-    if switches.strict_parameters:
+    if signer.switches.strict_parameters:
         # a parameter a tool does not take is refused by name, never dropped
         make_tools_strict(mcp, activity)
     return mcp

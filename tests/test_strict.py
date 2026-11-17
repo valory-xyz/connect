@@ -23,6 +23,7 @@ import json
 import typing as t
 
 import pytest
+from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -39,16 +40,29 @@ from connect.server.strict import (
 from connect.signer import Signer
 from connect.switches import Switches
 
-from tests.conftest import FakeW3, audit_entries
+from tests.conftest import FakeW3, audit_entries, on_fake_chain
 
 TOKEN = "strict-test-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
 
 
+STRICT = Switches(strict_parameters=True)
+
+
+@pytest.fixture(name="test_signer")
+def strict_signer(
+    account: LocalAccount, app_config: AppConfig, activity: ActivityLog, fake_w3: FakeW3
+) -> Signer:
+    """Return the test signer with the strict_parameters switch on, for this module."""
+    return on_fake_chain(
+        Signer(account, app_config, activity, switches=STRICT), fake_w3
+    )
+
+
 @pytest.fixture
 def mcp(make_mcp: t.Callable[..., FastMCP]) -> FastMCP:
     """Return the MCP server built with the strict_parameters switch on."""
-    return make_mcp(Switches(strict_parameters=True))
+    return make_mcp(STRICT)
 
 
 async def test_an_unknown_parameter_is_ignored_with_the_switch_off(

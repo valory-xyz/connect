@@ -267,8 +267,10 @@ as a maximum, even when revoking). A send with no intent is held to the
 reads it as declaring only what the call itself says (a spend of its own
 `value` in native, its target as the one recipient, no approvals and no
 position leaving) and refuses whatever goes beyond that by the rule it breaks,
-so a plain transfer needs no intent. The bench's `simulate-only` refuses a
-no-intent send only when it reverts. A refusal is its problems in
+so a plain transfer needs no intent; a position leaving under a capped token
+is `token-cap-positions`, otherwise `overspend`. The bench's `simulate-only`
+refuses a no-intent send only when it reverts, except that a capped token's
+call still moves no position (`token-cap-positions`). A refusal is its problems in
 OnchainBench's reference words, joined with `; ` and closed with
 `. Nothing was sent.`: each problem reads `intent gate: rule '<id>' (<detail>)`,
 the detail as the reference words it (`overspend`: `<symbol>: spends <n>,
@@ -276,10 +278,12 @@ intent allows <m>`; `receive-min`: `<symbol>: receives <n>, intent needs <m>`;
 `undeclared-recipient`: the address; `undeclared-approval`: `<symbol> to
 <spender>, <amount>`; `reverts`: the revert reason), a token named by its
 `symbol()` where it has one. `simulate_transaction`'s `problems` are the same
-strings; a call simulated with no intent answers `fits_intent: null` and no
-problems, a revert showing only in the diff's `ok` and `revert` (a call that
-cannot be simulated, or an EOA call refused before simulation, still answers
-`fits_intent: false` with its problem). Only the CELO face's `Transfer` is native:
+strings, and it answers a no-intent call as the send would: under `strict`
+the call is held to what it says, so `fits_intent` and `problems` are those
+of the implied intent; under `simulate-only` it answers `fits_intent: null`
+and no problems, a revert showing only in the diff's `ok` and `revert` (a
+call that cannot be simulated, or an EOA call refused before simulation,
+still answers `fits_intent: false` with its problem). Only the CELO face's `Transfer` is native:
 its `Approval` is an approval like any other, and an intent naming the face in
 `spend` or `receive_min` means `"native"` (naming both is `bad-intent`). Under a
 value-capped token the gate also refuses any ERC-721/1155 position leaving the
@@ -959,8 +963,9 @@ Connect. Two public modules carry that contract:
   reference. The bench imports the module, so a rename fails its suite.
 - `connect.switches` — `Switches`, one position per feature only Connect has
   and per protection Pearl keeps. `PRODUCTION` is what Pearl runs;
-  `TEST_INTERFACE` is the reference's behaviour. A switch is a constructor
-  argument of `create_app` / `build_mcp` and nothing else: no env var,
+  `TEST_INTERFACE` is the reference's behaviour. The set is given once, to
+  `Signer(..., switches=)`, and `create_app` / `build_mcp` read it from the
+  signer, so one build cannot mix two sets: no env var,
   setting or route can set one, `__main__` passes none, and the release binary
   excludes `connect.testing`. So far: `no_intent_policy` (`strict` in Pearl,
   `simulate-only` for the bench; see [Intent gate](#intent-gate)),

@@ -51,7 +51,6 @@ from connect.server.mcp_tools import build_mcp
 from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
 from connect.settings import MODE_RESTRICTED, SettingsStore
 from connect.signer import SERVER_BUILT, Signer
-from connect.switches import PRODUCTION, Switches
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
@@ -170,9 +169,9 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     settings_store: SettingsStore,
     mech: MechService,
     workspace: Workspace,
-    switches: Switches = PRODUCTION,
 ) -> FastAPI:
-    """Create app; see `connect.switches` for `switches`."""
+    """Create app, at the signer's switch positions (`connect.switches`)."""
+    switches = signer.switches
     # the run's token is the workspace's scoped token (read + mech + tx);
     # narrower ones are minted from it through POST /tokens
     grants = GrantStore(token, held=signer.holds_request)
@@ -184,7 +183,6 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
         mech=mech,
         settings_store=settings_store,
         grants=grants,
-        switches=switches,
     )
 
     @asynccontextmanager
