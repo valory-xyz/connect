@@ -306,6 +306,12 @@ def test_built_launch_calls_verify(
     call = launch.build_launch_call(params, 0, pair, FEE, buy)
     assert call["value"] == value
     launch.verify_launch_call(call, params, 0, pair, FEE, buy)
+    # the intent the server re-checks: the fee (and a native buy) in native,
+    # an ERC-20 buy in its own token
+    spend = call["intent"]["spend"]
+    assert spend["native"] == value
+    if buy is not None and not evm.is_native(pair):
+        assert spend[pair.lower()] == buy.quote_in
 
 
 def test_token_params_encode_as_the_factory_struct() -> None:

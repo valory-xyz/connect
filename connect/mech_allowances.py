@@ -19,117 +19,72 @@
 
 """The single-use grants the mech flow registers with the guard."""
 
+import contextlib
+import functools
 import logging
+import typing as t
 
-from eth_abi import encode as abi_encode
-from mech_client.infrastructure.config import (
-    CHAIN_TO_NATIVE_BALANCE_TRACKER,
-    CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS,
-    CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC,
-    PaymentType,
-)
-from mech_client.infrastructure.ipfs.metadata import fetch_ipfs_hash
-from mech_client.services.marketplace_service import (
-    MarketplaceService,
-    _MAX_AUTO_DEPOSIT_RATIO,
-)
-from mech_client.utils.constants import CHAIN_NAME_TO_ID
+from mech_client import balance_tracker
+from mech_client.infrastructure.config import PaymentType
+from mech_client.services.marketplace_service import _MAX_AUTO_DEPOSIT_RATIO
 from web3 import Web3
 
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.mech_types import MechError, PricedMech
-from connect.safe import ZERO_ADDRESS, safe_message_hash
+from connect.mech_types import MechDepositUnknown, PricedMech, top_up_failure
+from connect.safe import (
+    SafeExec,
+    decode_deposit,
+    is_exec_transaction,
+    safe_message_hash,
+)
 from connect.settings import MODE_RESTRICTED
+from connect.signer_errors import SignerError
 
 logger = logging.getLogger("agent")
 
+# what one request armed, each entry withdrawing one grant (MechAllowances.revoke)
+Armed = list[t.Callable[[], None]]
+# draws a top-up's amount on the calling token's mech session budget: the
+# refusal, naming its rule, or None once drawn
+TopUpBudget = t.Callable[[int], str | None]
 
-def request_digest(  # pylint: disable=too-many-arguments
-    *,
-    domain_separator: bytes,
-    marketplace: str,
-    mech: str,
-    requester: str,
-    data_hash: bytes,
-    delivery_rate: int,
-    payment_type: bytes,
-    nonce: int,
-) -> bytes:
-    r"""Recompute MechMarketplace.getRequestId locally — trusting no RPC for it.
 
-    The id an off-chain request signs is EIP-712-shaped::
+class _TopUp(t.NamedTuple):
+    """The one 402 top-up a send may make: its tracker, bound and budget."""
 
-        keccak256("\x19\x01" ‖ domainSeparator ‖ keccak256(abi.encode(
-            marketplace, mech, requester, keccak256(data),
-            deliveryRate, paymentType, nonce)))
-
-    (pinned byte-for-byte against the deployed gnosis marketplace by a
-    golden-vector test). Deriving it here is what keeps the RPC out of the
-    signing trust base: mech-client asks the *contract* for the id over
-    eth_call, and were that answer signed on faith, a lying RPC could hand
-    back any 32 bytes — a safe transaction hash included — and collect a
-    signature on it. Locally derived, the digest is always our own keccak
-    over a preimage we assembled, so a lying RPC (domain separator and nonce
-    are still reads) can only produce a mismatch, which is refused.
-    """
-    struct_hash = Web3.keccak(
-        abi_encode(
-            [
-                "address",
-                "address",
-                "address",
-                "bytes32",
-                "uint256",
-                "bytes32",
-                "uint256",
-            ],
-            [
-                marketplace,
-                mech,
-                requester,
-                Web3.keccak(data_hash),
-                delivery_rate,
-                payment_type,
-                nonce,
-            ],
-        )
-    )
-    return bytes(Web3.keccak(b"\x19\x01" + domain_separator + struct_hash))
+    tracker: str
+    cap: int  # max_payment, within mech-client's ratio of the mech's rate
+    budget: TopUpBudget | None  # None: a caller with no token, nothing to draw on
 
 
 def deposit_tracker(chain: str, payment_type: str) -> tuple[str | None, bool]:
     """Resolve (tracker, is_token) for a payment type; (None, False) otherwise.
 
-    The addresses come from the pinned mech-client's own constants — the same
-    source its deposit path reads — so the allowance armed from this answer
-    names the contract mech-client will actually pay. NVM subscription types
-    resolve to nothing on purpose: mech-client's auto-deposit refuses them
-    too. Malformed constants fail closed to (None, False) — auto-deposit is
-    disarmed rather than a request dying mid-flow. (Unlike the settings-side
-    readers of these tables, a wholly broken mech-client is not survivable
-    here: this module hard-imports it at the top either way.)
+    The tracker is mech-client's `balance_tracker`, the contract its deposit
+    path pays, so the allowance armed from this answer names the contract
+    mech-client will actually pay. None where it names none (NVM
+    subscriptions) or raises (no deployment, a chain it does not know):
+    auto-deposit is then disarmed rather than a request dying mid-flow.
     """
+    kind = PaymentType(payment_type)
     try:
-        chain_id = CHAIN_NAME_TO_ID.get(chain.lower())
-        if chain_id is None:
-            return None, False
-        trackers_by_type: dict[str, tuple[dict, bool]] = {
-            PaymentType.NATIVE.value: (CHAIN_TO_NATIVE_BALANCE_TRACKER, False),
-            PaymentType.OLAS_TOKEN.value: (CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS, True),
-            PaymentType.USDC_TOKEN.value: (CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC, True),
-        }
-        entry = trackers_by_type.get(payment_type)
-        if entry is None:
-            return None, False
-        tracker = str(entry[0].get(chain_id) or "").lower()
-        if not tracker or tracker == ZERO_ADDRESS:
-            return None, False
-        return tracker, entry[1]
-    except Exception as e:  # pylint: disable=broad-exception-caught
+        tracker = balance_tracker(chain, kind)
+    except ValueError as e:
         logger.warning("could not resolve the mech balance tracker: %s", e)
         return None, False
+    if tracker is None:
+        return None, False
+    return tracker.lower(), kind.is_token()
+
+
+def read_map_nonces(contract: t.Any, safe: str) -> int:
+    """Read the marketplace's settled nonce for `safe` (an RPC read).
+
+    mech-client's allocator takes this reader from its caller.
+    """
+    return int(contract.functions.mapNonces(Web3.to_checksum_address(safe)).call())
 
 
 class MechAllowances:
@@ -140,116 +95,136 @@ class MechAllowances:
         self._config = config
         self._guard = guard
         self._activity = activity
+        # chain -> the top-up the send under its queue's lock may make
+        self._top_ups: dict[str, _TopUp] = {}
 
-    def register_offchain_digest(  # pylint: disable=too-many-arguments,too-many-locals
+    def arm(  # pylint: disable=too-many-arguments
         self,
-        service: MarketplaceService,
         *,
         chain: str,
-        priced: PricedMech,
-        prompt: str,
-        tool: str,
-        extra_attributes: dict,
+        safe: str,
+        chain_id: int,
+        mech: str,
+        request_id: bytes,
+        nonce: int,
+        armed: Armed,
     ) -> None:
-        """Derive the digest mech-client will sign, and pre-authorize it once.
+        """Pre-authorize, once, the safe's signature on a request id.
 
-        The requester of record is the service safe (mech-client ≥0.21.3
-        binds agent-mode off-chain requests to the safe on every surface),
-        so the request id commits to the safe, the marketplace nonce is the
-        safe's, and what actually gets signed is the ERC-1271 SafeMessage
-        wrap of the request id — the allowance registers that wrapped hash,
-        the same bytes MechSigner.sign_safe_message will produce.
+        mech-client's pre-sign hook: it hands over the id it is about to sign,
+        derived locally and checked against the contract's getRequestId
+        before the hook runs (a mismatch is RequestIdMismatch, and nothing is
+        signed), so a lying RPC cannot make the safe sign any other digest.
 
-        The request id commits to the metadata CID, which is deterministic
-        here because the salt is pinned: fetch_ipfs_hash generates a random
-        nonce but merges ``extra_attributes`` over it, so this method and
-        mech-client (handed the same dict moments later) run the same pure
-        function on the same inputs and get the same CID. The domain separator
-        and the marketplace nonce are RPC reads; a wrong answer makes the
-        derived digest mismatch the one mech-client asks to sign, so the
-        failure mode is a refusal, never a wrong signature.
-
-        Audited: the allowance is what lets funds-adjacent signing happen in
-        restricted mode, so the trail must show each one that was granted,
-        not only the signatures that followed.
+        Audited in every mode; the allowance is armed only while restricted.
         """
-        safe = self._config.chain(chain).safe_address
-        if safe is None:
-            # unreachable through request(): _service already refused the
-            # chain — kept as a real error so the invariant is not silent
-            raise MechError(
-                f"no service safe is configured for chain '{chain}'; the "
-                "off-chain requester of record is the safe"
-            )
-        try:
-            # same private-but-pinned helper _watch already leans on
-            # pylint: disable-next=protected-access
-            contract = service._get_marketplace_contract()
-            domain_separator = bytes(contract.functions.domainSeparator().call())
-            nonce = int(
-                contract.functions.mapNonces(Web3.to_checksum_address(safe)).call()
-            )
-            marketplace = str(contract.address)
-        except Exception as e:
-            raise MechError(
-                f"could not derive the off-chain request digest: {e}"
-            ) from e
-        data_hash, _, _ = fetch_ipfs_hash(prompt, tool, extra_attributes)
-        request_id = request_digest(
-            domain_separator=domain_separator,
-            marketplace=marketplace,
-            mech=priced.mech,
-            requester=safe,
-            data_hash=bytes.fromhex(data_hash.removeprefix("0x")),
-            delivery_rate=priced.rate,
-            payment_type=bytes.fromhex(priced.payment_type),
-            nonce=nonce,
-        )
-        # the chain id mech-client passes to sign_safe_message for this chain
-        chain_id = int(service.mech_config.ledger_config.chain_id)
-        digest = safe_message_hash(safe, chain_id, request_id)
+        digest = safe_message_hash(safe, chain_id, bytes(request_id))
         if self._guard.mode() == MODE_RESTRICTED:
             self._guard.allow_digest_once(digest)
+            armed.append(functools.partial(self._guard.revoke_digest, digest))
         self._activity.record(
             "mech_offchain_digest",
             chain=chain,
-            mech=priced.mech,
-            request_id="0x" + request_id.hex(),
+            mech=mech,
+            request_id="0x" + bytes(request_id).hex(),
             digest="0x" + digest.hex(),
             nonce=nonce,
         )
 
-    def arm_auto_deposit(self, chain: str, priced: PricedMech) -> bool:
-        """Pre-authorize the one 402 top-up this request may send, and say so.
+    def keeps_auto_deposit(self, chain: str, priced: PricedMech) -> bool:
+        """Say whether auto_deposit should stay on for this request.
 
-        Returns whether auto_deposit should stay on. The deposit pays the
-        balance tracker from the safe, which restricted mode only allows
-        through a one-shot allowance bounded by the same cap mech-client
-        itself enforces on the shortfall (ratio x the mech's per-request
-        rate). The audit record is written in every mode; the allowance is
-        armed only while restricted — unrestricted needs none, and one armed
-        there would outlive a switch back to restricted for its TTL.
-        When no tracker resolves for the payment type, restricted mode
-        disarms instead of letting the flow die mid-request on a guard
-        denial; unrestricted stays armed.
+        Restricted mode lets the 402 top-up through only on a grant naming its
+        tracker, so where no tracker resolves for the payment type it disarms
+        instead of letting the flow die mid-request on a guard denial;
+        unrestricted stays armed.
         """
-        restricted = self._guard.mode() == MODE_RESTRICTED
-        tracker, is_token = deposit_tracker(chain, priced.payment_type)
-        if tracker is None:
-            if restricted:
-                logger.info(
-                    "no balance tracker for payment type %s on %s; auto_deposit "
-                    "disarmed in restricted mode",
-                    priced.payment_type,
-                    chain,
-                )
-                return False
+        if self._guard.mode() != MODE_RESTRICTED:
             return True
-        amount_cap = _MAX_AUTO_DEPOSIT_RATIO * priced.rate
-        if restricted:
-            self._guard.allow_safe_deposit_once(
+        if deposit_tracker(chain, priced.payment_type)[0] is not None:
+            return True
+        logger.info(
+            "no balance tracker for payment type %s on %s; auto_deposit "
+            "disarmed in restricted mode",
+            priced.payment_type,
+            chain,
+        )
+        return False
+
+    @contextlib.contextmanager
+    def auto_deposit_armed(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        priced: PricedMech,
+        *,
+        auto_deposit: bool,
+        max_payment: int,
+        budget: TopUpBudget | None,
+    ) -> t.Iterator[None]:
+        """Pre-authorize the one 402 top-up of the send this wraps, then withdraw it.
+
+        The deposit pays the balance tracker from the safe. It is bounded by
+        the same cap mech-client itself enforces on the shortfall: the
+        request's `max_payment`, within ratio x the mech's per-request rate;
+        `check_top_up` holds it to that cap and draws it on `budget` before
+        it is signed, in every mode, and restricted mode allows it only
+        through a one-shot allowance of that cap. The guard consumes a grant
+        by its shape, not by who
+        armed it, so it is armed only inside the send, under the queue's
+        lock, and withdrawn before that lock is released: one request at a
+        time holds one, and a top-up cannot spend another request's grant.
+        The audit record is written in every mode; the allowance is armed
+        only while restricted — unrestricted needs none, and one armed there
+        would outlive a switch back to restricted for its TTL. A top-up's
+        signer failure is raised unwrapped (`top_up_failure`), and a deposit
+        that may have landed is audited as `mech_deposit_unconfirmed`.
+        """
+        armed: Armed = []
+        if auto_deposit:
+            self._arm_deposit(
+                chain, priced, armed, max_payment=max_payment, budget=budget
+            )
+        try:
+            yield
+        except Exception as e:
+            failure = top_up_failure(e)
+            if isinstance(failure, MechDepositUnknown):
+                self._activity.record(
+                    "mech_deposit_unconfirmed",
+                    chain=chain,
+                    mech=priced.mech,
+                    tx_hash=failure.tx_hash,
+                )
+                raise failure from e
+            if failure is e:
+                raise
+            # the signer's error already below e keeps its own cause: `from e`
+            # would make the chain a loop
+            raise failure from failure.__cause__
+        finally:
+            self.revoke(armed)
+
+    def _arm_deposit(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        priced: PricedMech,
+        armed: Armed,
+        *,
+        max_payment: int,
+        budget: TopUpBudget | None,
+    ) -> None:
+        """Arm the top-up's bound (every mode) and grant (restricted only), audited."""
+        tracker, is_token = deposit_tracker(chain, priced.payment_type)
+        if tracker is None:  # restricted already disarmed it; unrestricted needs none
+            return
+        amount_cap = min(_MAX_AUTO_DEPOSIT_RATIO * priced.rate, max_payment)
+        self._top_ups[chain] = _TopUp(tracker, amount_cap, budget)
+        armed.append(functools.partial(self._disarm_top_up, chain))
+        if self._guard.mode() == MODE_RESTRICTED:
+            grant = self._guard.allow_safe_deposit_once(
                 chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
             )
+            armed.append(functools.partial(self._guard.revoke_safe_deposit, grant))
         self._activity.record(
             "mech_deposit_allowance",
             chain=chain,
@@ -257,4 +232,65 @@ class MechAllowances:
             amount_cap=str(amount_cap),
             is_token=is_token,
         )
-        return True
+
+    def _disarm_top_up(self, chain: str) -> None:
+        """Forget the top-up armed on `chain`: its send has ended."""
+        self._top_ups.pop(chain, None)
+
+    def check_top_up(self, chain: str, to: str, data: str) -> None:
+        """Hold a top-up to its cap and draw it on its budget, before it is signed.
+
+        `MechSigner` calls this on every transaction the mech flow sends; one
+        is a top-up when a top-up is armed on `chain` and it is the safe's call
+        to that tracker, which moves its value plus any `deposit(uint256)`.
+
+        :raises SignerError: past the cap or the budget, naming which.
+        """
+        top_up = self._top_ups.get(chain)
+        safe = str(self._config.chain(chain).safe_address).lower()
+        if top_up is None or to.lower() != safe or not is_exec_transaction(data):
+            return
+        try:
+            call = SafeExec.decode(data)
+        except ValueError:  # the guard refuses what it cannot decode
+            return
+        if call.to.lower() != top_up.tracker:
+            return
+        amount = call.value + (decode_deposit(call.data) or 0)
+        refusal = None
+        if amount > top_up.cap:
+            refusal = (
+                f"the top-up of {amount} is above the {top_up.cap} this request "
+                "may deposit (its max_payment, and at most "
+                f"{_MAX_AUTO_DEPOSIT_RATIO}x the mech's price); deposit it "
+                "yourself or raise max_payment"
+            )
+        elif top_up.budget is not None:
+            refusal = top_up.budget(amount)
+        if refusal is not None:
+            self._activity.record(
+                "mech_deposit_refused",
+                chain=chain,
+                tracker=top_up.tracker,
+                amount=str(amount),
+                reason=refusal,
+            )
+            raise SignerError(refusal)
+
+    def record_deposit(self, chain: str, request_id: str | None, amount: int) -> None:
+        """Audit what a top-up deposited before the mech refused or lost it."""
+        if amount:
+            self._activity.record(
+                "mech_deposit", chain=chain, request_id=request_id, amount=str(amount)
+            )
+
+    @staticmethod
+    def revoke(armed: Armed) -> None:
+        """Withdraw every grant a request armed; it signs nothing more.
+
+        Called on every exit of the send, so no grant outlives its request:
+        a refusal before the POST spends nothing, and a grant unused by a sent
+        request is not left for another caller to consume.
+        """
+        while armed:
+            armed.pop()()

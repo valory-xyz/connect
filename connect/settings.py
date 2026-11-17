@@ -54,6 +54,7 @@ from eth_account.signers.local import LocalAccount
 from web3 import Web3
 
 from connect.activity import ActivityLog
+from connect.chains import MECH_CLIENT_CHAIN_NAMES
 from connect.safe import ZERO_ADDRESS
 
 logger = logging.getLogger("agent")
@@ -278,7 +279,11 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     The marketplace is the only contract the safe CALLs to *submit* a mech
     request (`request`/`requestBatch`; native payment rides as the inner
     value); token-paid mechs additionally `approve` the payment token, see
-    token_approve_targets(). Balance trackers are deliberately NOT whitelisted —
+    token_approve_targets(). A marketplace takes only the requests the
+    server's mech flow composes, in every mode; the guard reads the
+    marketplaces from Connect's own `chains.MECH_MARKETPLACES`, not from
+    this read. Balance
+    trackers are deliberately NOT whitelisted —
     the safe only calls them for prepaid deposits, which restricted mode
     admits through the guard's one-shot capped deposit allowances (armed per
     off-chain request by the mech flow). Payment token contracts
@@ -293,7 +298,8 @@ def _mech_system_addresses() -> dict[str, list[str]]:
     their persisted whitelist as-is — it is operator-owned state, and merging
     defaults at load time would silently re-add an address the operator
     deliberately removed. An upgrade that moves the marketplace reaches them
-    only when settings are reset or re-saved.
+    only when settings are reset or re-saved; until then the address they
+    hold stays in `chains.MECH_MARKETPLACES`, so it admits no agent call.
     """
     # pylint: disable=import-outside-toplevel
     try:
@@ -315,40 +321,58 @@ def _mech_system_addresses() -> dict[str, list[str]]:
         return {}
 
 
+def prepaid_balance_trackers(chain: str) -> dict[str, str]:
+    """Return each mech balance tracker on `chain` -> the asset its balance is in.
+
+    The asset is a payment token's lowercase address, or "native". From the
+    pinned mech-client (`balance_tracker`, `payment_token`); a payment type
+    with no tracker deployed on the chain is left out, and so is every one on
+    a chain mech-client does not know.
+
+    :raises ValueError: mech-client cannot resolve the chain id payments use
+        (a malformed `MECHX_LEDGER_CHAIN_ID` or `MECHX_GAS_LIMIT`), so the
+        table cannot be read; never read as "none deployed".
+    """
+    # pylint: disable=import-outside-toplevel
+    from mech_client import balance_tracker, payment_token
+    from mech_client.infrastructure.config import PaymentType
+    from mech_client.infrastructure.config.loader import get_chain_id, ledger_chain_id
+
+    name = MECH_CLIENT_CHAIN_NAMES.get(chain.lower(), chain.lower())
+    try:
+        get_chain_id(name)
+    except ValueError:  # a chain mech-client does not know
+        return {}
+    # the lookups below read the same environment, so past this line their
+    # ValueError can only mean "not deployed on this chain"
+    ledger_chain_id(name)
+    trackers: dict[str, str] = {}
+    for payment_type in PaymentType:
+        try:
+            tracker = balance_tracker(name, payment_type)
+            token = payment_token(payment_type, name)
+        except ValueError:  # not deployed on this chain
+            continue
+        if tracker is not None:
+            trackers[tracker.lower()] = (token or "native").lower()
+    return trackers
+
+
 def token_approve_targets(chain: str) -> dict[str, str]:
     """Payment token -> its mech balance tracker for one chain, from mech-client.
 
     In restricted mode the safe may `approve` these tokens, but only with the
-    tracker as spender (the guard enforces that). A token is included only when
-    both it and its tracker are configured for the chain. Fail closed to empty
-    if mech-client cannot be read.
+    tracker as spender (the guard enforces that). The inverse of
+    `prepaid_balance_trackers`' token entries, so the guard's approve targets
+    and the intent gate's trackers are one reading of mech-client's table.
+    Fail closed to empty, logged, if mech-client cannot be read.
     """
-    # pylint: disable=import-outside-toplevel
     try:
-        from mech_client.infrastructure.config import (
-            CHAIN_TO_PRICE_TOKEN_OLAS,
-            CHAIN_TO_PRICE_TOKEN_USDC,
-            CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS,
-            CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC,
-        )
-        from mech_client.utils.constants import CHAIN_NAME_TO_ID
-
-        chain_id = CHAIN_NAME_TO_ID.get(chain.lower())
-        if chain_id is None:
-            return {}
-        result: dict[str, str] = {}
-        for tokens, trackers in (
-            (CHAIN_TO_PRICE_TOKEN_USDC, CHAIN_TO_TOKEN_BALANCE_TRACKER_USDC),
-            (CHAIN_TO_PRICE_TOKEN_OLAS, CHAIN_TO_TOKEN_BALANCE_TRACKER_OLAS),
-        ):
-            token = (tokens.get(chain_id) or "").lower()
-            tracker = (trackers.get(chain_id) or "").lower()
-            if token and tracker and ZERO_ADDRESS not in (token, tracker):
-                result[token] = tracker
-        return result
+        trackers = prepaid_balance_trackers(chain)
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.warning("could not load mech token payment addresses: %s", e)
         return {}
+    return {asset: tracker for tracker, asset in trackers.items() if asset != "native"}
 
 
 def default_whitelist() -> dict[str, tuple[str, ...]]:

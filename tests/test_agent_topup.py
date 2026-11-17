@@ -37,6 +37,7 @@ from connect.guard import Guard
 from connect.server import app as app_module
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import Signer, SignerError, _ChainState
+from connect.signer_errors import SEND_FAILED
 from connect.wallet import AgentTopUp, plan_agent_topup
 
 from tests.conftest import FakeW3, audit_entries
@@ -511,7 +512,8 @@ class TestTopUpAgentSigner:
         ]
         (failed,) = _audited(app_config, "agent_topup_failed")
         assert (failed["chain"], failed["tx_hash"]) == ("broken", None)
-        assert "nonce too low" in failed["error"]
+        assert failed["error"] == SEND_FAILED  # the RPC's own text: log only
+        assert "nonce too low" in caplog.text
         assert not _audited(app_config, "send_failed")
         assert _performance_card(app_config) == (0, None)
 

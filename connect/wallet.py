@@ -29,10 +29,13 @@ from dataclasses import dataclass
 
 from web3 import Web3
 
+from connect.chains import chain_info
 from connect.config import AppConfig, FundRequirement, NATIVE_ASSET
 from connect.signer import Signer
 
 logger = logging.getLogger("agent")
+# what a failed balance read reports; the RPC library's text goes to the log
+BALANCE_READ_FAILED = "balance read failed (the cause is in Connect's log)"
 
 ERC20_ABI = [
     {
@@ -207,8 +210,10 @@ def wallet_overview(config: AppConfig, signer: Signer) -> dict:
                 balances["safe"] = str(
                     w3.eth.get_balance(Web3.to_checksum_address(safe))
                 )
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            balances = {"error": str(e)}
+        except Exception:  # pylint: disable=broad-exception-caught
+            # the RPC library's text may name the RPC URL and its key
+            logger.warning("balance read on %s failed", chain, exc_info=True)
+            balances = {"error": BALANCE_READ_FAILED}
         reason = _not_actionable_because(safe, balances)
         entry: dict = {
             "rpc": chain_config.rpc_url,
@@ -218,6 +223,11 @@ def wallet_overview(config: AppConfig, signer: Signer) -> dict:
         }
         if reason is not None:
             entry["not_actionable_because"] = reason
+        info = chain_info(chain)
+        if info is not None:
+            # chain id, native symbol, and whether a mech marketplace (or the
+            # facilitator) is there, so "none here" is known before a request
+            entry.update(info)
         chains[chain] = entry
     actionable = [chain for chain, entry in chains.items() if entry["actionable"]]
     return {

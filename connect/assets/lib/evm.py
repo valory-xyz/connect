@@ -63,12 +63,22 @@ MULTICALL3 = to_checksum_address("0xcA11bde05977b3631167028862bE2a173976CA11")
 
 
 class Call(t.TypedDict):
-    """One call the safe makes, as the signer expects it."""
+    """One call the safe makes, as the signer expects it.
+
+    `intent` is what the call may do (spend caps, the least it must receive,
+    recipients, approvals); the signer refuses a value-moving call without one.
+    """
 
     to: str
     data: str
     what: str
     value: t.NotRequired[int]
+    intent: t.NotRequired[dict]
+
+
+def intent_token(token: str) -> str:
+    """Return the key an intent uses for a token: "native", or its address."""
+    return "native" if is_native(token) else token.lower()
 
 
 class SwapError(RuntimeError):
@@ -448,7 +458,16 @@ def erc20_approval_call(token: str, spender: str, amount: int, label: str) -> Ca
     data = SEL_ERC20_APPROVE + abi_encode(
         ["address", "uint256"], [to_checksum_address(spender), amount]
     )
-    return {"to": token, "data": "0x" + data.hex(), "what": label}
+    return {
+        "to": token,
+        "data": "0x" + data.hex(),
+        "what": label,
+        "intent": {
+            "approvals": [
+                {"token": token.lower(), "spender": spender.lower(), "amount": amount}
+            ]
+        },
+    }
 
 
 def to_base_units(w3: Web3, token: str, whole: float) -> int:
@@ -472,13 +491,22 @@ def weth_deposit_call(weth: str, amount: int) -> Call:
         "data": "0x" + SEL_WETH_DEPOSIT.hex(),
         "what": "wrap ETH",
         "value": amount,
+        "intent": {
+            "spend": {"native": amount},
+            "receive_min": {weth.lower(): amount},
+        },
     }
 
 
 def weth_withdraw_call(weth: str, amount: int) -> Call:
     """Unwrap this much WETH back into native coin."""
     data = SEL_WETH_WITHDRAW + abi_encode(["uint256"], [amount])
-    return {"to": weth, "data": "0x" + data.hex(), "what": "unwrap WETH"}
+    return {
+        "to": weth,
+        "data": "0x" + data.hex(),
+        "what": "unwrap WETH",
+        "intent": {"spend": {weth.lower(): amount}, "receive_min": {"native": amount}},
+    }
 
 
 class Sent(t.NamedTuple):
@@ -513,7 +541,8 @@ REFUSED_BEFORE_SIGNING = "The signer refused it before signing; nothing was broa
 REVERTED_BEFORE_SIGNING = (
     "It reverted in simulation before signing; nothing was broadcast."
 )
-# /safe-transaction refusals raised before signing; pinned to the server by a test.
+# /safe-transaction refusals raised before signing, the guard's, the intent
+# gate's and a scoped token's; pinned to the server by a test.
 SIGNER_REFUSALS: dict[int, tuple[str, ...]] = {
     400: (
         "unknown chain '",
@@ -522,9 +551,11 @@ SIGNER_REFUSALS: dict[int, tuple[str, ...]] = {
         "the safe may not call itself ",
         "the operator's guardrail settings do not allow the safe to call ",
         "the guardrail only allows approve(spender=",
+        "refused by the intent gate: ",
     ),
-    401: ("invalid or missing bearer token",),
-    403: ("cross-origin requests are not allowed",),
+    # a scoped token's refusal names its rule: an expired token is a 401
+    401: ("invalid or missing bearer token", "rule 'token-expired': "),
+    403: ("cross-origin requests are not allowed", "rule '"),
     429: ("too many failed authentication attempts",),
 }
 SIGNER_SIMULATION_REVERT = re.compile(r"send failed: .*execution reverted", re.DOTALL)
@@ -590,6 +621,7 @@ def send_calls(w3: Web3, signer: t.Any, calls: list[Call]) -> list[Sent]:
 
 __all__ = [
     "Call",
+    "intent_token",
     "DEFAULT_MAX_IMPACT_BPS",
     "LOG_BACKOFF_CAP_S",
     "MAX_IMPACT_CEILING_BPS",

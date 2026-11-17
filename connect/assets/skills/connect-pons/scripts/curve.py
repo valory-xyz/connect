@@ -226,6 +226,9 @@ def buy_calls(
         "data": _trade_call(SEL_BUY, quote_in, min_tokens_out, recipient),
         "value": value,
         "what": "curve buy",
+        # the floor on tokens out is already in the calldata and re-checked
+        # above; the intent caps what the buy may spend
+        "intent": {"spend": {evm.intent_token(pair_token): quote_in}},
     }
     verify_trade(buy, True, curve, quote_in, min_tokens_out, recipient, value)
     if native:
@@ -243,6 +246,7 @@ def sell_calls(
         "data": _trade_call(SEL_SELL, tokens_in, min_quote_out, recipient),
         "value": 0,
         "what": "curve sell",
+        "intent": {"spend": {token.lower(): tokens_in}},
     }
     verify_trade(sell, False, curve, tokens_in, min_quote_out, recipient, 0)
     approve = evm.erc20_approval_call(token, curve, tokens_in, "approve curve")

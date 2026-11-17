@@ -29,16 +29,20 @@ from pathlib import Path
 import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client import NonceAllocator, NonceRefused, RULE_QUEUE_LOCKED
+from web3 import Web3
+from web3.exceptions import ContractLogicError
 
 from connect import wallet as wallet_module
 from connect import workspace
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server import app as app_module
+from connect.server import receipts
 from connect.settings import HARNESSES
 from connect.signer import Signer
 
-from tests.conftest import FakeW3, audit_entries, audit_kinds
+from tests.conftest import FakeW3, audit_entries, audit_kinds, pay
 
 TOKEN = "unit-test-token"  # nosec B105
 
@@ -517,7 +521,12 @@ class TestAuth:
         """Test sign and send."""
         response = client.post(
             "/sign-and-send",
-            json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": "0x10"},
+            json={
+                "chain": "testchain",
+                "to": "0x" + "aa" * 20,
+                "value": "0x10",
+                "intent": pay("0x" + "aa" * 20, 16),
+            },
             headers=auth(),
         )
         assert response.status_code == 200
@@ -528,12 +537,250 @@ class TestAuth:
         """The route names the inner call; the server composes the safe's tx."""
         response = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": "0x10"},
+            json={
+                "chain": "testchain",
+                "target": "0x" + "aa" * 20,
+                "value": "0x10",
+                "intent": pay("0x" + "aa" * 20, 16),
+            },
             headers=auth(),
         )
         assert response.status_code == 200
         assert response.json()["tx_hash"].startswith("0x")
         assert len(fake_w3.eth.sent) == 1
+
+    @pytest.mark.parametrize(
+        ("path", "to_key"), [("/safe-transaction", "target"), ("/sign-and-send", "to")]
+    )
+    def test_a_route_waits_for_the_receipt_as_the_tool_does(
+        self, client: TestClient, fake_w3: FakeW3, path: str, to_key: str
+    ) -> None:
+        """wait_for_receipt and timeout: the same fields, the same status."""
+        fake_w3.eth.receipt = {
+            "status": 1,
+            "blockNumber": 7,
+            "gasUsed": 21000,
+            "logs": [],
+        }
+        body = {
+            "chain": "testchain",
+            to_key: "0x" + "aa" * 20,
+            "value": 16,
+            "intent": pay("0x" + "aa" * 20, 16),
+            "wait_for_receipt": True,
+            "timeout": 5,
+        }
+        mined = client.post(path, json=body, headers=auth())
+        assert mined.status_code == 200
+        assert mined.json()["status"] == "mined"
+        assert mined.json()["receipt"]["status"] == 1
+        assert fake_w3.eth.receipt_waits == [5]  # the body's timeout, forwarded
+        huge = {
+            **body,
+            "timeout": 10**9,
+            "value": 19,
+            "intent": pay("0x" + "aa" * 20, 19),
+        }
+        client.post(path, json=huge, headers=auth())
+        assert fake_w3.eth.receipt_waits[-1] == receipts.MAX_RECEIPT_TIMEOUT
+        fake_w3.eth.receipt = None
+        pending = client.post(
+            path,
+            json={**body, "value": 17, "intent": pay("0x" + "aa" * 20, 17)},
+            headers=auth(),
+        )
+        assert pending.json()["status"] == "pending"
+        quick = client.post(
+            path,
+            json={
+                **body,
+                "wait_for_receipt": False,
+                "value": 18,
+                "intent": pay("0x" + "aa" * 20, 18),
+            },
+            headers=auth(),
+        )
+        assert set(quick.json()) == {"tx_hash"}
+
+    @pytest.mark.parametrize(
+        ("tool", "path", "to_key"),
+        [
+            ("safe_transaction", "/safe-transaction", "target"),
+            ("send_transaction", "/sign-and-send", "to"),
+        ],
+    )
+    @pytest.mark.parametrize("surface", ["http", "mcp"])
+    @pytest.mark.parametrize("fails", ["broadcast", "receipt", "simulation"])
+    @pytest.mark.parametrize(
+        "leak",
+        [
+            # urllib3's own form: no scheme, the key in the path
+            (
+                "HTTPSConnectionPool(host='rpc.example', port=443): Max retries "
+                + "exceeded with url: /v2/SECRETKEY (Caused by NewConnectionError)"
+            ),
+            "https://rpc.example/v3/SECRETKEY timed out",
+        ],
+    )
+    def test_a_library_error_never_reaches_the_answer(  # pylint: disable=too-many-arguments
+        self,
+        client: TestClient,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        tool: str,
+        path: str,
+        to_key: str,
+        surface: str,
+        fails: str,
+        leak: str,
+    ) -> None:
+        """An RPC's error text may name its URL, key and all: only the log sees it."""
+
+        def broken(*_args: t.Any, **_kwargs: t.Any) -> t.Any:
+            raise ConnectionError(leak)
+
+        if fails == "simulation":
+            monkeypatch.setattr(fake_w3.provider, "make_request", broken)
+        else:
+            name = {
+                "broadcast": "send_raw_transaction",
+                "receipt": "wait_for_transaction_receipt",
+            }[fails]
+            monkeypatch.setattr(fake_w3.eth, name, broken)
+        arguments = {
+            "chain": "testchain",
+            to_key: "0x" + "aa" * 20,
+            "value": 16,
+            "intent": pay("0x" + "aa" * 20, 16),
+            "wait_for_receipt": True,
+        }
+        if surface == "http":
+            answer = client.post(path, json=arguments, headers=auth())
+        else:
+            call = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            }
+            answer = client.post(
+                "/mcp/",
+                json=call,
+                headers={"Accept": "application/json, text/event-stream", **auth()},
+            )
+        assert "SECRETKEY" not in answer.text
+        assert "rpc.example" not in answer.text
+        expected = {
+            "broadcast": "the transaction may have been sent",
+            "receipt": "receipt could not be read",
+            "simulation": "cannot simulate this call",
+        }[fails]
+        assert expected in answer.text
+
+    @pytest.mark.parametrize(
+        ("tool", "path", "to_key"),
+        [
+            ("safe_transaction", "/safe-transaction", "target"),
+            ("send_transaction", "/sign-and-send", "to"),
+        ],
+    )
+    @pytest.mark.parametrize("surface", ["http", "mcp"])
+    @pytest.mark.parametrize("wait_for_receipt", [False, True])
+    def test_a_retry_after_a_possibly_sent_broadcast_is_never_a_confirmed_send(  # pylint: disable=too-many-arguments
+        self,
+        client: TestClient,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        tool: str,
+        path: str,
+        to_key: str,
+        surface: str,
+        wait_for_receipt: bool,
+    ) -> None:
+        """The retry the error invites answers the same error: hash held, nothing sent."""
+        taken: list[bytes] = []
+
+        def timed_out(raw: bytes) -> t.Any:
+            taken.append(bytes(raw))
+            raise TimeoutError("read timed out")
+
+        monkeypatch.setattr(fake_w3.eth, "send_raw_transaction", timed_out)
+        arguments = {
+            "chain": "testchain",
+            to_key: "0x" + "aa" * 20,
+            "value": 16,
+            "intent": pay("0x" + "aa" * 20, 16),
+            "request_id": "retry-me",
+            "wait_for_receipt": wait_for_receipt,
+        }
+
+        def send() -> t.Any:
+            if surface == "http":
+                return client.post(path, json=arguments, headers=auth())
+            call = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            }
+            return client.post(
+                "/mcp/",
+                json=call,
+                headers={"Accept": "application/json, text/event-stream", **auth()},
+            )
+
+        first, retry = send(), send()
+        (raw,) = taken  # the retry broadcast nothing
+        tx_hash = Web3.keccak(raw).to_0x_hex()
+        for answer in (first, retry):
+            assert tx_hash in answer.text
+            assert "its request_id stays held with that hash" in answer.text
+            if surface == "http":
+                assert answer.status_code == 400
+            else:
+                assert '"isError":true' in answer.text
+        assert fake_w3.eth.receipt_waits == []
+
+    def test_a_revert_keeps_the_contract_s_reason(
+        self, client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A revert is the contract's answer, not the RPC's: its reason stays."""
+
+        def reverting(_tx: t.Any) -> t.Any:
+            raise ContractLogicError("execution reverted: GS013", data="0x")
+
+        monkeypatch.setattr(fake_w3.eth, "estimate_gas", reverting)
+        answer = client.post(
+            "/sign-and-send",
+            json={"chain": "testchain", "to": "0x" + "aa" * 20, "data": "0x12"},
+            headers=auth(),
+        )
+        assert answer.json()["detail"] == "send failed: execution reverted: GS013"
+        bare = ContractLogicError("GS013", data="0x")  # no "execution reverted"
+        monkeypatch.setattr(
+            fake_w3.eth, "estimate_gas", lambda _tx: (_ for _ in ()).throw(bare)
+        )
+        again = client.post(
+            "/sign-and-send",
+            json={"chain": "testchain", "to": "0x" + "aa" * 20, "data": "0x12"},
+            headers=auth(),
+        )
+        assert again.json()["detail"] == "send failed: execution reverted: GS013"
+
+    def test_a_failed_balance_read_names_no_rpc(
+        self, client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """wallet_info's per-chain error is Connect's words, not the RPC library's."""
+
+        def broken(*_args: t.Any, **_kwargs: t.Any) -> t.Any:
+            raise ConnectionError("with url: /v2/SECRETKEY")
+
+        monkeypatch.setattr(fake_w3.eth, "get_balance", broken)
+        answer = client.get("/wallet", headers=auth())
+        assert "SECRETKEY" not in answer.text
+        assert answer.json()["chains"]["testchain"]["balances"] == {
+            "error": wallet_module.BALANCE_READ_FAILED
+        }
 
     def test_safe_transaction_without_a_safe_is_400(
         self, client: TestClient, fake_w3: FakeW3
@@ -541,7 +788,7 @@ class TestAuth:
         """A chain we cannot spend from is the caller's problem, not a 500."""
         response = client.post(
             "/safe-transaction",
-            json={"chain": "mystery", "to": "0x" + "aa" * 20},
+            json={"chain": "mystery", "target": "0x" + "aa" * 20},
             headers=auth(),
         )
         assert response.status_code == 400
@@ -557,13 +804,13 @@ class TestAuth:
         """
         bad_target = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "to": "0x1234"},
+            json={"chain": "testchain", "target": "0x1234"},
             headers=auth(),
         )
         assert bad_target.status_code == 400
         huge_value = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": 2**256},
+            json={"chain": "testchain", "target": "0x" + "aa" * 20, "value": 2**256},
             headers=auth(),
         )
         assert huge_value.status_code == 400
@@ -577,3 +824,23 @@ class TestAuth:
             headers=auth(),
         )
         assert response.status_code == 400
+
+
+def test_the_app_holds_the_one_queue_store_and_releases_it_on_shutdown(
+    make_app: t.Callable,
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+) -> None:
+    """One allocator per STORE_PATH: a second is refused while the app runs.
+
+    mech-client's allocator takes an advisory lock on the store, so the
+    lifespan must close it on shutdown or a restart in this process (or the
+    next one, on some platforms) is refused as mech-queue-locked.
+    """
+    app = make_app(test_signer, app_config, activity)
+    with TestClient(app, base_url="http://127.0.0.1:8716"):
+        with pytest.raises(NonceRefused) as refused:
+            NonceAllocator(app_config.store_path, settle_timeout=1, gap_retries=0)
+        assert refused.value.rule == RULE_QUEUE_LOCKED
+    NonceAllocator(app_config.store_path, settle_timeout=1, gap_retries=0).close()

@@ -32,6 +32,7 @@ that hand a URL to a URL handler or a command to a terminal, and the
 environment scrub that keeps our own packaging out of the session it starts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -461,7 +462,10 @@ class Workspace:
         if self._ocb_mech is None:
             raise ValueError("OCB has no confirmed chat mech on this instance's chain")
         command = ocb_command(
-            self.ocb.ensure(OCB_SESSION_WAIT_SECONDS), self._ocb_mech, self.path
+            self.ocb.ensure(OCB_SESSION_WAIT_SECONDS),
+            self._ocb_mech,
+            self.path,
+            skill_hashes(),
         )
         if not _open_terminal(self.path, command):
             raise OcbLaunchError(
@@ -573,6 +577,22 @@ class Workspace:
             target_root.mkdir(parents=True, exist_ok=True)
             for skill_dir in skills:
                 _replace_tree(skill_dir, target_root / skill_dir.name)
+
+
+def skill_hashes() -> list[str]:
+    """Return the SHA-256 of each bundled skill file, as installed in the workspace.
+
+    `_install_skills` copies each skill tree byte for byte, so the bundle's
+    `SKILL.md` and the workspace copy hash alike. Sorted, so the launch line
+    is stable; empty when the bundle has no skills.
+    """
+    skills = assets_dir() / "skills"
+    if not skills.is_dir():
+        return []
+    return sorted(
+        hashlib.sha256(skill.read_bytes()).hexdigest()
+        for skill in skills.glob("*/SKILL.md")
+    )
 
 
 def _remove(target: Path) -> None:

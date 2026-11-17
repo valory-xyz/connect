@@ -51,6 +51,9 @@ SAFES_ENV = CUSTOM_ENV_VARS_PREFIX + "SAFE_CONTRACT_ADDRESSES"
 FUND_REQUIREMENTS_ENV = CUSTOM_ENV_VARS_PREFIX + "FUND_REQUIREMENTS"
 LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
+MECH_SETTLE_TIMEOUT_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_SETTLE_TIMEOUT"
+MECH_GAP_RETRIES_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_GAP_RETRIES"
+MECH_HARD_CANCEL_AFTER_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_HARD_CANCEL_AFTER"
 
 # A QA override, never set by Pearl: OCB_CHAT_MECH_GNOSIS=0x... gives OCB that
 # chat mech on that chain in place of the shipped one
@@ -59,6 +62,14 @@ OCB_CHAT_MECH_ENV_PREFIX = "OCB_CHAT_MECH_"
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_MINUTES_PER_RUN = 15
+# seconds mapNonces may take to pass a delivered (or timed-out) mech request
+# before its safe's queue stalls; and how often a 503 gap resends a nonce
+DEFAULT_MECH_SETTLE_TIMEOUT = 1800
+DEFAULT_MECH_GAP_RETRIES = 3
+# seconds a safe's queue must have been stalled before the operator may hard
+# cancel it (one paid on-chain request); longer than the settle timeout, so a
+# queue gets the time to clear itself first
+DEFAULT_MECH_HARD_CANCEL_AFTER = 21600
 
 
 class FundRequirement(TypedDict):
@@ -77,7 +88,7 @@ class ChainConfig:
 
 
 @dataclass
-class AppConfig:
+class AppConfig:  # pylint: disable=too-many-instance-attributes
     """AppConfig."""
 
     chains: dict[str, ChainConfig]
@@ -90,6 +101,20 @@ class AppConfig:
     # the starting run window; the first write stores it, and the stored value
     # wins from then on, so changing this never reaches an existing install
     minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
+    mech_settle_timeout: int = DEFAULT_MECH_SETTLE_TIMEOUT
+    mech_gap_retries: int = DEFAULT_MECH_GAP_RETRIES
+    mech_hard_cancel_after: int = DEFAULT_MECH_HARD_CANCEL_AFTER
+
+    def __post_init__(self) -> None:
+        """Refuse a hard-cancel window no longer than the settle timeout."""
+        if self.mech_hard_cancel_after <= self.mech_settle_timeout:
+            raise ValueError(
+                f"{MECH_HARD_CANCEL_AFTER_ENV} ({self.mech_hard_cancel_after}s) "
+                "must be longer than "
+                f"{MECH_SETTLE_TIMEOUT_ENV} ({self.mech_settle_timeout}s): a "
+                "stalled queue gets the settle timeout to clear itself first"
+            )
+
     # chain -> OCB chat mech, from OCB_CHAT_MECH_<CHAIN>
     ocb_chat_mech_overrides: dict[str, str] = field(default_factory=dict)
 
@@ -234,6 +259,20 @@ def _parse_minutes_per_run(raw: str) -> int:
         ) from e
 
 
+def _parse_count(env: dict[str, str], name: str, default: int) -> int:
+    """Parse a whole number >= 0 from the environment; unset means the default."""
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ValueError(f"{name} is not a whole number >= 0: {raw!r}")
+    return value
+
+
 def _is_mech_address(value: str) -> bool:
     """Whether `value` is a 0x address, checksummed whenever it is mixed case.
 
@@ -304,5 +343,14 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         fund_requirements=fund_requirements,
         log_level=log_level,
         minutes_per_run=_parse_minutes_per_run(env.get(MINUTES_PER_RUN_ENV, "")),
+        mech_settle_timeout=_parse_count(
+            env, MECH_SETTLE_TIMEOUT_ENV, DEFAULT_MECH_SETTLE_TIMEOUT
+        ),
+        mech_gap_retries=_parse_count(
+            env, MECH_GAP_RETRIES_ENV, DEFAULT_MECH_GAP_RETRIES
+        ),
+        mech_hard_cancel_after=_parse_count(
+            env, MECH_HARD_CANCEL_AFTER_ENV, DEFAULT_MECH_HARD_CANCEL_AFTER
+        ),
         ocb_chat_mech_overrides=_parse_ocb_chat_mechs(env),
     )
