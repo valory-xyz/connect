@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from web3 import Web3
 
 from connect import ocb
 from connect import settings as settings_module
@@ -129,9 +130,15 @@ def test_ocb_needs_a_chat_mech_and_not_windows(
     assert harness_unavailable_reason(harness, mech, platform) == expected
 
 
-def test_no_chat_mech_ships_confirmed() -> None:
-    """Until each mech is deployed and confirmed, OCB is offered nowhere."""
-    assert set(settings_module.OCB_CHAT_MECHS.values()) == {None}
+def test_the_deployed_chat_mechs_ship() -> None:
+    """Each chain ships its deployed, on-chain-confirmed chat mech."""
+    assert settings_module.OCB_CHAT_MECHS == {
+        "gnosis": "0x4a8A3FA1cde489DFec96F8442d65e9526ec3405c",
+        "polygon": "0x364b8238C7d9a05e0F68F87cfF364b6aBD926fEc",
+        "robinhood": "0xd3f392C8384cAa4D2864ACba826374337d43a100",
+    }
+    for mech in settings_module.OCB_CHAT_MECHS.values():
+        assert Web3.is_checksum_address(mech)
     assert settings_module.HARNESSES[-1] == HARNESS_OCB_CLI
     assert DEFAULT_HARNESS != HARNESS_OCB_CLI
 

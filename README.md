@@ -189,8 +189,9 @@ session could read the keys in `~/.operate`. Elsewhere it is unavailable with
 safe) has a chat mech: `OCB_CHAT_MECH_<CHAIN>` if set (e.g.
 `OCB_CHAT_MECH_GNOSIS=0x...`, a QA override Pearl never sets; anything but an
 address is a configuration error), else that chain's entry in
-`OCB_CHAT_MECHS` (`connect/settings.py`), where `None` means no confirmed
-chat mech. `__main__.resolve_ocb_mech` resolves it once at boot, and both
+`OCB_CHAT_MECHS` (`connect/settings.py`), which ships the deployed chat mech
+for gnosis, polygon and robinhood (a `None` entry would mean no confirmed
+chat mech on that chain). `__main__.resolve_ocb_mech` resolves it once at boot, and both
 this rule and the launch line read that value. When it finds none it logs
 why: no single chain carries a safe, or the instance chain has no confirmed
 mech and no override; an override for any other chain is logged as having no

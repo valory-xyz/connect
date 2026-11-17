@@ -515,6 +515,7 @@ class TestMain:
     ) -> None:
         """An override for another chain does not make OCB available here."""
         monkeypatch.setattr(main_module.sys, "platform", "linux")
+        monkeypatch.setitem(settings_module.OCB_CHAT_MECHS, "gnosis", None)
         monkeypatch.setenv("OCB_CHAT_MECH_POLYGON", "0x" + "ab" * 20)
         monkeypatch.setenv(
             "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
@@ -551,7 +552,8 @@ class TestMain:
         served: list[StubServer],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Today's case on every chain: a chain, no override, nothing shipped."""
+        """A chain, no override, and nothing shipped for that chain."""
+        monkeypatch.setitem(settings_module.OCB_CHAT_MECHS, "gnosis", None)
         monkeypatch.setenv(
             "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
         )

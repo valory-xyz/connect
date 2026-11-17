@@ -53,7 +53,7 @@ LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 
 # A QA override, never set by Pearl: OCB_CHAT_MECH_GNOSIS=0x... gives OCB that
-# chain's chat mech before the shipped table has a confirmed one
+# chat mech on that chain in place of the shipped one
 OCB_CHAT_MECH_ENV_PREFIX = "OCB_CHAT_MECH_"
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")

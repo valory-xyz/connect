@@ -105,12 +105,12 @@ DEFAULT_HARNESS = HARNESS_CLAUDE_CODE_CLI
 # OCB's model is a chat mech paid per request through mech_request; the
 # budget matches OCB's own per-session cap on mech spending
 OCB_MODEL_BUDGET_USD = 1
-# chain -> OCB's chat mech; None until that mech is deployed and confirmed,
-# which leaves "OCB CLI" unavailable there rather than unable to think
+# chain -> OCB's chat mech (deployed and confirmed on-chain); None would leave
+# "OCB CLI" unavailable on that chain rather than unable to think
 OCB_CHAT_MECHS: dict[str, str | None] = {
-    "gnosis": None,
-    "polygon": None,
-    "robinhood": None,
+    "gnosis": "0x4a8A3FA1cde489DFec96F8442d65e9526ec3405c",
+    "polygon": "0x364b8238C7d9a05e0F68F87cfF364b6aBD926fEc",
+    "robinhood": "0xd3f392C8384cAa4D2864ACba826374337d43a100",
 }
 # the only reasons GET /settings may give; connect-ui renders each one
 UnavailableReason = t.Literal["windows_unsupported", "model_unavailable"]
