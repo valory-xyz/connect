@@ -22,18 +22,25 @@
 
 Each switch has a production position, which Pearl always runs, and a
 test-interface position, the bench's reference behaviour. They are
-constructor arguments only (`create_app(..., switches=)`): no env var,
-setting or route can set one, and `__main__` passes none, so Pearl never
-leaves `PRODUCTION`.
+constructor arguments only (`create_app(..., switches=)`,
+`Signer(..., switches=)`): no env var, setting or route can set one, and
+`__main__` passes none, so Pearl never leaves `PRODUCTION`.
 """
 
+import typing as t
 from dataclasses import dataclass
+
+# strict: a send with no intent is held to its own value, no approvals and no
+# recipient but its target; simulate-only: it is refused only if it reverts
+NoIntentPolicy = t.Literal["strict", "simulate-only"]
 
 
 @dataclass(frozen=True)
 class Switches:
     """One position per switch; the defaults are the production positions."""
 
+    # what a send with no intent is held to
+    no_intent_policy: NoIntentPolicy = "strict"
     # refuse a tool argument the tool does not take, naming the ones it
     # does. Off in both positions: unknown arguments are ignored.
     strict_parameters: bool = False
@@ -46,6 +53,7 @@ class Switches:
 PRODUCTION = Switches()
 
 TEST_INTERFACE = Switches(
+    no_intent_policy="simulate-only",
     strict_parameters=False,
     rest_signing_routes=False,
     agent_topup_at_boot=False,

@@ -26,6 +26,7 @@ import typing as t
 from pathlib import Path
 
 import pytest
+from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from mcp.server.fastmcp import FastMCP
 from web3 import Web3
@@ -45,8 +46,9 @@ from connect.signer_errors import (
     cause_of,
     logged_cause,
 )
+from connect.switches import TEST_INTERFACE
 
-from tests.conftest import FakeW3, audit_entries, pay
+from tests.conftest import FakeW3, audit_entries, on_fake_chain, pay
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -66,12 +68,12 @@ def _rules(problems: list[str]) -> list[str]:
     return rules
 
 
-def _approval_log(amount: int) -> dict:
+def _approval_log(amount: int, owner: str = SAFE) -> dict:
     return {
         "address": TOKEN,
         "topics": [
             "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
-            "0x" + SAFE[2:].rjust(64, "0"),
+            "0x" + owner[2:].rjust(64, "0"),
             "0x" + SPENDER[2:].rjust(64, "0"),
         ],
         "data": "0x" + hex(amount)[2:].rjust(64, "0"),
@@ -92,16 +94,66 @@ def tools(
 class TestSignerGate:
     """The gate sits after the guard on every agent-originated send."""
 
-    def test_value_without_an_intent_is_refused_and_audited(
+    def test_a_send_with_no_intent_may_spend_its_own_value(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Strict policy: a no-intent send that does only what it says goes through."""
+        test_signer.send_via_safe("testchain", EOA, value=5)
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_a_no_intent_approval_is_refused_and_audited(
         self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
     ) -> None:
-        """No intent, value moves: refused naming missing-intent, nothing sent."""
-        with pytest.raises(SignerError, match="rule 'missing-intent'"):
-            test_signer.send_via_safe("testchain", EOA, value=5)
+        """Strict policy: no intent declares no approvals, so granting one is refused."""
+        fake_w3.provider.logs = [_approval_log(10)]
+        with pytest.raises(SignerError, match="rule 'undeclared-approval'"):
+            test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
         assert not fake_w3.eth.sent
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
-        assert entry["rule"] == "missing-intent"
-        assert entry["to"] == EOA
+        assert entry["rule"] == "undeclared-approval"
+        assert entry["to"] == TOKEN
+
+    def test_a_no_intent_send_is_held_to_its_own_value_and_target(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Strict policy: a spend beyond the value or another recipient is refused."""
+        extra = {
+            "address": "0x" + "ee" * 20,  # the synthetic native-transfer log
+            "topics": [
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                "0x" + SAFE[2:].rjust(64, "0"),
+                "0x" + SPENDER[2:].rjust(64, "0"),
+            ],
+            "data": "0x" + hex(3)[2:].rjust(64, "0"),
+        }
+        fake_w3.provider.logs = [extra]
+        with pytest.raises(SignerError) as refused:
+            test_signer.send_via_safe("testchain", EOA, value=5)
+        assert "rule 'overspend' (native: spends 8, intent allows 5)" in str(
+            refused.value
+        )
+        assert f"rule 'undeclared-recipient' ({SPENDER})" in str(refused.value)
+        assert not fake_w3.eth.sent
+
+    def test_the_simulate_only_policy_refuses_only_a_revert(
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        fake_w3: FakeW3,
+    ) -> None:
+        """The bench's policy: an undeclared approval mines, a revert is refused."""
+        signer = on_fake_chain(
+            Signer(account, app_config, activity, switches=TEST_INTERFACE), fake_w3
+        )
+        fake_w3.provider.logs = [_approval_log(10)]
+        signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
+        assert len(fake_w3.eth.sent) == 1
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        with pytest.raises(SignerError, match=r"rule 'reverts' \(execution reverted\)"):
+            signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
+        assert len(fake_w3.eth.sent) == 1
 
     def test_the_safe_path_simulates_the_safes_own_call(
         self, test_signer: Signer, fake_w3: FakeW3
@@ -334,19 +386,24 @@ class TestSignerGate:
         assert repr(SERVER_BUILT) == "SERVER_BUILT"
 
     def test_unaudited_refusal_records_nothing(
-        self, test_signer: Signer, store_path: t.Any
+        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
     ) -> None:
         """audit=False callers audit outcomes themselves, refusals included."""
+        fake_w3.provider.logs = [_approval_log(10)]
         with pytest.raises(SignerError):
-            test_signer.send_via_safe("testchain", EOA, value=5, audit=False)
+            test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL, audit=False)
         assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
 
-    def test_check_reports_the_gate_problems(self, test_signer: Signer) -> None:
+    def test_check_reports_the_gate_problems(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
         """A dry run answers what the send would: the same rules, nothing spent."""
-        reason, problems = test_signer.check("testchain", EOA, value=5)
+        fake_w3.provider.logs = [_approval_log(10)]
+        reason, problems = test_signer.check("testchain", TOKEN, data=TOKEN_CALL)
         assert reason is not None
-        assert "missing-intent" in reason
-        assert [p["rule"] for p in problems] == ["missing-intent"]
+        assert "undeclared-approval" in reason
+        assert [p["rule"] for p in problems] == ["undeclared-approval"]
+        fake_w3.provider.logs = []
         assert test_signer.check(
             "testchain", EOA, value=5, intent=pay(EOA, 5), via_safe=False
         ) == (None, [])
@@ -357,7 +414,7 @@ class TestSignerGate:
         """send_transaction to the safe with execTransaction moves the safe's assets.
 
         Simulated as the EOA it would look like it moves nothing; the gate
-        simulates the call inside it, as the safe, so it needs an intent.
+        simulates the call inside it, as the safe, so the safe's grant counts.
         """
         from connect import (
             safe as safe_module,  # pylint: disable=import-outside-toplevel
@@ -366,11 +423,13 @@ class TestSignerGate:
         calldata = safe_module.exec_transaction(
             target=EOA, value=7, data="0xabcdef", owner=test_signer.address
         )
-        with pytest.raises(SignerError, match="'missing-intent'"):
+        fake_w3.provider.logs = [_approval_log(10)]  # granted by the safe
+        with pytest.raises(SignerError, match="'undeclared-approval'"):
             test_signer.send("testchain", SAFE, data=calldata)
         assert fake_w3.provider.simulated[-1]["from"] == SAFE
         assert fake_w3.provider.simulated[-1]["to"] == EOA
         assert fake_w3.provider.simulated[-1]["data"] == "0xabcdef"
+        fake_w3.provider.logs = []
         test_signer.send("testchain", SAFE, data=calldata, intent=pay(EOA, 7))
         assert len(fake_w3.eth.sent) == 1
         with pytest.raises(SignerError, match="may not also carry value"):
@@ -431,7 +490,7 @@ class TestSignerGate:
 
         A selector check that stripped only `0x` would simulate the EOA's own
         call, which moves nothing, and the safe's execTransaction inside would
-        be signed with no intent; approveHash would slip past its refusal.
+        be signed unchecked; approveHash would slip past its refusal.
         """
         from connect import (
             safe as safe_module,  # pylint: disable=import-outside-toplevel
@@ -440,14 +499,15 @@ class TestSignerGate:
         calldata = safe_module.exec_transaction(
             target=EOA, value=7, data="0xabcdef", owner=test_signer.address
         )
-        with pytest.raises(SignerError, match="'missing-intent'"):
+        fake_w3.provider.logs = [_approval_log(10)]
+        with pytest.raises(SignerError, match="'undeclared-approval'"):
             test_signer.send("testchain", SAFE, data="0X" + calldata[2:])
         assert fake_w3.provider.simulated[-1]["from"] == SAFE
         with pytest.raises(SignerError, match="'approve-hash'"):
             test_signer.send("testchain", SAFE, data="0Xd4d9bdcd" + "ab" * 32)
         assert fake_w3.eth.sent == []
         rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-        assert rules == ["missing-intent", "approve-hash"]
+        assert rules == ["undeclared-approval", "approve-hash"]
 
     def test_the_floor_reads_an_uppercase_hex_prefix(
         self, test_signer: Signer, guard: Guard, fake_w3: FakeW3
@@ -483,7 +543,8 @@ class TestSignerGate:
         calldata = safe_module.exec_transaction(
             target=EOA, value=7, data="0x", owner=test_signer.address
         )
-        with pytest.raises(SignerError, match="'missing-intent'"):
+        fake_w3.provider.logs = [_approval_log(10, owner=lower)]
+        with pytest.raises(SignerError, match="'undeclared-approval'"):
             test_signer.send("testchain", lower, data=calldata)
         assert fake_w3.provider.simulated[-1]["from"].lower() == lower
 
@@ -515,10 +576,11 @@ class TestSignerGate:
         moving = safe_module.exec_transaction(
             target=EOA, value=7, data="0x", owner=test_signer.address
         )
+        fake_w3.provider.logs = [_approval_log(10)]
         reason, problems = test_signer.check(
             "testchain", SAFE, data=moving, via_safe=False
         )
-        assert "'missing-intent'" in str(reason)
+        assert "'undeclared-approval'" in str(reason)
         assert fake_w3.provider.simulated[-1]["from"] == SAFE
         args: list = [EOA, 0, b"", 1, 0, 0, 0, safe_module.ZERO_ADDRESS]
         args += [safe_module.ZERO_ADDRESS, b""]
@@ -926,8 +988,10 @@ class TestTools:
             "testchain", EOA, 5, intent=pay(EOA, 5)
         )
         assert result["tx_hash"].startswith("0x")
-        with pytest.raises(SignerError, match="missing-intent"):
-            await tools["safe_transaction"]("testchain", EOA, 5)
+        with pytest.raises(SignerError, match="undeclared-recipient"):
+            await tools["safe_transaction"](
+                "testchain", EOA, 5, intent={"spend": {"native": "5"}}
+            )
 
     async def test_preflight_runs_no_gate(
         self, tools: dict[str, t.Callable], monkeypatch: pytest.MonkeyPatch
@@ -973,13 +1037,18 @@ def test_http_routes_take_an_intent(
     make_app: t.Callable,
     fake_w3: FakeW3,
 ) -> None:
-    """Skill scripts pass intents through the HTTP routes; a missing one is a 400."""
+    """Skill scripts pass intents through the HTTP routes; a broken one is a 400."""
     app = make_app(test_signer, app_config, activity, token=TOKEN_TOKEN)
     headers = {"Authorization": f"Bearer {TOKEN_TOKEN}"}
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         refused = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "target": EOA, "value": 5},
+            json={
+                "chain": "testchain",
+                "target": EOA,
+                "value": 5,
+                "intent": {"spend": {"native": 5}},
+            },
             headers=headers,
         )
         sent = client.post(
@@ -993,5 +1062,5 @@ def test_http_routes_take_an_intent(
             headers=headers,
         )
     assert refused.status_code == 400
-    assert "missing-intent" in refused.json()["detail"]
+    assert "undeclared-recipient" in refused.json()["detail"]
     assert sent.status_code == 200

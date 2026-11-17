@@ -146,7 +146,7 @@ def test_an_approval_by_the_celo_face_is_an_approval() -> None:
             "infinite": True,
         }
     ]
-    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
     assert rules(intent.check_intent(diff, intent.parse_intent({})[0])) == [
         "undeclared-approval"
     ]
@@ -196,7 +196,7 @@ def test_burns_and_self_transfers_are_not_recipients() -> None:
     assert intent.check_intent(diff, {"spend": {TOKEN: 4}}) == []
 
 
-def test_an_nft_approval_is_value_moving_and_checked() -> None:
+def test_an_nft_approval_is_checked() -> None:
     """ERC-721 Approval has every field indexed; it is a grant like any other."""
 
     def nft_approval(spender: str) -> dict:
@@ -216,7 +216,7 @@ def test_an_nft_approval_is_value_moving_and_checked() -> None:
             "id": "9",
         }
     ]
-    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
     assert rules(intent.check_intent(diff, {})) == ["undeclared-approval"]
     cleared = simulate([nft_approval("0x" + "00" * 20)])
     assert intent.check_intent(cleared, None) == []  # approving nobody clears it
@@ -441,25 +441,44 @@ def rules(problems: list[intent.Problem]) -> list[str]:
     return [p["rule"] for p in problems]
 
 
-def test_value_moving_needs_an_intent() -> None:
-    """Any spend, NFT out or non-zero approval without an intent is refused."""
-    assert rules(intent.check_intent(_diff(native="-1"), None)) == ["missing-intent"]
-    assert rules(intent.check_intent(_diff(tokens={TOKEN: {"delta": "-1"}}), None)) == [
-        "missing-intent"
-    ]
-    assert rules(
-        intent.check_intent(
-            _diff(positions=[{"token": TOKEN, "id": "1", "delta": "-1"}]), None
-        )
-    ) == ["missing-intent"]
-    assert rules(
-        intent.check_intent(
+IMPLIED = intent.implied_intent(0, EOA, positions_locked=False)
+
+
+@pytest.mark.parametrize(
+    ("diff", "rule"),
+    [
+        (_diff(native="-1"), "overspend"),
+        (_diff(tokens={TOKEN: {"symbol": "T", "delta": "-1"}}), "overspend"),
+        (_diff(positions=[{"token": TOKEN, "id": "1", "delta": "-1"}]), "overspend"),
+        (
             _diff(approvals=[{"token": TOKEN, "spender": SPENDER, "amount": "1"}]),
-            None,
-        )
-    ) == ["missing-intent"]
-    # a claim moves nothing of the sender's, so it needs none
-    assert intent.check_intent(_diff(tokens={TOKEN: {"delta": "3"}}), None) == []
+            "undeclared-approval",
+        ),
+        (
+            _diff(recipients=[{"address": SPENDER, "contract": False}]),
+            "undeclared-recipient",
+        ),
+    ],
+)
+def test_the_strict_policy_holds_a_no_intent_call_to_what_it_says(
+    diff: intent.AssetDiff, rule: str
+) -> None:
+    """No spend beyond the call's value, no approval, no recipient but the target."""
+    assert rules(intent.check_intent(diff, IMPLIED)) == [rule]
+    assert intent.check_intent(diff, None) == []
+
+
+def test_the_implied_intent_allows_the_call_s_own_value_and_target() -> None:
+    """The value the call carries, to its own target, is what it declared."""
+    implied = intent.implied_intent(5, EOA.upper(), positions_locked=True)
+    diff = _diff(native="-5", recipients=[{"address": EOA, "contract": False}])
+    assert intent.check_intent(diff, implied) == []
+    assert implied["positions_locked"] is True
+    moved = _diff(positions=[{"token": TOKEN, "id": "7", "delta": "-1"}])
+    (problem,) = [
+        p for p in intent.check_intent(moved, implied) if p["rule"] == "overspend"
+    ]
+    assert problem["detail"] == f"{TOKEN} #7: spends 1, intent allows 0"
 
 
 def test_a_token_the_spend_does_not_name_may_not_be_spent_at_all() -> None:
@@ -666,7 +685,7 @@ def test_a_permit2_grant_is_an_approval_the_intent_must_declare(event: str) -> N
             "via": "permit2",
         }
     ]
-    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
     assert rules(intent.check_intent(diff, {})) == ["undeclared-approval"]
     declared = {
         "approvals": [
@@ -885,8 +904,7 @@ def test_a_fall_of_the_prepaid_mech_balance_is_spent_of_its_asset() -> None:
     assert diff["prepaid"] == [
         {"tracker": TRACKER, "token": intent.NATIVE, "delta": "-60"}
     ]
-    assert intent.is_value_moving(diff)
-    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
     assert rules(intent.check_intent(diff, {"spend": {"native": 59}})) == ["overspend"]
     assert intent.check_intent(diff, {"spend": {"native": 60}}) == []
     token = _simulate_prepaid(_prepaid_rpc({TRACKER: (1, 1), OLAS_TRACKER: (9, 2)}))

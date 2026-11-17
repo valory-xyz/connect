@@ -243,10 +243,10 @@ the agent's reach and give the agent only a minted, capped child token
 
 ## Intent gate
 
-After the guardrail, every agent-originated value-moving send (`safe_transaction`
-and `send_transaction`, MCP and HTTP alike) must carry an **intent** — spend
-caps per token, minimum receive, allowed recipients, approvals — and is
-simulated at head over the chain's RPC with `eth_simulateV1`
+After the guardrail, every agent-originated send (`safe_transaction` and
+`send_transaction`, MCP and HTTP alike) may carry an **intent** — spend caps
+per token, minimum receive, allowed recipients, approvals — and is simulated
+at head over the chain's RPC with `eth_simulateV1`
 (`traceTransfers: true`, `validation: false`) before it is signed. The asset
 diff comes from the simulated logs (`connect/intent.py`): no fork, no trace, so
 `called` lists the target plus every contract that emitted a log. Native value
@@ -258,11 +258,17 @@ and never counted. A WETH `Deposit`/`Withdrawal` is counted only when the same
 token logged no `Transfer` mint to (or burn from) the sender, since
 Solmate- and OpenZeppelin-style wrappers log both for one wrap. The rules, each named in
 the refusal and recorded as an activity `refusal` entry: `reverts`,
-`bad-intent`, `missing-intent`, `overspend`, `receive-min`,
+`bad-intent`, `overspend`, `receive-min`,
 `undeclared-recipient` (EOAs only, an EIP-7702 delegated EOA counted as one;
 burns to the zero address skipped) and
 `undeclared-approval` (a 0 approval is not checked; `setApprovalForAll` counts
-as a maximum, even when revoking). A refusal is its problems in
+as a maximum, even when revoking). A send with no intent is held to the
+`no_intent_policy` switch ([Bench parity](#bench-parity)): Pearl's `strict`
+reads it as declaring only what the call itself says (a spend of its own
+`value` in native, its target as the one recipient, no approvals and no
+position leaving) and refuses whatever goes beyond that by the rule it breaks,
+so a plain transfer needs no intent. The bench's `simulate-only` refuses a
+no-intent send only when it reverts. A refusal is its problems in
 OnchainBench's reference words, joined with `; ` and closed with
 `. Nothing was sent.`: each problem reads `intent gate: rule '<id>' (<detail>)`,
 the detail as the reference words it (`overspend`: `<symbol>: spends <n>,
@@ -317,7 +323,7 @@ balance trackers, the simulation reads `mapRequesterBalances(sender)` at each
 tracker before and after the call, in the same simulated block, and a fall is
 spent of the tracker's asset (`"native"`, or its payment token), listed under
 `prepaid` and counted in `native`/`tokens`, so it needs an intent whose
-`spend` covers it and draws on the token's caps; a rise (a deposit) is no
+`spend` covers it (no intent allows only the call's own value) and draws on the token's caps; a rise (a deposit) is no
 spend of its own, and a read that does not answer fails closed as
 `simulation-unavailable`. So does a tracker table mech-client cannot give
 (a malformed `MECHX_LEDGER_CHAIN_ID` or `MECHX_GAS_LIMIT` in Connect's
@@ -956,7 +962,9 @@ Connect. Two public modules carry that contract:
   `TEST_INTERFACE` is the reference's behaviour. A switch is a constructor
   argument of `create_app` / `build_mcp` and nothing else: no env var,
   setting or route can set one, `__main__` passes none, and the release binary
-  excludes `connect.testing`. So far: `strict_parameters` (off in both: an MCP
+  excludes `connect.testing`. So far: `no_intent_policy` (`strict` in Pearl,
+  `simulate-only` for the bench; see [Intent gate](#intent-gate)),
+  `strict_parameters` (off in both: an MCP
   tool ignores an argument it does not take), `rest_signing_routes`
   (`POST /sign-and-send`; on in Pearl) and `agent_topup_at_boot` (the
   [Agent top-up](#agent-top-up); on in Pearl).

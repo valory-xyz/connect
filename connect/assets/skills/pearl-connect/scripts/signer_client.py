@@ -31,8 +31,9 @@ Usage:
         intent={"spend": {"native": 10**16}, "recipients": ["0x..."]},
     )
 
-A call that moves value needs an intent, which only signer.send_transaction
-carries: w3.eth.send_transaction and .transact() suit calls that move nothing.
+A call with no intent may spend only its own value, pay only its target and
+grant no approval; only signer.send_transaction carries one, so
+w3.eth.send_transaction and .transact() suit calls that do no more.
 
 To run another script under a narrower token, mint one and hand it over in
 the environment; every .mcp.json reader here picks it up (see _signing_token):

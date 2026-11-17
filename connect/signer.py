@@ -54,6 +54,7 @@ from connect.signer_errors import (
     logged_cause,
     send_failure,
 )
+from connect.switches import PRODUCTION, Switches
 
 logger = logging.getLogger("agent")
 
@@ -281,9 +282,12 @@ class Signer:
         config: AppConfig,
         activity: ActivityLog,
         guard: Guard | None = None,
+        *,
+        switches: Switches = PRODUCTION,
     ) -> None:
-        """Initialize."""
+        """Initialize; `switches` stays at `PRODUCTION` for every Pearl build."""
         self._account = account
+        self._switches = switches
         self._activity = activity
         self._config = config
         self._chains = _ChainPool(config)
@@ -643,6 +647,14 @@ class Signer:
         parsed, problems = intent_module.parse_intent(raw_intent)
         if problems:
             return None, None, problems
+        held_to = parsed
+        if parsed is None and self._switches.no_intent_policy == "strict":
+            # what the call says it does is all it may do
+            held_to = intent_module.implied_intent(
+                call.value,
+                call.to,
+                positions_locked=isinstance(raw_intent, intent_module.Capped),
+            )
         try:
             diff = self._simulate(chain, call)
         except intent_module.SimulationUnavailable as e:
@@ -666,7 +678,7 @@ class Signer:
                     )
                 ],
             )
-        return diff, parsed, intent_module.check_intent(diff, parsed)
+        return diff, parsed, intent_module.check_intent(diff, held_to)
 
     def _gate_problems(
         self, chain: str, call: _GateCall, raw_intent: t.Any

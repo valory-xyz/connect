@@ -416,7 +416,20 @@ def test_send_outcome_knows_every_refusal_the_signer_raises_before_signing(
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         send(chain="mystery")
         send(chain="nosafe")
-        send(value=1)  # moves value with no intent: the intent gate refuses
+        # grants an approval with no intent: the intent gate refuses
+        fake_w3.provider.logs = [
+            {
+                "address": "0x" + "70" * 20,
+                "topics": [
+                    "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
+                    "0x" + safe[2:].rjust(64, "0"),
+                    "0x" + "5e" * 32,
+                ],
+                "data": "0x" + "01".rjust(64, "0"),
+            }
+        ]
+        send(to="0x" + "70" * 20, data="0x12345678")
+        fake_w3.provider.logs = []
         capped = client.post(
             "/tokens",
             json={

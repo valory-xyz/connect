@@ -263,10 +263,12 @@ tx_hash = signer.send_transaction(                              # sent by the sa
 )
 ```
 
-A call that moves value needs an intent, and only `signer.send_transaction`
-carries one. `.transact()` and `w3.eth.send_transaction` send the bare call,
-so they work only for calls that move nothing of the safe's; anything else is
-refused as `missing-intent`.
+A call with no intent may do only what it says: spend no more than its own
+`value`, pay no one but its target and grant no approval. Only
+`signer.send_transaction` carries an intent; `.transact()` and
+`w3.eth.send_transaction` send the bare call, so anything beyond that is
+refused by the intent gate rule it breaks (`overspend`,
+`undeclared-recipient`, `undeclared-approval`).
 
 Two things `connect()` handles that hand-rolled web3 code gets wrong: PoA
 chains (Polygon above all) pad `extraData` past 32 bytes and break every block

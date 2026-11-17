@@ -569,7 +569,13 @@ def test_signer(
     account: LocalAccount, app_config: AppConfig, activity: ActivityLog, fake_w3: FakeW3
 ) -> Signer:
     """Signer wired to the fake Web3 client."""
-    signer = Signer(account=account, config=app_config, activity=activity)
+    return on_fake_chain(
+        Signer(account=account, config=app_config, activity=activity), fake_w3
+    )
+
+
+def on_fake_chain(signer: Signer, fake_w3: "FakeW3") -> Signer:
+    """Wire a signer's test chain to the fake Web3 client, and return it."""
     signer._chains._states["testchain"] = (  # pylint: disable=protected-access
         _ChainState(w3=t.cast(Web3, fake_w3), lock=threading.Lock(), chain_id=31337)
     )

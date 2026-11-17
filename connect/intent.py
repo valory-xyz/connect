@@ -77,7 +77,6 @@ NATIVE_ERC20_FACES = frozenset(_FACES.values())
 Rule = t.Literal[
     "reverts",
     "bad-intent",
-    "missing-intent",
     "overspend",
     "receive-min",
     "undeclared-recipient",
@@ -108,6 +107,9 @@ class Intent(t.TypedDict, total=False):
     approvals: list[IntentApproval]
     # set only through Capped, never by a caller: no position may leave
     positions_locked: bool
+    # set only by `implied_intent`, never by a caller: the strict no-intent
+    # policy's limits, under which a position leaving is a spend
+    implied: bool
 
 
 class Capped(t.NamedTuple):
@@ -640,15 +642,20 @@ def _erc1155_items(kind: str, data: str) -> list[tuple[int, int]]:
     ]
 
 
-def is_value_moving(diff: AssetDiff) -> bool:
-    """Whether the transaction spends, sends or grants anything of the sender's."""
-    if int(diff["native"]) < 0:
-        return True
-    if any(int(entry["delta"]) < 0 for entry in diff["tokens"].values()):
-        return True
-    if any(int(entry["delta"]) < 0 for entry in diff["positions"]):
-        return True
-    return any(entry["amount"] != "0" for entry in diff["approvals"])
+def implied_intent(value: int, target: str, *, positions_locked: bool) -> Intent:
+    """Return what a call with no intent may do under the strict policy.
+
+    No spend beyond the call's own value, no approvals and no recipient but the
+    call's target.
+    """
+    return Intent(
+        spend={NATIVE: value} if value else {},
+        receive_min={},
+        recipients=[target.lower()],
+        approvals=[],
+        positions_locked=positions_locked,
+        implied=True,
+    )
 
 
 def parse_intent(raw: t.Any) -> tuple[Intent | None, list[Problem]]:
@@ -803,15 +810,7 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
     problems: list[Problem] = []
     if not diff["ok"]:
         problems.append(Problem(rule="reverts", detail=str(diff["revert"])))
-    if intent is None:
-        if is_value_moving(diff):
-            problems.append(
-                Problem(
-                    rule="missing-intent",
-                    detail="this transaction moves value, so it needs an intent "
-                    "(spend, receive_min, recipients, approvals)",
-                )
-            )
+    if intent is None:  # nothing declared: only a revert is refused
         return problems
     spend = intent.get("spend", {})
     deltas = {NATIVE: int(diff["native"])}
@@ -863,6 +862,18 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
                         _named(diff, entry["token"]),
                         entry["spender"],
                         entry["amount"],
+                    ),
+                )
+            )
+    for position in diff["positions"]:
+        if int(position["delta"]) < 0 and intent.get("implied"):
+            problems.append(
+                Problem(
+                    rule="overspend",
+                    detail=gate_overspend(
+                        f"{position['token']} #{position['id']}",
+                        -int(position["delta"]),
+                        0,
                     ),
                 )
             )

@@ -109,11 +109,16 @@ def test_a_guardrail_refusal_reads_as_its_constant_through_the_transport(
 def test_a_gate_refusal_ends_not_sent_through_the_transport(
     client: TestClient, fake_w3: FakeW3
 ) -> None:
-    """A value-moving call with no intent reads as the gate's, ending not-sent."""
+    """A call breaking its intent reads as the gate's refusal, ending not-sent."""
     text = _tool_error(
         client,
         "safe_transaction",
-        {"chain": "testchain", "target": RECIPIENT, "value": "5"},
+        {
+            "chain": "testchain",
+            "target": RECIPIENT,
+            "value": "5",
+            "intent": {"spend": {"native": "5"}},
+        },
     )
     assert text.startswith("intent gate: rule '")
     assert text.endswith(texts.NOT_SENT_SUFFIX)
@@ -232,10 +237,14 @@ def test_target_wins_over_to_and_other_tools_are_left_alone() -> None:
 
 
 def test_the_test_interface_takes_the_reference_s_positions() -> None:
-    """The bench's positions: no strict parameters, no EOA route, no boot top-up."""
+    """The bench's positions: simulate-only, lenient, no EOA route, no boot top-up."""
     assert TEST_INTERFACE == Switches(
-        strict_parameters=False, rest_signing_routes=False, agent_topup_at_boot=False
+        no_intent_policy="simulate-only",
+        strict_parameters=False,
+        rest_signing_routes=False,
+        agent_topup_at_boot=False,
     )
+    assert PRODUCTION.no_intent_policy == "strict"
     assert PRODUCTION.rest_signing_routes
     assert PRODUCTION.agent_topup_at_boot
 

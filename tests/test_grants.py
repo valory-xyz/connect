@@ -690,10 +690,11 @@ def test_http_capped_token_is_refused_above_its_cap(
 def test_http_a_fall_of_the_prepaid_mech_balance_is_held_to_the_intent_and_caps(
     client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A safe call that spends the prepaid mech balance needs an intent, within caps.
+    """A safe call that spends the prepaid mech balance is held to an intent, in caps.
 
-    No intent is `missing-intent`, an intent short of the fall `overspend`,
-    and one that declares it past the token's cap `token-cap-per-tx`.
+    No intent declares no spend beyond the call's own value, so the fall is
+    `overspend`; so is an intent short of it; one that declares it past the
+    token's cap is `token-cap-per-tx`.
     """
     tracker = "0x" + "7e" * 20
     monkeypatch.setattr(
@@ -708,7 +709,10 @@ def test_http_a_fall_of_the_prepaid_mech_balance_is_held_to_the_intent_and_caps(
             "/safe-transaction", json={**body, "intent": intent}, headers=_bearer(token)
         )
 
-    assert "missing-intent" in send(capped, None).json()["detail"]
+    assert (
+        "rule 'overspend' (native: spends 6, intent allows 0)"
+        in send(capped, None).json()["detail"]
+    )
     assert "overspend" in send(capped, {"spend": {"native": 5}}).json()["detail"]
     over = send(capped, {"spend": {"native": 6}})
     assert (over.status_code, "token-cap-per-tx" in over.json()["detail"]) == (
