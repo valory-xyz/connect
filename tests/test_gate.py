@@ -21,6 +21,7 @@
 
 import json
 import logging
+import re
 import typing as t
 from pathlib import Path
 
@@ -55,6 +56,16 @@ TOKEN = "0x" + "70" * 20
 SPENDER = "0x" + "5e" * 20
 TOKEN_CALL = "0x" + "12" * 4
 TOKEN_TOKEN = "unit-test-token"  # nosec B105
+
+
+def _rules(problems: list[str]) -> list[str]:
+    """Return the rule ids of a simulation's problem strings, in order."""
+    rules = []
+    for problem in problems:
+        match = re.fullmatch(r"intent gate: rule '([^']+)' \(.*\)", problem, re.S)
+        assert match is not None, problem
+        rules.append(match[1])
+    return rules
 
 
 def _approval_log(amount: int) -> dict:
@@ -188,7 +199,7 @@ class TestSignerGate:
         """Some RPCs answer the call's error as a string, not an object."""
         fake_w3.provider.status = "0x0"
         fake_w3.provider.error = "execution reverted"
-        with pytest.raises(SignerError, match="'reverts': .*execution reverted"):
+        with pytest.raises(SignerError, match=r"rule 'reverts' \(.*execution reverted"):
             test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
         assert not fake_w3.eth.sent
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
@@ -208,7 +219,7 @@ class TestSignerGate:
     ) -> None:
         """A caller's typo is refused as one, not as an RPC that cannot simulate."""
         send = test_signer.send_via_safe if via_safe else test_signer.send
-        with pytest.raises(SignerError, match="'bad-calldata': cannot decode"):
+        with pytest.raises(SignerError, match=r"rule 'bad-calldata' \(cannot decode"):
             send("testchain", TOKEN, data=data)
         assert fake_w3.provider.simulated == []
         assert not fake_w3.eth.sent
@@ -222,7 +233,7 @@ class TestSignerGate:
         simulated = test_signer.simulate(
             "testchain", TOKEN, data=data, via_safe=via_safe
         )
-        assert simulated["problems"][0]["rule"] == "bad-calldata"
+        assert _rules(simulated["problems"])[0] == "bad-calldata"
         assert fake_w3.provider.simulated == []
 
     def test_an_unavailable_simulation_is_logged(
@@ -527,8 +538,8 @@ class TestSignerGate:
         delegate += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()
         result = test_signer.simulate("testchain", SAFE, data=delegate, via_safe=False)
         assert result["fits_intent"] is False
-        assert result["problems"][0]["rule"] == "bad-exec-transaction"
-        assert "DELEGATECALL" in result["problems"][0]["detail"]
+        assert _rules(result["problems"])[0] == "bad-exec-transaction"
+        assert "DELEGATECALL" in result["problems"][0]
         args[3], args[6] = 0, 1
         refund = "0x" + safe_module.EXEC_TRANSACTION_SELECTOR
         refund += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()
@@ -539,7 +550,7 @@ class TestSignerGate:
         bad = test_signer.simulate(
             "testchain", SAFE, data="0x6a761202zz", via_safe=False
         )
-        assert bad["problems"][0]["rule"] == "bad-exec-transaction"
+        assert _rules(bad["problems"])[0] == "bad-exec-transaction"
 
     def test_a_replay_answers_before_the_gate(
         self, test_signer: Signer, fake_w3: FakeW3
@@ -762,7 +773,7 @@ def test_an_unreadable_prepaid_tracker_table_refuses_every_send_unsimulated(
         verdict = test_signer.simulate("testchain", EOA, value=value)
     assert not fake_w3.eth.sent
     assert not fake_w3.provider.simulated
-    assert [p["rule"] for p in verdict["problems"]] == ["simulation-unavailable"]
+    assert _rules(verdict["problems"]) == ["simulation-unavailable"]
     record, _ = [r for r in caplog.records if "cannot simulate" in r.message]
     assert "ValueError raised at:" in record.message
     assert "in unreadable" in record.message
@@ -871,11 +882,30 @@ class TestSimulate:
         """The asset diff plus fits_intent and problems."""
         result = test_signer.simulate("testchain", EOA, value=5)
         assert result["native"] == "-5"
-        assert result["fits_intent"] is None  # no intent given
-        assert [p["rule"] for p in result["problems"]] == ["missing-intent"]
+        # no intent given: no verdict and no problems, as the reference answers
+        assert result["fits_intent"] is None
+        assert result["problems"] == []
         fits = test_signer.simulate("testchain", EOA, value=5, intent=pay(EOA, 5))
         assert fits["fits_intent"] is True
         assert fits["problems"] == []
+
+    def test_a_revert_without_an_intent_shows_in_the_diff_alone(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """With no intent a revert is the diff's ok and revert, not a problem."""
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        result = test_signer.simulate("testchain", EOA, value=5)
+        assert result["ok"] is False
+        assert result["fits_intent"] is None
+        assert result["problems"] == []
+
+    def test_a_problem_is_the_reference_s_string(self, test_signer: Signer) -> None:
+        """Each problem reads `intent gate: rule '<id>' (<detail>)`."""
+        result = test_signer.simulate("testchain", EOA, value=5, intent=pay(EOA, 4))
+        assert result["problems"] == [
+            "intent gate: rule 'overspend' (native: spends 5, intent allows 4)"
+        ]
 
     def test_bad_intent_and_unavailable_rpc(
         self, test_signer: Signer, fake_w3: FakeW3
@@ -883,10 +913,10 @@ class TestSimulate:
         """Neither yields a diff; both say why."""
         bad = test_signer.simulate("testchain", EOA, intent=[1])
         assert bad["fits_intent"] is False
-        assert bad["problems"][0]["rule"] == "bad-intent"
+        assert _rules(bad["problems"])[0] == "bad-intent"
         fake_w3.provider.unavailable = True
         down = test_signer.simulate("testchain", EOA, via_safe=False)
-        assert down["problems"][0]["rule"] == "simulation-unavailable"
+        assert _rules(down["problems"])[0] == "simulation-unavailable"
 
     def test_needs_a_safe_on_the_safe_path(
         self, test_signer: Signer, app_config: AppConfig

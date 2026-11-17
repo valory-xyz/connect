@@ -692,15 +692,17 @@ class Signer:
             try:
                 call = self._eoa_gate(chain, target, value, data)
             except _GateRefused as e:
-                return {"fits_intent": False, "problems": [e.problem]}
+                return {
+                    "fits_intent": False,
+                    "problems": [intent_module.problem_text(e.problem)],
+                }
         diff, parsed, problems = self._evaluate(chain, call, intent)
+        texts = [intent_module.problem_text(p) for p in problems]
         if diff is None:
-            return {"fits_intent": False, "problems": problems}
-        return {
-            **diff,
-            "fits_intent": None if parsed is None else not problems,
-            "problems": problems,
-        }
+            return {"fits_intent": False, "problems": texts}
+        if parsed is None:  # a revert shows in the diff's own ok and revert
+            return {**diff, "fits_intent": None, "problems": []}
+        return {**diff, "fits_intent": not problems, "problems": texts}
 
     def _sender(self, chain: str, via_safe: bool) -> str:
         """Whose call it is: the chain's safe, or the agent EOA."""

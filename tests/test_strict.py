@@ -545,6 +545,6 @@ async def test_a_misspelled_intent_key_on_a_tool_is_refused_not_dropped(
         {"chain": "testchain", "target": RECIPIENT, "intent": intent},
     )
     (problem,) = json.loads(content.text)["problems"]  # type: ignore[union-attr]
-    assert problem["rule"] == "bad-intent"
-    assert unknown in problem["detail"]
+    assert problem.startswith("intent gate: rule 'bad-intent' (")
+    assert unknown in problem
     assert not fake_w3.eth.sent

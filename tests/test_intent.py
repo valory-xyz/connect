@@ -804,7 +804,8 @@ def test_refusal_message_names_every_rule() -> None:
         ]
     )
     assert message == (
-        "refused by the intent gate: rule 'overspend': a; rule 'reverts': b"
+        "intent gate: rule 'overspend' (a); intent gate: rule 'reverts' (b). "
+        "Nothing was sent."
     )
 
 

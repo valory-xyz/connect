@@ -253,7 +253,16 @@ the refusal and recorded as an activity `refusal` entry: `reverts`,
 `undeclared-recipient` (EOAs only, an EIP-7702 delegated EOA counted as one;
 burns to the zero address skipped) and
 `undeclared-approval` (a 0 approval is not checked; `setApprovalForAll` counts
-as a maximum, even when revoking). Only the CELO face's `Transfer` is native:
+as a maximum, even when revoking). A refusal is its problems in
+OnchainBench's reference words, joined with `; ` and closed with
+`. Nothing was sent.`: each problem reads `intent gate: rule '<id>' (<detail>)`,
+the detail as the reference words it (`overspend`: `<symbol>: spends <n>,
+intent allows <m>`; `receive-min`: `<symbol>: receives <n>, intent needs <m>`;
+`undeclared-recipient`: the address; `undeclared-approval`: `<symbol> to
+<spender>, <amount>`; `reverts`: the revert reason), a token named by its
+`symbol()` where it has one. `simulate_transaction`'s `problems` are the same
+strings; with no intent it answers `fits_intent: null` and no problems, a
+revert showing only in the diff's `ok` and `revert`. Only the CELO face's `Transfer` is native:
 its `Approval` is an approval like any other, and an intent naming the face in
 `spend` or `receive_min` means `"native"` (naming both is `bad-intent`). Under a
 value-capped token the gate also refuses any ERC-721/1155 position leaving the

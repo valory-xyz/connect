@@ -28,6 +28,14 @@ import typing as t
 
 from connect.chains import NATIVE_ERC20_FACES as _FACES
 from connect.safe import ZERO_ADDRESS, calldata_hex
+from connect.texts import (
+    GATE_PROBLEM,
+    NOT_SENT_SUFFIX,
+    gate_overspend,
+    gate_receive_min,
+    gate_undeclared_approval,
+    gate_undeclared_recipient,
+)
 
 TokenKey = str  # an ERC-20 address, lower-case, or "native"
 NATIVE = "native"
@@ -794,7 +802,7 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
     """Return every rule the simulated transaction breaks under `intent`."""
     problems: list[Problem] = []
     if not diff["ok"]:
-        problems.append(Problem(rule="reverts", detail=f"reverts: {diff['revert']}"))
+        problems.append(Problem(rule="reverts", detail=str(diff["revert"])))
     if intent is None:
         if is_value_moving(diff):
             problems.append(
@@ -813,8 +821,9 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="overspend",
-                    detail=f"spends {-delta} of {token}, more than the intent's "
-                    f"{spend.get(token, 0)}",
+                    detail=gate_overspend(
+                        _named(diff, token), -delta, spend.get(token, 0)
+                    ),
                 )
             )
     for token, least in intent.get("receive_min", {}).items():
@@ -822,8 +831,9 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="receive-min",
-                    detail=f"receives {max(deltas.get(token, 0), 0)} of {token}, "
-                    f"less than the intent's minimum {least}",
+                    detail=gate_receive_min(
+                        _named(diff, token), deltas.get(token, 0), least
+                    ),
                 )
             )
     allowed = set(intent.get("recipients", []))
@@ -832,8 +842,7 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="undeclared-recipient",
-                    detail=f"sends to {entry['address']}, an account the intent's "
-                    "recipients do not name",
+                    detail=gate_undeclared_recipient(entry["address"]),
                 )
             )
     granted = intent.get("approvals", [])
@@ -850,8 +859,11 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="undeclared-approval",
-                    detail=f"approves {entry['spender']} for {entry['amount']} of "
-                    f"{entry['token']}, which the intent's approvals do not cover",
+                    detail=gate_undeclared_approval(
+                        _named(diff, entry["token"]),
+                        entry["spender"],
+                        entry["amount"],
+                    ),
                 )
             )
     if intent.get("positions_locked"):
@@ -867,8 +879,17 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
     return problems
 
 
+def problem_text(problem: Problem) -> str:
+    """Return one problem as the reference words it."""
+    return GATE_PROBLEM(problem["rule"], problem["detail"])
+
+
 def refusal_message(problems: list[Problem]) -> str:
-    """Return the one-line refusal a session reads: every rule, each named."""
-    return "refused by the intent gate: " + "; ".join(
-        f"rule '{p['rule']}': {p['detail']}" for p in problems
-    )
+    """Return the one-line refusal a session reads: every rule, then not-sent."""
+    return "; ".join(problem_text(p) for p in problems) + NOT_SENT_SUFFIX
+
+
+def _named(diff: AssetDiff, token: str) -> str:
+    """Return how a problem names a token: its symbol, else its key."""
+    entry = diff["tokens"].get(token)
+    return (entry or {}).get("symbol") or token

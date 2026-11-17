@@ -550,7 +550,7 @@ SIGNER_REFUSALS: dict[int, tuple[str, ...]] = {
         "cannot compose the safe call: ",
         # every guardrail refusal, whichever rule it names
         "guardrail: rule ",
-        "refused by the intent gate: ",
+        "intent gate: rule ",
     ),
     # a scoped token's refusal names its rule: an expired token is a 401
     401: ("invalid or missing bearer token", "rule 'token-expired': "),
