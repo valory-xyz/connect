@@ -23,9 +23,9 @@
 #   UV_TOOL_DIR, UV_TOOL_BIN_DIR, UV_PYTHON_INSTALL_DIR, UV_CACHE_DIR   uv's own locations
 set -eu
 
-DEFAULT_VERSION="0.4.1"  # keep in step with pyproject.toml (tests/test_install_scripts.py checks)
+DEFAULT_VERSION="0.5.0"  # keep in step with pyproject.toml (tests/test_install_scripts.py checks)
 # Its dependencies resolve as PyPI stood at its release: bump with DEFAULT_VERSION.
-EXCLUDE_NEWER="2026-11-16T10:00:00Z"
+EXCLUDE_NEWER="2026-11-17T15:00:00Z"
 UV_VERSION="0.13.8"
 UV_INSTALLER_SHA256="4d8fa56e00f16b66feecacbd943773c61d61ab768b13856de350d86fd8740e2f"  # astral.sh/uv/0.13.8/install.sh
 
