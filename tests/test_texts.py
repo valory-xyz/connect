@@ -335,7 +335,7 @@ def _readers() -> list[str]:
     """Return every module of `connect` that imports the texts module."""
     package = Path(texts.__file__).parent
     return sorted(
-        str(path.relative_to(package))
+        path.relative_to(package).as_posix()
         for path in package.rglob("*.py")
         if path.name != "texts.py"
         and "assets" not in path.parts
