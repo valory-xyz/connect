@@ -19,9 +19,10 @@
 
 """Environment-driven configuration.
 
-All values arrive as environment variables injected by the Pearl middleware
-(from the service template / agent.json). This module is the only place that
-knows the env var names.
+Values arrive as environment variables, almost all injected by the Pearl
+middleware (from the service template / agent.json); the exception is the
+QA-only OCB_CHAT_MECH_<CHAIN>, which Pearl never sets. This module is the only
+place that knows the env var names.
 """
 
 import json
@@ -30,6 +31,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
+
+from web3 import Web3
 
 from connect.run_goal import check_target
 
@@ -51,6 +54,10 @@ MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 MECH_SETTLE_TIMEOUT_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_SETTLE_TIMEOUT"
 MECH_GAP_RETRIES_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_GAP_RETRIES"
 MECH_HARD_CANCEL_AFTER_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_HARD_CANCEL_AFTER"
+
+# A QA override, never set by Pearl: OCB_CHAT_MECH_GNOSIS=0x... gives OCB that
+# chat mech on that chain in place of the shipped one
+OCB_CHAT_MECH_ENV_PREFIX = "OCB_CHAT_MECH_"
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 DEFAULT_LOG_LEVEL = "info"
@@ -107,6 +114,24 @@ class AppConfig:
                 f"{MECH_SETTLE_TIMEOUT_ENV} ({self.mech_settle_timeout}s): a "
                 "stalled queue gets the settle timeout to clear itself first"
             )
+
+    # chain -> OCB chat mech, from OCB_CHAT_MECH_<CHAIN>
+    ocb_chat_mech_overrides: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def safe_chains(self) -> list[str]:
+        """The configured chains that carry a safe, in configuration order."""
+        return [name for name, chain in self.chains.items() if chain.safe_address]
+
+    @property
+    def instance_chain(self) -> str | None:
+        """The one chain this instance runs on: the chain carrying its safe.
+
+        Pearl configures an RPC for every chain but a safe for one, so a
+        config with no safe, or with several, names no instance chain.
+        """
+        chains = self.safe_chains
+        return chains[0] if len(chains) == 1 else None
 
     def chain(self, name: str) -> ChainConfig:
         """Chain."""
@@ -248,6 +273,35 @@ def _parse_count(env: dict[str, str], name: str, default: int) -> int:
     return value
 
 
+def _is_mech_address(value: str) -> bool:
+    """Whether `value` is a 0x address, checksummed whenever it is mixed case.
+
+    Web3.is_address alone takes bare hex and does not check a mixed-case
+    checksum, and a typo here becomes OCB's model.
+    """
+    if not (value.startswith("0x") and Web3.is_address(value)):
+        return False
+    digits = value[2:]
+    return digits in (digits.lower(), digits.upper()) or Web3.is_checksum_address(value)
+
+
+def _parse_ocb_chat_mechs(env: dict[str, str]) -> dict[str, str]:
+    """Collect OCB_CHAT_MECH_<CHAIN> overrides; an unset or empty one is ignored.
+
+    :raises ValueError: on a value that is not an address.
+    """
+    overrides: dict[str, str] = {}
+    for key, value in env.items():
+        if not key.startswith(OCB_CHAT_MECH_ENV_PREFIX) or not value.strip():
+            continue
+        if not _is_mech_address(value.strip()):
+            raise ValueError(f"{key} is not an address: {value!r}")
+        chain = key[len(OCB_CHAT_MECH_ENV_PREFIX) :].lower()
+        overrides[chain] = value.strip()
+        logger.warning("OCB chat mech on %s overridden by %s", chain, key)
+    return overrides
+
+
 def load_config(env: dict[str, str] | None = None) -> AppConfig:
     """Load config."""
     env = dict(os.environ) if env is None else env
@@ -298,4 +352,5 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         mech_hard_cancel_after=_parse_count(
             env, MECH_HARD_CANCEL_AFTER_ENV, DEFAULT_MECH_HARD_CANCEL_AFTER
         ),
+        ocb_chat_mech_overrides=_parse_ocb_chat_mechs(env),
     )

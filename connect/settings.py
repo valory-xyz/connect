@@ -24,14 +24,18 @@ workspace — the agent can read it (nothing in it is secret) and could write
 it, so every read verifies an HMAC keyed off the agent private key before the
 content is trusted. The canonical shape nests the security-critical fields
 under "protected" ({"protected": {"mode", "whitelist"}, "harness"}) and the
-MAC covers exactly that object (plus the version); a failed verification
-resets it to the built-in defaults. Landing on the defaults (rather than a
+MAC covers that object, the harness and the version; a failed verification
+resets them to the built-in defaults. Landing on the defaults (rather than a
 narrower fail-closed state) is deliberate: a mistaken edit or deletion of
 the file must not brick the agent, and the defaults are exactly what a
 fresh install ships with — so the reset adds no exposure a new install does
 not already accept. Every reset-to-defaults transition is audited once per episode.
-Preference fields (harness) live outside "protected" without integrity
-checks: editing them simply applies, and they survive a protected reset.
+The harness is a preference (a harness-only PATCH needs no password), but it
+is under the MAC too: with OCB it decides what an unnamed launch installs and
+runs, with no fallback, so an edited one must not apply. A version-1 file
+(MAC'd before the harness was) verifies its protected object once and keeps
+its harness unless it is ocb_cli, which no released version-1 file holds; it
+is then rewritten under the current MAC.
 Legitimate protected changes go through the password-gated settings PATCH,
 never through the agent session.
 """
@@ -56,19 +60,19 @@ from connect.safe import ZERO_ADDRESS
 logger = logging.getLogger("agent")
 
 SETTINGS_FILE = "pearl-connect.settings.json"
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
 
-# The MAC covers the version and the "protected" object of the canonical
-# shape — everything an attacker could profit from editing. The harness is
-# deliberately outside it: it cannot move funds or widen the guardrail. It is
-# not free of consequence, though — a tampered value is the preference the UI
-# shows and the harness /session reaches for first. What it cannot do is deny
-# a session (an unnamed launch falls back), so what it buys is a misleading
-# readout, visible in the UI and correctable there. A new top-level field
-# ships outside the MAC unless it is named here, so a test pins the file's
-# top-level keys against this tuple: adding one fails it until its integrity
-# coverage is a decision rather than an oversight.
-MAC_FIELDS = ("version", "protected")
+# The MAC covers the version, the "protected" object of the canonical shape
+# and the harness — everything an attacker could profit from editing. The
+# harness cannot move funds or widen the guardrail, but with OCB a written
+# value would make the next unnamed launch install and open OCB, which never
+# falls back, so it is covered too. A new top-level field ships outside the
+# MAC unless it is named here, so a test pins the file's top-level keys
+# against this tuple: adding one fails it until its integrity coverage is a
+# decision rather than an oversight.
+MAC_FIELDS = ("version", "protected", "harness")
+# what a version-1 file's MAC covered, accepted once to migrate it
+LEGACY_MAC_FIELDS = ("version", "protected")
 
 MODE_RESTRICTED = "restricted"
 MODE_UNRESTRICTED = "unrestricted"
@@ -91,13 +95,34 @@ HARNESS_CLAUDE_CODE_CLI = "claude_code_cli"
 HARNESS_CLAUDE_CODE_DESKTOP = "claude_code_desktop"
 HARNESS_CODEX_CLI = "codex_cli"
 HARNESS_CODEX_DESKTOP = "codex_desktop"
+HARNESS_OCB_CLI = "ocb_cli"
+# display order: the UI lists GET /settings' `harnesses` in this order,
+# desktop before CLI within each tool
 HARNESSES = (
-    HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CLAUDE_CODE_DESKTOP,
-    HARNESS_CODEX_CLI,
+    HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CODEX_DESKTOP,
+    HARNESS_CODEX_CLI,
+    HARNESS_OCB_CLI,
 )
 DEFAULT_HARNESS = HARNESS_CLAUDE_CODE_CLI
+
+# OCB's model is a chat mech paid per request through mech_request; the
+# budget matches OCB's own per-session cap on mech spending
+OCB_MODEL_BUDGET_USD = 1
+# chain -> OCB's chat mech (deployed and confirmed on-chain); None would leave
+# "OCB CLI" unavailable on that chain rather than unable to think
+OCB_CHAT_MECHS: dict[str, str | None] = {
+    "gnosis": "0x4a8A3FA1cde489DFec96F8442d65e9526ec3405c",
+    "polygon": "0x364b8238C7d9a05e0F68F87cfF364b6aBD926fEc",
+    "robinhood": "0xd3f392C8384cAa4D2864ACba826374337d43a100",
+    "base": "0x195Fe9d745a92deE64C9Bf75EFDc7779EB7a5C91",
+    "optimism": "0x8122Dcd1E271d0F793827D13410333852DBB9dAb",
+}
+# the only reasons GET /settings may give; connect-ui renders each one
+UnavailableReason = t.Literal["windows_unsupported", "model_unavailable"]
+UNAVAILABLE_WINDOWS: UnavailableReason = "windows_unsupported"
+UNAVAILABLE_MODEL: UnavailableReason = "model_unavailable"
 
 _MAC_KEY_INFO = b"pearl-connect settings hmac v1"
 
@@ -149,6 +174,46 @@ def validate_harness(value: object) -> str:
     if value not in HARNESSES:
         raise ValueError(f"harness must be one of {list(HARNESSES)}")
     return str(value)
+
+
+def harness_unavailable_reason(
+    harness: str, ocb_mech: str | None, platform: str
+) -> UnavailableReason | None:
+    """Why `harness` cannot be used on this instance, or None when it can.
+
+    OCB runs unsandboxed on native Windows, where a session could read the
+    keys under ~/.operate, so Windows is ruled out before the chain is asked.
+    """
+    if harness != HARNESS_OCB_CLI:
+        return None
+    if platform == "win32":
+        return UNAVAILABLE_WINDOWS
+    if ocb_mech is None:
+        return UNAVAILABLE_MODEL
+    return None
+
+
+def ocb_chat_mech(
+    chain: str | None, overrides: t.Mapping[str, str] | None = None
+) -> str | None:
+    """Return OCB's chat mech on `chain` — an override first — or None."""
+    if chain is None:
+        return None
+    return (overrides or {}).get(chain) or OCB_CHAT_MECHS.get(chain)
+
+
+def harness_options(
+    unavailable: t.Callable[[str], UnavailableReason | None],
+) -> list[dict]:
+    """GET /settings' `harnesses`: each harness and why it is unavailable, if so."""
+    options = []
+    for harness in HARNESSES:
+        reason = unavailable(harness)
+        option: dict[str, object] = {"id": harness, "available": reason is None}
+        if reason is not None:
+            option["unavailable_reason"] = reason
+        options.append(option)
+    return options
 
 
 def _harness_or_default(value: object) -> str:
@@ -369,19 +434,66 @@ class SettingsStore:
     with a valid MAC.
     """
 
-    def __init__(self, path: Path, mac_key: bytes, activity: ActivityLog) -> None:
-        """Initialize."""
+    def __init__(
+        self,
+        path: Path,
+        mac_key: bytes,
+        activity: ActivityLog,
+        unavailable: t.Callable[[str], UnavailableReason | None] = lambda _: None,
+    ) -> None:
+        """Initialize; `unavailable` names why a harness is unusable here, or None."""
         self._path = path
         self._mac_key = mac_key
         self._activity = activity
+        self._unavailable = unavailable
         self._lock = threading.Lock()
         self._expected_mac: str | None = None
         self._degraded: str | None = None
+        self._unusable: str | None = None
 
     def load(self) -> Settings:
         """Return the verified settings, restoring defaults on any problem."""
         with self._lock:
-            return self._load()
+            return self._usable(self._load())
+
+    def unavailable_reason(self, harness: str) -> UnavailableReason | None:
+        """Why this instance cannot use `harness`, or None when it can."""
+        return self._unavailable(harness)
+
+    def require_available(self, harness: str) -> None:
+        """Refuse a harness this instance cannot use.
+
+        :raises ValueError: naming the reason, for PATCH /settings and
+            POST /session alike.
+        """
+        reason = self.unavailable_reason(harness)
+        if reason is not None:
+            raise ValueError(f"harness {harness} is unavailable: {reason}")
+
+    def harnesses(self) -> list[dict]:
+        """Every harness with its availability on this instance."""
+        return harness_options(self._unavailable)
+
+    def _usable(self, settings: Settings) -> Settings:
+        """Swap a saved harness this instance cannot use for the default.
+
+        A settings file copied from another machine or chain is the usual
+        cause. The file keeps its value, so it applies again where it can.
+        """
+        reason = self.unavailable_reason(settings.harness)
+        unusable = None if reason is None else f"{settings.harness}:{reason}"
+        # load() runs on every guarded request: say it once per condition
+        if unusable is not None and unusable != self._unusable:
+            logger.warning(
+                "saved harness %s is unavailable here (%s); using %s",
+                settings.harness,
+                reason,
+                DEFAULT_HARNESS,
+            )
+        self._unusable = unusable
+        if reason is None:
+            return settings
+        return Settings(protected=settings.protected, harness=DEFAULT_HARNESS)
 
     def patch(self, patch: t.Mapping) -> PatchResult:
         """Merge a partial canonical-shaped patch and persist the result.
@@ -390,14 +502,20 @@ class SettingsStore:
         independent protected and harness forms) must not lose an update.
         Returns both sides of the change, so a caller can audit what actually
         moved rather than what was submitted.
-        :raises ValueError: on invalid replacements;
+        :raises ValueError: on invalid replacements, or a harness this
+        instance cannot use;
         :raises SettingsPersistError: when the merged settings cannot be
         persisted — an explicit change must never claim success while the disk
         disagrees (unlike the load path, which degrades to its in-memory value).
         """
+        harness = patch.get("harness")
+        if harness is not None:
+            self.require_available(validate_harness(harness))
         with self._lock:
-            previous = self._load()
-            updated = previous.merged(patch)
+            # merged onto the stored harness, not the usable one: a patch of
+            # something else must not overwrite a harness unavailable only here
+            stored = self._load()
+            updated = stored.merged(patch)
             try:
                 self._save(updated)
             except OSError as e:
@@ -405,7 +523,9 @@ class SettingsStore:
                     "settings_persist_failed", path=str(self._path), error=str(e)
                 )
                 raise SettingsPersistError(str(e)) from e
-            return PatchResult(previous=previous, updated=updated)
+            return PatchResult(
+                previous=self._usable(stored), updated=self._usable(updated)
+            )
 
     def _record_once(self, condition: str, kind: str, **fields: object) -> None:
         """Audit a degraded-state transition once per episode, not per read.
@@ -450,15 +570,19 @@ class SettingsStore:
         if verified is not None:
             self._degraded = None  # healthy again: re-arm transition records
             return verified
+        migrated = self._verify_legacy(payload)
+        if migrated is not None:
+            logger.info(
+                "settings file %s predates the harness MAC; migrated with %s",
+                self._path,
+                migrated.harness,
+            )
+            return self._reset(migrated)
         logger.warning(
             "settings file %s failed verification; restoring defaults", self._path
         )
         self._record_once("tampered", "settings_tampered", path=str(self._path))
-        fallback = defaults()
-        # the harness is a preference, not a security control: a tampered
-        # mode/whitelist resets those, but must not discard the harness
-        fallback.harness = _harness_or_default(payload.get("harness", DEFAULT_HARNESS))
-        return self._reset(fallback)
+        return self._reset(defaults())
 
     @staticmethod
     def _parse(raw: str) -> dict:
@@ -506,9 +630,9 @@ class SettingsStore:
             raise
         self._expected_mac = payload["mac"]
 
-    def _mac(self, payload: dict) -> str:
+    def _mac(self, payload: dict, fields: tuple[str, ...] = MAC_FIELDS) -> str:
         canonical = json.dumps(
-            {k: payload.get(k) for k in MAC_FIELDS},
+            {k: payload.get(k) for k in fields},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -526,3 +650,26 @@ class SettingsStore:
             return None
         self._expected_mac = mac
         return settings
+
+    def _verify_legacy(self, payload: dict) -> Settings | None:
+        """Verify a version-1 file, MAC'd before the harness was; None otherwise.
+
+        Only on the first load of a run, as for any file not written by this
+        process. Its harness was never covered, but no released version-1 file
+        could hold ocb_cli, so any other harness is kept and ocb_cli (which only
+        a write outside Connect can have put there) becomes the default.
+        """
+        if payload.get("version") != 1 or self._expected_mac is not None:
+            return None
+        if not hmac.compare_digest(
+            str(payload.get("mac", "")), self._mac(payload, LEGACY_MAC_FIELDS)
+        ):
+            return None
+        try:
+            protected = Protected.from_raw(payload["protected"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+        harness = _harness_or_default(payload.get("harness", DEFAULT_HARNESS))
+        if harness == HARNESS_OCB_CLI:
+            harness = DEFAULT_HARNESS
+        return Settings(protected=protected, harness=harness)

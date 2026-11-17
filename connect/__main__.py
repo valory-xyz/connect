@@ -42,13 +42,19 @@ from mech_client import NonceRefused
 
 from connect import workspace
 from connect.activity import ActivityLog
-from connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
+from connect.config import AGENT_HTTP_PORT, AppConfig, BIND_HOST, load_config
 from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
 from connect.run_goal import RunGoal
 from connect.server.app import create_app
-from connect.settings import SETTINGS_FILE, SettingsStore, derive_mac_key
+from connect.settings import (
+    SETTINGS_FILE,
+    SettingsStore,
+    derive_mac_key,
+    harness_unavailable_reason,
+    ocb_chat_mech,
+)
 from connect.signer import Signer
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [agent] %(message)s"
@@ -168,6 +174,40 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
     return password
 
 
+def resolve_ocb_mech(config: AppConfig) -> str | None:
+    """Return OCB's model here: the instance chain's chat mech, override first.
+
+    Called once at boot; the availability rule and the launch line both read
+    its answer. When there is none, it logs why, since the operator otherwise
+    sees only `model_unavailable`; an override that cannot apply is logged too.
+    """
+    logger = logging.getLogger("agent")
+    chain = config.instance_chain
+    for other in sorted(set(config.ocb_chat_mech_overrides) - {chain}):
+        logger.warning(
+            "OCB_CHAT_MECH_%s has no effect: %s",
+            other.upper(),
+            (
+                "no single instance chain"
+                if chain is None
+                else f"this instance runs on {chain}"
+            ),
+        )
+    mech = ocb_chat_mech(chain, config.ocb_chat_mech_overrides)
+    if chain is None:
+        logger.warning(
+            "OCB has no chat mech: no single instance chain (chains with a safe: %s)",
+            config.safe_chains or "none",
+        )
+    elif mech is None:
+        logger.warning(
+            "OCB has no chat mech: %s has no confirmed one and OCB_CHAT_MECH_%s is not set",
+            chain,
+            chain.upper(),
+        )
+    return mech
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the agent server; return the process exit code."""
     password = resolve_password(argv)
@@ -192,8 +232,14 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("configured chains: %s", sorted(config.chains) or "none")
 
     activity = ActivityLog(config.store_path, RunGoal(config.minutes_per_run))
+    ocb_mech = resolve_ocb_mech(config)
     settings_store = SettingsStore(
-        config.store_path / SETTINGS_FILE, derive_mac_key(account), activity
+        config.store_path / SETTINGS_FILE,
+        derive_mac_key(account),
+        activity,
+        unavailable=lambda harness: harness_unavailable_reason(
+            harness, ocb_mech, sys.platform
+        ),
     )
     guard = Guard(settings_store, config, agent_signer=account.address)
     signer = Signer(account=account, config=config, activity=activity, guard=guard)
@@ -213,7 +259,9 @@ def main(argv: list[str] | None = None) -> int:
     # beats a crash loop the middleware just keeps restarting); the workspace
     # re-attempts its own population on every /healthcheck, so a condition that
     # clears by itself heals without a restart.
-    agent_workspace = workspace.Workspace(config.store_path, token)
+    agent_workspace = workspace.Workspace(
+        config.store_path, token, ocb_mech, record_key=derive_mac_key(account)
+    )
     agent_workspace.ensure()
 
     # Pearl reads it whatever our health, so write it even on a degraded boot.
