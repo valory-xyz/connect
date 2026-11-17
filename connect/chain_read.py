@@ -35,7 +35,9 @@ from eth_utils import keccak, to_checksum_address
 from web3 import Web3
 from web3.exceptions import ContractLogicError
 
+from connect.input_errors import InputError
 from connect.safe import calldata_hex
+from connect.texts import ADDRESS_INVALID, HEX_INVALID
 
 # EIP-1967: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
 IMPLEMENTATION_SLOT = int(
@@ -234,11 +236,17 @@ def chain_call(w3: Web3, to: str, data: str, block: str = "latest") -> dict:
     so an unreachable chain never reads as a contract that said no, and a
     malformed argument raises ValueError naming it before anything is asked.
     """
-    address = to_checksum_address(to)  # ValueError: not an address
+    try:
+        address = to_checksum_address(to)
+    except ValueError as e:
+        raise InputError(ADDRESS_INVALID("to", to)) from e
     data = data or "0x"
+    try:
+        bytes.fromhex(data.removeprefix("0x"))
+    except ValueError as e:
+        raise InputError(HEX_INVALID("data", data)) from e
     if not data.startswith("0x"):
-        raise ValueError(f"data must be 0x-hex, got '{data}'")
-    bytes.fromhex(data[2:])  # ValueError: not hex
+        raise InputError(HEX_INVALID("data", data))
     try:
         raw = w3.eth.call(
             {"to": address, "data": t.cast(t.Any, data)},
@@ -264,11 +272,11 @@ def _block(block: str) -> t.Any:
     try:
         number = int(block, 0)
     except (TypeError, ValueError) as e:
-        raise ValueError(
+        raise InputError(
             f"block must be one of {', '.join(BLOCK_TAGS)} or a number, got '{block}'"
         ) from e
     if number < 0:
-        raise ValueError(f"block must be >= 0, got {number}")
+        raise InputError(f"block must be >= 0, got {number}")
     return number
 
 

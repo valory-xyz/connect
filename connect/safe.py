@@ -38,6 +38,8 @@ from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from web3 import Web3
 
+from connect.input_errors import InputError
+
 # Safe v1.x execTransaction(address,uint256,bytes,uint8,uint256,uint256,
 #                           uint256,address,address,bytes)
 EXEC_TRANSACTION_SELECTOR = "6a761202"
@@ -217,13 +219,13 @@ class SafeExec:
         """Decode execTransaction calldata; ValueError when it will not read."""
         calldata = calldata_hex(data)
         if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
-            raise ValueError("not execTransaction calldata")
+            raise InputError("not execTransaction calldata")
         try:
             decoded = tuple(
                 abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
             )
         except Exception as e:
-            raise ValueError(f"could not decode execTransaction calldata: {e}") from e
+            raise InputError(f"could not decode execTransaction calldata: {e}") from e
         return cls(
             to=str(decoded[0]),
             value=int(decoded[1]),

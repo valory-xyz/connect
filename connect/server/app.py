@@ -172,7 +172,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     workspace: Workspace,
     switches: Switches = PRODUCTION,
 ) -> FastAPI:
-    """Create app; `switches` stays at `PRODUCTION` for every Pearl build."""
+    """Create app; see `connect.switches` for `switches`."""
     # the run's token is the workspace's scoped token (read + mech + tx);
     # narrower ones are minted from it through POST /tokens
     grants = GrantStore(token, held=signer.holds_request)
@@ -249,7 +249,13 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
         app.include_router(signer_routes.eoa_router, dependencies=signing_auth)
     app.mount(
         "/mcp",
-        AuthMiddleware(mcp.streamable_http_app(), grants, activity, limiter),
+        AuthMiddleware(
+            mcp.streamable_http_app(),
+            grants,
+            activity,
+            limiter,
+            tools=mcp.tool_names(),
+        ),
     )
 
     # the agent UI last, so it can own / without shadowing an endpoint: routes

@@ -932,7 +932,6 @@ class TestSimulate:
         """The asset diff plus fits_intent and problems."""
         result = test_signer.simulate("testchain", EOA, value=5)
         assert result["native"] == "-5"
-        # no intent given: no verdict and no problems, as the reference answers
         assert result["fits_intent"] is None
         assert result["problems"] == []
         fits = test_signer.simulate("testchain", EOA, value=5, intent=pay(EOA, 5))
@@ -1003,6 +1002,17 @@ class TestTools:
         assert await tools["preflight_transaction"]("testchain", EOA, 5) == {
             "permitted": True
         }
+
+    async def test_preflight_permits_a_call_that_would_revert(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """The guardrail permits these bytes; whether they revert is not asked."""
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        assert await tools["preflight_transaction"](
+            "testchain", TOKEN, data=TOKEN_CALL
+        ) == {"permitted": True}
+        assert fake_w3.provider.simulated == []
 
     async def test_simulate_transaction_tool(
         self, tools: dict[str, t.Callable]

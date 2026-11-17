@@ -28,10 +28,10 @@ formatters included.
 
 Not every text is emitted by Connect yet. `WEI_DESCRIPTION`, `MINED_PREFIX`,
 `MINED_REVERT`, `INTENT_UNKNOWN_TOKEN`, `LOST_RESPONSE`, `SIGNER_REFUSED`,
-`UNAUTHORIZED_BODY`, `INVALID_REQUEST`, `ADDRESS_INVALID`, `HEX_INVALID`,
-`AMOUNT_INEXACT`, `ABI_UNVERIFIED`, `UNKNOWN_SELECTOR` and the `MECH_*` texts
-are the reference's wording for behaviour still to be matched; until each is
-wired, Connect answers those cases in its own words.
+`UNAUTHORIZED_BODY`, `INVALID_REQUEST`, `AMOUNT_INEXACT`, `ABI_UNVERIFIED`,
+`UNKNOWN_SELECTOR` and the `MECH_*` texts are the reference's wording for
+behaviour still to be matched; until each is wired, Connect answers those
+cases in its own words.
 """
 
 # pylint: disable=invalid-name

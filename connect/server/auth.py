@@ -800,12 +800,19 @@ class AuthMiddleware:
         grants: GrantStore,
         activity: ActivityLog,
         limiter: AuthFailureLimiter,
+        *,
+        tools: t.Collection[str] | None = None,
     ) -> None:
-        """Initialize."""
+        """Initialize; `tools` names the MCP app's tools, None meaning unknown.
+
+        A call naming none of them is passed on unauthorized, for the MCP app
+        to answer as unknown; with `tools` unknown, every call is authorized.
+        """
         self._app = app
         self._grants = grants
         self._activity = activity
         self._limiter = limiter
+        self._tools = None if tools is None else frozenset(tools)
 
     async def __call__(self, scope: t.Any, receive: t.Any, send: t.Any) -> None:
         """Enforce Origin locality + bearer token, then delegate."""
@@ -860,9 +867,10 @@ class AuthMiddleware:
             arguments = params.get("arguments")
             arguments = arguments if isinstance(arguments, dict) else {}
             name = str(params.get("name"))
-            if name not in ACTION_SCOPES:
-                # no tool of that name: nothing is authorized by passing it
-                # on, and the MCP app answers it `texts.UNKNOWN_TOOL`
+            if self._tools is not None and name not in self._tools:
+                # no tool of that name: passing it on authorizes nothing, and
+                # the MCP app answers it `texts.UNKNOWN_TOOL`. A registered
+                # tool always meets `authorize`, so one with no scope is refused
                 continue
             try:
                 check_tool_amounts(name, arguments)

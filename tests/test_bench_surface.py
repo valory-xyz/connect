@@ -29,10 +29,15 @@ from fastapi.testclient import TestClient
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
+from connect import settings as settings_module
 from connect import texts
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.server.auth import ACTION_SCOPES
+from connect.guard import GuardError
+from connect.idempotency import InFlightError
+from connect.input_errors import InputError
+from connect.mech import MechError
+from connect.server.auth import ACTION_SCOPES, GrantRefused
 from connect.server.mcp_tools import (
     GET_ABI_DESCRIPTION,
     REQUEST_CONTEXT_NOTE,
@@ -130,9 +135,17 @@ def test_an_unknown_tool_is_named_through_the_transport(client: TestClient) -> N
     assert _tool_error(client, "no_such_tool", {}) == texts.UNKNOWN_TOOL("no_such_tool")
 
 
-async def test_every_registered_tool_has_a_scope(mcp: FastMCP) -> None:
-    """The mount passes on only names it has no scope for, and no tool is one."""
-    assert {tool.name for tool in await mcp.list_tools()} <= set(ACTION_SCOPES)
+@pytest.mark.parametrize("expose_mode", [False, True])
+def test_every_registered_tool_has_a_scope(
+    make_mcp: t.Callable[..., FastMCP],
+    monkeypatch: pytest.MonkeyPatch,
+    expose_mode: bool,
+) -> None:
+    """A tool with no scope would be refused by every token, `settings` included."""
+    monkeypatch.setattr(settings_module, "EXPOSE_MODE_TO_AGENT", expose_mode)
+    names = make_mcp().tool_names()
+    assert ("settings" in names) is expose_mode
+    assert names <= set(ACTION_SCOPES)
 
 
 async def test_the_in_process_error_is_the_handler_s_own_text(
@@ -254,3 +267,43 @@ async def test_request_context_warns_that_it_may_be_published(mcp: FastMCP) -> N
     (tool,) = [t for t in await mcp.list_tools() if t.name == "mech_request"]
     field = tool.inputSchema["properties"]["request_context"]
     assert field["description"] == REQUEST_CONTEXT_NOTE
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        InputError("unknown chain 'x'"),
+        SignerError(texts.GUARD_NO_SELF_CALL),
+        GuardError(texts.GUARD_NO_DELEGATECALL),
+        GrantRefused("token-scope", "this token does not allow it"),
+        MechError("refused before payment"),
+        InFlightError("request r1 is still in flight"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+async def test_each_error_connect_words_reaches_the_caller_verbatim(
+    mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, test_signer: Signer, error: Exception
+) -> None:
+    """Every forwarded type keeps its text; dropping one from the list fails here."""
+
+    def refuse(*_: t.Any, **__: t.Any) -> str:
+        raise error
+
+    monkeypatch.setattr(test_signer, "send_via_safe", refuse)
+    with pytest.raises(ToolError) as raised:
+        await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
+    assert str(raised.value) == str(error)
+
+
+async def test_a_library_value_error_is_not_forwarded(
+    mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, test_signer: Signer
+) -> None:
+    """A builtin ValueError is a library's words, so the caller reads TOOL_FAILED."""
+
+    def broken(*_: t.Any, **__: t.Any) -> str:
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(test_signer, "send_via_safe", broken)
+    with pytest.raises(ToolError) as raised:
+        await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
+    assert str(raised.value) == TOOL_FAILED.format(tool="safe_transaction")

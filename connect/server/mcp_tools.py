@@ -33,7 +33,7 @@ from hexbytes import HexBytes
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import BeforeValidator, ConfigDict, Field, with_config
+from pydantic import BeforeValidator, ConfigDict, Field, ValidationError, with_config
 from typing_extensions import TypedDict
 from web3.exceptions import TransactionNotFound
 
@@ -44,6 +44,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
 from connect.idempotency import InFlightError
+from connect.input_errors import InputError
 from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
@@ -159,10 +160,12 @@ TOOLS_TAKING_TO_FOR_TARGET = frozenset(
     {"safe_transaction", "preflight_transaction", "simulate_transaction"}
 )
 
-# errors whose text Connect wrote for the caller; any other is a library's or
-# a bug's, which may carry an RPC URL and key, so it is logged, not forwarded
+# errors whose text Connect wrote for the caller (a tool's own argument check
+# included, as pydantic reports it); any other is a library's or a bug's,
+# which may carry an RPC URL and key, so it is logged, not forwarded
 CALLER_ERRORS: tuple[type[Exception], ...] = (
-    ValueError,
+    InputError,
+    ValidationError,
     SignerError,
     GuardError,
     GrantRefused,
@@ -189,9 +192,9 @@ def with_aliases(tool: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
 class ConnectMCP(FastMCP):
     """FastMCP with the reference's call boundary.
 
-    A tool's error reaches the agent as the text the refusing code wrote:
-    FastMCP prepends `Error executing tool <name>: ` to every raised error,
-    which would hide the markers the bench's broker reads.
+    A refusal Connect wrote reaches the agent verbatim, any other error as
+    `TOOL_FAILED`; FastMCP's `Error executing tool <name>: ` prefix would hide
+    the markers the bench's broker reads.
     """
 
     def __init__(self, **settings: t.Any) -> None:
@@ -199,6 +202,10 @@ class ConnectMCP(FastMCP):
         super().__init__(**settings)
         # FastMCP takes no version; unset, the MCP SDK reports its own
         self._mcp_server.version = SERVER_INFO["version"]
+
+    def tool_names(self) -> frozenset[str]:
+        """Return the names of the registered tools."""
+        return frozenset(tool.name for tool in self._tool_manager.list_tools())
 
     async def call_tool(self, name: str, arguments: dict[str, t.Any]) -> t.Any:
         """Call a tool, raising its own error text with no transport prefix."""
@@ -224,7 +231,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     settings_store: SettingsStore,
     grants: GrantStore,
     switches: Switches = PRODUCTION,
-) -> FastMCP:
+) -> ConnectMCP:
     """Build mcp."""
     # Read once per build: tool registration happens here while wallet_info's
     # mode key is added per call, and one snapshot keeps the MCP surface
@@ -343,7 +350,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             value=parse_amount(value),
             data=data,
             via_safe=via_safe,
-            gate=False,
+            run_intent_gate=False,
         )
         if reason is None:
             return {"permitted": True}
@@ -422,7 +429,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         try:
             raw = bytes.fromhex(digest.removeprefix("0x"))
         except ValueError as e:
-            raise ValueError(f"digest must be a 0x-hex string: {e}") from e
+            raise InputError(f"digest must be a 0x-hex string: {e}") from e
         return {"signature": await asyncio.to_thread(signer.sign_digest, raw)}
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["mech_request"])
@@ -586,7 +593,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     try:
         amount = parse_amount(value)
     except (TypeError, ValueError) as e:
-        raise ValueError(f"value must be a non-negative amount in wei: {e}") from e
+        raise InputError(f"value must be a non-negative amount in wei: {e}") from e
 
     def _run() -> dict:
         tx_hash = method(

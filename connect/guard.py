@@ -434,8 +434,6 @@ class Guard:
         if exec_call.to.lower() not in whitelist.get(chain, ()):
             if self._consume_deposit_allowance(chain, exec_call, consume=consume):
                 return
-            # the whitelist is not editable through the API yet, so pointing at
-            # it would send the operator down a path that does not exist
             raise GuardError(guard_not_allowed(exec_call.to, chain))
 
     def _consume_deposit_allowance(

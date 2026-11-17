@@ -85,8 +85,8 @@ other non-aea agent. It:
      switch is on (off in Pearl too; see [Bench parity](#bench-parity));
      read-only tools carry `readOnlyHint`
    - MCP (streamable HTTP) at `/mcp`, its published descriptions, initialize
-     answer (`serverInfo` `{"name": "connect", "version": "0.1.0"}`, no
-     `instructions`) and error texts OnchainBench's reference ones (see
+     answer (`serverInfo` is `connect.texts.SERVER_INFO`, the reference's name
+     and version, with no `instructions`) and error texts OnchainBench's reference ones (see
      [Bench parity](#bench-parity)): a failed tool call reads the refusing
      code's own text, with no `Error executing tool` prefix (an error Connect
      did not word for the caller reads `<tool> failed (the cause is in

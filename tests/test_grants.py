@@ -764,7 +764,11 @@ class TestMcpMiddleware:
         store = grant_store(WORKSPACE)
         reader = store.mint(WORKSPACE, grant(scopes=["read"]))
         middleware = AuthMiddleware(
-            lambda *a: None, store, activity, AuthFailureLimiter()
+            lambda *a: None,
+            store,
+            activity,
+            AuthFailureLimiter(),
+            tools=["wallet_info", "safe_transaction"],
         )
         return middleware, reader
 
@@ -810,6 +814,36 @@ class TestMcpMiddleware:
         assert "token-scope" in answer["error"]["message"]
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert entry["tool"] == "safe_transaction"
+
+    @pytest.mark.parametrize(
+        ("tools", "name", "passed"),
+        [
+            (["wallet_info"], "no_such_tool", True),  # unknown: the app answers
+            (["wallet_info", "unscoped"], "unscoped", False),  # registered: refused
+            (None, "no_such_tool", False),  # no tool list: everything authorized
+        ],
+    )
+    async def test_only_a_name_no_tool_answers_to_passes_unauthorized(
+        self,
+        activity: ActivityLog,
+        tools: list[str] | None,
+        name: str,
+        passed: bool,
+    ) -> None:
+        """The mount fails closed: a registered tool with no scope is refused."""
+        store = grant_store(WORKSPACE)
+        middleware = AuthMiddleware(
+            lambda *a: None, store, activity, AuthFailureLimiter(), tools=tools
+        )
+        call = json.dumps(
+            {"method": "tools/call", "params": {"name": name, "arguments": {}}}
+        ).encode()
+        sent, seen = await self._call(middleware, WORKSPACE, call)
+        if passed:
+            assert seen[0] == call
+        else:
+            assert not seen
+            assert "token-scope" in json.loads(sent[1]["body"])["error"]["message"]
 
     async def test_a_malformed_body_is_left_to_the_server(
         self, setup: tuple[AuthMiddleware, str]
@@ -946,34 +980,21 @@ def test_mcp_simulation_holds_a_capped_token_as_the_send_would(
     """
     fake_w3.provider.logs = [_position_out_log()]
     arguments = {"chain": "testchain", "target": POSITIONS}
-
-    def call(tool: str, token: str) -> str:
-        body = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": tool,
-                "arguments": (
-                    {**arguments, "intent": {"recipients": [RECIPIENT]}}
-                    if tool == "simulate_transaction"
-                    else arguments
-                ),
-            },
-        }
-        headers = {"Accept": "application/json, text/event-stream"}
-        return client.post(
-            "/mcp/", json=body, headers={**headers, **_bearer(token)}
-        ).text
-
+    simulated = {**arguments, "intent": {"recipients": [RECIPIENT]}}
     capped = client.post(
         "/tokens",
         json={"scopes": ["read", "tx"], "max_value_per_tx": {"native": 5}, **LIVE},
         headers=_bearer(WORKSPACE),
     ).json()["token"]
-    assert "token-cap-positions" in call("simulate_transaction", capped)
-    assert "token-cap-positions" not in call("simulate_transaction", WORKSPACE)
-    preflight = call("preflight_transaction", capped)
+
+    def answer(token: str, tool: str, args: dict) -> str:
+        return _mcp_call(client, token, tool, args).text
+
+    assert "token-cap-positions" in answer(capped, "simulate_transaction", simulated)
+    assert "token-cap-positions" not in answer(
+        WORKSPACE, "simulate_transaction", simulated
+    )
+    preflight = answer(capped, "preflight_transaction", arguments)
     assert '\\"permitted\\": true' in preflight
     assert "token-cap-positions" not in preflight
     assert not fake_w3.eth.sent

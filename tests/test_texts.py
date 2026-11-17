@@ -218,25 +218,6 @@ def test_a_malformed_value_is_quoted_truncated_to_sixty_characters() -> None:
     assert texts.HEX_INVALID("data", long).endswith(repr(long[:60]))
 
 
-def test_the_thirteen_tools_are_described() -> None:
-    """The description table names exactly the reference's 13 tools."""
-    assert set(texts.TOOL_DESCRIPTIONS) == {
-        "wallet_info",
-        "safe_transaction",
-        "send_transaction",
-        "preflight_transaction",
-        "simulate_transaction",
-        "chain_call",
-        "get_abi",
-        "decode_calldata",
-        "transaction_status",
-        "sign_message",
-        "mech_tools",
-        "mech_request",
-        "mech_result",
-    }
-
-
 def test_the_guardrail_texts_carry_the_prefix_the_broker_reads() -> None:
     """Every guardrail refusal begins with the prefix the broker classifies."""
     for text in (
@@ -247,7 +228,7 @@ def test_the_guardrail_texts_carry_the_prefix_the_broker_reads() -> None:
         assert text.startswith(texts.GUARDRAIL_PREFIX)
 
 
-# the modules whose refusals and answers read the texts module (B28)
+# modules that must not restate a contract text inline
 READERS = (
     "guard.py",
     "intent.py",

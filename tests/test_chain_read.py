@@ -26,6 +26,7 @@ from web3 import Web3
 from web3.exceptions import ContractLogicError
 
 from connect import chain_read
+from connect.input_errors import InputError
 
 TOKEN = "0x" + "70" * 20
 PROXY = "0x" + "71" * 20
@@ -110,7 +111,7 @@ def test_chain_call_reports_result_or_revert() -> None:
     ("to", "data", "block", "match"),
     [
         ("0x1234", "0x", "latest", None),
-        (TOKEN, "313ce567", "latest", "0x-hex"),
+        (TOKEN, "313ce567", "latest", r"data must be hex \(0x and whole bytes\)"),
         (TOKEN, "0xzz", "latest", None),
         (TOKEN, "0x", "yesterday", "block must be"),
         (TOKEN, "0x", "-1", "block must be >= 0"),
@@ -121,7 +122,7 @@ def test_chain_call_refuses_a_malformed_argument_rather_than_reverting(
 ) -> None:
     """A typo is the caller's mistake: it raises, it never reads as a revert."""
     w3 = _w3()
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(InputError, match=match):
         chain_read.chain_call(t.cast(Web3, w3), to, data, block)
 
 

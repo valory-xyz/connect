@@ -7338,7 +7338,7 @@ class TestMcpGuardrailTools:
             "data": "0xab",
             "via_safe": False,
             # the guardrail's verdict alone: nothing is simulated
-            "gate": False,
+            "run_intent_gate": False,
         }
 
     async def test_preflight_tool_carries_the_refusal(
@@ -7368,8 +7368,7 @@ class TestMcpGuardrailTools:
             "permitted": True
         }
         refused = await tools["preflight_transaction"]("testchain", SAFE)
-        assert refused["permitted"] is False
-        assert "may not call itself" in refused["rule"]
+        assert refused == {"permitted": False, "rule": texts.GUARD_NO_SELF_CALL}
 
     async def test_mech_tools_tool_delegates(
         self,
