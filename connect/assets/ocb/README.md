@@ -17,16 +17,16 @@ the installer again.
 
 ## What is here now
 
-- `install.sh`: `valory-xyz/olas-ocb-agent` commit `6ea9fd0`, copied byte
-  for byte (unchanged at `5dd58e5`)
-- Wheel: `olas_ocb_agent-0.4.1-py3-none-any.whl` from commit `5dd58e5`
-  (olas-ocb-agent#67, branch `fix/mech-delivery-reader`: MechModel reads
-  Connect's real mech answer, a dict `payment` label and the two-wrapper
-  delivery), sha256
-  `5b0a8d77e29f439f1dd68e7f43b3a92029e7d18104d233cb0ec899e4d1206cd0`
-- Built on Linux from `git archive 5dd58e5` (LF line endings) with uv 0.13.8:
-  `SOURCE_DATE_EPOCH=$(git show -s --format=%ct 5dd58e5) uv build --wheel`
+- Source: `valory-xyz/olas-ocb-agent` commit `e5ccec2` (main, the merge of
+  olas-ocb-agent#71, after #70 set the launch version 0.1.0); `install.sh`
+  copied byte for byte from it
+- Wheel: `olas_ocb_agent-0.1.0-py3-none-any.whl`, sha256
+  `98a68cd9e7ee62eb04412342f7d3c84da6004a91cc793e9c6eceaa8d7998846f`
+- Built on Linux from `git archive e5ccec2` (LF line endings) with uv 0.13.8:
+  `SOURCE_DATE_EPOCH=$(git show -s --format=%ct e5ccec2) uv build --wheel`
   (two builds gave the same sha256; the project names no build backend, so
   uv uses the latest setuptools)
-- `VERSION`: `v0.4.1` (the package version is still 0.4.1, so the wheel's
-  file name, and with it Connect's install identity, did not change)
+- `VERSION`: `v0.1.0`. It sorts below the 0.4.1 that earlier Connect
+  releases bundled; an install from those is still replaced, since Connect
+  reinstalls whenever the bundled wheel (name or sha256) changes and the
+  script installs the bundled wheel by URL
