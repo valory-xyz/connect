@@ -89,6 +89,12 @@ from connect.safe import (
     decode_deposit,
 )
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
+from connect.texts import (
+    GUARD_NO_DELEGATECALL,
+    GUARD_NO_SELF_CALL,
+    guard_not_allowed,
+    guard_refusal,
+)
 
 logger = logging.getLogger("agent")
 
@@ -96,10 +102,6 @@ logger = logging.getLogger("agent")
 class GuardError(Exception):
     """A transaction or signing request denied by the guardrail."""
 
-
-# The escalation clause every operator-changeable refusal ends with; one
-# literal so the two call sites cannot drift apart.
-_ASK_OPERATOR = "ask the operator to change them via the agent UI if it is required"
 
 # How long a registered allowance stays consumable. Arming must happen before
 # the request leaves: mech-client swallows the 402 -> deposit -> retry cycle
@@ -269,8 +271,12 @@ class Guard:
             if self._allowed_digests.pop(bytes(digest), None) is not None:
                 return
         raise GuardError(
-            "raw digest signing is disabled by the operator's guardrail "
-            f"settings; {_ASK_OPERATOR}"
+            guard_refusal(
+                "raw-digest",
+                "raw digest signing is disabled by the operator's guardrail "
+                "settings; ask the operator to change them via the agent UI if "
+                "it is required",
+            )
         )
 
     def check_transaction(  # pylint: disable=too-many-arguments
@@ -306,7 +312,7 @@ class Guard:
             except ValueError as e:
                 # calldata we cannot parse is calldata we cannot judge, so it
                 # is refused rather than waved through
-                raise GuardError(str(e)) from e
+                raise GuardError(guard_refusal("bad-calldata", str(e))) from e
             self._check_floor(to, exec_call)
         if not server_built:
             self._check_marketplace(chain, to, exec_call)
@@ -329,15 +335,9 @@ class Guard:
         owners, modules or guard.
         """
         if exec_call.operation != OPERATION_CALL:
-            raise GuardError(
-                "the safe may not delegatecall (got operation="
-                f"{exec_call.operation}) — the guardrail never allows it"
-            )
+            raise GuardError(GUARD_NO_DELEGATECALL)
         if exec_call.to.lower() == target.lower():
-            raise GuardError(
-                "the safe may not call itself (owner, module and guard changes "
-                "are made that way) — the guardrail never allows it"
-            )
+            raise GuardError(GUARD_NO_SELF_CALL)
 
     @staticmethod
     def _check_marketplace(chain: str, to: str, exec_call: "SafeExec | None") -> None:
@@ -350,8 +350,12 @@ class Guard:
         marketplaces = sorted(called & MECH_MARKETPLACES.get(chain, frozenset()))
         if marketplaces:
             raise GuardError(
-                f"the mech marketplace {marketplaces[0]} on {chain} takes only the "
-                "requests Connect composes; send a mech request with mech_request"
+                guard_refusal(
+                    "marketplace",
+                    f"the mech marketplace {marketplaces[0]} on {chain} takes only "
+                    "the requests Connect composes; send a mech request with "
+                    "mech_request",
+                )
             )
 
     def _check_restricted(  # pylint: disable=too-many-arguments
@@ -368,32 +372,48 @@ class Guard:
         """Restricted mode: the safe CALLs a whitelisted address, or nothing."""
         if safe is None:
             raise GuardError(
-                f"the operator's guardrail settings allow no transactions on "
-                f"chain '{chain}' (no service safe is configured there)"
+                guard_refusal(
+                    "no-safe",
+                    "the operator's guardrail settings allow no transactions on "
+                    f"chain '{chain}' (no service safe is configured there)",
+                )
             )
         if to.lower() != safe.lower():
             raise GuardError(
-                f"the operator's guardrail settings only allow transactions "
-                f"targeting the service safe {safe}, not {to}"
+                guard_refusal(
+                    "safe-only",
+                    "the operator's guardrail settings only allow transactions "
+                    f"targeting the service safe {safe}, not {to}",
+                )
             )
         if exec_call is None:
             raise GuardError(
-                "the guardrail requires calls to the safe to be execTransaction "
-                f"(selector 0x{EXEC_TRANSACTION_SELECTOR}), got 0x{calldata[:8]}"
+                guard_refusal(
+                    "exec-transaction-only",
+                    "the guardrail requires calls to the safe to be "
+                    f"execTransaction (selector 0x{EXEC_TRANSACTION_SELECTOR}), "
+                    f"got 0x{calldata[:8]}",
+                )
             )
         if value != 0:
             raise GuardError(
-                "the guardrail forbids native value on the outer transaction "
-                "of an execTransaction call"
+                guard_refusal(
+                    "outer-value",
+                    "the guardrail forbids native value on the outer transaction "
+                    "of an execTransaction call",
+                )
             )
         # A non-zero gasPrice makes the safe pay a refund (in gasToken, to
         # refundReceiver or tx.origin) — funds leaving the safe past the
         # whitelist. The standard flow always zeroes all three fields.
         if exec_call.pays_refund:
             raise GuardError(
-                "the guardrail requires execTransaction refund fields to be "
-                "zero (gasPrice=0, gasToken=0x0, refundReceiver=0x0) — a gas "
-                "refund would pay out of the safe past the allowed targets"
+                guard_refusal(
+                    "refund",
+                    "the guardrail requires execTransaction refund fields to be "
+                    "zero (gasPrice=0, gasToken=0x0, refundReceiver=0x0): a gas "
+                    "refund would pay out of the safe past the allowed targets",
+                )
             )
         tracker = token_approve_targets(chain).get(exec_call.to.lower())
         if tracker is not None:
@@ -403,8 +423,11 @@ class Guard:
             spender = decode_approve(exec_call.data)
             if spender is None or spender.lower() != tracker:
                 raise GuardError(
-                    f"the guardrail only allows approve(spender={tracker}) on "
-                    f"the payment token {exec_call.to}"
+                    guard_refusal(
+                        "payment-token-approve",
+                        f"the guardrail only allows approve(spender={tracker}) on "
+                        f"the payment token {exec_call.to}",
+                    )
                 )
             return
         whitelist = self._store.load().protected.whitelist
@@ -413,10 +436,7 @@ class Guard:
                 return
             # the whitelist is not editable through the API yet, so pointing at
             # it would send the operator down a path that does not exist
-            raise GuardError(
-                f"the operator's guardrail settings do not allow the safe to "
-                f"call {exec_call.to} on {chain}; {_ASK_OPERATOR}"
-            )
+            raise GuardError(guard_not_allowed(exec_call.to, chain))
 
     def _consume_deposit_allowance(
         self, chain: str, exec_call: "SafeExec", *, consume: bool

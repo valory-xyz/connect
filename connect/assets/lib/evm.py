@@ -548,9 +548,8 @@ SIGNER_REFUSALS: dict[int, tuple[str, ...]] = {
         "unknown chain '",
         "no service safe is configured for chain '",
         "cannot compose the safe call: ",
-        "the safe may not call itself ",
-        "the operator's guardrail settings do not allow the safe to call ",
-        "the guardrail only allows approve(spender=",
+        # every guardrail refusal, whichever rule it names
+        "guardrail: rule ",
         "refused by the intent gate: ",
     ),
     # a scoped token's refusal names its rule: an expired token is a 401

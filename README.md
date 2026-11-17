@@ -417,6 +417,15 @@ agent-facing send path — `safe_transaction`, `send_transaction` (to the
 marketplace, or an `execTransaction` carrying a call to it) and their HTTP
 routes — is refused, and `preflight_transaction` answers the same.
 
+Every guardrail refusal begins `guardrail: rule '<id>': `, the prefix
+OnchainBench's broker reads as "not sent". The floor and whitelist texts are
+the reference's, verbatim (`connect.texts`): `no-delegatecall`,
+`no-self-call` and `whitelist` (naming the safe's call target and the chain).
+Connect's own rules use the same form: `marketplace`, `bad-calldata` (an
+`execTransaction` it cannot decode) and, in restricted mode, `no-safe`,
+`safe-only`, `exec-transaction-only`, `outer-value`, `refund`,
+`payment-token-approve` and `raw-digest`.
+
 On that floor, the signer enforces one of two persistent modes. The modes are
 an operator concept only: agent-facing surfaces (the MCP tools, `GET /wallet`,
 the workspace brief and bundled skills, and every guard refusal message)

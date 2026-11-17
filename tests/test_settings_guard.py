@@ -72,6 +72,7 @@ from connect import mech_allowances as allowances_module
 from connect import mech_budget
 from connect import mech_queue as mech_queue_module
 from connect import settings as settings_module
+from connect import texts
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
 from connect.chains import MECH_MARKETPLACES
@@ -1277,12 +1278,44 @@ class TestGuard:
         for mode in (MODE_RESTRICTED, MODE_UNRESTRICTED):
             guard = make_guard(store, mode, {"testchain": (WHITELISTED.lower(),)})
             delegatecall = exec_transaction_calldata(WHITELISTED, operation=1)
-            with pytest.raises(GuardError, match="may not delegatecall"):
+            with pytest.raises(GuardError) as refused:
                 guard.check_transaction("testchain", SAFE, 0, delegatecall)
+            # the reference's text, which carries no operation value
+            assert str(refused.value) == texts.GUARD_NO_DELEGATECALL
             # enableModule/addOwnerWithThreshold/setGuard are all self-calls
             self_call = exec_transaction_calldata(SAFE, data=b"\x61\x0b\x59\x25")
-            with pytest.raises(GuardError, match="may not call itself"):
+            with pytest.raises(GuardError) as refused:
                 guard.check_transaction("testchain", SAFE, 0, self_call)
+            assert str(refused.value) == texts.GUARD_NO_SELF_CALL
+
+    def test_the_whitelist_refusal_is_the_reference_s_text(
+        self, store: SettingsStore
+    ) -> None:
+        """The refusal names the safe's call target and the chain, verbatim."""
+        guard = make_guard(store, MODE_RESTRICTED, {"testchain": ()})
+        call = exec_transaction_calldata(WHITELISTED)
+        with pytest.raises(GuardError) as refused:
+            guard.check_transaction("testchain", SAFE, 0, call)
+        assert str(refused.value) == texts.guard_not_allowed(WHITELISTED, "testchain")
+
+    def test_every_guardrail_refusal_names_its_rule(self, store: SettingsStore) -> None:
+        """Connect's own restricted rules carry the prefix the broker reads too."""
+        guard = make_guard(store, MODE_RESTRICTED, {"testchain": ()})
+        refusals = (
+            lambda: guard.check_transaction("testchain", WHITELISTED, 0, "0x"),
+            lambda: guard.check_transaction("testchain", SAFE, 0, "0x12345678"),
+            lambda: guard.check_transaction(
+                "testchain", SAFE, 1, exec_transaction_calldata(WHITELISTED)
+            ),
+            lambda: guard.check_sign_digest(b"\x00" * 32),
+            lambda: guard.check_transaction(
+                "testchain", SAFE, 0, "0x" + EXEC_TRANSACTION_SELECTOR + "00"
+            ),
+        )
+        for refuse in refusals:
+            with pytest.raises(GuardError) as refused:
+                refuse()
+            assert str(refused.value).startswith(texts.GUARDRAIL_PREFIX + "'")
 
     def test_the_floor_holds_where_no_safe_is_configured(
         self, store: SettingsStore

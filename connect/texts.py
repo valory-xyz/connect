@@ -115,6 +115,12 @@ GUARDRAIL_PREFIX = "guardrail: rule "
 NOT_SENT_SUFFIX = ". Nothing was sent."
 MINED_PREFIX = "transaction 0x"
 
+
+def guard_refusal(rule: str, detail: str) -> str:
+    """Return a guardrail refusal of Connect's own rules, in the reference's form."""
+    return f"{GUARDRAIL_PREFIX}'{rule}': {detail}"
+
+
 GUARD_NO_DELEGATECALL = (
     "guardrail: rule 'no-delegatecall': the safe may not delegatecall; the "
     "guardrail never allows it"
