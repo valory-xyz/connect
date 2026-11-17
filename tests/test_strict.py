@@ -32,7 +32,7 @@ from connect.config import AppConfig
 from connect.guard import Guard
 from connect.intent import parse_intent
 from connect.mech import MechService
-from connect.server.auth import TOOL_AMOUNTS
+from connect.server.auth import TOOL_AMOUNTS, TOOL_CAPS
 from connect.server.mcp_tools import build_mcp
 from connect.server.strict import (
     audit_unknown_parameters,
@@ -308,25 +308,55 @@ async def test_the_tool_schema_declares_base_unit_amounts_as_strings(
                 assert "string" in kinds, (tool.name, name, schema)
                 assert not kinds & {"integer", "number"}, (tool.name, name, schema)
                 declared.setdefault(tool.name, []).append(name)
-    assert declared == {tool: list(names) for tool, names in TOOL_AMOUNTS.items()}
+    assert declared == {
+        tool: list(names) for tool, names in (TOOL_AMOUNTS | TOOL_CAPS).items()
+    }
 
 
 @pytest.mark.parametrize("amount", [1.5, 1.0, 2**53, 2**53 + 1, "1e18", -1, True])
 async def test_a_tool_refuses_an_amount_a_json_number_may_have_rounded(
     mcp: FastMCP, fake_w3: FakeW3, amount: t.Any
 ) -> None:
-    """A float, a number from 2^53 on or a non-amount is refused naming the rule."""
+    """A float, a number from 2^53 on or a non-amount is refused naming the rule.
+
+    The mech cap is a bound, not a spend, so only the amounts a double cannot
+    hold are exempt there (`test_a_mech_cap_takes_any_whole_json_integer`).
+    """
     for tool, arguments in (
         ("safe_transaction", {"chain": "testchain", "target": RECIPIENT}),
         ("simulate_transaction", {"chain": "testchain", "target": RECIPIENT}),
     ):
         with pytest.raises(ToolError, match="rule 'bad-value'"):
             await mcp.call_tool(tool, {**arguments, "value": amount})
-    with pytest.raises(ToolError, match="rule 'bad-value'"):
-        await mcp.call_tool(
-            "mech_request", {"prompt": "q", "tool": "t", "max_payment": amount}
-        )
+    if amount not in (2**53, 2**53 + 1):
+        with pytest.raises(ToolError, match="rule 'bad-value'"):
+            await mcp.call_tool(
+                "mech_request", {"prompt": "q", "tool": "t", "max_payment": amount}
+            )
     assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize("cap", [2**53, 2**53 + 1, 10**18])
+async def test_a_mech_cap_takes_any_whole_json_integer(
+    mcp: FastMCP, mech_service: MechService, monkeypatch: pytest.MonkeyPatch, cap: int
+) -> None:
+    """A cap a double could not hold still reaches the mech flow as itself.
+
+    The cap bounds the mech's price, which is checked exactly; it is never
+    spent, so a client sending its budget in base units as a JSON integer is
+    not refused.
+    """
+    seen: list[t.Any] = []
+
+    def request(*_args: t.Any, **kwargs: t.Any) -> dict:
+        seen.append(kwargs["max_payment"])
+        return {}
+
+    monkeypatch.setattr(mech_service, "request", request)
+    await mcp.call_tool(
+        "mech_request", {"prompt": "q", "tool": "t", "max_payment": cap}
+    )
+    assert seen == [cap]
 
 
 async def test_a_decimal_string_amount_reaches_the_signer_exactly(
@@ -361,9 +391,12 @@ async def test_a_decimal_string_amount_reaches_the_signer_exactly(
         "mech_request", {"prompt": "q", "tool": "t", "max_payment": str(exact)}
     )
     await mcp.call_tool(
+        "mech_request", {"prompt": "q", "tool": "t", "max_payment": exact}
+    )
+    await mcp.call_tool(
         "safe_transaction", {"chain": "testchain", "target": RECIPIENT, "value": 5}
     )
-    assert seen == [exact, exact, exact, 5]
+    assert seen == [exact, exact, exact, exact, 5]
 
 
 def _schema_types(schema: dict, defs: dict) -> set[t.Any]:
@@ -408,7 +441,7 @@ async def test_the_tool_schema_declares_every_intent_amount_as_a_string(
         assert kinds == {"string"}, (tool.name, approval)
     # preflight answers the guardrail's verdict alone, so it takes no intent
     assert sorted(with_intent) == sorted(
-        TOOL_AMOUNTS.keys() - {"mech_request", "preflight_transaction"}
+        TOOL_AMOUNTS.keys() - {"preflight_transaction"}
     )
 
 

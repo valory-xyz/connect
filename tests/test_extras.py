@@ -44,7 +44,9 @@ from connect import __main__ as main_module
 from connect import ocb
 from connect import settings as settings_module
 from connect import signer as signer_module
-from connect import wallet, workspace
+from connect import wallet
+from connect import workspace
+from connect import workspace as workspace_module
 from connect.activity import ActivityLog, MAX_LOG_BYTES
 from connect.config import (
     AppConfig,
@@ -546,7 +548,9 @@ class TestMain:
         )
         assert state.workspace.open_session("ocb_cli") == "ocb_cli"
         assert opened == [
-            ocb.ocb_command(Path("/opt/ocb-agent"), mech, boot_env),
+            ocb.ocb_command(
+                Path("/opt/ocb-agent"), mech, boot_env, workspace_module.skill_hashes()
+            ),
         ]
 
     def test_main_without_a_chat_mech_offers_no_ocb(

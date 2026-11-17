@@ -106,7 +106,10 @@ other non-aea agent. It:
      `value`, so a client that cannot hold the number exactly passes it
      exactly; a JSON integer up to 2^53 - 1 is still taken, and a float, or
      an integer from 2^53 on, is refused (`bad-value`) at the mount, before any
-     budget is drawn on.
+     budget is drawn on. `max_payment` is the one exception: it is a cap on a
+     price that is checked exactly, never an amount that is spent, so it takes
+     a whole JSON integer of any size too (OCB sends its model budget that
+     way).
 
 The binary opens no session itself: Pearl waits for `is_healthy`, then calls
 `POST /session`. A launch failure (harness not installed, deep link unhandled)
@@ -394,12 +397,16 @@ installed for an operator who never selects `ocb_cli`.
 **Launch.** A terminal opens, the same way as for `codex_cli`, running
 
 ```sh
-<recorded path> --dir <STORE_PATH> --model 'mech:chat@<the chat mech>' --model-budget <OCB_MODEL_BUDGET_USD>
+<recorded path> --dir <STORE_PATH> --model 'mech:chat@<the chat mech>' --model-budget <OCB_MODEL_BUDGET_USD> --trusted-skill-hash <sha256> ...
 ```
 
 by absolute path, without a PATH probe: uv's tool directory is not always on
 the login shell's PATH. `--dir` names this instance's workspace; without it
-`ocb-agent` takes the first Connect service it finds under `~/.operate`.
+`ocb-agent` takes the first Connect service it finds under `~/.operate`. One
+`--trusted-skill-hash` names the SHA-256 of each skill file Connect installs
+into the workspace: OCB treats a skill file whose digest it was not given as
+data, not instructions, so without these it would be told to ignore Connect's
+own skills.
 OCB's REPL takes no opening prompt, so the session
 opens empty. Its model calls go through the `mech_request` MCP tool with that
 mech as `priority_mech`, so they are paid like any other mech request and pass
