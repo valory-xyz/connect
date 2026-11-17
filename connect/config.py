@@ -27,6 +27,7 @@ knows the env var names.
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
@@ -48,6 +49,11 @@ SAFES_ENV = CUSTOM_ENV_VARS_PREFIX + "SAFE_CONTRACT_ADDRESSES"
 FUND_REQUIREMENTS_ENV = CUSTOM_ENV_VARS_PREFIX + "FUND_REQUIREMENTS"
 LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
+
+# A QA override, never set by Pearl: OCB_CHAT_MECH_GNOSIS=0x... gives OCB that
+# chain's chat mech before the shipped table has a confirmed one
+OCB_CHAT_MECH_ENV_PREFIX = "OCB_CHAT_MECH_"
+ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 DEFAULT_LOG_LEVEL = "info"
@@ -83,6 +89,8 @@ class AppConfig:
     # the starting run window; the first write stores it, and the stored value
     # wins from then on, so changing this never reaches an existing install
     minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
+    # chain -> OCB chat mech, from OCB_CHAT_MECH_<CHAIN>
+    ocb_chat_mech_overrides: dict[str, str] = field(default_factory=dict)
 
     @property
     def instance_chain(self) -> str | None:
@@ -220,6 +228,23 @@ def _parse_minutes_per_run(raw: str) -> int:
         ) from e
 
 
+def _parse_ocb_chat_mechs(env: dict[str, str]) -> dict[str, str]:
+    """Collect OCB_CHAT_MECH_<CHAIN> overrides; an unset or empty one is ignored.
+
+    :raises ValueError: on a value that is not an address.
+    """
+    overrides: dict[str, str] = {}
+    for key, value in env.items():
+        if not key.startswith(OCB_CHAT_MECH_ENV_PREFIX) or not value.strip():
+            continue
+        if not ADDRESS_RE.fullmatch(value.strip()):
+            raise ValueError(f"{key} is not an address: {value!r}")
+        chain = key[len(OCB_CHAT_MECH_ENV_PREFIX) :].lower()
+        overrides[chain] = value.strip()
+        logger.warning("OCB chat mech on %s overridden by %s", chain, key)
+    return overrides
+
+
 def load_config(env: dict[str, str] | None = None) -> AppConfig:
     """Load config."""
     env = dict(os.environ) if env is None else env
@@ -261,4 +286,5 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         fund_requirements=fund_requirements,
         log_level=log_level,
         minutes_per_run=_parse_minutes_per_run(env.get(MINUTES_PER_RUN_ENV, "")),
+        ocb_chat_mech_overrides=_parse_ocb_chat_mechs(env),
     )

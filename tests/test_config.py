@@ -218,3 +218,24 @@ def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:
     config = load_config(base_env(tmp_path))
     with pytest.raises(ValueError, match="unknown chain"):
         config.chain("solana")
+
+
+def test_ocb_chat_mech_overrides_are_read_per_chain(tmp_path: Path) -> None:
+    """OCB_CHAT_MECH_<CHAIN> fills that chain's mech; empty means unset."""
+    mech = "0x" + "ab" * 20
+    env = base_env(tmp_path) | {
+        "OCB_CHAT_MECH_GNOSIS": f" {mech} ",
+        "OCB_CHAT_MECH_POLYGON": "",
+    }
+    assert load_config(env).ocb_chat_mech_overrides == {"gnosis": mech}
+    assert load_config(base_env(tmp_path)).ocb_chat_mech_overrides == {}
+
+
+@pytest.mark.parametrize("value", ["0x1234", "gnosis", "0x" + "zz" * 20])
+def test_an_ocb_chat_mech_override_must_be_an_address(
+    tmp_path: Path, value: str
+) -> None:
+    """A typo must not reach the launch line as OCB's model."""
+    env = base_env(tmp_path) | {"OCB_CHAT_MECH_GNOSIS": value}
+    with pytest.raises(ValueError, match="OCB_CHAT_MECH_GNOSIS"):
+        load_config(env)
