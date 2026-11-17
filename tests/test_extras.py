@@ -38,6 +38,7 @@ from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
 
 from connect import __main__ as main_module
+from connect import ocb
 from connect import settings as settings_module
 from connect import signer as signer_module
 from connect import wallet, workspace
@@ -459,15 +460,23 @@ class TestMain:
             assert client.get("/healthcheck").json() == {"is_healthy": True}
 
     @pytest.mark.skipif(sys.platform == "win32", reason="OCB is off on Windows")
+    @pytest.mark.parametrize("source", ["shipped", "override"])
     def test_main_offers_and_launches_ocb_on_the_instance_chain(
         self,
         monkeypatch: pytest.MonkeyPatch,
         boot_env: Path,
         served: list[StubServer],
+        source: str,
     ) -> None:
-        """The chain carrying the safe decides OCB's availability and its model."""
+        """The chain carrying the safe decides OCB's availability and its model.
+
+        The QA override reaches both exactly as a shipped mech does.
+        """
         mech = "0x" + "ab" * 20
-        monkeypatch.setitem(settings_module.OCB_CHAT_MECHS, "gnosis", mech)
+        if source == "shipped":
+            monkeypatch.setitem(settings_module.OCB_CHAT_MECHS, "gnosis", mech)
+        else:
+            monkeypatch.setenv("OCB_CHAT_MECH_GNOSIS", mech)
         monkeypatch.setenv(
             "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
         )
@@ -486,12 +495,25 @@ class TestMain:
 
         monkeypatch.setattr(workspace, "_open_terminal", terminal)
         monkeypatch.setattr(
-            state.workspace.ocb, "ensure", lambda timeout: Path("/opt/ocb-agent")
+            state.workspace.ocb, "ensure", lambda wait: Path("/opt/ocb-agent")
         )
         assert state.workspace.open_session("ocb_cli") == "ocb_cli"
         assert opened == [
-            workspace.ocb_command(Path("/opt/ocb-agent"), "gnosis"),
+            ocb.ocb_command(Path("/opt/ocb-agent"), mech, boot_env),
         ]
+
+    def test_main_without_a_chat_mech_offers_no_ocb(
+        self, monkeypatch: pytest.MonkeyPatch, boot_env: Path, served: list[StubServer]
+    ) -> None:
+        """An override for another chain does not make OCB available here."""
+        monkeypatch.setenv("OCB_CHAT_MECH_POLYGON", "0x" + "ab" * 20)
+        monkeypatch.setenv(
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
+        )
+        monkeypatch.setenv(SAFES_ENV, json.dumps({"gnosis": "0x" + "22" * 20}))
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        harnesses = served[0].config.app.state.settings_store.harnesses()
+        assert harnesses[-1]["unavailable_reason"] == "model_unavailable"
 
     def test_populate_failure_serves_unhealthy(
         self,

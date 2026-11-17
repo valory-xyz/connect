@@ -168,7 +168,7 @@ def validate_harness(value: object) -> str:
 
 
 def harness_unavailable_reason(
-    harness: str, chain: str | None, platform: str
+    harness: str, ocb_mech: str | None, platform: str
 ) -> str | None:
     """Why `harness` cannot be used on this instance, or None when it can.
 
@@ -179,14 +179,18 @@ def harness_unavailable_reason(
         return None
     if platform == "win32":
         return UNAVAILABLE_WINDOWS
-    if ocb_chat_mech(chain) is None:
+    if ocb_mech is None:
         return UNAVAILABLE_MODEL
     return None
 
 
-def ocb_chat_mech(chain: str | None) -> str | None:
-    """Return OCB's confirmed chat mech on `chain`, or None when it has none."""
-    return OCB_CHAT_MECHS.get(chain) if chain is not None else None
+def ocb_chat_mech(
+    chain: str | None, overrides: t.Mapping[str, str] | None = None
+) -> str | None:
+    """Return OCB's chat mech on `chain` — an override first — or None."""
+    if chain is None:
+        return None
+    return (overrides or {}).get(chain) or OCB_CHAT_MECHS.get(chain)
 
 
 def harness_options(unavailable: t.Callable[[str], str | None]) -> list[dict]:
@@ -411,6 +415,7 @@ class SettingsStore:
         self._lock = threading.Lock()
         self._expected_mac: str | None = None
         self._degraded: str | None = None
+        self._unusable: str | None = None
 
     def load(self) -> Settings:
         """Return the verified settings, restoring defaults on any problem."""
@@ -432,14 +437,18 @@ class SettingsStore:
         cause. The file keeps its value, so it applies again where it can.
         """
         reason = self.unavailable_reason(settings.harness)
+        unusable = None if reason is None else f"{settings.harness}:{reason}"
+        # load() runs on every guarded request: say it once per condition
+        if unusable is not None and unusable != self._unusable:
+            logger.warning(
+                "saved harness %s is unavailable here (%s); using %s",
+                settings.harness,
+                reason,
+                DEFAULT_HARNESS,
+            )
+        self._unusable = unusable
         if reason is None:
             return settings
-        logger.warning(
-            "saved harness %s is unavailable here (%s); using %s",
-            settings.harness,
-            reason,
-            DEFAULT_HARNESS,
-        )
         return Settings(protected=settings.protected, harness=DEFAULT_HARNESS)
 
     def patch(self, patch: t.Mapping) -> PatchResult:

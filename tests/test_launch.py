@@ -19,6 +19,7 @@
 
 """Open a real terminal for the terminal harnesses, running stand-in binaries."""
 
+import json
 import os
 import shlex
 import sys
@@ -27,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from connect import settings, workspace
+from connect import ocb, workspace
 from connect.workspace import Workspace
 
 LAUNCH_TIMEOUT_SECONDS = 90
@@ -97,7 +98,6 @@ def test_ocb_cli_launches_the_installed_agent_with_its_model(
 ) -> None:
     """An ocb_cli session is a terminal running the installed ocb-agent by path."""
     mech = "0x" + "ab" * 20
-    monkeypatch.setitem(settings.OCB_CHAT_MECHS, "testchain", mech)
     agent = tmp_path / "uv tools" / "ocb-agent"  # a space: the path must be quoted
     agent.parent.mkdir()
     agent.write_text(
@@ -106,9 +106,14 @@ def test_ocb_cli_launches_the_installed_agent_with_its_model(
     )
     agent.chmod(0o755)
     store_path.mkdir(parents=True, exist_ok=True)
-    (store_path / workspace.OCB_PATH_FILE).write_text(str(agent), encoding="utf-8")
+    record_dir = tmp_path / "deployment"
+    record_dir.mkdir()
+    (record_dir / ocb.OCB_RECORD_FILE).write_text(
+        json.dumps({"path": str(agent)}), encoding="utf-8"
+    )
+    monkeypatch.setattr(workspace, "assets_dir", lambda: record_dir / "no-bundle")
 
-    agent_workspace = Workspace(store_path, "tok", "testchain")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", mech, record_dir)  # nosec B106
     assert agent_workspace.open_session("ocb_cli") == "ocb_cli"
 
     marker = store_path / "ocb-launched"
@@ -118,4 +123,4 @@ def test_ocb_cli_launches_the_installed_agent_with_its_model(
     assert marker.exists(), "no terminal ran ocb-agent"
     ran_in, args = marker.read_text(encoding="utf-8").strip().split(" ", 1)
     assert Path(ran_in).samefile(store_path)
-    assert args == f"--model mech:chat@{mech} --model-budget 1"
+    assert args == f"--dir {store_path} --model mech:chat@{mech} --model-budget 1"

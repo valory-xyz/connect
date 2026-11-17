@@ -41,7 +41,7 @@ import uvicorn
 
 from connect import workspace
 from connect.activity import ActivityLog
-from connect.config import AGENT_HTTP_PORT, BIND_HOST, load_config
+from connect.config import AGENT_HTTP_PORT, AppConfig, BIND_HOST, load_config
 from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
@@ -52,6 +52,7 @@ from connect.settings import (
     SettingsStore,
     derive_mac_key,
     harness_unavailable_reason,
+    ocb_chat_mech,
 )
 from connect.signer import Signer
 
@@ -172,6 +173,14 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
     return password
 
 
+def instance_ocb_mech(config: AppConfig) -> str | None:
+    """Return OCB's model here: the instance chain's chat mech, override first.
+
+    One resolution for the availability rule and the launch line alike.
+    """
+    return ocb_chat_mech(config.instance_chain, config.ocb_chat_mech_overrides)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the agent server; return the process exit code."""
     password = resolve_password(argv)
@@ -201,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         derive_mac_key(account),
         activity,
         unavailable=lambda harness: harness_unavailable_reason(
-            harness, config.instance_chain, sys.platform
+            harness, instance_ocb_mech(config), sys.platform
         ),
     )
     guard = Guard(settings_store, config, agent_signer=account.address)
@@ -219,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     # re-attempts its own population on every /healthcheck, so a condition that
     # clears by itself heals without a restart.
     agent_workspace = workspace.Workspace(
-        config.store_path, token, config.instance_chain
+        config.store_path, token, instance_ocb_mech(config)
     )
     agent_workspace.ensure()
 

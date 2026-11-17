@@ -186,37 +186,48 @@ Claude `Read` deny rules.
 `windows_unsupported` on native Windows, where OCB runs unsandboxed and a
 session could read the keys in `~/.operate`. Elsewhere it is unavailable with
 `model_unavailable` unless the instance's chain (the one chain carrying the
-safe) has a confirmed chat mech in `OCB_CHAT_MECHS` (`connect/settings.py`).
-A chain whose entry is `None` has no confirmed chat mech, so OCB is
-unavailable there. `PATCH /settings` and `POST /session`
+safe) has a chat mech: `OCB_CHAT_MECH_<CHAIN>` if set (e.g.
+`OCB_CHAT_MECH_GNOSIS=0x...`, a QA override Pearl never sets; anything but an
+address is a configuration error), else that chain's entry in
+`OCB_CHAT_MECHS` (`connect/settings.py`), where `None` means no confirmed
+chat mech. `__main__.instance_ocb_mech` resolves it once, and both this rule
+and the launch line read that value. `PATCH /settings` and `POST /session`
 refuse an unavailable harness with a 400, and a saved `ocb_cli` that has
 become unavailable (a settings file copied between machines) loads as the
-default.
+default, logged once.
 
-**Install.** Connect installs from OCB's `install.sh` and a built `ocb_agent`
-wheel under `connect/assets/ocb/`, which `olas-ocb-agent` supplies and which
-are committed as given (`VERSION` names the tag to install from once that repo
-is public). Until they are committed, every install fails with
-`install_failed`. Selecting
+**Install.** Connect installs from OCB's `install.sh` and one built
+`olas_ocb_agent-*.whl` under `connect/assets/ocb/` (its README says what goes
+there), which the OCB team supplies and which are committed as given. Until
+they are committed, every install fails with `install_failed`. Selecting
 `ocb_cli` in `PATCH /settings` starts the install in the background and
-returns. `POST /session` with `ocb_cli` waits for an install already running,
-or runs one when the path it stored is gone. The script runs as `sh install.sh`
-in STORE_PATH, with stdin closed, `harness_env()` plus `OCB_AGENT_SPEC=<the
-bundled wheel>`, and the `OCB_INSTALL_TIMEOUT_SECONDS` timeout
-(`connect/workspace.py`). It brings uv and a Python of its own,
-prints the absolute path of `ocb-agent` on success, and a one-line reason on
-stderr otherwise; that line becomes `/session`'s `error`. Connect keeps the
-path in `STORE_PATH/.ocb-agent-path`. One install runs at a time. Nothing is
+returns. `POST /session` with `ocb_cli` joins an install already running, or
+starts one, and waits for it at most `OCB_SESSION_WAIT_SECONDS` (240 s,
+inside Pearl's ~300 s request): past that it answers `install_failed` ("still
+being installed") while the install goes on, so a Retry finds it done. The
+script runs as `sh install.sh` in STORE_PATH, in its own session, with stdin
+closed, `harness_env()` plus `OCB_AGENT_SPEC=<the bundled wheel>`, and the
+`OCB_INSTALL_TIMEOUT_SECONDS` timeout (`connect/ocb.py`), after which its
+whole process group is killed, uv and curl included. It brings uv and a
+Python of its own, prints the absolute path of `ocb-agent` on success, and a
+one-line reason on stderr otherwise; that line becomes `/session`'s `error`.
+Connect records the path with the wheel it came from in `.ocb-agent.json` in
+its own working directory (beside `log.txt`), outside the workspace, so the
+session cannot point the next launch at another program. A record naming
+another wheel than the one bundled installs again, so a release with a newer
+wheel reaches existing installs. One install runs at a time. Nothing is
 installed for an operator who never selects `ocb_cli`.
 
 **Launch.** A terminal opens, the same way as for `codex_cli`, running
 
 ```sh
-<stored path> --model 'mech:chat@<the chain's chat mech>' --model-budget <OCB_MODEL_BUDGET_USD>
+<recorded path> --dir <STORE_PATH> --model 'mech:chat@<the chat mech>' --model-budget <OCB_MODEL_BUDGET_USD>
 ```
 
 by absolute path, without a PATH probe: uv's tool directory is not always on
-the login shell's PATH. OCB's REPL takes no opening prompt, so the session
+the login shell's PATH. `--dir` names this instance's workspace; without it
+`ocb-agent` takes the first Connect service it finds under `~/.operate`.
+OCB's REPL takes no opening prompt, so the session
 opens empty. Its model calls go through the `mech_request` MCP tool with that
 mech as `priority_mech`, so they are paid like any other mech request and pass
 the same guard. OCB's own guardrails apply unchanged. A failed install answers

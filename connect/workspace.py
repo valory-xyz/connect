@@ -41,7 +41,6 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import threading
-import time
 import tomllib
 import typing as t
 from pathlib import Path
@@ -50,6 +49,13 @@ from urllib.parse import quote
 import tomli_w
 
 from connect.config import AGENT_HTTP_PORT, BIND_HOST
+from connect.launch_errors import LaunchError, OcbLaunchError
+from connect.ocb import (
+    OCB_ASSETS_SUBDIR,
+    OCB_SESSION_WAIT_SECONDS,
+    OcbInstaller,
+    ocb_command,
+)
 from connect.settings import (
     DEFAULT_HARNESS,
     HARNESS_CLAUDE_CODE_CLI,
@@ -57,8 +63,6 @@ from connect.settings import (
     HARNESS_CODEX_CLI,
     HARNESS_CODEX_DESKTOP,
     HARNESS_OCB_CLI,
-    OCB_MODEL_BUDGET_USD,
-    ocb_chat_mech,
 )
 
 logger = logging.getLogger("agent")
@@ -118,37 +122,6 @@ LOADER_ENV_VARS = (
     "DYLD_LIBRARY_PATH_ORIG",
 )
 LOADER_ENV_PREFIXES = ("_PYI_",)
-
-
-# OCB's installer and the wheel it installs, bundled from olas-ocb-agent
-OCB_ASSETS_SUBDIR = "ocb"
-OCB_INSTALL_SCRIPT = "install.sh"
-OCB_WHEEL_GLOB = "ocb_agent-*.whl"
-# where the installer's reported ocb-agent path is kept, in STORE_PATH
-OCB_PATH_FILE = ".ocb-agent-path"
-# the script fetches uv, a Python and the wheel's dependencies
-OCB_INSTALL_TIMEOUT_SECONDS = 600.0
-# how much of the installer's output a failure log keeps
-OCB_INSTALL_LOG_CHARS = 2000
-
-
-class LaunchError(Exception):
-    """An agent session could not be opened in the requested harness."""
-
-    # POST /session's `reason` for a launch that failed this way
-    reason = "not_installed"
-
-
-class InstallError(LaunchError):
-    """OCB could not be installed, so no OCB session could be opened."""
-
-    reason = "install_failed"
-
-
-class OcbLaunchError(LaunchError):
-    """OCB is installed, but no terminal would open running it."""
-
-    reason = "launch_failed"
 
 
 def assets_dir() -> Path:
@@ -326,15 +299,27 @@ class Workspace:
     our health.
     """
 
-    def __init__(self, store_path: Path, token: str, chain: str | None = None) -> None:
+    def __init__(
+        self,
+        store_path: Path,
+        token: str,
+        ocb_mech: str | None = None,
+        record_dir: Path | None = None,
+    ) -> None:
         """Start unprovisioned: the first ensure() is what makes it real.
 
-        `chain` is the instance's chain, whose chat mech is OCB's model.
+        `ocb_mech` is OCB's model, the instance chain's chat mech; `record_dir`
+        keeps OCB's install record, by default Connect's own working directory.
         """
         self.path = store_path
         self._token = token
-        self._chain = chain
-        self.ocb = OcbInstaller(store_path)
+        self._ocb_mech = ocb_mech
+        self.ocb = OcbInstaller(
+            store_path,
+            record_dir or Path.cwd(),
+            bundle_dir=lambda: assets_dir() / OCB_ASSETS_SUBDIR,
+            env=harness_env,
+        )
         self._lock = threading.Lock()
         self._reason: str | None = "the workspace has not been provisioned yet"
 
@@ -460,7 +445,9 @@ class Workspace:
 
     def _open_ocb(self) -> str:
         """Install OCB if it is missing, then open a terminal running it."""
-        command = ocb_command(self.ocb.ensure(OCB_INSTALL_TIMEOUT_SECONDS), self._chain)
+        command = ocb_command(
+            self.ocb.ensure(OCB_SESSION_WAIT_SECONDS), self._ocb_mech, self.path
+        )
         if not _open_terminal(self.path, command):
             raise OcbLaunchError(
                 f"Could not open a terminal running OCB. The workspace is at {self.path}"
@@ -571,139 +558,6 @@ class Workspace:
             target_root.mkdir(parents=True, exist_ok=True)
             for skill_dir in skills:
                 _replace_tree(skill_dir, target_root / skill_dir.name)
-
-
-def ocb_command(path: Path, chain: str | None) -> str:
-    """Return the shell-quoted line running OCB with the chain's chat mech as model.
-
-    :raises ValueError: when the chain has no confirmed chat mech — a launch
-        must never hand OCB a model that does not exist.
-    """
-    mech = ocb_chat_mech(chain)
-    if mech is None:
-        raise ValueError(f"OCB has no chat mech on chain {chain!r}")
-    return shlex.join(
-        [
-            str(path),
-            "--model",
-            f"mech:chat@{mech}",
-            "--model-budget",
-            str(OCB_MODEL_BUDGET_USD),
-        ]
-    )
-
-
-class OcbInstaller:
-    """Installs OCB with its bundled script, one install at a time.
-
-    The script brings uv and a Python of its own, installs the bundled wheel
-    and prints the absolute path of `ocb-agent`, which is kept in STORE_PATH
-    and launched by path: uv's tool directory is not always on the login PATH.
-    """
-
-    def __init__(self, store_path: Path) -> None:
-        """Hold where the reported path is kept."""
-        self._path_file = store_path / OCB_PATH_FILE
-        self._install_lock = threading.Lock()
-
-    def path(self) -> Path | None:
-        """Return the installed `ocb-agent`, or None when it is missing."""
-        try:
-            reported = self._path_file.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            return None
-        except OSError as e:
-            logger.warning(
-                "could not read %s (%s); reinstalling OCB", self._path_file, e
-            )
-            return None
-        return _executable(reported)
-
-    def start(self) -> None:
-        """Install in the background; a no-op while an install is running."""
-        if self._install_lock.locked():
-            return
-        threading.Thread(
-            target=self._install_in_background, name="ocb-install", daemon=True
-        ).start()
-
-    def ensure(self, timeout: float) -> Path:
-        """Return `ocb-agent`, joining a running install or running one.
-
-        :raises InstallError: when the install fails, or one already running
-            does not finish within `timeout`.
-        """
-        deadline = time.monotonic() + timeout
-        # pylint: disable-next=consider-using-with  # released in the finally
-        if not self._install_lock.acquire(timeout=timeout):
-            raise InstallError("OCB is still being installed; try again shortly")
-        try:
-            return self.path() or self._install(max(deadline - time.monotonic(), 0))
-        finally:
-            self._install_lock.release()
-
-    def _install_in_background(self) -> None:
-        try:
-            self.ensure(OCB_INSTALL_TIMEOUT_SECONDS)
-        except InstallError as e:
-            logger.error("OCB install failed: %s", e)
-        except Exception:  # pylint: disable=broad-exception-caught
-            # a thread's own excepthook prints to stderr, not to log.txt
-            logger.exception("OCB install failed unexpectedly")
-
-    def _install(self, timeout: float) -> Path:
-        """Run the bundled script and keep the path it reports."""
-        try:
-            bundle = assets_dir() / OCB_ASSETS_SUBDIR
-        except FileNotFoundError as e:
-            raise InstallError(str(e)) from e
-        script = bundle / OCB_INSTALL_SCRIPT
-        wheels = sorted(bundle.glob(OCB_WHEEL_GLOB))
-        if not script.is_file() or len(wheels) != 1:
-            raise InstallError(f"this Connect build does not bundle OCB under {bundle}")
-        logger.info("installing OCB from %s", wheels[0].name)
-        try:
-            result = subprocess.run(  # nosec B603 B607
-                ["sh", str(script)],
-                cwd=self._path_file.parent,
-                env={**harness_env(), "OCB_AGENT_SPEC": str(wheels[0])},
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as e:
-            raise InstallError(f"the OCB installer did not finish: {e}") from e
-        installed = None if result.returncode else _executable(result.stdout.strip())
-        if installed is None:
-            logger.error(
-                "OCB installer exited %s; stdout: %s; stderr: %s",
-                result.returncode,
-                result.stdout[-OCB_INSTALL_LOG_CHARS:],
-                result.stderr[-OCB_INSTALL_LOG_CHARS:],
-            )
-        if result.returncode:
-            lines = result.stderr.strip().splitlines()
-            raise InstallError(
-                lines[-1] if lines else f"the OCB installer exited {result.returncode}"
-            )
-        if installed is None:
-            raise InstallError("the OCB installer reported no ocb-agent executable")
-        try:
-            self._path_file.write_text(f"{installed}\n", encoding="utf-8")
-        except OSError as e:
-            raise InstallError(f"could not record where OCB is installed: {e}") from e
-        logger.info("OCB installed at %s", installed)
-        return installed
-
-
-def _executable(reported: str) -> Path | None:
-    """Return the path if it names an executable file by absolute path, else None."""
-    path = Path(reported)
-    if reported and path.is_absolute() and path.is_file() and os.access(path, os.X_OK):
-        return path
-    return None
 
 
 def _remove(target: Path) -> None:
