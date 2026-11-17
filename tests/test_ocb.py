@@ -21,6 +21,7 @@
 """OCB CLI: availability, install, launch and the routes that drive them."""
 
 import json
+import os
 import shlex
 import shutil
 import sys
@@ -137,6 +138,8 @@ def test_the_deployed_chat_mechs_ship() -> None:
         "gnosis": "0x4a8A3FA1cde489DFec96F8442d65e9526ec3405c",
         "polygon": "0x364b8238C7d9a05e0F68F87cfF364b6aBD926fEc",
         "robinhood": "0xd3f392C8384cAa4D2864ACba826374337d43a100",
+        "base": "0x195Fe9d745a92deE64C9Bf75EFDc7779EB7a5C91",
+        "optimism": "0x8122Dcd1E271d0F793827D13410333852DBB9dAb",
     }
     for mech in settings_module.OCB_CHAT_MECHS.values():
         assert Web3.is_checksum_address(mech)
@@ -510,7 +513,7 @@ def test_a_build_without_assets_cannot_install(
         installer.ensure(30)
 
 
-@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc")
+@POSIX_ONLY
 def test_a_script_that_cannot_finish_takes_its_children_with_it(
     tmp_path: Path, store_path: Path, record_dir: Path
 ) -> None:
@@ -526,10 +529,13 @@ def test_a_script_that_cannot_finish_takes_its_children_with_it(
         )
     # a child left holding the pipes would keep the caller waiting on it
     assert time.monotonic() - began < 10
-    stat = Path(f"/proc/{int(child.read_text())}/stat")
-    for _ in range(50):
-        # gone, or a zombie waiting for its reaper: either way not running
-        if not stat.exists() or stat.read_text().split(") ")[1][0] == "Z":
+    pid = int(child.read_text())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        # the orphaned child is killed with the group, then reaped by init
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
             break
         time.sleep(0.05)
     else:

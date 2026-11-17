@@ -111,6 +111,8 @@ OCB_CHAT_MECHS: dict[str, str | None] = {
     "gnosis": "0x4a8A3FA1cde489DFec96F8442d65e9526ec3405c",
     "polygon": "0x364b8238C7d9a05e0F68F87cfF364b6aBD926fEc",
     "robinhood": "0xd3f392C8384cAa4D2864ACba826374337d43a100",
+    "base": "0x195Fe9d745a92deE64C9Bf75EFDc7779EB7a5C91",
+    "optimism": "0x8122Dcd1E271d0F793827D13410333852DBB9dAb",
 }
 # the only reasons GET /settings may give; connect-ui renders each one
 UnavailableReason = t.Literal["windows_unsupported", "model_unavailable"]
