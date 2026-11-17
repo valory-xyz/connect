@@ -982,6 +982,11 @@ Connect. Two public modules carry that contract:
   (`POST /sign-and-send`; on in Pearl) and `agent_topup_at_boot` (the
   [Agent top-up](#agent-top-up); on in Pearl).
 
+Mech amounts are JSON integers, as the reference answers them: `mech_tools`'
+`max_delivery_rate` and `default_max_payment`, and `mech_request`'s
+`payment`, so an agent compares a price with its own `max_payment` without
+parsing.
+
 ## Development
 
 ```bash

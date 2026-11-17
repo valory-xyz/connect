@@ -270,7 +270,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             "payment_type": payment_type.name,
             **payment_report(payment_type, chain),
             "service_id": service_id,
-            "max_delivery_rate": str(max_delivery_rate),
+            "max_delivery_rate": int(max_delivery_rate),
         }
         read = service.tool_manager.read_tools_metadata(service_id)
         tool_names = published_tools(read.document)

@@ -4392,7 +4392,10 @@ class TestMech:
         assert info["mech"] == OTHER
         assert info["payment_type"] == "NATIVE"
         assert info["payment_token"] == "native"
-        assert info["default_max_payment"] == str(10**17)
+        assert info["default_max_payment"] == 10**17
+        # the reference's integer amounts: a JSON number, never a string
+        assert type(info["default_max_payment"]) is int  # pylint: disable=unidiomatic-typecheck
+        assert type(info["max_delivery_rate"]) is int  # pylint: disable=unidiomatic-typecheck
         assert info["service_id"] == 42
         assert info["tools"] == ["prediction-online"]
         # this mech published an endpoint, so nothing bars the default flow
@@ -4922,7 +4925,7 @@ class TestMech:
         info = mech_service.tools(chain="robinhood", priority_mech=OTHER)
         assert info["payment_type"] == "USDC_TOKEN"
         assert info["payment_token"] == "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
-        assert info["default_max_payment"] == "100000"
+        assert info["default_max_payment"] == 100000
         unknown_chain = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert unknown_chain["payment_token"] is None
 

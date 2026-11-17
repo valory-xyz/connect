@@ -83,7 +83,7 @@ def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
     default = DEFAULT_MAX_PAYMENT.get(payment_type)
     return {
         "payment_token": _payment_token(payment_type, chain),
-        "default_max_payment": None if default is None else str(default),
+        "default_max_payment": default,
     }
 
 
