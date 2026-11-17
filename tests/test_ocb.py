@@ -237,6 +237,7 @@ def test_patching_to_an_unavailable_ocb_is_refused(
 # --- launch line ----------------------------------------------------------
 
 
+@POSIX_ONLY
 def test_ocb_runs_by_path_in_this_workspace_with_the_chat_mech() -> None:
     """--dir names this instance; the mech is the model, at OCB's own budget."""
     command = ocb.ocb_command(
