@@ -59,10 +59,11 @@ from connect.config import (
     STORE_PATH_ENV,
     load_config,
 )
+from connect.input_errors import InputError
 from connect.keystore import KeystoreError, load_account
 from connect.run_goal import RunGoal
 from connect.server import receipts
-from connect.server.auth import AuthFailureLimiter, AuthMiddleware
+from connect.server.auth import ACTION_SCOPES, AuthFailureLimiter, AuthMiddleware
 from connect.signer import Signer, SignerError, _IdempotencyCache
 from connect.switches import PRODUCTION, Switches
 
@@ -1103,7 +1104,11 @@ class TestAuthMiddlewareASGI:
     async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
         """Lifespan scopes bypass auth."""
         middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
+            lambda *a: None,
+            grant_store("tok"),
+            activity,
+            AuthFailureLimiter(),
+            tools=ACTION_SCOPES,
         )
         _, passed = await self._run(middleware, {"type": "lifespan"})
         assert passed == ["lifespan"]
@@ -1111,7 +1116,11 @@ class TestAuthMiddlewareASGI:
     async def test_bad_origin_rejected(self, activity: ActivityLog) -> None:
         """Cross-origin requests get 403."""
         middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
+            lambda *a: None,
+            grant_store("tok"),
+            activity,
+            AuthFailureLimiter(),
+            tools=ACTION_SCOPES,
         )
         scope = {
             "type": "http",
@@ -1124,7 +1133,11 @@ class TestAuthMiddlewareASGI:
     async def test_bad_token_rejected(self, activity: ActivityLog) -> None:
         """Missing token gets 401."""
         middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
+            lambda *a: None,
+            grant_store("tok"),
+            activity,
+            AuthFailureLimiter(),
+            tools=ACTION_SCOPES,
         )
         sent, passed = await self._run(middleware, {"type": "http", "headers": []})
         assert sent[0]["status"] == 401
@@ -1133,7 +1146,11 @@ class TestAuthMiddlewareASGI:
     async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
         """Websocket scopes never reach the inner app; the handshake is closed."""
         middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
+            lambda *a: None,
+            grant_store("tok"),
+            activity,
+            AuthFailureLimiter(),
+            tools=ACTION_SCOPES,
         )
         sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
         assert not passed
@@ -1142,7 +1159,11 @@ class TestAuthMiddlewareASGI:
     async def test_valid_request_passes(self, activity: ActivityLog) -> None:
         """Correct token reaches the inner app."""
         middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
+            lambda *a: None,
+            grant_store("tok"),
+            activity,
+            AuthFailureLimiter(),
+            tools=ACTION_SCOPES,
         )
         scope = {"type": "http", "headers": [(b"authorization", b"Bearer tok")]}
         _, passed = await self._run(middleware, scope)
@@ -1385,15 +1406,18 @@ class TestMcpTools:
     async def test_sign_message_rejects_bad_hex(
         self, tools: dict[str, t.Callable]
     ) -> None:
-        """Malformed digests get a clean error, matching the HTTP route."""
-        with pytest.raises(ValueError, match="0x-hex"):
+        """A malformed digest is refused in the reference's words."""
+        with pytest.raises(InputError) as refused:
             await tools["sign_message"]("0xzz")
+        assert (
+            str(refused.value) == "digest must be hex (0x and whole bytes), got '0xzz'"
+        )
 
     async def test_send_transaction_rejects_negative_value(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
         """Negative amounts fail fast, before reaching the signer."""
-        with pytest.raises(ValueError, match="non-negative"):
+        with pytest.raises(InputError, match="non-negative"):
             await tools["send_transaction"]("testchain", "0x" + "aa" * 20, value=-1)
         assert not fake_w3.eth.sent
 

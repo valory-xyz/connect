@@ -32,6 +32,7 @@ no safe nonce appears anywhere here. Nothing is signed over it, so nobody has
 to predict it; the Safe reads and increments its own.
 """
 
+import logging
 from dataclasses import dataclass
 
 from eth_abi import decode as abi_decode
@@ -39,6 +40,7 @@ from eth_abi import encode as abi_encode
 from web3 import Web3
 
 from connect.input_errors import InputError
+from connect.signer_errors import cause_of
 
 # Safe v1.x execTransaction(address,uint256,bytes,uint8,uint256,uint256,
 #                           uint256,address,address,bytes)
@@ -57,6 +59,10 @@ EXEC_TRANSACTION_TYPES = [
 ]
 OPERATION_CALL = 0
 ZERO_ADDRESS = "0x" + "00" * 20
+
+logger = logging.getLogger("agent")
+
+EXEC_UNDECODABLE = "could not decode execTransaction calldata"
 
 APPROVE_SELECTOR = "095ea7b3"  # approve(address,uint256)
 # Safe.approveHash(bytes32): an owner pre-approves a safe transaction by hash,
@@ -225,7 +231,9 @@ class SafeExec:
                 abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
             )
         except Exception as e:
-            raise InputError(f"could not decode execTransaction calldata: {e}") from e
+            # eth_abi's words are a library's: logged, not handed to the caller
+            logger.warning("could not decode execTransaction calldata: %s", cause_of(e))
+            raise InputError(EXEC_UNDECODABLE) from e
         return cls(
             to=str(decoded[0]),
             value=int(decoded[1]),

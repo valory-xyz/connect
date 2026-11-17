@@ -42,7 +42,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
 from connect.idempotency import InFlightError
-from connect.input_errors import InputError
+from connect.input_errors import InputError, checked_hex
 from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
@@ -57,7 +57,12 @@ from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
 from connect.signer_errors import logged_cause
-from connect.texts import SERVER_INFO, TOOL_DESCRIPTIONS, UNKNOWN_TOOL
+from connect.texts import (
+    INVALID_REQUEST,
+    SERVER_INFO,
+    TOOL_DESCRIPTIONS,
+    UNKNOWN_TOOL,
+)
 
 # tools that read and never sign, broadcast or pay: harnesses may run them
 # without asking the operator
@@ -157,12 +162,10 @@ TOOLS_TAKING_TO_FOR_TARGET = frozenset(
     {"safe_transaction", "preflight_transaction", "simulate_transaction"}
 )
 
-# errors whose text Connect wrote for the caller (a tool's own argument check
-# included, as pydantic reports it); any other is a library's or a bug's,
-# which may carry an RPC URL and key, so it is logged, not forwarded
+# errors whose text Connect wrote for the caller; any other is a library's or
+# a bug's, which may carry an RPC URL and key, so it is logged, not forwarded
 CALLER_ERRORS: tuple[type[Exception], ...] = (
     InputError,
-    ValidationError,
     SignerError,
     GuardError,
     GrantRefused,
@@ -186,6 +189,18 @@ def with_aliases(tool: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
     return aliased
 
 
+def argument_problems(error: ValidationError) -> str:
+    """Say what was wrong with each argument, never echoing the value sent."""
+    return "; ".join(
+        (
+            ".".join(str(part) for part in issue["loc"]) + ": " + issue["msg"]
+            if issue["loc"]
+            else issue["msg"]
+        )
+        for issue in error.errors()
+    )
+
+
 class ConnectMCP(FastMCP):
     """FastMCP with the reference's call boundary.
 
@@ -206,10 +221,19 @@ class ConnectMCP(FastMCP):
 
     async def call_tool(self, name: str, arguments: dict[str, t.Any]) -> t.Any:
         """Call a tool, raising its own error text with no transport prefix."""
-        if self._tool_manager.get_tool(name) is None:
+        tool = self._tool_manager.get_tool(name)
+        if tool is None:
             raise ToolError(UNKNOWN_TOOL(name))
+        arguments = with_aliases(name, arguments)
+        try:  # the arguments' check is Connect's; one inside a tool body is not
+            metadata = tool.fn_metadata
+            metadata.arg_model.model_validate(metadata.pre_parse_json(arguments))
+        except ValidationError as e:
+            raise ToolError(
+                INVALID_REQUEST(type(e).__name__, argument_problems(e))
+            ) from e
         try:
-            return await super().call_tool(name, with_aliases(name, arguments))
+            return await super().call_tool(name, arguments)
         except ToolError as e:
             cause = e.__cause__ or e
             if isinstance(cause, (ToolError, *CALLER_ERRORS)):
@@ -409,10 +433,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     @mcp.tool(description=TOOL_DESCRIPTIONS["sign_message"])
     async def sign_message(digest: str) -> dict:
         """Sign a raw 32-byte digest with the agent EOA."""
-        try:
-            raw = bytes.fromhex(digest.removeprefix("0x"))
-        except ValueError as e:
-            raise InputError(f"digest must be a 0x-hex string: {e}") from e
+        raw = bytes.fromhex(checked_hex("digest", digest)[2:])
         return {"signature": await asyncio.to_thread(signer.sign_digest, raw)}
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["mech_request"])

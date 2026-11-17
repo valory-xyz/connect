@@ -18,12 +18,35 @@
 # ------------------------------------------------------------------------------
 
 
-"""`InputError`: a caller's input Connect refused, in words Connect wrote.
+"""`InputError`, and the reference's checks of an address or hex argument.
 
-A `ValueError`, so existing callers that catch one keep working; its own
-class, so the MCP call boundary can tell Connect's words from a library's.
+`InputError` is a `ValueError`, so existing callers that catch one keep
+working, and its own class, so the MCP call boundary can tell Connect's words
+from a library's. The two checks are OnchainBench's `check_args` patterns, so
+a malformed argument is refused where, and in the words, the reference does.
 """
+
+import re
+
+from connect.texts import ADDRESS_INVALID, HEX_INVALID
+
+_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}", re.ASCII)
+_HEX = re.compile(r"(?:0x)?(?:[0-9a-fA-F]{2})*", re.ASCII)
 
 
 class InputError(ValueError):
     """A caller's input refused by Connect, with a message meant for that caller."""
+
+
+def checked_address(field: str, value: object) -> str:
+    """Return `value` if it is 0x and 40 hex digits; else refuse it, naming `field`."""
+    if not (isinstance(value, str) and _ADDRESS.fullmatch(value)):
+        raise InputError(ADDRESS_INVALID(field, value))
+    return value
+
+
+def checked_hex(field: str, value: object) -> str:
+    """Return `value` as 0x-prefixed whole-byte hex; else refuse it, naming `field`."""
+    if not (isinstance(value, str) and _HEX.fullmatch(value)):
+        raise InputError(HEX_INVALID(field, value))
+    return "0x" + value.removeprefix("0x")

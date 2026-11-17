@@ -35,9 +35,8 @@ from eth_utils import keccak, to_checksum_address
 from web3 import Web3
 from web3.exceptions import ContractLogicError
 
-from connect.input_errors import InputError
+from connect.input_errors import InputError, checked_address, checked_hex
 from connect.safe import calldata_hex
-from connect.texts import ADDRESS_INVALID, HEX_INVALID
 
 # EIP-1967: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
 IMPLEMENTATION_SLOT = int(
@@ -234,19 +233,10 @@ def chain_call(w3: Web3, to: str, data: str, block: str = "latest") -> dict:
 
     Only a revert is reported as one: an RPC that is down or times out raises,
     so an unreachable chain never reads as a contract that said no, and a
-    malformed argument raises ValueError naming it before anything is asked.
+    malformed argument raises InputError naming it before anything is asked.
     """
-    try:
-        address = to_checksum_address(to)
-    except ValueError as e:
-        raise InputError(ADDRESS_INVALID("to", to)) from e
-    data = data or "0x"
-    try:
-        bytes.fromhex(data.removeprefix("0x"))
-    except ValueError as e:
-        raise InputError(HEX_INVALID("data", data)) from e
-    if not data.startswith("0x"):
-        raise InputError(HEX_INVALID("data", data))
+    address = to_checksum_address(checked_address("to", to))
+    data = checked_hex("data", data or "0x")
     try:
         raw = w3.eth.call(
             {"to": address, "data": t.cast(t.Any, data)},
@@ -329,7 +319,7 @@ def get_abi(w3: Web3, address: str) -> dict:
     is storage the contract writes itself, so whatever it points at is
     reported as `implementation_verified`, never as the contract's own.
     """
-    address = to_checksum_address(address)
+    address = to_checksum_address(checked_address("address", address))
     chain_id = int(w3.eth.chain_id)
     verified, signatures = _interfaces(w3, address, chain_id)
     report: dict = {

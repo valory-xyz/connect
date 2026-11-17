@@ -90,7 +90,10 @@ other non-aea agent. It:
      [Bench parity](#bench-parity)): a failed tool call reads the refusing
      code's own text, with no `Error executing tool` prefix (an error Connect
      did not word for the caller reads `<tool> failed (the cause is in
-     Connect's log)` instead, its cause logged), an unknown tool
+     Connect's log)` instead, its cause logged; a malformed argument reads
+     `invalid request: ValidationError: <argument>: <problem>`, and an
+     address or hex argument the reference's `must be a 0x address` / `must
+     be hex` text), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
      of `target`. Two descriptions stay Connect's own for now: `get_abi`'s,
      until its answers match the reference's, and the warning on

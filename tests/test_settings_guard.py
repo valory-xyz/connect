@@ -7337,7 +7337,6 @@ class TestMcpGuardrailTools:
             "value": 5,
             "data": "0xab",
             "via_safe": False,
-            # the guardrail's verdict alone: nothing is simulated
             "run_intent_gate": False,
         }
 
@@ -7362,7 +7361,7 @@ class TestMcpGuardrailTools:
         test_signer: Signer,
         guard: Guard,
     ) -> None:
-        """End to end, unmocked: the tool, the signer and the gate together."""
+        """End to end, unmocked: the tool, the signer and the guardrail together."""
         test_signer.set_guard(guard)
         assert await tools["preflight_transaction"]("testchain", OTHER) == {
             "permitted": True

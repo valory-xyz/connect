@@ -28,6 +28,7 @@ import pytest
 from fastapi.testclient import TestClient
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import ValidationError
 
 from connect import settings as settings_module
 from connect import texts
@@ -177,32 +178,21 @@ def test_every_registered_tool_has_a_scope(
     assert names <= set(ACTION_SCOPES)
 
 
-async def test_the_in_process_error_is_the_handler_s_own_text(
-    mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, test_signer: Signer
-) -> None:
-    """A refusal Connect wrote is raised character for character."""
-
-    def refuse(*_: t.Any, **__: t.Any) -> str:
-        raise SignerError(texts.GUARD_NO_SELF_CALL)
-
-    monkeypatch.setattr(test_signer, "send_via_safe", refuse)
-    with pytest.raises(ToolError) as raised:
-        await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
-    assert str(raised.value) == texts.GUARD_NO_SELF_CALL
-    assert isinstance(raised.value.__cause__, SignerError)
-
-
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError, ValidationError])
 async def test_an_unexpected_error_is_logged_and_never_forwarded(
     mcp: FastMCP,
     monkeypatch: pytest.MonkeyPatch,
     test_signer: Signer,
     caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
 ) -> None:
-    """A library's text (which may name an RPC key) stays in the log."""
+    """A library's text (which may name an RPC key) stays in the log, redacted."""
     rpc = "https://rpc.example/v2/" + "SECRETKEY"  # kept off the raising line
 
     def broken(*_: t.Any, **__: t.Any) -> str:
-        raise RuntimeError(f"{rpc} is down")
+        if error_type is ValidationError:  # a model inside the body, not the args
+            raise ValidationError.from_exception_data(f"{rpc} model", [])
+        raise error_type(f"{rpc} is down")
 
     monkeypatch.setattr(test_signer, "send_via_safe", broken)
     with caplog.at_level(logging.ERROR, logger="agent"):
@@ -211,7 +201,7 @@ async def test_an_unexpected_error_is_logged_and_never_forwarded(
                 "safe_transaction", {"chain": "testchain", "target": RECIPIENT}
             )
     assert str(raised.value) == TOOL_FAILED.format(tool="safe_transaction")
-    assert "tool safe_transaction failed: RuntimeError" in caplog.text
+    assert f"tool safe_transaction failed: {error_type.__name__}" in caplog.text
     assert "SECRETKEY" not in caplog.text
 
 
@@ -306,13 +296,14 @@ async def test_request_context_warns_that_it_may_be_published(mcp: FastMCP) -> N
         GrantRefused("token-scope", "this token does not allow it"),
         MechError("refused before payment"),
         InFlightError("request r1 is still in flight"),
+        ToolError("a tool's own refusal"),
     ],
     ids=lambda e: type(e).__name__,
 )
 async def test_each_error_connect_words_reaches_the_caller_verbatim(
     mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, test_signer: Signer, error: Exception
 ) -> None:
-    """Every forwarded type keeps its text; dropping one from the list fails here."""
+    """Every type CALLER_ERRORS holds, and ToolError, keeps its text verbatim."""
 
     def refuse(*_: t.Any, **__: t.Any) -> str:
         raise error
@@ -321,20 +312,7 @@ async def test_each_error_connect_words_reaches_the_caller_verbatim(
     with pytest.raises(ToolError) as raised:
         await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
     assert str(raised.value) == str(error)
-
-
-async def test_a_library_value_error_is_not_forwarded(
-    mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, test_signer: Signer
-) -> None:
-    """A builtin ValueError is a library's words, so the caller reads TOOL_FAILED."""
-
-    def broken(*_: t.Any, **__: t.Any) -> str:
-        raise ValueError("Expecting value: line 1 column 1 (char 0)")
-
-    monkeypatch.setattr(test_signer, "send_via_safe", broken)
-    with pytest.raises(ToolError) as raised:
-        await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
-    assert str(raised.value) == TOOL_FAILED.format(tool="safe_transaction")
+    assert isinstance(raised.value.__cause__, type(error))
 
 
 def test_an_app_built_at_the_test_interface_gates_at_its_positions(
@@ -375,3 +353,47 @@ def test_an_unknown_no_intent_policy_is_refused() -> None:
     """A typo is an error, never read as the permissive position."""
     with pytest.raises(ValueError, match="no_intent_policy 'Strict' is unknown"):
         Switches(no_intent_policy="Strict")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "expected"),
+    [
+        (
+            "safe_transaction",
+            {"chain": "gnosiss", "target": RECIPIENT},
+            "unknown chain 'gnosiss'; configured chains: ['testchain']",
+        ),
+        (
+            "sign_message",
+            {"digest": "0xzz"},
+            "digest must be hex (0x and whole bytes), got '0xzz'",
+        ),
+        (
+            "get_abi",
+            {"chain": "testchain", "address": "0x12"},
+            "address must be a 0x address (40 hex digits), got '0x12'",
+        ),
+    ],
+)
+async def test_connect_s_input_refusals_reach_the_caller(
+    mcp: FastMCP, tool: str, arguments: dict, expected: str
+) -> None:
+    """Each InputError site reads as its own words, never as TOOL_FAILED."""
+    with pytest.raises(ToolError) as raised:
+        await mcp.call_tool(tool, arguments)
+    assert str(raised.value) == expected
+
+
+async def test_a_malformed_argument_reads_as_the_reference_s_invalid_request(
+    mcp: FastMCP,
+) -> None:
+    """The arguments' check is Connect's: named, and never echoing the value."""
+    with pytest.raises(ToolError) as raised:
+        await mcp.call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "value": -1},
+        )
+    text = str(raised.value)
+    assert text.startswith("invalid request: ValidationError: value: ")
+    assert "rule 'bad-value'" in text
+    assert "errors.pydantic.dev" not in text

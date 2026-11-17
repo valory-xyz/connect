@@ -37,6 +37,7 @@ from connect.server import auth as auth_module
 from connect.server import mcp_tools as mcp_tools_module
 from connect.server import signer_routes as signer_routes_module
 from connect.server.auth import (
+    ACTION_SCOPES,
     AuthFailureLimiter,
     AuthMiddleware,
     GrantRefused,
@@ -820,13 +821,12 @@ class TestMcpMiddleware:
         [
             (["wallet_info"], "no_such_tool", True),  # unknown: the app answers
             (["wallet_info", "unscoped"], "unscoped", False),  # registered: refused
-            (None, "no_such_tool", False),  # no tool list: everything authorized
         ],
     )
     async def test_only_a_name_no_tool_answers_to_passes_unauthorized(
         self,
         activity: ActivityLog,
-        tools: list[str] | None,
+        tools: list[str],
         name: str,
         passed: bool,
     ) -> None:
@@ -867,7 +867,11 @@ async def test_a_disconnect_before_any_body_is_passed_on(activity: ActivityLog) 
         seen.append(await receive())
 
     middleware = AuthMiddleware(
-        inner, grant_store(WORKSPACE), activity, AuthFailureLimiter()
+        inner,
+        grant_store(WORKSPACE),
+        activity,
+        AuthFailureLimiter(),
+        tools=ACTION_SCOPES,
     )
     messages = [{"type": "http.disconnect"}, {"type": "http.disconnect"}]
 

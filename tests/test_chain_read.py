@@ -110,20 +110,53 @@ def test_chain_call_reports_result_or_revert() -> None:
 @pytest.mark.parametrize(
     ("to", "data", "block", "match"),
     [
-        ("0x1234", "0x", "latest", None),
-        (TOKEN, "313ce567", "latest", r"data must be hex \(0x and whole bytes\)"),
-        (TOKEN, "0xzz", "latest", None),
+        (
+            "0x1234",
+            "0x",
+            "latest",
+            r"^to must be a 0x address \(40 hex digits\), got '0x1234'$",
+        ),
+        (
+            "7070707070707070707070707070707070707070",
+            "0x",
+            "latest",
+            "^to must be a 0x address",
+        ),
+        (
+            TOKEN,
+            "0xzz",
+            "latest",
+            r"^data must be hex \(0x and whole bytes\), got '0xzz'$",
+        ),
+        (TOKEN, "0x31 3c", "latest", "^data must be hex"),
         (TOKEN, "0x", "yesterday", "block must be"),
         (TOKEN, "0x", "-1", "block must be >= 0"),
     ],
 )
 def test_chain_call_refuses_a_malformed_argument_rather_than_reverting(
-    to: str, data: str, block: str, match: str | None
+    to: str, data: str, block: str, match: str
 ) -> None:
     """A typo is the caller's mistake: it raises, it never reads as a revert."""
     w3 = _w3()
     with pytest.raises(InputError, match=match):
         chain_read.chain_call(t.cast(Web3, w3), to, data, block)
+
+
+def test_chain_call_takes_data_with_or_without_0x() -> None:
+    """As the reference's hex check does, a bare hex string is the same bytes."""
+    w3 = _w3()
+    assert chain_read.chain_call(
+        t.cast(Web3, w3), TOKEN, "313ce567"
+    ) == chain_read.chain_call(t.cast(Web3, w3), TOKEN, "0x313ce567")
+
+
+def test_get_abi_refuses_a_malformed_address_by_name() -> None:
+    """get_abi's address is checked as chain_call's is, in the reference's words."""
+    with pytest.raises(InputError) as refused:
+        chain_read.get_abi(t.cast(Web3, _w3()), "0x12")
+    assert (
+        str(refused.value) == "address must be a 0x address (40 hex digits), got '0x12'"
+    )
 
 
 def test_chain_call_takes_a_block_tag_or_number() -> None:

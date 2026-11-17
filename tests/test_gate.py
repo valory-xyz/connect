@@ -38,6 +38,7 @@ from connect import signer as signer_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
+from connect.input_errors import InputError
 from connect.signer import SERVER_BUILT, Signer, SignerError
 from connect.signer_errors import (
     SEND_FAILED,
@@ -48,7 +49,13 @@ from connect.signer_errors import (
 )
 from connect.switches import PRODUCTION, TEST_INTERFACE
 
-from tests.conftest import FakeW3, audit_entries, on_fake_chain, pay
+from tests.conftest import (
+    FakeW3,
+    audit_entries,
+    native_transfer_log,
+    on_fake_chain,
+    pay,
+)
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -143,16 +150,7 @@ class TestSignerGate:
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
         """Strict policy: a spend beyond the value or another recipient is refused."""
-        extra = {
-            "address": "0x" + "ee" * 20,  # the synthetic native-transfer log
-            "topics": [
-                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-                "0x" + SAFE[2:].rjust(64, "0"),
-                "0x" + SPENDER[2:].rjust(64, "0"),
-            ],
-            "data": "0x" + hex(3)[2:].rjust(64, "0"),
-        }
-        fake_w3.provider.logs = [extra]
+        fake_w3.provider.logs = [native_transfer_log(SAFE, SPENDER, 3)]
         with pytest.raises(SignerError) as refused:
             test_signer.send_via_safe("testchain", EOA, value=5)
         assert "rule 'overspend' (native: spends 8, intent allows 5)" in str(
@@ -211,6 +209,28 @@ class TestSignerGate:
                 "testchain", TOKEN, data=TOKEN_CALL, intent=intent_module.Capped(None)
             )
         assert not fake_w3.eth.sent
+
+    def test_a_no_intent_eoa_exec_transaction_is_held_to_its_inner_call(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Strict reads the safe's call inside it: 7 to EOA, and nothing more."""
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        calldata = safe_module.exec_transaction(
+            target=EOA, value=7, data="0x", owner=test_signer.address
+        )
+        test_signer.send("testchain", SAFE, data=calldata)
+        assert len(fake_w3.eth.sent) == 1
+        fake_w3.provider.logs = [native_transfer_log(SAFE, SPENDER, 2)]
+        with pytest.raises(SignerError) as refused:
+            test_signer.send("testchain", SAFE, data=calldata)
+        assert "rule 'overspend' (native: spends 9, intent allows 7)" in str(
+            refused.value
+        )
+        assert f"rule 'undeclared-recipient' ({SPENDER})" in str(refused.value)
+        assert len(fake_w3.eth.sent) == 1
 
     def test_the_simulate_only_policy_refuses_only_a_revert(
         self,
@@ -513,7 +533,9 @@ class TestSignerGate:
             test_signer.send(
                 "testchain", SAFE, value=1, data=calldata, intent=pay(EOA, 7)
             )
-        with pytest.raises(ValueError, match="could not decode"):
+        with pytest.raises(
+            InputError, match="^could not decode execTransaction calldata$"
+        ):
             safe_module.SafeExec.decode("0x6a761202" + "zz")
         with pytest.raises(ValueError, match="not execTransaction"):
             safe_module.SafeExec.decode("0x12345678")
@@ -1147,7 +1169,7 @@ def test_http_routes_take_an_intent(
     make_app: t.Callable,
     fake_w3: FakeW3,
 ) -> None:
-    """Skill scripts pass intents through the HTTP routes; a broken one is a 400."""
+    """Skill scripts pass intents through the HTTP routes; one the call breaks is a 400."""
     app = make_app(test_signer, app_config, activity, token=TOKEN_TOKEN)
     headers = {"Authorization": f"Bearer {TOKEN_TOKEN}"}
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
