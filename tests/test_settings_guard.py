@@ -204,6 +204,63 @@ def exec_transaction_calldata(  # pylint: disable=too-many-arguments
     return "0x" + EXEC_TRANSACTION_SELECTOR + encoded.hex()
 
 
+# one call per guardrail rule check_transaction answers, and its whole refusal:
+# a swapped argument at a call site reads as a different text
+GUARD_RULE_CASES = [
+    (
+        "no-delegatecall",
+        "testchain",
+        SAFE,
+        0,
+        exec_transaction_calldata(OTHER, operation=1),
+    ),
+    ("no-self-call", "testchain", SAFE, 0, exec_transaction_calldata(SAFE)),
+    ("whitelist", "testchain", SAFE, 0, exec_transaction_calldata(WHITELISTED)),
+    ("no-safe", "nosafe", WHITELISTED, 0, "0x"),
+    ("safe-only", "testchain", WHITELISTED, 0, "0x"),
+    ("exec-transaction-only", "testchain", SAFE, 0, "0x12345678"),
+    ("outer-value", "testchain", SAFE, 1, exec_transaction_calldata(OTHER)),
+    ("refund", "testchain", SAFE, 0, exec_transaction_calldata(OTHER, gas_price=1)),
+    (
+        "payment-token-approve",
+        "testchain",
+        SAFE,
+        0,
+        exec_transaction_calldata(PAYMENT_TOKEN),
+    ),
+    ("marketplace", "testchain", FLOOR_MARKETPLACE, 0, "0x"),
+    (
+        "undecodable-exec-transaction",
+        "testchain",
+        SAFE,
+        0,
+        "0x" + EXEC_TRANSACTION_SELECTOR,
+    ),
+]
+GUARD_REFUSALS = {
+    "no-delegatecall": texts.GUARD_NO_DELEGATECALL,
+    "no-self-call": texts.GUARD_NO_SELF_CALL,
+    "whitelist": texts.guard_not_allowed(WHITELISTED, "testchain"),
+    "no-safe": texts.guard_no_safe("nosafe"),
+    "safe-only": texts.guard_safe_only(SAFE, WHITELISTED),
+    "exec-transaction-only": texts.guard_exec_transaction_only(
+        EXEC_TRANSACTION_SELECTOR, "12345678"
+    ),
+    "outer-value": texts.GUARD_OUTER_VALUE,
+    "refund": texts.GUARD_REFUND,
+    "payment-token-approve": texts.guard_payment_token_approve(TRACKER, PAYMENT_TOKEN),
+    "marketplace": texts.guard_marketplace(FLOOR_MARKETPLACE, "testchain"),
+    "undecodable-exec-transaction": texts.GUARD_UNDECODABLE,
+}
+
+
+def test_every_guardrail_rule_is_exercised() -> None:
+    """A rule added to `GuardRule` cannot go untested: raw-digest has its own test."""
+    exercised = {case[0] for case in GUARD_RULE_CASES} | {"raw-digest"}
+    assert exercised == set(texts.GUARD_RULES)
+    assert set(GUARD_REFUSALS) == {case[0] for case in GUARD_RULE_CASES}
+
+
 @pytest.fixture(name="store")
 def store_fixture(
     account: LocalAccount, store_path: Path, activity: ActivityLog
@@ -1302,34 +1359,7 @@ class TestGuard:
 
     @pytest.mark.parametrize(
         ("rule", "chain", "to", "value", "data"),
-        [
-            ("no-safe", "nosafe", WHITELISTED, 0, "0x"),
-            ("safe-only", "testchain", WHITELISTED, 0, "0x"),
-            ("exec-transaction-only", "testchain", SAFE, 0, "0x12345678"),
-            ("outer-value", "testchain", SAFE, 1, exec_transaction_calldata(OTHER)),
-            (
-                "refund",
-                "testchain",
-                SAFE,
-                0,
-                exec_transaction_calldata(OTHER, gas_price=1),
-            ),
-            (
-                "payment-token-approve",
-                "testchain",
-                SAFE,
-                0,
-                exec_transaction_calldata(PAYMENT_TOKEN),
-            ),
-            ("marketplace", "testchain", FLOOR_MARKETPLACE, 0, "0x"),
-            (
-                "undecodable-exec-transaction",
-                "testchain",
-                SAFE,
-                0,
-                "0x" + EXEC_TRANSACTION_SELECTOR,
-            ),
-        ],
+        GUARD_RULE_CASES,
     )
     def test_every_guardrail_refusal_names_its_rule(  # pylint: disable=too-many-arguments
         self,
@@ -1341,7 +1371,7 @@ class TestGuard:
         value: int,
         data: str,
     ) -> None:
-        """Connect's own rules carry the broker's prefix and their own rule id."""
+        """Each rule's whole refusal, so every call site's arguments are pinned."""
         monkeypatch.setattr(
             guard_module,
             "MECH_MARKETPLACES",
@@ -1355,7 +1385,7 @@ class TestGuard:
         guard = make_guard(store, MODE_RESTRICTED, {"testchain": ()})
         with pytest.raises(GuardError) as refused:
             guard.check_transaction(chain, to, value, data)
-        assert str(refused.value).startswith(f"guardrail: rule '{rule}': ")
+        assert str(refused.value) == GUARD_REFUSALS[rule]
 
     def test_a_refused_raw_digest_names_its_rule(self, store: SettingsStore) -> None:
         """The raw-digest refusal carries the broker's prefix and its rule id."""
@@ -4422,7 +4452,8 @@ class TestMech:
         assert info["terms"] == VALORY_TERMS_NOTICE
         assert info["terms_url"] == "https://www.valory.xyz/terms/mechs"
         assert info["delivery"] == {"received_requests": 120}
-        assert info["payment"] == {"type": "native"}
+        assert info["payment_info"] == {"type": "native"}
+        assert "payment" not in info  # B12: `payment` is only ever an integer
         # the report's other keys survive the merge
         assert info["tools"] == ["prediction-online"]
         assert "report_note" not in info
@@ -4538,7 +4569,8 @@ class TestMech:
             "age_days": (datetime.now(timezone.utc) - SAMPLE_CREATED_AT).days,
             "note": manager_module.DELIVERY_NOTE,
         }
-        assert info["payment"] == {
+        assert "payment" not in info
+        assert info["payment_info"] == {
             "type": "native",
             "note": manager_module.PAYMENT_NOTE,
         }

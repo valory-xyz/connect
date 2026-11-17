@@ -87,6 +87,7 @@ from connect.safe import (
     calldata_hex,
     decode_approve,
     decode_deposit,
+    decode_exec,
 )
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
 from connect.texts import (
@@ -95,13 +96,13 @@ from connect.texts import (
     GUARD_OUTER_VALUE,
     GUARD_RAW_DIGEST,
     GUARD_REFUND,
+    GUARD_UNDECODABLE,
     guard_exec_transaction_only,
     guard_marketplace,
     guard_no_safe,
     guard_not_allowed,
     guard_payment_token_approve,
     guard_safe_only,
-    guard_undecodable,
 )
 
 logger = logging.getLogger("agent")
@@ -309,11 +310,11 @@ class Guard:
             # any safe the agent reaches, and "protected only if configured"
             # would be a hole an unconfigured chain walks straight through.
             try:
-                exec_call = SafeExec.decode(calldata)
+                exec_call = decode_exec(calldata, chain=chain, to=to)
             except ValueError as e:
                 # calldata we cannot parse is calldata we cannot judge, so it
                 # is refused rather than waved through
-                raise GuardError(guard_undecodable(str(e))) from e
+                raise GuardError(GUARD_UNDECODABLE) from e
             self._check_floor(to, exec_call)
         if not server_built:
             self._check_marketplace(chain, to, exec_call)

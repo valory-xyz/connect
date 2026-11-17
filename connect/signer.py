@@ -568,7 +568,7 @@ class Signer:
         ):
             return own
         try:
-            exec_call = safe_module.SafeExec.decode(data)
+            exec_call = safe_module.decode_exec(data, chain=chain, to=to)
         except ValueError as e:
             raise _GateRefused("bad-exec-transaction", str(e)) from e
         if value:
@@ -664,7 +664,7 @@ class Signer:
                 call.value,
                 call.to,
                 strict=self._switches.no_intent_policy != "simulate-only",
-                capped=intent_module.locks_positions(raw_intent),
+                capped=isinstance(raw_intent, intent_module.Capped),
             )
         try:
             diff = self._simulate(chain, call)

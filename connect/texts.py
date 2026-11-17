@@ -20,8 +20,10 @@
 
 """Every agent-visible text whose wording is part of Connect's contract.
 
-The wording is OnchainBench's reference implementation's, verbatim, so an
-agent reads the same text on the bench and in Pearl. The module is public:
+Most of the wording is OnchainBench's reference implementation's, verbatim,
+so an agent reads the same text on the bench and in Pearl; the guardrail
+rules and gate details Connect adds, its amount refusals and the descriptions
+it keeps are its own, in the same form. The module is public:
 the bench imports it, so a rename here fails the bench's suite instead of
 drifting. Names the bench imports keep their reference spelling, upper-case
 formatters included.
@@ -132,8 +134,27 @@ NOT_SENT_SUFFIX = ". Nothing was sent."
 MINED_PREFIX = "transaction 0x"
 
 
-def guard_refusal(rule: str, detail: str) -> str:
-    """Return a guardrail refusal of Connect's own rules, in the reference's form."""
+# every guardrail rule id: the reference's three (the floor and the whitelist)
+# and Connect's own, which are the same under every `Switches` position
+GuardRule = t.Literal[
+    "no-delegatecall",
+    "no-self-call",
+    "whitelist",
+    "raw-digest",
+    "outer-value",
+    "refund",
+    "undecodable-exec-transaction",
+    "marketplace",
+    "no-safe",
+    "safe-only",
+    "exec-transaction-only",
+    "payment-token-approve",
+]
+GUARD_RULES: tuple[GuardRule, ...] = t.get_args(GuardRule)
+
+
+def guard_refusal(rule: GuardRule, detail: str) -> str:
+    """Return a guardrail refusal, in the reference's form."""
     return f"{GUARDRAIL_PREFIX}'{rule}': {detail}"
 
 
@@ -159,11 +180,11 @@ def guard_not_allowed(target: str, chain: str) -> str:
     )
 
 
-# Connect's own guardrail rules, in every position and in the same form as
-# the reference's three: agents read them on the bench too
+# Connect's own guardrail rules, the same under every `Switches` position and
+# in the same form as the reference's three: agents read them on the bench too
 GUARD_RAW_DIGEST = guard_refusal(
     "raw-digest",
-    f"raw digest signing is disabled by the operator's guardrail settings; "
+    "raw digest signing is disabled by the operator's guardrail settings; "
     f"{ASK_OPERATOR}",
 )
 GUARD_OUTER_VALUE = guard_refusal(
@@ -179,9 +200,9 @@ GUARD_REFUND = guard_refusal(
 )
 
 
-def guard_undecodable(detail: str) -> str:
-    """Return the refusal of execTransaction calldata the guardrail cannot read."""
-    return guard_refusal("undecodable-exec-transaction", detail)
+EXEC_UNDECODABLE = "could not decode execTransaction calldata"
+NOT_EXEC_TRANSACTION = "not execTransaction calldata"
+GUARD_UNDECODABLE = guard_refusal("undecodable-exec-transaction", EXEC_UNDECODABLE)
 
 
 def guard_marketplace(marketplace: str, chain: str) -> str:
@@ -229,6 +250,31 @@ def guard_payment_token_approve(tracker: str, token: str) -> str:
     )
 
 
+# get_abi answers in Connect's own way until it matches the reference's
+# (unverified sources an error), so it publishes Connect's own description
+GET_ABI_DESCRIPTION = (
+    "Report what Connect can say about a contract's ABI, following EIP-1967. "
+    "Only ABIs Connect ships: well-known contracts by address on the chains they "
+    "are deployed to (`verified`, for the queried address alone; a proxy's "
+    "implementation has its own `implementation_verified`) and the standard "
+    "interfaces a contract answers to; no explorer lookup."
+)
+
+# transaction_status answers pending too (a transaction the node holds unmined),
+# which the reference's description does not name, so it publishes Connect's own
+TRANSACTION_STATUS_DESCRIPTION = (
+    "Settlement of a transaction hash you already hold: success (mined, with its "
+    "block), reverted, pending (sent but not yet mined) or not_found."
+)
+
+# Pearl keeps this warning on the field, beside the reference's tool text
+REQUEST_CONTEXT_NOTE = (
+    "optional dict handed to the tool alongside the prompt; it reaches the mech, "
+    "and legacy_on_chain=true also publishes it to IPFS for good: put nothing "
+    "private in it"
+)
+
+
 def GATE_PROBLEM(rule: str, detail: str) -> str:
     """Return one intent-gate problem, as the gate's refusal joins them."""
     return f"intent gate: rule '{rule}' ({detail})"
@@ -252,6 +298,11 @@ def gate_undeclared_recipient(address: str) -> str:
 def gate_undeclared_approval(symbol: str, spender: str, amount: object) -> str:
     """Return the `undeclared-approval` problem's detail."""
     return f"{symbol} to {spender}, {amount}"
+
+
+def gate_token_cap_positions(where: str) -> str:
+    """Return the `token-cap-positions` problem's detail: Connect's own rule."""
+    return f"moves {where} out, and a value-capped token may not move positions"
 
 
 def INTENT_UNKNOWN_TOKEN(key: str) -> str:
@@ -292,6 +343,18 @@ def ADDRESS_INVALID(field: str, value: object) -> str:
 def HEX_INVALID(field: str, value: object) -> str:
     """Return the refusal of a hex argument that is not whole-byte hex."""
     return f"{field} must be hex (0x and whole bytes), got {str(value)[:60]!r}"
+
+
+# Connect's own refusal of a base-unit amount it cannot read exactly: it names
+# the rule and the form to send, never the value sent
+AMOUNT_RULE = (
+    "pass a decimal or 0x-hex string of base units, or a JSON integer below 2^53"
+)
+CAP_RULE = (
+    "pass a whole number of base units, as an integer or a decimal or 0x-hex string"
+)
+AMOUNT_REFUSED = f"rule 'bad-value': {AMOUNT_RULE}"
+CAP_REFUSED = f"rule 'bad-value': {CAP_RULE}"
 
 
 def AMOUNT_INEXACT(value: object) -> str:

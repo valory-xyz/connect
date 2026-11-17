@@ -39,17 +39,16 @@ from connect.idempotency import InFlightError
 from connect.input_errors import InputError
 from connect.mech import MechError
 from connect.server.auth import ACTION_SCOPES, GrantRefused
-from connect.server.mcp_tools import (
+from connect.server.mcp_tools import tool_failed, with_aliases
+from connect.signer import Signer, SignerError
+from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
+from connect.texts import (
     AMOUNT_REFUSED,
     CAP_REFUSED,
     GET_ABI_DESCRIPTION,
     REQUEST_CONTEXT_NOTE,
     TRANSACTION_STATUS_DESCRIPTION,
-    tool_failed,
-    with_aliases,
 )
-from connect.signer import Signer, SignerError
-from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
 
 from tests.conftest import FakeW3, approval_log
 
@@ -510,3 +509,62 @@ async def test_an_argument_the_handler_does_not_read_changes_nothing(
     (bare,) = await mcp.call_tool(tool, plain)
     (carried,) = await mcp.call_tool(tool, {**plain, **extra})
     assert json.loads(carried.text) == json.loads(bare.text)  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "refusal"),
+    [
+        ({"to": "0x12"}, "to must be a 0x address (40 hex digits), got '0x12'"),
+        (
+            {"target": RECIPIENT, "to": "0xzz"},
+            "to must be a 0x address (40 hex digits), got '0xzz'",
+        ),
+        (
+            {"target": RECIPIENT, "data": "0Xabcd"},
+            "data must be hex (0x and whole bytes), got '0Xabcd'",
+        ),
+    ],
+)
+async def test_the_arguments_are_checked_as_sent_before_any_alias(
+    mcp: FastMCP, fake_w3: FakeW3, arguments: dict, refusal: str
+) -> None:
+    """The reference checks `to` by its own name, even beside a valid `target`."""
+    with pytest.raises(ToolError) as refused:
+        await mcp.call_tool("safe_transaction", {"chain": "testchain", **arguments})
+    assert str(refused.value) == refusal
+    assert not fake_w3.eth.sent
+
+
+async def test_an_empty_target_reads_the_alias(mcp: FastMCP, fake_w3: FakeW3) -> None:
+    """`a.get("target") or a.get("to")`: an empty target does not hide `to`."""
+    await mcp.call_tool(
+        "safe_transaction", {"chain": "testchain", "target": "", "to": RECIPIENT}
+    )
+    assert len(fake_w3.eth.sent) == 1
+
+
+async def test_a_checksummed_address_is_accepted_at_the_boundary(
+    mcp: FastMCP, fake_w3: FakeW3
+) -> None:
+    """Mixed case is a valid address: the check reads hex, not a checksum."""
+    checksummed = "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa"
+    await mcp.call_tool(
+        "safe_transaction", {"chain": "testchain", "target": checksummed}
+    )
+    assert len(fake_w3.eth.sent) == 1
+
+
+async def test_a_checksummed_priority_mech_is_accepted_at_the_boundary(
+    mcp: FastMCP, mech_service: t.Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mech tools take a checksummed mech address as sent."""
+    checksummed = "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa"
+    asked: list[t.Any] = []
+
+    def tools(**kwargs: t.Any) -> dict:
+        asked.append(kwargs["priority_mech"])
+        return {}
+
+    monkeypatch.setattr(mech_service, "tools", tools)
+    await mcp.call_tool("mech_tools", {"priority_mech": checksummed})
+    assert asked == [checksummed]

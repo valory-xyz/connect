@@ -59,6 +59,7 @@ from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
 from mech_client.services.marketplace_service import MarketplaceService
 from safe_eth.eth import EthereumClient
 
+from connect import mech_budget
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
@@ -285,7 +286,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         info["offchain_capable"] = blocker is None
         if blocker is not None:
             info["offchain_note"] = blocker
-        info |= service.tool_manager.mech_report_or_terms(priority_mech, read.document)
+        report = service.tool_manager.mech_report_or_terms(priority_mech, read.document)
+        info |= mech_budget.payment_labelled(report)
         return info
 
     def _list_mechs(self, chain: str, *, limit: int, offset: int) -> dict:

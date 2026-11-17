@@ -47,6 +47,7 @@ from connect.server.auth import (
     narrower,
 )
 from connect.signer import Signer
+from connect.texts import AMOUNT_RULE, CAP_RULE
 
 from tests.conftest import (
     FakeW3,
@@ -1076,10 +1077,59 @@ def test_mcp_an_amount_from_2_53_on_is_refused_at_the_mount_before_any_draw(
     )
     refused = _mcp_call(client, WORKSPACE, tool, {**arguments, name: 2**53})
     assert _refused_rule(refused) == "bad-value"
-    assert "2^53 - 1" in refused.json()["error"]["message"]
+    assert refused.json()["error"]["message"] == (
+        f"rule 'bad-value': {name}: {AMOUNT_RULE}"
+    )
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert rules == ["bad-value"]
     assert not fake_w3.eth.sent
+
+
+def test_mcp_a_malformed_amount_is_refused_without_echoing_it(
+    client: TestClient, fake_w3: FakeW3
+) -> None:
+    """Over the transport too, the refusal names the argument and never the value."""
+    marker = "MARKER-" + "9" * 40
+    answers = [
+        _mcp_call(
+            client,
+            WORKSPACE,
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "value": marker},
+        ),
+        _mcp_call(
+            client,
+            WORKSPACE,
+            "mech_request",
+            {"prompt": "q", "tool": "t", "max_payment": marker},
+        ),
+    ]
+    messages = [answer.json()["error"]["message"] for answer in answers]
+    assert messages == [
+        f"rule 'bad-value': value: {AMOUNT_RULE}",
+        f"rule 'bad-value': max_payment: {CAP_RULE}",
+    ]
+    assert not fake_w3.eth.sent
+
+
+def test_mcp_a_malformed_address_is_refused_before_the_budget_is_drawn(
+    client: TestClient, fake_w3: FakeW3
+) -> None:
+    """The mount checks the arguments as sent before authorize draws on a budget."""
+    capped = _session_capped(client)  # 10 native for the session
+    arguments = {"chain": "testchain", "value": 5, "intent": pay(RECIPIENT, 5)}
+    refused = _mcp_call(
+        client, capped, "safe_transaction", {**arguments, "target": "0x12"}
+    )
+    result = refused.json()["result"]
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "target must be a 0x address (40 hex digits), got '0x12'"
+    )
+    whole = {"chain": "testchain", "value": 10, "intent": pay(RECIPIENT, 10)}
+    sent = _mcp_call(client, capped, "safe_transaction", {**whole, "target": RECIPIENT})
+    assert _refused_rule(sent) is None  # the session's 10 are all still there
+    assert len(fake_w3.eth.sent) == 1
 
 
 def test_mcp_a_mech_cap_from_2_53_on_reaches_the_flow_exactly(

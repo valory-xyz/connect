@@ -47,6 +47,7 @@ from connect.signer_errors import (
     logged_cause,
 )
 from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
+from connect.texts import EXEC_UNDECODABLE
 
 from tests.conftest import (
     FakeW3,
@@ -517,24 +518,39 @@ class TestSignerGate:
         with pytest.raises(ValueError, match="not execTransaction"):
             safe_module.SafeExec.decode("0x12345678")
 
-    def test_undecodable_exec_transaction_is_logged_with_its_cause(
-        self, caplog: pytest.LogCaptureFixture
+    def test_undecodable_exec_transaction_is_logged_with_where_it_went(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The caller gets the fixed line; the log keeps the size and the cause."""
+        """The caller gets the fixed line; the log names chain, target and cause."""
+        undecodable = "0x6a761202" + "00" * 4
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
+            test_signer.send("testchain", SAFE, data=undecodable)
+        (record,) = [
+            r for r in caplog.records if r.message.startswith(EXEC_UNDECODABLE)
+        ]
+        prefix = f"{EXEC_UNDECODABLE} to {SAFE} on testchain (8 bytes): "
+        assert record.levelname == "WARNING"
+        assert record.message.startswith(prefix)
+        assert len(record.message) > len(prefix)  # eth_abi's cause, logged only
+        assert not fake_w3.eth.sent
+
+    def test_a_fault_in_the_decoder_is_not_read_as_bad_input(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only the hex and eth_abi's decoding errors are the caller's input."""
         from connect import (
             safe as safe_module,  # pylint: disable=import-outside-toplevel
         )
 
-        with caplog.at_level("WARNING", logger="agent"), pytest.raises(InputError):
+        def broken(*_args: t.Any) -> t.NoReturn:
+            raise TypeError("a fault in Connect's own types")
+
+        monkeypatch.setattr(safe_module, "abi_decode", broken)
+        with pytest.raises(TypeError):
             safe_module.SafeExec.decode("0x6a761202" + "00" * 4)
-        (record,) = [
-            r
-            for r in caplog.records
-            if r.message.startswith(safe_module.EXEC_UNDECODABLE)
-        ]
-        assert record.levelname == "WARNING"
-        assert record.message.startswith(f"{safe_module.EXEC_UNDECODABLE} (8 bytes): ")
-        assert len(record.message) > len(f"{safe_module.EXEC_UNDECODABLE} (8 bytes): ")
 
     @pytest.mark.parametrize("field", [6, 7, 8])
     def test_an_eoa_exec_transaction_may_not_pay_a_gas_refund(

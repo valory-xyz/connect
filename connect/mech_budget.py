@@ -87,17 +87,26 @@ def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
     }
 
 
+def payment_labelled(report: dict) -> dict:
+    """Return mech-client's mech report with its `payment` label as `payment_info`.
+
+    The report labels the mech's payment asset under `payment`, an object; in
+    every mech answer `payment` is a JSON integer of base units (B12), so the
+    label moves aside.
+    """
+    fields = dict(report)
+    if "payment" in fields:
+        fields["payment_info"] = fields.pop("payment")
+    return fields
+
+
 def charged(terms: dict, rate: int, result: dict) -> dict:
     """Return the fields a request's answer carries about the mech and its charge.
 
-    `terms` is mech-client's mech report (or the terms alone). It labels the
-    mech's payment asset under `payment`; in the answer that key is the charge
-    the request accepted, `rate` for each request id the mech took, in base
-    units of the asset (settlement charges at most this), so the label moves
-    to `payment_info`.
+    `terms` is mech-client's mech report (or the terms alone); `payment` is
+    the charge the request accepted, `rate` for each request id the mech took,
+    in base units of the asset (settlement charges at most this).
     """
-    fields = dict(terms)
-    if "payment" in fields:
-        fields["payment_info"] = fields.pop("payment")
+    fields = payment_labelled(terms)
     fields["payment"] = rate * len(result.get("request_ids") or [])
     return fields

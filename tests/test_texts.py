@@ -29,6 +29,8 @@ import pytest
 from connect import texts
 
 ADDR = "0x" + "ab" * 20
+SAFE_ADDR = "0x" + "5a" * 20
+OTHER_ADDR = "0x" + "07" * 20
 
 # (constant, reference value): the reference's literals, copied from
 # onchainbench 40b9430 (fork_connect.py, mock_connect/server.py,
@@ -219,7 +221,7 @@ CONNECT_GUARD = [
         "outer transaction of an execTransaction call",
     ),
     (
-        texts.guard_undecodable("could not decode execTransaction calldata"),
+        texts.GUARD_UNDECODABLE,
         "guardrail: rule 'undecodable-exec-transaction': could not decode "
         "execTransaction calldata",
     ),
@@ -234,12 +236,33 @@ CONNECT_GUARD = [
         "guardrail: rule 'no-safe': the operator's guardrail settings allow no "
         "transactions on chain 'base' (no service safe is configured there)",
     ),
+    (
+        texts.GUARD_REFUND,
+        "guardrail: rule 'refund': the guardrail requires execTransaction refund "
+        "fields to be zero (gasPrice=0, gasToken=0x0, refundReceiver=0x0): a gas "
+        "refund would pay out of the safe past the allowed targets",
+    ),
+    (
+        texts.guard_safe_only(SAFE_ADDR, OTHER_ADDR),
+        "guardrail: rule 'safe-only': the operator's guardrail settings only allow "
+        f"transactions targeting the service safe {SAFE_ADDR}, not {OTHER_ADDR}",
+    ),
+    (
+        texts.guard_exec_transaction_only("6a761202", "12345678"),
+        "guardrail: rule 'exec-transaction-only': the guardrail requires calls to "
+        "the safe to be execTransaction (selector 0x6a761202), got 0x12345678",
+    ),
+    (
+        texts.guard_payment_token_approve(SAFE_ADDR, OTHER_ADDR),
+        "guardrail: rule 'payment-token-approve': the guardrail only allows "
+        f"approve(spender={SAFE_ADDR}) on the payment token {OTHER_ADDR}",
+    ),
 ]
 
 
 @pytest.mark.parametrize(("constant", "expected"), CONNECT_GUARD)
 def test_connect_s_own_guardrail_texts(constant: str, expected: str) -> None:
-    """Connect's own rules keep their words, now that agents on the bench read them."""
+    """Connect's own rules keep their words: agents on the bench read them."""
     assert constant == expected
 
 

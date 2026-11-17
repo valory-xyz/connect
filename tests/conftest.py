@@ -445,6 +445,11 @@ TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523
 APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
 
 
+def _hex_word(n: int) -> str:
+    """Return a number as one 32-byte ABI word, without 0x."""
+    return hex(n)[2:].rjust(64, "0")
+
+
 def _topic(address: str) -> str:
     """Return an address as a log topic."""
     return "0x" + address.lower().removeprefix("0x").rjust(64, "0")
@@ -455,7 +460,7 @@ def approval_log(token: str, owner: str, spender: str, amount: int) -> dict:
     return {
         "address": token,
         "topics": [APPROVAL_TOPIC, _topic(owner), _topic(spender)],
-        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
+        "data": "0x" + _hex_word(amount),
     }
 
 
@@ -468,7 +473,7 @@ def transfer_log(src: str, dst: str, amount: int, address: str = NATIVE_LOG) -> 
             _topic(src),
             _topic(dst),
         ],
-        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
+        "data": "0x" + _hex_word(amount),
     }
 
 
@@ -477,7 +482,7 @@ def position_out_log(holder: str, contract: str, to: str, amount: int = 1) -> di
     return {
         "address": contract,
         "topics": [TRANSFER_SINGLE, _topic(holder), _topic(holder), _topic(to)],
-        "data": "0x" + hex(7)[2:].rjust(64, "0") + hex(amount)[2:].rjust(64, "0"),
+        "data": "0x" + _hex_word(7) + _hex_word(amount),
     }
 
 
@@ -541,7 +546,7 @@ class FakeProvider:
     def _prepaid(self, read: dict, when: int) -> dict:
         """Answer one prepaid balance read, before (0) or after (1) the call."""
         balance = self.prepaid[read["to"]][when]
-        data = "0x" + hex(balance)[2:].rjust(64, "0")
+        data = "0x" + _hex_word(balance)
         return {"status": "0x1", "returnData": data, "gasUsed": "0x5208", "logs": []}
 
 

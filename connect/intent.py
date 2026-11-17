@@ -33,6 +33,7 @@ from connect.texts import (
     NOT_SENT_SUFFIX,
     gate_overspend,
     gate_receive_min,
+    gate_token_cap_positions,
     gate_undeclared_approval,
     gate_undeclared_recipient,
 )
@@ -107,9 +108,7 @@ class Intent(t.TypedDict, total=False):
     approvals: list[IntentApproval]
     # set only through Capped, never by a caller: no position may leave
     positions_locked: bool
-    # set only by `implied_intent`, never by a caller: what a call with no
-    # intent is held to, under which a position leaving is an overspend (or
-    # `token-cap-positions`, when `positions_locked`)
+    # set only by `implied_intent`, never by a caller
     implied: bool
 
 
@@ -882,8 +881,7 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="token-cap-positions",
-                    detail=f"moves {where} out, "
-                    "and a value-capped token may not move positions",
+                    detail=gate_token_cap_positions(where),
                 )
             )
         elif intent.get("implied"):
@@ -899,11 +897,6 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
 def _leaving(diff: AssetDiff) -> list[dict]:
     """Return the positions the call moves out of the sender."""
     return [p for p in diff["positions"] if int(p["delta"]) < 0]
-
-
-def locks_positions(raw: t.Any) -> bool:
-    """Whether an intent comes under a capped token, which moves no position."""
-    return isinstance(raw, Capped)
 
 
 def no_intent_hold(
@@ -925,9 +918,11 @@ def simulation_answer(
 ) -> dict:
     """Return what `simulate_transaction` answers: the diff, and its verdict.
 
-    A call held to nothing (`held_to` None: no intent, `simulate-only`, no
-    capped token) answers no verdict and no problems, as the reference does:
-    a revert shows in the diff's own `ok` and `revert`, not as a problem.
+    A call refused before it was simulated (no diff) answers
+    `fits_intent: false` with its problems. A simulated call held to nothing
+    (`held_to` None: no intent, `simulate-only`, no capped token) answers no
+    verdict and no problems, as the reference does: a revert shows in the
+    diff's own `ok` and `revert`, not as a problem.
     """
     texts = [problem_text(p) for p in problems]
     if diff is None:

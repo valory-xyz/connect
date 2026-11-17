@@ -50,8 +50,10 @@ from connect import intent as intent_module
 from connect.activity import ActivityLog
 from connect.chain_read import UNIVERSAL_ROUTER_NAME, known_contract
 from connect.chains import chain_info
+from connect.input_errors import InputError, check_arguments
 from connect.server.strict import StrictBody
 from connect.signer import MAX_CACHED_RESULTS
+from connect.texts import AMOUNT_RULE, CAP_RULE
 
 Scope = t.Literal["read", "mech", "tx"]
 SCOPES: tuple[Scope, ...] = ("read", "mech", "tx")
@@ -133,7 +135,12 @@ def check_tool_amounts(tool: str, arguments: t.Mapping[str, t.Any]) -> None:
             try:
                 reader(raw)
             except (TypeError, ValueError) as e:
-                raise GrantRefused("bad-value", f"{name}: {e} (got {raw!r})") from e
+                rule = (
+                    AMOUNT_RULE
+                    if reader is intent_module.parse_tool_amount
+                    else CAP_RULE
+                )
+                raise GrantRefused("bad-value", f"{name}: {rule}") from e
 
 
 def _intent_argument(arguments: t.Mapping[str, t.Any]) -> t.Any:
@@ -852,7 +859,10 @@ class AuthMiddleware:
     def _refusal(
         self, token: str, body: bytes, replays: set[tuple[str, str]]
     ) -> dict | None:
-        """Return a JSON-RPC error for the first tool call this token may not make.
+        """Return the answer to the first tool call this token may not make.
+
+        A malformed address or hex argument is answered as the tool's own error
+        (the reference's `check_args` text); a grant refusal as a JSON-RPC error.
 
         Each call relieved as a retry is added to `replays` as (tool, request id).
         """
@@ -870,10 +880,21 @@ class AuthMiddleware:
             name = str(params.get("name"))
             if name not in self._tools:
                 continue
-            try:
+            try:  # every input check runs before authorize draws on a budget
+                check_arguments(arguments)
                 check_tool_amounts(name, arguments)
                 if self._grants.authorize(token, name, arguments):
                     replays.add((name, str(arguments["request_id"])))
+            except InputError as e:  # answered as the tool's own error would be
+                self._activity.record("refusal", tool=name, reason=str(e))
+                return {
+                    "jsonrpc": "2.0",
+                    "id": call.get("id"),
+                    "result": {
+                        "content": [{"type": "text", "text": str(e)}],
+                        "isError": True,
+                    },
+                }
             except GrantRefused as e:
                 self._activity.record(
                     "refusal", rule=e.rule, tool=params.get("name"), reason=str(e)

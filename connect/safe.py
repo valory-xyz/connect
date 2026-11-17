@@ -37,10 +37,12 @@ from dataclasses import dataclass
 
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
+from eth_abi.exceptions import DecodingError
 from web3 import Web3
 
 from connect.input_errors import InputError
 from connect.signer_errors import cause_of
+from connect.texts import EXEC_UNDECODABLE, NOT_EXEC_TRANSACTION
 
 # Safe v1.x execTransaction(address,uint256,bytes,uint8,uint256,uint256,
 #                           uint256,address,address,bytes)
@@ -62,8 +64,6 @@ ZERO_ADDRESS = "0x" + "00" * 20
 
 logger = logging.getLogger("agent")
 
-EXEC_UNDECODABLE = "could not decode execTransaction calldata"
-NOT_EXEC_TRANSACTION = "not execTransaction calldata"
 
 APPROVE_SELECTOR = "095ea7b3"  # approve(address,uint256)
 # Safe.approveHash(bytes32): an owner pre-approves a safe transaction by hash,
@@ -226,7 +226,13 @@ class SafeExec:
 
     @classmethod
     def decode(cls, data: str) -> "SafeExec":
-        """Decode execTransaction calldata; ValueError when it will not read."""
+        """Decode execTransaction calldata.
+
+        :raises InputError: `NOT_EXEC_TRANSACTION`, or `EXEC_UNDECODABLE` from
+            the hex or eth_abi's decoding error (its words are a library's, so
+            they are the cause, never the text). Anything else is a fault in
+            this code, and propagates as itself.
+        """
         calldata = calldata_hex(data)
         if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
             raise InputError(NOT_EXEC_TRANSACTION)
@@ -234,11 +240,7 @@ class SafeExec:
             decoded = tuple(
                 abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
             )
-        except Exception as e:
-            # eth_abi's words are a library's: logged, not handed to the caller
-            logger.warning(
-                "%s (%d bytes): %s", EXEC_UNDECODABLE, len(calldata) // 2, cause_of(e)
-            )
+        except (DecodingError, ValueError) as e:
             raise InputError(EXEC_UNDECODABLE) from e
         return cls(
             to=str(decoded[0]),
@@ -258,6 +260,28 @@ class SafeExec:
             or self.gas_token.lower() != ZERO_ADDRESS
             or self.refund_receiver.lower() != ZERO_ADDRESS
         )
+
+
+def decode_exec(data: str, *, chain: str, to: str) -> SafeExec:
+    """`SafeExec.decode`, logging undecodable calldata with where it was sent.
+
+    The guard and the EOA gate call this, so each refusal is logged once with
+    its chain and target; the mech flow's check reads `SafeExec.decode`
+    directly, since it leaves the refusal to the guard.
+    """
+    try:
+        return SafeExec.decode(data)
+    except InputError as e:
+        if e.__cause__ is not None:  # the decoder's own failure, not the selector
+            logger.warning(
+                "%s to %s on %s (%d bytes): %s",
+                EXEC_UNDECODABLE,
+                to,
+                chain,
+                len(calldata_hex(data)) // 2,
+                cause_of(e.__cause__),
+            )
+        raise
 
 
 def is_exec_transaction(data: str) -> bool:

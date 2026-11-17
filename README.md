@@ -94,10 +94,11 @@ other non-aea agent. It:
      `invalid request: ValidationError: <argument>: <problem>`, never the
      value sent, and every address argument — `target`, `to`, `address`,
      `priority_mech` — or hex argument — `data`, `digest` — the reference's
-     `must be a 0x address` / `must be hex` text, checked before any tool
-     runs), an unknown tool
+     `must be a 0x address` / `must be hex` text, checked on the arguments
+     as sent, before any alias is read and before a token's budget is drawn
+     on), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
-     of `target`. Every argument the reference takes is taken: `wallet_info`'s
+     of an empty or absent `target`. Every argument the reference takes is taken: `wallet_info`'s
      `chain` and `decode_calldata`'s `address` and `chain` are accepted and
      ignored (`decode_calldata` needs only `data`), and `safe_transaction`
      reads an unpublished `operation`, so a DELEGATECALL is refused by the
@@ -469,8 +470,9 @@ Every guardrail refusal begins `guardrail: rule '<id>': `, the prefix
 OnchainBench's broker reads as "not sent". The floor and whitelist texts are
 the reference's, verbatim (`connect.texts`): `no-delegatecall`,
 `no-self-call` and `whitelist` (naming the safe's call target and the chain).
-Connect's own rules use the same form, in every position, their texts in
-`connect.texts` beside the reference's: `marketplace`,
+Connect's own rules use the same form, and are the same under every
+`Switches` position, their texts in `connect.texts` beside the reference's
+(`GuardRule` names every rule id): `marketplace`,
 `undecodable-exec-transaction` (an
 `execTransaction` it cannot decode) and, in restricted mode, `no-safe`,
 `safe-only`, `exec-transaction-only`, `outer-value`, `refund`,
@@ -898,8 +900,10 @@ on-chain record from the marketplace indexer: requests received,
 self-delivered and delivered by others, the creation time in ISO 8601 UTC and
 `age_days`; its `note` says the counters cover on-chain requests and off-chain
 requests the mech settled on-chain, so an off-chain request that was never
-delivered appears nowhere. `payment` names the method with no price, since the
-contract quotes the charge at request time. The record is only an aid to
+delivered appears nowhere. The report's `payment` label, which names the
+method with no price since the contract quotes the charge at request time, is
+answered as `payment_info`: in every mech answer `payment` is only ever an
+integer. The record is only an aid to
 choosing: when the manifest or the indexer cannot be read, mech-client reports
 the terms alone and says so in `report_note`.
 
@@ -975,8 +979,11 @@ Connect. Two public modules carry that contract:
 - `connect.texts` — every agent-visible text whose wording is part of it (every
   tool description, the guardrail and intent-gate refusals, the markers the
   bench's broker classifies — `guardrail: rule `, `. Nothing was sent.`,
-  `transaction 0x` — and the mech and transport errors), verbatim from the
-  reference. The bench imports the module, so a rename fails its suite.
+  `transaction 0x` — and the mech, amount and transport errors). Most are the
+  reference's word for word; the guardrail rules and gate details Connect adds,
+  its refusal of an amount it cannot read exactly and the descriptions it keeps
+  (`get_abi`'s, `transaction_status`'s and `request_context`'s field note) are
+  its own. The bench imports the module, so a rename fails its suite.
 - `connect.switches` — `Switches`, one position per feature only Connect has
   and per protection Pearl keeps. `PRODUCTION` is what Pearl runs;
   `TEST_INTERFACE` is the reference's behaviour. The set is given once, to

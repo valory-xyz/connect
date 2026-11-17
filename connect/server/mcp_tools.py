@@ -44,7 +44,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
 from connect.idempotency import InFlightError
-from connect.input_errors import InputError, checked_address, checked_hex
+from connect.input_errors import InputError, check_arguments, checked_hex
 from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
@@ -60,25 +60,20 @@ from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
 from connect.signer_errors import logged_cause
 from connect.texts import (
+    AMOUNT_REFUSED,
+    CAP_REFUSED,
+    GET_ABI_DESCRIPTION,
     INVALID_REQUEST,
+    REQUEST_CONTEXT_NOTE,
     SERVER_INFO,
     TOOL_DESCRIPTIONS,
+    TRANSACTION_STATUS_DESCRIPTION,
     UNKNOWN_TOOL,
 )
 
 # tools that read and never sign, broadcast or pay: harnesses may run them
 # without asking the operator
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
-
-
-AMOUNT_REFUSED = (
-    "rule 'bad-value': pass a decimal or 0x-hex string of base units, or a JSON "
-    "integer below 2^53"
-)
-CAP_REFUSED = (
-    "rule 'bad-value': pass a whole number of base units, as an integer or a "
-    "decimal or 0x-hex string"
-)
 
 
 def _amount_text(value: t.Any) -> str:
@@ -144,29 +139,6 @@ class ToolIntent(TypedDict, total=False):
     approvals: list[ToolApproval] | None
 
 
-# get_abi answers in Connect's own way until it matches the reference's
-# (unverified sources an error), so it publishes Connect's own description
-GET_ABI_DESCRIPTION = (
-    "Report what Connect can say about a contract's ABI, following EIP-1967. "
-    "Only ABIs Connect ships: well-known contracts by address on the chains they "
-    "are deployed to (`verified`, for the queried address alone; a proxy's "
-    "implementation has its own `implementation_verified`) and the standard "
-    "interfaces a contract answers to; no explorer lookup."
-)
-
-# transaction_status answers pending too (a transaction the node holds unmined),
-# which the reference's description does not name, so it publishes Connect's own
-TRANSACTION_STATUS_DESCRIPTION = (
-    "Settlement of a transaction hash you already hold: success (mined, with its "
-    "block), reverted, pending (sent but not yet mined) or not_found."
-)
-
-# Pearl keeps this warning on the field, beside the reference's tool text
-REQUEST_CONTEXT_NOTE = (
-    "optional dict handed to the tool alongside the prompt; it reaches the mech, "
-    "and legacy_on_chain=true also publishes it to IPFS for good: put nothing "
-    "private in it"
-)
 RequestContext = t.Annotated[dict | None, Field(description=REQUEST_CONTEXT_NOTE)]
 
 
@@ -192,34 +164,21 @@ def tool_failed(tool: str) -> str:
     return f"{tool} failed (the cause is in Connect's log)"
 
 
-# the reference's check_args: every tool's address and hex arguments, checked
-# before any tool runs
-ADDRESS_ARGUMENTS = ("target", "to", "address", "priority_mech")
-HEX_ARGUMENTS = ("data", "digest")
-
 logger = logging.getLogger("agent")
 
 
 def with_aliases(tool: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
     """Return a tool's arguments with `to` read as `target` where it aliases it.
 
-    `target` wins when both are given, as in the reference.
+    A non-empty `target` wins when both are given: the reference reads
+    `a.get("target") or a.get("to")`.
     """
     if tool not in TOOLS_TAKING_TO_FOR_TARGET or "to" not in arguments:
         return arguments
     aliased = {k: v for k, v in arguments.items() if k != "to"}
-    aliased.setdefault("target", arguments["to"])
+    if not aliased.get("target"):
+        aliased["target"] = arguments["to"]
     return aliased
-
-
-def check_arguments(arguments: dict[str, t.Any]) -> None:
-    """Refuse a malformed address or hex argument, naming it, as the reference does."""
-    for name in ADDRESS_ARGUMENTS:
-        if arguments.get(name) not in (None, ""):
-            checked_address(name, arguments[name])
-    for name in HEX_ARGUMENTS:
-        if arguments.get(name) not in (None, ""):
-            checked_hex(name, arguments[name])
 
 
 def argument_problems(error: ValidationError) -> str:
@@ -257,9 +216,9 @@ class ConnectMCP(FastMCP):
         tool = self._tool_manager.get_tool(name)
         if tool is None:
             raise ToolError(UNKNOWN_TOOL(name))
-        arguments = with_aliases(name, arguments)
         try:  # the arguments' check is Connect's; one inside a tool body is not
-            check_arguments(arguments)
+            check_arguments(arguments)  # as sent, before `to` is read as `target`
+            arguments = with_aliases(name, arguments)
             metadata = tool.fn_metadata
             metadata.arg_model.model_validate(metadata.pre_parse_json(arguments))
         except InputError as e:

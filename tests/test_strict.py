@@ -30,10 +30,10 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from connect.activity import ActivityLog
 from connect.config import AppConfig
+from connect.input_errors import ADDRESS_ARGUMENTS, HEX_ARGUMENTS
 from connect.intent import parse_intent
 from connect.mech import MechService
 from connect.server.auth import TOOL_AMOUNTS, TOOL_CAPS
-from connect.server.mcp_tools import ADDRESS_ARGUMENTS, HEX_ARGUMENTS
 from connect.server.strict import (
     audit_unknown_parameters,
     unknown_parameters_message,
