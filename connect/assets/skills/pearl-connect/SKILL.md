@@ -85,10 +85,9 @@ more than that. What a refusal won't tell you:
 - A Permit2 grant (`approve` on Permit2, or a permit the router carries) is
   always declared as an approval of the token to its spender, even within an
   existing allowance.
-- A call with no intent may spend only its own `value`, pay only its target
-  and grant no approval; a call that moves nothing (a claim, a vote) needs
-  none. This is the one statement of the rule; the rest of this skill points
-  here.
+- A call with no intent may spend only its own `value`, pay only its target,
+  grant no approval and move no position out; a call that moves nothing (a
+  claim, a vote) needs none.
 - `simulation-unavailable` means Connect cannot simulate on that chain: no
   call can be sent there until it can.
 

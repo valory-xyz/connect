@@ -52,8 +52,9 @@ from tests.conftest import (
     FakeW3,
     approval_log,
     audit_entries,
-    native_transfer_log,
     pay,
+    position_out_log,
+    transfer_log,
 )
 
 SAFE = "0x" + "22" * 20
@@ -72,20 +73,6 @@ def _rules(problems: list[str]) -> list[str]:
         assert match is not None, problem
         rules.append(match[1])
     return rules
-
-
-def _position_out_log(holder: str = SAFE) -> dict:
-    """Return an ERC-1155 TransferSingle moving one position out of `holder`."""
-    return {
-        "address": TOKEN,
-        "topics": [
-            intent_module.TRANSFER_SINGLE,
-            "0x" + holder[2:].rjust(64, "0"),
-            "0x" + holder[2:].rjust(64, "0"),
-            "0x" + EOA[2:].rjust(64, "0"),
-        ],
-        "data": "0x" + hex(7)[2:].rjust(64, "0") + hex(1)[2:].rjust(64, "0"),
-    }
 
 
 def _approval_log(amount: int, owner: str = SAFE) -> dict:
@@ -129,7 +116,7 @@ class TestSignerGate:
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
         """Strict policy: a spend beyond the value or another recipient is refused."""
-        fake_w3.provider.logs = [native_transfer_log(SAFE, SPENDER, 3)]
+        fake_w3.provider.logs = [transfer_log(SAFE, SPENDER, 3)]
         with pytest.raises(SignerError) as refused:
             test_signer.send_via_safe("testchain", EOA, value=5)
         assert "rule 'overspend' (native: spends 8, intent allows 5)" in str(
@@ -148,7 +135,7 @@ class TestSignerGate:
         """Strict names the implied limit; simulate-only sends the same call."""
         signer = signer_with(PRODUCTION if strict else TEST_INTERFACE)
         fake_w3.eth.contracts.add(SPENDER)  # paid to a contract: no recipient rule
-        fake_w3.provider.logs = [native_transfer_log(SAFE, SPENDER, 4, address=TOKEN)]
+        fake_w3.provider.logs = [transfer_log(SAFE, SPENDER, 4, address=TOKEN)]
         if strict:
             with pytest.raises(SignerError) as refused:
                 signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
@@ -171,7 +158,7 @@ class TestSignerGate:
         """A capped token's no-intent call keeps positions, under either policy."""
         signer = signer_with(switches)
         fake_w3.eth.contracts.add(EOA)  # the position's taker: no recipient rule
-        fake_w3.provider.logs = [_position_out_log()]
+        fake_w3.provider.logs = [position_out_log(SAFE, TOKEN, EOA)]
         with pytest.raises(SignerError) as refused:
             signer.send_via_safe(
                 "testchain", TOKEN, data=TOKEN_CALL, intent=intent_module.Capped(None)
@@ -185,7 +172,7 @@ class TestSignerGate:
     @pytest.mark.parametrize(
         ("log", "rule"),
         [
-            (native_transfer_log(SAFE, SPENDER, 4, address=TOKEN), "overspend"),
+            (transfer_log(SAFE, SPENDER, 4, address=TOKEN), "overspend"),
             (approval_log(TOKEN, SAFE, SPENDER, 10), "undeclared-approval"),
         ],
     )
@@ -219,7 +206,7 @@ class TestSignerGate:
         )
         test_signer.send("testchain", SAFE, data=calldata)
         assert len(fake_w3.eth.sent) == 1
-        fake_w3.provider.logs = [native_transfer_log(SAFE, SPENDER, 2)]
+        fake_w3.provider.logs = [transfer_log(SAFE, SPENDER, 2)]
         with pytest.raises(SignerError) as refused:
             test_signer.send("testchain", SAFE, data=calldata)
         assert "rule 'overspend' (native: spends 9, intent allows 7)" in str(
@@ -529,6 +516,25 @@ class TestSignerGate:
             safe_module.SafeExec.decode("0x6a761202" + "zz")
         with pytest.raises(ValueError, match="not execTransaction"):
             safe_module.SafeExec.decode("0x12345678")
+
+    def test_undecodable_exec_transaction_is_logged_with_its_cause(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The caller gets the fixed line; the log keeps the size and the cause."""
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(InputError):
+            safe_module.SafeExec.decode("0x6a761202" + "00" * 4)
+        (record,) = [
+            r
+            for r in caplog.records
+            if r.message.startswith(safe_module.EXEC_UNDECODABLE)
+        ]
+        assert record.levelname == "WARNING"
+        assert record.message.startswith(f"{safe_module.EXEC_UNDECODABLE} (8 bytes): ")
+        assert len(record.message) > len(f"{safe_module.EXEC_UNDECODABLE} (8 bytes): ")
 
     @pytest.mark.parametrize("field", [6, 7, 8])
     def test_an_eoa_exec_transaction_may_not_pay_a_gas_refund(
@@ -1061,7 +1067,7 @@ class TestSimulate:
         """A capped token is held even here, so its dry run gives a verdict."""
         signer = signer_with(TEST_INTERFACE)
         fake_w3.eth.contracts.add(EOA)
-        fake_w3.provider.logs = [_position_out_log()]
+        fake_w3.provider.logs = [position_out_log(SAFE, TOKEN, EOA)]
         fake_w3.provider.status = "0x0"
         fake_w3.provider.error = {"message": "execution reverted"}
         result = signer.simulate(

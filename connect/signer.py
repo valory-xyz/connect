@@ -657,10 +657,10 @@ class Signer:
         held_to = parsed
         if parsed is None:  # fails closed: any position but simulate-only is strict
             held_to = intent_module.no_intent_hold(
-                raw_intent,
                 call.value,
                 call.to,
                 strict=self._switches.no_intent_policy != "simulate-only",
+                capped=intent_module.locks_positions(raw_intent),
             )
         try:
             diff = self._simulate(chain, call)

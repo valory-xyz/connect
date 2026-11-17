@@ -28,7 +28,7 @@ from web3 import Web3
 
 from connect import intent
 
-from tests.conftest import canary_result, native_transfer_log
+from tests.conftest import canary_result, transfer_log
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -104,8 +104,8 @@ def test_native_and_token_spend_are_netted_per_asset() -> None:
     """The diff is what left and arrived at the sender, per asset."""
     diff = simulate(
         [
-            native_transfer_log(SAFE, CONTRACT, 100),
-            native_transfer_log(CONTRACT, SAFE, 30),
+            transfer_log(SAFE, CONTRACT, 100),
+            transfer_log(CONTRACT, SAFE, 30),
             transfer(TOKEN, SAFE, CONTRACT, 40),
             transfer(TOKEN, CONTRACT, SAFE, 15),
         ]
@@ -127,7 +127,7 @@ def test_celo_native_moves_from_both_sources_are_summed() -> None:
     """
     diff = simulate(
         [
-            native_transfer_log(SAFE, EOA, 7),
+            transfer_log(SAFE, EOA, 7),
             transfer(CELO_FACE, SAFE, EOA, 3),
         ]
     )
@@ -179,7 +179,7 @@ def test_polygons_own_log_transfer_is_not_counted() -> None:
         ],
         "data": "0x" + _word(5) + _word(0) + _word(0),
     }
-    diff = simulate([native_transfer_log(SAFE, EOA, 5), log_transfer])
+    diff = simulate([transfer_log(SAFE, EOA, 5), log_transfer])
     assert diff["native"] == "-5"
     assert diff["tokens"] == {}
 
@@ -588,7 +588,7 @@ def test_any_call_on_an_rpc_that_ignores_trace_transfers_fails_closed(
     value: int,
 ) -> None:
     """A zero-value call can move native internally: the canary must be traced."""
-    logs = [native_transfer_log(SAFE, EOA, value)] if value else []
+    logs = [transfer_log(SAFE, EOA, value)] if value else []
     with pytest.raises(intent.SimulationUnavailable, match="traceTransfers"):
         intent.simulate(
             rpc_with(logs, traced=False),
@@ -640,7 +640,7 @@ def test_an_answer_without_the_canary_is_simulation_unavailable() -> None:
 
 def test_a_value_send_the_rpc_did_not_trace_fails_closed() -> None:
     """With no native Transfer log, a value send would look like it moves nothing."""
-    for logs in ([], [native_transfer_log(SAFE, EOA, 3)]):
+    for logs in ([], [transfer_log(SAFE, EOA, 3)]):
         with pytest.raises(intent.SimulationUnavailable, match="traceTransfers"):
             intent.simulate(
                 rpc_with(logs),
@@ -651,7 +651,7 @@ def test_a_value_send_the_rpc_did_not_trace_fails_closed() -> None:
                 get_code=lambda a: b"",
             )
     traced = intent.simulate(
-        rpc_with([native_transfer_log(SAFE, EOA, 5)]),
+        rpc_with([transfer_log(SAFE, EOA, 5)]),
         sender=SAFE,
         to=EOA,
         value=5,

@@ -43,6 +43,7 @@ from web3.exceptions import TimeExhausted, TransactionNotFound, Web3RPCError
 from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
+from connect.intent import TRANSFER_SINGLE
 from connect.mech import MechService
 from connect.server import auth as auth_module
 from connect.server.app import create_app
@@ -458,18 +459,25 @@ def approval_log(token: str, owner: str, spender: str, amount: int) -> dict:
     }
 
 
-def native_transfer_log(
-    src: str, dst: str, amount: int, address: str = NATIVE_LOG
-) -> dict:
+def transfer_log(src: str, dst: str, amount: int, address: str = NATIVE_LOG) -> dict:
     """Return a Transfer log: the synthetic native one, or a token's at `address`."""
     return {
         "address": address,
         "topics": [
             TRANSFER_TOPIC,
-            "0x" + src.lower().removeprefix("0x").rjust(64, "0"),
-            "0x" + dst.lower().removeprefix("0x").rjust(64, "0"),
+            _topic(src),
+            _topic(dst),
         ],
         "data": "0x" + hex(amount)[2:].rjust(64, "0"),
+    }
+
+
+def position_out_log(holder: str, contract: str, to: str, amount: int = 1) -> dict:
+    """Return an ERC-1155 TransferSingle moving `amount` of id 7 from `holder` to `to`."""
+    return {
+        "address": contract,
+        "topics": [TRANSFER_SINGLE, _topic(holder), _topic(holder), _topic(to)],
+        "data": "0x" + hex(7)[2:].rjust(64, "0") + hex(amount)[2:].rjust(64, "0"),
     }
 
 
@@ -515,7 +523,7 @@ class FakeProvider:
         logs = list(self.logs)
         value = int(call["value"], 16)
         if value and self.traced:
-            logs.insert(0, native_transfer_log(call["from"], call["to"], value))
+            logs.insert(0, transfer_log(call["from"], call["to"], value))
         result: dict[str, t.Any] = {
             "status": self.status,
             "returnData": "0x",
@@ -552,7 +560,7 @@ def canary_result(block: dict, traced: bool = True) -> dict:
     balance = int(overrides.get(canary["from"].lower(), {}).get("balance", "0x0"), 16)
     if not traced or balance < value:
         return {"status": "0x0", "returnData": "0x", "gasUsed": "0x5208", "logs": []}
-    logs = [native_transfer_log(canary["from"], canary["to"], value)]
+    logs = [transfer_log(canary["from"], canary["to"], value)]
     return {"status": "0x1", "returnData": "0x", "gasUsed": "0x5208", "logs": logs}
 
 

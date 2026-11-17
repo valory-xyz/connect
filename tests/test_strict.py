@@ -33,6 +33,7 @@ from connect.config import AppConfig
 from connect.intent import parse_intent
 from connect.mech import MechService
 from connect.server.auth import TOOL_AMOUNTS, TOOL_CAPS
+from connect.server.mcp_tools import ADDRESS_ARGUMENTS, HEX_ARGUMENTS
 from connect.server.strict import (
     audit_unknown_parameters,
     unknown_parameters_message,
@@ -114,11 +115,17 @@ async def test_a_misspelled_target_is_refused_by_name(
     mcp: FastMCP, fake_w3: FakeW3, store_path: t.Any
 ) -> None:
     """`targett` beside `target` is refused and the message names `target`."""
-    with pytest.raises(ToolError, match=r"'targett' \(did you mean 'target'\?\)"):
+    with pytest.raises(ToolError) as refused:
         await mcp.call_tool(
             "safe_transaction",
             {"chain": "testchain", "target": RECIPIENT, "targett": RECIPIENT},
         )
+    # a model-level refusal has no argument to name before it
+    assert str(refused.value) == (
+        "invalid request: ValidationError: unknown parameter 'targett' (did you "
+        "mean 'target'?); this call takes chain, data, intent, request_id, "
+        "target, timeout, value, wait_for_receipt"
+    )
     assert not fake_w3.eth.sent
     (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert entry == {**entry, "rule": "unknown-parameter", "tool": "safe_transaction"}
@@ -132,8 +139,12 @@ async def test_to_is_an_alias_of_target_with_the_switch_on(
     assert len(fake_w3.eth.sent) == 1
 
 
-def _placeholder(schema: dict) -> t.Any:
-    """Return a value of the JSON schema's type, so only the unknown name fails."""
+def _placeholder(name: str, schema: dict) -> t.Any:
+    """Return a valid value for the argument, so only the unknown name fails."""
+    if name in ADDRESS_ARGUMENTS:
+        return RECIPIENT
+    if name in HEX_ARGUMENTS:
+        return "0x"
     kinds = {schema.get("type")} | {o.get("type") for o in schema.get("anyOf", [])}
     for kind, value in (
         ("integer", 1),
@@ -156,7 +167,7 @@ async def test_every_mcp_tool_refuses_an_unknown_parameter(
     for tool in tools:
         properties = tool.inputSchema.get("properties", {})
         required = {
-            name: _placeholder(properties[name])
+            name: _placeholder(name, properties[name])
             for name in tool.inputSchema.get("required", [])
         }
         with pytest.raises(ToolError, match="unknown parameter 'zzz'"):

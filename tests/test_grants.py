@@ -55,6 +55,7 @@ from tests.conftest import (
     audit_entries,
     grant_store,
     pay,
+    position_out_log,
 )
 
 WORKSPACE = "workspace-token"  # nosec B105
@@ -816,6 +817,33 @@ class TestMcpMiddleware:
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert entry["tool"] == "safe_transaction"
 
+    async def test_an_unknown_name_does_not_carry_a_batch_past_the_check(
+        self, setup: tuple[AuthMiddleware, str]
+    ) -> None:
+        """Each call in a batch is checked; an unknown name only skips itself."""
+        middleware, reader = setup
+        body = json.dumps(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "no_such_tool", "arguments": {}},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "safe_transaction", "arguments": {}},
+                },
+            ]
+        ).encode()
+        sent, seen = await self._call(middleware, reader, body)
+        assert seen == []
+        answer = json.loads(sent[1]["body"])
+        assert answer["id"] == 2
+        assert "token-scope" in answer["error"]["message"]
+
     @pytest.mark.parametrize(
         ("tools", "name", "passed"),
         [
@@ -897,20 +925,6 @@ SAFE = "0x" + "22" * 20
 POSITIONS = "0x" + "4d" * 20
 
 
-def _position_out_log(holder: str = SAFE) -> dict:
-    """Return an ERC-1155 TransferSingle moving one position out of `holder`."""
-    return {
-        "address": POSITIONS,
-        "topics": [
-            intent_module.TRANSFER_SINGLE,
-            "0x" + holder[2:].lower().rjust(64, "0"),
-            "0x" + holder[2:].lower().rjust(64, "0"),
-            "0x" + RECIPIENT[2:].rjust(64, "0"),
-        ],
-        "data": "0x" + hex(7)[2:].rjust(64, "0") + hex(3)[2:].rjust(64, "0"),
-    }
-
-
 def _mint_capped(client: TestClient) -> str:
     minted = client.post(
         "/tokens",
@@ -925,7 +939,7 @@ def test_http_capped_token_may_not_move_a_position(
     client: TestClient, fake_w3: FakeW3, store_path: t.Any
 ) -> None:
     """No cap bounds a position, so a capped token moves none out; others may."""
-    fake_w3.provider.logs = [_position_out_log()]
+    fake_w3.provider.logs = [position_out_log(SAFE, POSITIONS, RECIPIENT, amount=3)]
     body = {
         "chain": "testchain",
         "target": POSITIONS,
@@ -950,7 +964,7 @@ def test_mcp_capped_token_may_not_move_a_position(
 ) -> None:
     """Through the real MCP mount, on both send tools: the tool sees the token."""
     holder = SAFE if tool == "safe_transaction" else test_signer.address
-    fake_w3.provider.logs = [_position_out_log(holder)]
+    fake_w3.provider.logs = [position_out_log(holder, POSITIONS, RECIPIENT, amount=3)]
     call = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -982,7 +996,7 @@ def test_mcp_simulation_holds_a_capped_token_as_the_send_would(
     Preflight does not: it is the guardrail's verdict alone and simulates
     nothing, so it permits the same call the send refuses by the position cap.
     """
-    fake_w3.provider.logs = [_position_out_log()]
+    fake_w3.provider.logs = [position_out_log(SAFE, POSITIONS, RECIPIENT, amount=3)]
     arguments = {"chain": "testchain", "target": POSITIONS}
     simulated = {**arguments, "intent": {"recipients": [RECIPIENT]}}
     capped = client.post(
@@ -1008,7 +1022,9 @@ def test_http_sign_and_send_holds_a_capped_token_to_its_positions(
     client: TestClient, fake_w3: FakeW3, test_signer: Signer
 ) -> None:
     """The EOA route wraps a capped token's intent as the safe route does."""
-    fake_w3.provider.logs = [_position_out_log(test_signer.address)]
+    fake_w3.provider.logs = [
+        position_out_log(test_signer.address, POSITIONS, RECIPIENT, amount=3)
+    ]
     body = {
         "chain": "testchain",
         "to": POSITIONS,

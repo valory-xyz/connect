@@ -91,9 +91,11 @@ other non-aea agent. It:
      code's own text, with no `Error executing tool` prefix (an error Connect
      did not word for the caller reads `<tool> failed (the cause is in
      Connect's log)` instead, its cause logged; a malformed argument reads
-     `invalid request: ValidationError: <argument>: <problem>`, and an
-     address or hex argument the reference's `must be a 0x address` / `must
-     be hex` text), an unknown tool
+     `invalid request: ValidationError: <argument>: <problem>`, never the
+     value sent, and every address argument — `target`, `to`, `address`,
+     `priority_mech` — or hex argument — `data`, `digest` — the reference's
+     `must be a 0x address` / `must be hex` text, checked before any tool
+     runs), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
      of `target`. Three texts stay Connect's own: `get_abi`'s description,
      until its answers match the reference's; `transaction_status`'s, which
@@ -287,9 +289,9 @@ strings, and it answers a no-intent call as the send would: under `strict`
 the call is held to what it says, so `fits_intent` and `problems` are those
 of the implied intent; under `simulate-only` it answers `fits_intent: null`
 and no problems, a revert showing only in the diff's `ok` and `revert`,
-except under a capped token, held as above, which gets a verdict (a
-call that cannot be simulated, or an EOA call refused before simulation,
-still answers `fits_intent: false` with its problem). Only the CELO face's `Transfer` is native:
+except under a capped token, held as above, which gets a verdict. Under
+either position, a call that cannot be simulated, or an EOA call refused
+before simulation, answers `fits_intent: false` with its problem. Only the CELO face's `Transfer` is native:
 its `Approval` is an approval like any other, and an intent naming the face in
 `spend` or `receive_min` means `"native"` (naming both is `bad-intent`). Under a
 value-capped token the gate also refuses any ERC-721/1155 position leaving the

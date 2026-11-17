@@ -42,7 +42,7 @@ from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard, GuardError
 from connect.idempotency import InFlightError
-from connect.input_errors import InputError, checked_hex
+from connect.input_errors import InputError, checked_address, checked_hex
 from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
@@ -69,6 +69,16 @@ from connect.texts import (
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 
+AMOUNT_REFUSED = (
+    "rule 'bad-value': pass a decimal or 0x-hex string of base units, or a JSON "
+    "integer below 2^53"
+)
+CAP_REFUSED = (
+    "rule 'bad-value': pass a whole number of base units, as an integer or a "
+    "decimal or 0x-hex string"
+)
+
+
 def _amount_text(value: t.Any) -> str:
     """Read a base-unit amount as `intent.parse_tool_amount` reads it, as a string.
 
@@ -76,11 +86,8 @@ def _amount_text(value: t.Any) -> str:
     """
     try:
         return str(parse_tool_amount(value))
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"rule 'bad-value': {e}; pass a decimal or 0x-hex string of base "
-            f"units (got {value!r})"
-        ) from e
+    except (TypeError, ValueError) as e:  # Connect's words: no value, no int()'s
+        raise ValueError(AMOUNT_REFUSED) from e
 
 
 # a base-unit amount on the tool surface: declared a string, so a client
@@ -103,10 +110,7 @@ def _cap_text(value: t.Any) -> str:
     try:
         return str(parse_amount(value))
     except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"rule 'bad-value': {e}; pass a whole number of base units, as an "
-            f"integer or a decimal or 0x-hex string (got {value!r})"
-        ) from e
+        raise ValueError(CAP_REFUSED) from e
 
 
 # a base-unit cap on the tool surface: a string or any whole JSON integer
@@ -179,7 +183,17 @@ CALLER_ERRORS: tuple[type[Exception], ...] = (
     MechError,
     InFlightError,
 )
-TOOL_FAILED = "{tool} failed (the cause is in Connect's log)"
+
+
+def tool_failed(tool: str) -> str:
+    """Return what the caller reads for an error Connect did not word for it."""
+    return f"{tool} failed (the cause is in Connect's log)"
+
+
+# the reference's check_args: every tool's address and hex arguments, checked
+# before any tool runs
+ADDRESS_ARGUMENTS = ("target", "to", "address", "priority_mech")
+HEX_ARGUMENTS = ("data", "digest")
 
 logger = logging.getLogger("agent")
 
@@ -194,6 +208,16 @@ def with_aliases(tool: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
     aliased = {k: v for k, v in arguments.items() if k != "to"}
     aliased.setdefault("target", arguments["to"])
     return aliased
+
+
+def check_arguments(arguments: dict[str, t.Any]) -> None:
+    """Refuse a malformed address or hex argument, naming it, as the reference does."""
+    for name in ADDRESS_ARGUMENTS:
+        if arguments.get(name) not in (None, ""):
+            checked_address(name, arguments[name])
+    for name in HEX_ARGUMENTS:
+        if arguments.get(name) not in (None, ""):
+            checked_hex(name, arguments[name])
 
 
 def argument_problems(error: ValidationError) -> str:
@@ -212,7 +236,7 @@ class ConnectMCP(FastMCP):
     """FastMCP with the reference's call boundary.
 
     A refusal Connect wrote reaches the agent verbatim, any other error as
-    `TOOL_FAILED`; FastMCP's `Error executing tool <name>: ` prefix would hide
+    `tool_failed`; FastMCP's `Error executing tool <name>: ` prefix would hide
     the markers the bench's broker reads.
     """
 
@@ -233,12 +257,18 @@ class ConnectMCP(FastMCP):
             raise ToolError(UNKNOWN_TOOL(name))
         arguments = with_aliases(name, arguments)
         try:  # the arguments' check is Connect's; one inside a tool body is not
+            check_arguments(arguments)
             metadata = tool.fn_metadata
             metadata.arg_model.model_validate(metadata.pre_parse_json(arguments))
+        except InputError as e:
+            raise ToolError(str(e)) from e
         except ValidationError as e:
             raise ToolError(
                 INVALID_REQUEST(type(e).__name__, argument_problems(e))
             ) from e
+        except Exception as e:  # e.g. a JSON intent nested past the stack
+            logger.error("tool %s failed: %s", name, logged_cause(e))
+            raise ToolError(tool_failed(name)) from e
         try:
             return await super().call_tool(name, arguments)
         except ToolError as e:
@@ -246,7 +276,7 @@ class ConnectMCP(FastMCP):
             if isinstance(cause, (ToolError, *CALLER_ERRORS)):
                 raise ToolError(str(cause)) from cause
             logger.error("tool %s failed: %s", name, logged_cause(cause))
-            raise ToolError(TOOL_FAILED.format(tool=name)) from cause
+            raise ToolError(tool_failed(name)) from cause
 
 
 def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-locals

@@ -31,7 +31,11 @@ import re
 from connect.texts import ADDRESS_INVALID, HEX_INVALID
 
 _ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}", re.ASCII)
+# the reference's hex rule, for every tool argument; the intent gate's
+# `intent.calldata_problem` also reads a `0X` prefix, since it checks HTTP
+# routes and the server's own calls, which the reference has no part in
 _HEX = re.compile(r"(?:0x)?(?:[0-9a-fA-F]{2})*", re.ASCII)
+_TX_HASH = re.compile(r"(?:0x)?[0-9a-fA-F]{64}", re.ASCII)
 
 
 class InputError(ValueError):
@@ -43,6 +47,11 @@ def checked_address(field: str, value: object) -> str:
     if not (isinstance(value, str) and _ADDRESS.fullmatch(value)):
         raise InputError(ADDRESS_INVALID(field, value))
     return value
+
+
+def is_tx_hash(value: str) -> bool:
+    """Whether `value` is a 32-byte transaction hash, 0x optional, nothing else."""
+    return _TX_HASH.fullmatch(value) is not None
 
 
 def checked_hex(field: str, value: object) -> str:

@@ -30,6 +30,7 @@ from hexbytes import HexBytes
 from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
+from connect.input_errors import is_tx_hash
 from connect.signer import Signer
 
 RECEIPT_POLL_SECONDS = 2
@@ -102,11 +103,7 @@ def settlement(w3: Web3, tx_hash: str) -> dict:
 
     A malformed hash can never resolve, so it is simply `not_found`.
     """
-    try:
-        valid = len(bytes.fromhex(tx_hash.removeprefix("0x"))) == 32
-    except ValueError:
-        valid = False
-    if not valid:
+    if not is_tx_hash(tx_hash):
         return not_found(tx_hash)
     try:
         receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))

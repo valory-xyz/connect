@@ -63,6 +63,7 @@ ZERO_ADDRESS = "0x" + "00" * 20
 logger = logging.getLogger("agent")
 
 EXEC_UNDECODABLE = "could not decode execTransaction calldata"
+NOT_EXEC_TRANSACTION = "not execTransaction calldata"
 
 APPROVE_SELECTOR = "095ea7b3"  # approve(address,uint256)
 # Safe.approveHash(bytes32): an owner pre-approves a safe transaction by hash,
@@ -225,14 +226,16 @@ class SafeExec:
         """Decode execTransaction calldata; ValueError when it will not read."""
         calldata = calldata_hex(data)
         if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
-            raise InputError("not execTransaction calldata")
+            raise InputError(NOT_EXEC_TRANSACTION)
         try:
             decoded = tuple(
                 abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
             )
         except Exception as e:
             # eth_abi's words are a library's: logged, not handed to the caller
-            logger.warning("could not decode execTransaction calldata: %s", cause_of(e))
+            logger.warning(
+                "%s (%d bytes): %s", EXEC_UNDECODABLE, len(calldata) // 2, cause_of(e)
+            )
             raise InputError(EXEC_UNDECODABLE) from e
         return cls(
             to=str(decoded[0]),

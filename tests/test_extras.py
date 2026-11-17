@@ -1077,6 +1077,17 @@ def test_keystore_valid_json_but_not_keystore(tmp_path: Path) -> None:
 class TestAuthMiddlewareASGI:
     """Direct ASGI-level tests of the MCP mount auth."""
 
+    @pytest.fixture
+    def middleware(self, activity: ActivityLog) -> AuthMiddleware:
+        """Return the mount's auth over a store holding the workspace token "tok"."""
+        return AuthMiddleware(
+            lambda *a: None,
+            grant_store("tok"),
+            activity,
+            AuthFailureLimiter(),
+            tools=ACTION_SCOPES,
+        )
+
     @staticmethod
     async def _run(
         middleware: AuthMiddleware, scope: dict
@@ -1099,27 +1110,13 @@ class TestAuthMiddlewareASGI:
         await middleware(scope, receive, send)
         return sent, passed
 
-    async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
+    async def test_non_http_passthrough(self, middleware: AuthMiddleware) -> None:
         """Lifespan scopes bypass auth."""
-        middleware = AuthMiddleware(
-            lambda *a: None,
-            grant_store("tok"),
-            activity,
-            AuthFailureLimiter(),
-            tools=ACTION_SCOPES,
-        )
         _, passed = await self._run(middleware, {"type": "lifespan"})
         assert passed == ["lifespan"]
 
-    async def test_bad_origin_rejected(self, activity: ActivityLog) -> None:
+    async def test_bad_origin_rejected(self, middleware: AuthMiddleware) -> None:
         """Cross-origin requests get 403."""
-        middleware = AuthMiddleware(
-            lambda *a: None,
-            grant_store("tok"),
-            activity,
-            AuthFailureLimiter(),
-            tools=ACTION_SCOPES,
-        )
         scope = {
             "type": "http",
             "headers": [(b"origin", b"https://evil.example")],
@@ -1128,41 +1125,22 @@ class TestAuthMiddlewareASGI:
         assert sent[0]["status"] == 403
         assert not passed
 
-    async def test_bad_token_rejected(self, activity: ActivityLog) -> None:
+    async def test_bad_token_rejected(self, middleware: AuthMiddleware) -> None:
         """Missing token gets 401."""
-        middleware = AuthMiddleware(
-            lambda *a: None,
-            grant_store("tok"),
-            activity,
-            AuthFailureLimiter(),
-            tools=ACTION_SCOPES,
-        )
         sent, passed = await self._run(middleware, {"type": "http", "headers": []})
         assert sent[0]["status"] == 401
         assert not passed
 
-    async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
+    async def test_websocket_scope_refused_cleanly(
+        self, middleware: AuthMiddleware
+    ) -> None:
         """Websocket scopes never reach the inner app; the handshake is closed."""
-        middleware = AuthMiddleware(
-            lambda *a: None,
-            grant_store("tok"),
-            activity,
-            AuthFailureLimiter(),
-            tools=ACTION_SCOPES,
-        )
         sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
         assert not passed
         assert sent == [{"type": "websocket.close"}]
 
-    async def test_valid_request_passes(self, activity: ActivityLog) -> None:
+    async def test_valid_request_passes(self, middleware: AuthMiddleware) -> None:
         """Correct token reaches the inner app."""
-        middleware = AuthMiddleware(
-            lambda *a: None,
-            grant_store("tok"),
-            activity,
-            AuthFailureLimiter(),
-            tools=ACTION_SCOPES,
-        )
         scope = {"type": "http", "headers": [(b"authorization", b"Bearer tok")]}
         _, passed = await self._run(middleware, scope)
         assert passed == ["http"]
@@ -1377,10 +1355,23 @@ class TestMcpTools:
         assert reverted["status"] == "reverted"
 
     async def test_transaction_status_rejects_malformed_hash(
-        self, tools: dict[str, t.Callable]
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
-        """A malformed hash is not_found, as the reference answers, never raised."""
-        for malformed in ("0xzz", "0x1234"):
+        """A malformed hash is not_found, as the reference answers, with no RPC."""
+
+        def no_rpc(_hash: object) -> dict:
+            raise AssertionError("a malformed hash must not reach the RPC")
+
+        fake_w3.eth.get_transaction_receipt = no_rpc  # type: ignore[method-assign,assignment]
+        fake_w3.eth.get_transaction = no_rpc  # type: ignore[method-assign,assignment]
+        for malformed in (
+            "0xzz",
+            "0x1234",
+            "0x" + "11" * 31,
+            "0x" + "11" * 33,
+            "0x" + "11" * 16 + " " + "11" * 16,
+            "0x" + "11" * 32 + "\n",
+        ):
             assert await tools["transaction_status"]("testchain", malformed) == {
                 "tx_hash": malformed,
                 "status": "not_found",

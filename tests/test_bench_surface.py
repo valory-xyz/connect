@@ -40,10 +40,12 @@ from connect.input_errors import InputError
 from connect.mech import MechError
 from connect.server.auth import ACTION_SCOPES, GrantRefused
 from connect.server.mcp_tools import (
+    AMOUNT_REFUSED,
+    CAP_REFUSED,
     GET_ABI_DESCRIPTION,
     REQUEST_CONTEXT_NOTE,
-    TOOL_FAILED,
     TRANSACTION_STATUS_DESCRIPTION,
+    tool_failed,
     with_aliases,
 )
 from connect.signer import Signer, SignerError
@@ -191,7 +193,7 @@ async def test_an_unexpected_error_is_logged_and_never_forwarded(
             await mcp.call_tool(
                 "safe_transaction", {"chain": "testchain", "target": RECIPIENT}
             )
-    assert str(raised.value) == TOOL_FAILED.format(tool="safe_transaction")
+    assert str(raised.value) == tool_failed("safe_transaction")
     assert f"tool safe_transaction failed: {error_type.__name__}" in caplog.text
     assert "SECRETKEY" not in caplog.text
 
@@ -360,7 +362,7 @@ def test_an_unknown_no_intent_policy_is_refused() -> None:
 async def test_connect_s_input_refusals_reach_the_caller(
     mcp: FastMCP, tool: str, arguments: dict, expected: str
 ) -> None:
-    """Each InputError site reads as its own words, never as TOOL_FAILED."""
+    """Each InputError site reads as its own words, never as tool_failed."""
     with pytest.raises(ToolError) as raised:
         await mcp.call_tool(tool, arguments)
     assert str(raised.value) == expected
@@ -370,12 +372,89 @@ async def test_a_malformed_argument_reads_as_the_reference_s_invalid_request(
     mcp: FastMCP,
 ) -> None:
     """The arguments' check is Connect's: named, and never echoing the value."""
+    marker = "MARKER-" + "x" * 200
     with pytest.raises(ToolError) as raised:
         await mcp.call_tool(
             "safe_transaction",
-            {"chain": "testchain", "target": RECIPIENT, "value": -1},
+            {"chain": "testchain", "target": RECIPIENT, "value": marker},
         )
-    text = str(raised.value)
-    assert text.startswith("invalid request: ValidationError: value: ")
-    assert "rule 'bad-value'" in text
-    assert "errors.pydantic.dev" not in text
+    assert str(raised.value) == (
+        f"invalid request: ValidationError: value: Value error, {AMOUNT_REFUSED}"
+    )
+
+
+async def test_two_bad_arguments_are_named_in_order_joined(mcp: FastMCP) -> None:
+    """Each failing argument is named, the problems joined with `; `."""
+    with pytest.raises(ToolError) as raised:
+        await mcp.call_tool(
+            "mech_request",
+            {"prompt": "q", "tool": "t", "max_payment": "nope", "timeout": "soon"},
+        )
+    assert str(raised.value) == (
+        "invalid request: ValidationError: timeout: Input should be a valid "
+        "number, unable to parse string as a number; "
+        f"max_payment: Value error, {CAP_REFUSED}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (
+            {"chain": "testchain", "target": "0x12"},
+            "target must be a 0x address (40 hex digits), got '0x12'",
+        ),
+        (
+            {"chain": "testchain", "target": RECIPIENT, "data": "0xzz"},
+            "data must be hex (0x and whole bytes), got '0xzz'",
+        ),
+    ],
+)
+async def test_every_address_and_hex_argument_is_checked_as_the_reference(
+    mcp: FastMCP, fake_w3: FakeW3, arguments: dict, expected: str
+) -> None:
+    """The reference's check_args runs before any tool, for every tool."""
+    with pytest.raises(ToolError) as raised:
+        await mcp.call_tool("safe_transaction", arguments)
+    assert str(raised.value) == expected
+    with pytest.raises(ToolError, match="priority_mech must be a 0x address"):
+        await mcp.call_tool("mech_tools", {"priority_mech": "nope"})
+    assert not fake_w3.eth.sent
+
+
+async def test_a_failure_in_the_argument_check_itself_is_logged_not_forwarded(
+    mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A deeply nested intent (RecursionError) reads tool_failed, cause logged."""
+    tool = mcp._tool_manager.get_tool(
+        "safe_transaction"
+    )  # pylint: disable=protected-access
+
+    def deep(*_: t.Any) -> dict:
+        raise RecursionError("maximum recursion depth exceeded while decoding")
+
+    monkeypatch.setattr(type(tool.fn_metadata), "pre_parse_json", deep)
+    with caplog.at_level(logging.ERROR, logger="agent"):
+        with pytest.raises(ToolError) as raised:
+            await mcp.call_tool(
+                "safe_transaction", {"chain": "testchain", "target": RECIPIENT}
+            )
+    assert str(raised.value) == tool_failed("safe_transaction")
+    assert "tool safe_transaction failed: RecursionError" in caplog.text
+
+
+async def test_a_stringified_intent_is_taken_like_the_object(
+    mcp: FastMCP, fake_w3: FakeW3
+) -> None:
+    """The argument check still runs FastMCP's JSON pre-parse."""
+    intent = {"spend": {"native": "5"}, "recipients": [RECIPIENT]}
+    await mcp.call_tool(
+        "safe_transaction",
+        {
+            "chain": "testchain",
+            "target": RECIPIENT,
+            "value": "5",
+            "intent": json.dumps(intent),
+        },
+    )
+    assert len(fake_w3.eth.sent) == 1

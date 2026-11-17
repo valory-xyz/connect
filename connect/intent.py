@@ -107,8 +107,9 @@ class Intent(t.TypedDict, total=False):
     approvals: list[IntentApproval]
     # set only through Capped, never by a caller: no position may leave
     positions_locked: bool
-    # set only by `implied_intent`, never by a caller: the strict no-intent
-    # policy's limits, under which a position leaving is a spend
+    # set only by `implied_intent`, never by a caller: what a call with no
+    # intent is held to, under which a position leaving is an overspend (or
+    # `token-cap-positions`, when `positions_locked`)
     implied: bool
 
 
@@ -891,8 +892,13 @@ def _leaving(diff: AssetDiff) -> list[dict]:
     return [p for p in diff["positions"] if int(p["delta"]) < 0]
 
 
+def locks_positions(raw: t.Any) -> bool:
+    """Whether an intent comes under a capped token, which moves no position."""
+    return isinstance(raw, Capped)
+
+
 def no_intent_hold(
-    raw: t.Any, value: int, target: str, *, strict: bool
+    value: int, target: str, *, strict: bool, capped: bool
 ) -> Intent | None:
     """Return what a call with no intent is held to, or None for a revert check alone.
 
@@ -900,7 +906,6 @@ def no_intent_hold(
     otherwise), it is held to its own value and target (`implied_intent`), a
     capped token's with no position leaving.
     """
-    capped = isinstance(raw, Capped)
     if not (strict or capped):
         return None
     return implied_intent(value, target, positions_locked=capped)
@@ -915,15 +920,12 @@ def simulation_answer(
     capped token) answers no verdict and no problems, as the reference does:
     a revert shows in the diff's own `ok` and `revert`, not as a problem.
     """
+    texts = [problem_text(p) for p in problems]
     if diff is None:
-        return {"fits_intent": False, "problems": [problem_text(p) for p in problems]}
+        return {"fits_intent": False, "problems": texts}
     if held_to is None:
         return {**diff, "fits_intent": None, "problems": []}
-    return {
-        **diff,
-        "fits_intent": not problems,
-        "problems": [problem_text(p) for p in problems],
-    }
+    return {**diff, "fits_intent": not problems, "problems": texts}
 
 
 def problem_text(problem: Problem) -> str:

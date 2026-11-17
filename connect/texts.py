@@ -290,7 +290,7 @@ def ADDRESS_INVALID(field: str, value: object) -> str:
 
 
 def HEX_INVALID(field: str, value: object) -> str:
-    """Return the refusal of a hex argument that is not 0x and whole bytes."""
+    """Return the refusal of a hex argument that is not whole-byte hex."""
     return f"{field} must be hex (0x and whole bytes), got {str(value)[:60]!r}"
 
 
