@@ -32,7 +32,7 @@ from connect.activity import ActivityLog
 from connect.keystore import KeystoreError, load_account
 from connect.signer import Signer, SignerError
 
-from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds
+from tests.conftest import FakeW3, TEST_PASSWORD, audit_kinds, pay
 
 
 class TestKeystore:
@@ -65,7 +65,9 @@ class TestSigner:
         activity: ActivityLog,
     ) -> None:
         """Test send returns hash and logs."""
-        tx_hash = test_signer.send("testchain", to="0x" + "aa" * 20, value=1)
+        tx_hash = test_signer.send(
+            "testchain", to="0x" + "aa" * 20, value=1, intent=pay("0x" + "aa" * 20, 1)
+        )
         assert tx_hash.startswith("0x")
         assert len(tx_hash) == 66
         assert len(fake_w3.eth.sent) == 1
@@ -89,7 +91,9 @@ class TestSigner:
             "_append",
             lambda self, entry: (_ for _ in ()).throw(OSError("read-only fs")),
         )
-        tx_hash = test_signer.send("testchain", to="0x" + "aa" * 20, value=1)
+        tx_hash = test_signer.send(
+            "testchain", to="0x" + "aa" * 20, value=1, intent=pay("0x" + "aa" * 20, 1)
+        )
         assert tx_hash.startswith("0x")
         assert len(fake_w3.eth.sent) == 1  # broadcast once, and reported as such
 

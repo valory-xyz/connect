@@ -31,6 +31,11 @@ restricted mode, which is the one thing an operator flipping that switch is
 relying on. For the safe's own configuration, unrestricted is meant to be a
 wider gate, not a one-way door.
 
+A third holds in every mode: a marketplace takes only the requests the
+server's mech flow composes (`check_transaction(server_built=True)`). The
+marketplaces are Connect's own table (`chains.MECH_MARKETPLACES`), so the
+rule holds whether or not mech-client's configuration can be read.
+
 That guarantee is scoped to the safe itself. State granted on *other*
 contracts while unrestricted — an ERC-20 allowance above all — persists until
 explicitly revoked, and an unlimited approve lets its spender drain the safe
@@ -43,10 +48,11 @@ disabled: a digest is an opaque hash this gate cannot inspect, and the EOA
 owns the safe at threshold 1, so an attacker-chosen digest could be the hash
 of a safe transaction — one signature over it and the whitelist is bypassed.
 The exceptions are allowances the server registers for itself, and the agent
-session can register neither. For signing, the mech flow recomputes the
-off-chain request id from inputs it already validated, wraps it into the
-safe's ERC-1271 SafeMessage hash, and registers exactly that digest
-(allow_digest_once) before mech-client asks for the signature.
+session can register neither. For signing, the mech flow wraps the request
+id mech-client derived locally and checked against getRequestId (handed to
+its pre-sign hook) into the safe's ERC-1271 SafeMessage hash, and registers
+exactly that digest (allow_digest_once) before mech-client asks for the
+signature.
 For transactions, the same flow may pre-authorize the one deposit its 402
 top-up would send — the safe paying the mech balance tracker
 (allow_safe_deposit_once), shape-checked (a bare native transfer, or
@@ -72,14 +78,13 @@ import threading
 import time
 from dataclasses import dataclass
 
-from eth_abi import decode as abi_decode
-
+from connect.chains import MECH_MARKETPLACES
 from connect.config import AppConfig
 from connect.safe import (
     EXEC_TRANSACTION_SELECTOR,
-    EXEC_TRANSACTION_TYPES,
     OPERATION_CALL,
-    ZERO_ADDRESS,
+    SafeExec,
+    calldata_hex,
     decode_approve,
     decode_deposit,
 )
@@ -123,41 +128,8 @@ class _DepositAllowance:
     expires: float
 
 
-@dataclass(frozen=True)
-class _SafeExec:
-    """The execTransaction fields this gate has an opinion about."""
-
-    to: str
-    value: int
-    data: str
-    operation: int
-    gas_price: int
-    gas_token: str
-    refund_receiver: str
-
-    @classmethod
-    def decode(cls, calldata: str) -> "_SafeExec":
-        """Read an execTransaction, or :raises GuardError: if it will not read.
-
-        Calldata we cannot parse is calldata we cannot judge, so it is refused
-        rather than waved through — mech-client's transactions arrive here too,
-        and the agent can still hand-roll its own.
-        """
-        try:
-            decoded = tuple(
-                abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
-            )
-        except Exception as e:
-            raise GuardError(f"could not decode execTransaction calldata: {e}") from e
-        return cls(
-            to=str(decoded[0]),
-            value=int(decoded[1]),
-            data="0x" + decoded[2].hex(),
-            operation=decoded[3],
-            gas_price=decoded[6],
-            gas_token=str(decoded[7]),
-            refund_receiver=str(decoded[8]),
-        )
+# the handle allow_safe_deposit_once returns, for revoke_safe_deposit
+DepositGrant = _DepositAllowance
 
 
 class Guard:
@@ -195,7 +167,7 @@ class Guard:
 
     def allow_safe_deposit_once(
         self, *, chain: str, tracker: str, amount_cap: int, is_token: bool
-    ) -> None:
+    ) -> "DepositGrant":
         """Permit one restricted-mode safe payment to a mech balance tracker.
 
         Server-side callers only (the mech flow, arming a request's possible
@@ -206,33 +178,58 @@ class Guard:
         """
         with self._allowance_lock:
             self._purge_expired()
-            self._deposit_allowances = [
-                a
-                for a in self._deposit_allowances
-                if (a.chain, a.tracker) != (chain.lower(), tracker.lower())
-            ]
-            self._deposit_allowances.append(
-                _DepositAllowance(
-                    chain=chain.lower(),
-                    tracker=tracker.lower(),
-                    is_token=is_token,
-                    amount_cap=amount_cap,
-                    expires=time.monotonic() + ALLOWANCE_TTL,
-                )
+            # one entry per grant: concurrent requests to one tracker each
+            # keep their own, so withdrawing one leaves the others
+            grant = _DepositAllowance(
+                chain=chain.lower(),
+                tracker=tracker.lower(),
+                is_token=is_token,
+                amount_cap=amount_cap,
+                expires=time.monotonic() + ALLOWANCE_TTL,
             )
+            self._deposit_allowances.append(grant)
+            return grant
 
     def allow_agent_topup_once(self, *, chain: str, amount_cap: int) -> None:
         """Permit one restricted-mode native transfer from the safe to the agent EOA.
 
         The recipient is always the signer's own address, so the allowance
         only moves funds between the two accounts this key already controls.
+        It replaces any earlier one on the chain, which a failed top-up left.
         """
+        with self._allowance_lock:
+            self._deposit_allowances = [
+                a
+                for a in self._deposit_allowances
+                if (a.chain, a.tracker) != (chain.lower(), self._agent_signer)
+            ]
         self.allow_safe_deposit_once(
             chain=chain,
             tracker=self._agent_signer,
             amount_cap=amount_cap,
             is_token=False,
         )
+
+    def revoke_digest(self, digest: bytes) -> None:
+        """Withdraw a digest allowance before use; a no-op once used or expired.
+
+        For a server-side flow that armed one and then ended without sending:
+        left in place, it would outlive the request for its TTL.
+        """
+        with self._allowance_lock:
+            self._allowed_digests.pop(bytes(digest), None)
+
+    def revoke_safe_deposit(self, grant: "DepositGrant") -> None:
+        """Withdraw one unused safe payment allowance: the one `grant` names.
+
+        `grant` is what allow_safe_deposit_once returned, so a flow withdraws
+        only its own: another request's allowance of the same shape stands. A
+        no-op once it was used, expired or replaced.
+        """
+        with self._allowance_lock:
+            self._deposit_allowances = [
+                a for a in self._deposit_allowances if a is not grant
+            ]
 
     def _purge_expired(self) -> None:
         """Drop expired allowances — loudly; the caller holds the allowance lock.
@@ -276,8 +273,15 @@ class Guard:
             f"settings; {_ASK_OPERATOR}"
         )
 
-    def check_transaction(
-        self, chain: str, to: str, value: int, data: str, *, consume: bool = True
+    def check_transaction(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        to: str,
+        value: int,
+        data: str,
+        *,
+        consume: bool = True,
+        server_built: bool = False,
     ) -> None:
         """Raise unless the EOA transaction is allowed.
 
@@ -285,18 +289,27 @@ class Guard:
         mode. Decoding happens once, here, so both answer the same bytes.
         `consume=False` answers without spending a single-use allowance, so
         asking whether a call would pass cannot break the call that follows.
+        `server_built` marks a transaction the server composed itself (the
+        signer's SERVER_BUILT), the only kind that may call the marketplace.
         """
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
-        calldata = (data or "0x").removeprefix("0x").lower()
+        calldata = calldata_hex(data)
         exec_call = None
         if calldata.startswith(EXEC_TRANSACTION_SELECTOR):
             # decode and floor-check every execTransaction, whatever it targets
             # and whether or not a safe is configured here: the floor protects
             # any safe the agent reaches, and "protected only if configured"
             # would be a hole an unconfigured chain walks straight through.
-            exec_call = _SafeExec.decode(calldata)
+            try:
+                exec_call = SafeExec.decode(calldata)
+            except ValueError as e:
+                # calldata we cannot parse is calldata we cannot judge, so it
+                # is refused rather than waved through
+                raise GuardError(str(e)) from e
             self._check_floor(to, exec_call)
+        if not server_built:
+            self._check_marketplace(chain, to, exec_call)
         if self._store.load().protected.mode == MODE_RESTRICTED:
             self._check_restricted(
                 chain,
@@ -308,7 +321,7 @@ class Guard:
                 consume=consume,
             )
 
-    def _check_floor(self, target: str, exec_call: "_SafeExec") -> None:
+    def _check_floor(self, target: str, exec_call: "SafeExec") -> None:
         """Enforce the two rules no mode lifts; see the module docstring for why.
 
         `target` is the contract the execTransaction is sent to — the safe
@@ -326,6 +339,21 @@ class Guard:
                 "are made that way) — the guardrail never allows it"
             )
 
+    @staticmethod
+    def _check_marketplace(chain: str, to: str, exec_call: "SafeExec | None") -> None:
+        """Refuse a call to a mech marketplace, by the EOA or by the safe.
+
+        In every mode: a marketplace takes only the requests the server's
+        mech flow composes; see the module docstring.
+        """
+        called = {to.lower()} | ({exec_call.to.lower()} if exec_call else set())
+        marketplaces = sorted(called & MECH_MARKETPLACES.get(chain, frozenset()))
+        if marketplaces:
+            raise GuardError(
+                f"the mech marketplace {marketplaces[0]} on {chain} takes only the "
+                "requests Connect composes; send a mech request with mech_request"
+            )
+
     def _check_restricted(  # pylint: disable=too-many-arguments
         self,
         chain: str,
@@ -334,7 +362,7 @@ class Guard:
         to: str,
         value: int,
         calldata: str,
-        exec_call: "_SafeExec | None",
+        exec_call: "SafeExec | None",
         consume: bool,
     ) -> None:
         """Restricted mode: the safe CALLs a whitelisted address, or nothing."""
@@ -361,11 +389,7 @@ class Guard:
         # A non-zero gasPrice makes the safe pay a refund (in gasToken, to
         # refundReceiver or tx.origin) — funds leaving the safe past the
         # whitelist. The standard flow always zeroes all three fields.
-        if (
-            exec_call.gas_price != 0
-            or exec_call.gas_token.lower() != ZERO_ADDRESS
-            or exec_call.refund_receiver.lower() != ZERO_ADDRESS
-        ):
+        if exec_call.pays_refund:
             raise GuardError(
                 "the guardrail requires execTransaction refund fields to be "
                 "zero (gasPrice=0, gasToken=0x0, refundReceiver=0x0) — a gas "
@@ -395,7 +419,7 @@ class Guard:
             )
 
     def _consume_deposit_allowance(
-        self, chain: str, exec_call: "_SafeExec", *, consume: bool
+        self, chain: str, exec_call: "SafeExec", *, consume: bool
     ) -> bool:
         """Consume a deposit allowance this safe call matches, if any.
 

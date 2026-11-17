@@ -67,23 +67,29 @@ OCB_EXTRA = "facilitator"
 OCB_INSTALL_LOG_CHARS = 2000
 
 
-def ocb_command(path: Path, mech: str, store_path: Path) -> str:
+def ocb_command(
+    path: Path, mech: str, store_path: Path, trusted_skills: t.Iterable[str] = ()
+) -> str:
     """Return the shell-quoted line running OCB in store_path with `mech` as model.
 
     `--dir` names this instance's workspace: without it ocb-agent picks the
-    first Connect service it finds under ~/.operate.
+    first Connect service it finds under ~/.operate. `trusted_skills` are the
+    SHA-256 digests of the skill files this workspace ships, one
+    `--trusted-skill-hash` each: OCB reads a skill file whose digest it was
+    not given as data, never as instructions.
     """
-    return shlex.join(
-        [
-            str(path),
-            "--dir",
-            str(store_path),
-            "--model",
-            f"mech:chat@{mech}",
-            "--model-budget",
-            str(OCB_MODEL_BUDGET_USD),
-        ]
-    )
+    line = [
+        str(path),
+        "--dir",
+        str(store_path),
+        "--model",
+        f"mech:chat@{mech}",
+        "--model-budget",
+        str(OCB_MODEL_BUDGET_USD),
+    ]
+    for digest in trusted_skills:
+        line += ["--trusted-skill-hash", digest]
+    return shlex.join(line)
 
 
 def _requirement(target: str) -> str:

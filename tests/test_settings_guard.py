@@ -22,6 +22,7 @@
 import asyncio
 import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -39,10 +40,24 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client import (
+    MechInfo,
+    MechPriceExceeded,
+    MetadataRead,
+    OffchainRequestRejected,
+    OffchainTopUpFailed,
+    PreSignHook,
+    RequestIdMismatch,
+    RequestIdRpcError,
+)
+from mech_client import balance_tracker as mech_balance_tracker
+from mech_client import nonces as mech_nonces_module
+from mech_client import payment_token as mech_payment_token
 from mech_client.domain import identification
 from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
 from mech_client.domain.identification import VALORY_TERMS_NOTICE
+from mech_client.domain.request_id import request_digest
 from mech_client.domain.tools import manager as manager_module
 from mech_client.domain.tools.manager import ToolManager
 from mech_client.infrastructure.config import PaymentType
@@ -51,35 +66,43 @@ from mech_client.infrastructure.subgraph.queries import MechRecord
 from web3 import Web3
 from web3.datastructures import AttributeDict
 
+from connect import chains as chains_module
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
-from connect import mech_budget, mech_rpc
+from connect import mech_budget
+from connect import mech_queue as mech_queue_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
+from connect.chains import MECH_MARKETPLACES
 from connect.config import AppConfig, ChainConfig
 from connect.guard import ALLOWANCE_TTL, Guard, GuardError
 from connect.idempotency import RequestLedger
+from connect.intent import Capped
 from connect.mech import (
     DEFAULT_DELIVERY_TIMEOUT,
     DEFAULT_MECH_CHAIN,
     MAX_DELIVERY_TIMEOUT,
     MechError,
+    MechNotSent,
+    MechRefused,
     MechService,
     MechSigner,
     PendingDelivery,
-    PricedMech,
 )
-from connect.mech_allowances import (
-    _MAX_AUTO_DEPOSIT_RATIO,
-    deposit_tracker,
-    request_digest,
+from connect.mech_allowances import _MAX_AUTO_DEPOSIT_RATIO, deposit_tracker
+from connect.mech_types import (
+    MechAnswerUnknown,
+    MechDepositUnknown,
+    PricedMech,
+    UNSAID,
 )
 from connect.safe import (
     APPROVE_SELECTOR,
     DEPOSIT_SELECTOR,
     EXEC_TRANSACTION_SELECTOR,
     EXEC_TRANSACTION_TYPES,
+    ZERO_ADDRESS,
     decode_approve,
     decode_deposit,
     safe_message_hash,
@@ -106,11 +129,21 @@ from connect.settings import (
     default_whitelist,
     defaults,
     derive_mac_key,
+    prepaid_balance_trackers,
     token_approve_targets,
 )
 from connect.signer import Signer, SignerError, _ChainState
+from connect.signer_errors import SEND_FAILED, SendUnknown
 
-from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
+from tests.conftest import (
+    FakeW3,
+    TEST_PASSWORD,
+    TOKEN_EXPIRES_AT,
+    audit_entries,
+    audit_kinds,
+    grant_store,
+    pay,
+)
 
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
@@ -791,8 +824,35 @@ class TestDefaults:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A broken mech-client fails closed rather than taking the guard down."""
-        monkeypatch.setattr("mech_client.utils.constants.CHAIN_NAME_TO_ID", None)
+
+        def broken(*_args: t.Any) -> t.Any:
+            raise RuntimeError("mech-client's tables are unreadable")
+
+        monkeypatch.setattr("mech_client.balance_tracker", broken)
         assert token_approve_targets("polygon") == {}
+
+    def test_the_guard_s_approve_targets_are_the_gate_s_token_trackers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One reading of mech-client's tracker table serves the guard and the gate.
+
+        Each payment token maps to the tracker the intent gate reads its
+        prepaid balance at; the native tracker has no token to approve.
+        """
+        for chain in ("gnosis", "polygon", "base", "optimism", "robinhood"):
+            trackers = prepaid_balance_trackers(chain)
+            assert token_approve_targets(chain) == {
+                asset: tracker
+                for tracker, asset in trackers.items()
+                if asset != "native"
+            }
+        tracker, token = "0x" + "71" * 20, "0x" + "72" * 20
+        monkeypatch.setattr(
+            settings_module,
+            "prepaid_balance_trackers",
+            lambda chain: {tracker: token, "0x" + "73" * 20: "native"},
+        )
+        assert token_approve_targets("gnosis") == {token: tracker}
 
     def test_decode_approve_returns_none_on_undecodable(self) -> None:
         """The approve selector with unparseable args decodes to no spender."""
@@ -884,6 +944,55 @@ class TestGuard:
             guard.check_sign_digest(b"\xab" * 32)
         assert "expired unconsumed" in caplog.text
 
+    def test_a_revoked_allowance_is_gone_and_only_its_own(
+        self, store: SettingsStore
+    ) -> None:
+        """Revoking withdraws exactly the grant armed, leaving any other shape."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_digest_once(b"\xab" * 32)
+        guard.allow_digest_once(b"\xac" * 32)
+        guard.revoke_digest(b"\xab" * 32)
+        with pytest.raises(GuardError, match="digest signing is disabled"):
+            guard.check_sign_digest(b"\xab" * 32)
+        guard.check_sign_digest(b"\xac" * 32)  # the other one stands
+        shape: dict[str, t.Any] = dict(
+            chain="testchain", tracker=TRACKER, amount_cap=10, is_token=False
+        )
+        grant = guard.allow_safe_deposit_once(**shape)
+        deposit = exec_transaction_calldata(TRACKER, value=10)
+        guard.check_transaction("testchain", SAFE, 0, deposit, consume=False)
+        guard.revoke_safe_deposit(grant)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    def test_a_request_withdraws_only_its_own_deposit_allowance(
+        self, store: SettingsStore
+    ) -> None:
+        """Two requests to one mech arm the same shape; one withdrawn, the other stands."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        shape: dict[str, t.Any] = dict(
+            chain="testchain", tracker=TRACKER, amount_cap=10, is_token=False
+        )
+        deposit = exec_transaction_calldata(TRACKER, value=10)
+        for withdrawn in (0, 1):  # whichever was armed first or second
+            grants = [guard.allow_safe_deposit_once(**shape) for _ in range(2)]
+            guard.revoke_safe_deposit(grants[withdrawn])  # refused before its POST
+            guard.check_transaction("testchain", SAFE, 0, deposit)  # the other's 402
+            with pytest.raises(GuardError, match="do not allow the safe to call"):
+                guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    def test_an_agent_top_up_allowance_replaces_a_stale_one(
+        self, store: SettingsStore
+    ) -> None:
+        """A failed top-up leaves its allowance; the next arm does not stack on it."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        guard.allow_agent_topup_once(chain="testchain", amount_cap=10)
+        guard.allow_agent_topup_once(chain="testchain", amount_cap=10)
+        topup = exec_transaction_calldata(AGENT, value=10)
+        guard.check_transaction("testchain", SAFE, 0, topup)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, topup)
+
     def test_deposit_allowance_native(self, store: SettingsStore) -> None:
         """A pre-authorized bare transfer to the tracker passes — once, capped.
 
@@ -954,22 +1063,24 @@ class TestGuard:
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, transfer)
 
-    def test_rearming_replaces_the_deposit_allowance(
+    def test_every_armed_deposit_allowance_is_withdrawn_by_its_own_handle(
         self, store: SettingsStore
     ) -> None:
-        """N arms for one (chain, tracker) still admit exactly one deposit.
+        """N arms for one (chain, tracker) are N grants; each request withdraws its own.
 
-        Appending would stack grants — fifty requests arming the same
-        tracker would authorize fifty deposits at fifty caps. Re-arming must
-        refresh the single grant instead.
+        Stacked grants stay bounded because every request withdraws what it
+        armed when it ends (MechService._dispatch), sent or not.
         """
         guard = make_guard(store, MODE_RESTRICTED)
-        for _ in range(3):
+        grants = [
             guard.allow_safe_deposit_once(
                 chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
             )
+            for _ in range(3)
+        ]
         deposit = exec_transaction_calldata(TRACKER, value=50)
-        guard.check_transaction("testchain", SAFE, 0, deposit)  # the one grant
+        for grant in grants:
+            guard.revoke_safe_deposit(grant)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
 
@@ -1399,10 +1510,14 @@ class TestSignerGuardIntegration:
         different check: the guardrail's rules are about the composed
         execTransaction, so the two must be built the same way.
         """
-        reason = restricted_signer.refusal_reason("testchain", OTHER, value=5)
+        reason = restricted_signer.refusal_reason(
+            "testchain", OTHER, value=5, intent=pay(OTHER, 5)
+        )
         assert reason is not None
         with pytest.raises(SignerError) as raised:
-            restricted_signer.send_via_safe("testchain", OTHER, value=5)
+            restricted_signer.send_via_safe(
+                "testchain", OTHER, value=5, intent=pay(OTHER, 5)
+            )
         assert str(raised.value) == reason
         assert not fake_w3.eth.sent
 
@@ -1437,17 +1552,26 @@ class TestSignerGuardIntegration:
         guard.allow_safe_deposit_once(
             chain="testchain", tracker=TRACKER, amount_cap=100, is_token=False
         )
-        over_cap = restricted_signer.refusal_reason("testchain", TRACKER, value=101)
+        over_cap = restricted_signer.refusal_reason(
+            "testchain", TRACKER, value=101, intent=pay(TRACKER, 101)
+        )
         assert over_cap is not None
         assert "do not allow the safe to call" in over_cap
         wrong_shape = restricted_signer.refusal_reason(
-            "testchain", TRACKER, value=50, data="0x0102"
+            "testchain", TRACKER, value=50, intent=pay(TRACKER, 50), data="0x0102"
         )
         assert wrong_shape is not None
-        assert restricted_signer.refusal_reason("testchain", TRACKER, value=50) is None
+        assert (
+            restricted_signer.refusal_reason(
+                "testchain", TRACKER, value=50, intent=pay(TRACKER, 50)
+            )
+            is None
+        )
         # every one of those asked the guardrail, and none of them spent the
         # allowance the mech flow armed for the send it is about to make
-        restricted_signer.send_via_safe("testchain", TRACKER, value=50)
+        restricted_signer.send_via_safe(
+            "testchain", TRACKER, value=50, intent=pay(TRACKER, 50)
+        )
         assert len(fake_w3.eth.sent) == 1
 
     def test_dry_run_records_a_check_and_never_a_block(
@@ -1459,7 +1583,9 @@ class TestSignerGuardIntegration:
         so it must leave a trace — but not one that reads as a request the
         guardrail actually stopped.
         """
-        restricted_signer.refusal_reason("testchain", OTHER, value=5)
+        restricted_signer.refusal_reason(
+            "testchain", OTHER, value=5, intent=pay(OTHER, 5)
+        )
         restricted_signer.refusal_reason("testchain", OTHER)
         kinds = audit_kinds(store_path)
         assert kinds == ["checked", "checked"]
@@ -1472,7 +1598,12 @@ class TestSignerGuardIntegration:
         self, store_path: Path, test_signer: Signer
     ) -> None:
         """An allowed probe must not be forensically blank."""
-        assert test_signer.refusal_reason("testchain", OTHER, value=50) is None
+        assert (
+            test_signer.refusal_reason(
+                "testchain", OTHER, value=50, intent=pay(OTHER, 50)
+            )
+            is None
+        )
         entry = audit_entries(store_path)[0]
         assert entry["to"] == SAFE
         assert entry["value"] == "0"
@@ -1496,11 +1627,11 @@ class TestSignerGuardIntegration:
     ) -> None:
         """via_safe=False asks about send_transaction's call, not the safe's."""
         reason = restricted_signer.refusal_reason(
-            "testchain", OTHER, value=1, via_safe=False
+            "testchain", OTHER, value=1, intent=pay(OTHER, 1), via_safe=False
         )
         assert reason is not None
         with pytest.raises(SignerError) as raised:
-            restricted_signer.send("testchain", OTHER, value=1)
+            restricted_signer.send("testchain", OTHER, value=1, intent=pay(OTHER, 1))
         assert str(raised.value) == reason
 
     def test_dry_run_refuses_a_negative_value_the_send_would_reject(
@@ -1552,10 +1683,15 @@ class TestSignerGuardIntegration:
     ) -> None:
         """A consulted guardrail that says yes reports nothing, then it goes."""
         test_signer.set_guard(guard)
-        assert test_signer.refusal_reason("testchain", OTHER, value=1) is None
+        assert (
+            test_signer.refusal_reason(
+                "testchain", OTHER, value=1, intent=pay(OTHER, 1)
+            )
+            is None
+        )
         assert not fake_w3.eth.sent
         assert audit_kinds(store_path) == ["checked"]
-        test_signer.send_via_safe("testchain", OTHER, value=1)
+        test_signer.send_via_safe("testchain", OTHER, value=1, intent=pay(OTHER, 1))
         assert len(fake_w3.eth.sent) == 1
 
     def test_dry_run_without_a_guard_allows_and_says_so(
@@ -1564,11 +1700,18 @@ class TestSignerGuardIntegration:
         app_config: AppConfig,
         activity: ActivityLog,
         caplog: pytest.LogCaptureFixture,
+        fake_w3: FakeW3,
     ) -> None:
         """A choke point with no gate attached is worth a line in the log."""
         signer = Signer(account=account, config=app_config, activity=activity)
+        signer._chains._states["testchain"] = (  # pylint: disable=protected-access
+            _ChainState(w3=t.cast(Web3, fake_w3), lock=threading.Lock(), chain_id=1)
+        )
         with caplog.at_level(logging.ERROR, logger="agent"):
-            assert signer.refusal_reason("testchain", OTHER, value=1) is None
+            assert (
+                signer.refusal_reason("testchain", OTHER, value=1, intent=pay(OTHER, 1))
+                is None
+            )
         assert "no guardrail attached" in caplog.text
 
     def test_blocked_send_is_audited(
@@ -1580,7 +1723,7 @@ class TestSignerGuardIntegration:
     ) -> None:
         """A denied send raises SignerError, records 'blocked', broadcasts nothing."""
         with pytest.raises(SignerError, match="only allow transactions targeting"):
-            restricted_signer.send("testchain", OTHER, value=1)
+            restricted_signer.send("testchain", OTHER, value=1, intent=pay(OTHER, 1))
         assert "blocked" in audit_kinds(store_path)
         assert not fake_w3.eth.sent
 
@@ -1606,17 +1749,21 @@ class TestSignerGuardIntegration:
             )
         )
         sent: dict = {}
-        original = restricted_signer.send
+        original = restricted_signer._send_guarded  # pylint: disable=protected-access
         monkeypatch.setattr(
             restricted_signer,
-            "send",
+            "_send_guarded",
             lambda chain, to, **kw: (
                 sent.update({"chain": chain, "to": to, **kw}),
                 original(chain, to, **kw),
             )[1],
         )
         tx_hash = restricted_signer.send_via_safe(
-            "testchain", WHITELISTED, value=10**18, data="0xabcd"
+            "testchain",
+            WHITELISTED,
+            value=10**18,
+            intent=pay(WHITELISTED, 10**18),
+            data="0xabcd",
         )
 
         assert tx_hash.startswith("0x")
@@ -1642,7 +1789,9 @@ class TestSignerGuardIntegration:
         design exists to not have.
         """
         with pytest.raises(SignerError, match="do not allow the safe to call"):
-            restricted_signer.send_via_safe("testchain", OTHER, value=1)
+            restricted_signer.send_via_safe(
+                "testchain", OTHER, value=1, intent=pay(OTHER, 1)
+            )
         assert not fake_w3.eth.sent
 
     def test_the_composer_cannot_open_the_safe_to_itself(
@@ -1691,7 +1840,9 @@ class TestSignerGuardIntegration:
         with pytest.raises(SignerError, match="cannot compose"):
             restricted_signer.send_via_safe("testchain", "0x1234", value=1)
         with pytest.raises(SignerError, match="cannot compose"):
-            restricted_signer.send_via_safe("testchain", WHITELISTED, value=2**256)
+            restricted_signer.send_via_safe(
+                "testchain", WHITELISTED, value=2**256, intent=pay(WHITELISTED, 2**256)
+            )
         assert not fake_w3.eth.sent
 
     def test_the_safe_path_has_its_own_idempotency_namespace(
@@ -1710,16 +1861,28 @@ class TestSignerGuardIntegration:
             Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}))
         )
         eoa = restricted_signer.send(
-            "testchain", WHITELISTED, value=1, request_id="dup"
+            "testchain",
+            WHITELISTED,
+            value=1,
+            intent=pay(WHITELISTED, 1),
+            request_id="dup",
         )
         via_safe = restricted_signer.send_via_safe(
-            "testchain", WHITELISTED, value=1, request_id="dup"
+            "testchain",
+            WHITELISTED,
+            value=1,
+            intent=pay(WHITELISTED, 1),
+            request_id="dup",
         )
         assert eoa != via_safe
         assert len(fake_w3.eth.sent) == 2  # no cross-path collision
         # ...but a real retry on the safe path with the same id is still deduped
         again = restricted_signer.send_via_safe(
-            "testchain", WHITELISTED, value=1, request_id="dup"
+            "testchain",
+            WHITELISTED,
+            value=1,
+            intent=pay(WHITELISTED, 1),
+            request_id="dup",
         )
         assert again == via_safe
         assert len(fake_w3.eth.sent) == 2
@@ -1749,17 +1912,23 @@ class TestSignerGuardIntegration:
         settings_store.save(
             Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}))
         )
-        tx_hash = restricted_signer.send("testchain", OTHER, value=1, request_id="r1")
+        tx_hash = restricted_signer.send(
+            "testchain", OTHER, value=1, intent=pay(OTHER, 1), request_id="r1"
+        )
         settings_store.save(
             Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
         )
         assert (
-            restricted_signer.send("testchain", OTHER, value=1, request_id="r1")
+            restricted_signer.send(
+                "testchain", OTHER, value=1, intent=pay(OTHER, 1), request_id="r1"
+            )
             == tx_hash
         )
         assert len(fake_w3.eth.sent) == 1  # no second broadcast
         with pytest.raises(SignerError, match="only allow transactions targeting"):
-            restricted_signer.send("testchain", OTHER, value=1, request_id="r2")
+            restricted_signer.send(
+                "testchain", OTHER, value=1, intent=pay(OTHER, 1), request_id="r2"
+            )
 
 
 class FakeMarketplaceContract:
@@ -1800,7 +1969,7 @@ class FakeMarketplaceContract:
             marketplace=self.address,
             mech=mech,
             requester=requester,
-            data_hash=bytes(data),
+            data=bytes(data),
             delivery_rate=rate,
             payment_type=bytes(payment_type),
             nonce=nonce,
@@ -1811,8 +1980,15 @@ class FakeMarketplaceContract:
 NATIVE_PAYMENT_TYPE = "ba699a34be8fe0e7725e93dcbce1701b0211a8ca61330aaeb8a05bf2ec7abed1"
 
 
+def metadata_read(document: t.Any) -> MetadataRead:
+    """Answer ToolManager.read_tools_metadata: the document, or an unreadable one."""
+    if isinstance(document, dict):
+        return MetadataRead.ok(document)
+    return MetadataRead.failed("TimeoutError")
+
+
 def native_mech_info(rate: int) -> tuple:
-    """Canned _fetch_mech_info answer for a native-payment mech."""
+    """Canned (payment_type, service_id, rate) for a native-payment mech."""
     return (PaymentType(NATIVE_PAYMENT_TYPE), 42, rate)
 
 
@@ -1822,6 +1998,7 @@ class FakeMarketplaceService:
     def __init__(self) -> None:
         """Initialize."""
         self.calls: list[dict] = []
+        self.priced_out: list[dict] = []  # refused by max_price, before any work
         # the healthy case: the mech answered before the wait ran out, so
         # nothing is left pending (tests for the timeout path drop the
         # delivery_results entry to leave that id unanswered)
@@ -1833,7 +2010,12 @@ class FakeMarketplaceService:
             },
         }
         self.raises: Exception | None = None
-        self.mech_info = native_mech_info(10**16)
+        # raised once the request is signed: the POST may have reached the mech
+        self.raises_after_signing: Exception | None = None
+        # the shortfall the mech answers the POST with (HTTP 402): deposited
+        # into TRACKER through the signer, as the auto-deposit sends it
+        self.top_up: int | None = None
+        self.info = native_mech_info(10**16)
         # A mech that publishes both a tool list and an off-chain endpoint —
         # the rare healthy case; tests that need a blocker override `metadata`.
         self.metadata: dict | None = {
@@ -1853,16 +2035,15 @@ class FakeMarketplaceService:
         }
         self.report_fallback: str | None = None
         self.report_calls: list[tuple] = []
-        # whether each report ran with mech-client's RPC mismatch warning muted
-        self.report_muted: list[bool] = []
         self.tool_manager = SimpleNamespace(
-            fetch_tools_metadata=lambda service_id: self.metadata,
+            read_tools_metadata=lambda service_id: metadata_read(self.metadata),
             terms_report=self._terms_report,
             mech_report_or_terms=self._mech_report_or_terms,
         )
         self.contract = FakeMarketplaceContract()
         self.signer: t.Any = None  # the MechSigner mech-client would sign with
         self.safe_address: str | None = None  # agent-mode requester of record
+        self.rpc_url: str | None = None  # the rpc_url it was built with
         # mirrors BaseTransactionService.mech_config, whose chain id the flow
         # threads into sign_safe_message
         self.mech_config = SimpleNamespace(
@@ -1877,17 +2058,17 @@ class FakeMarketplaceService:
     def _mech_report_or_terms(self, mech_address: str, metadata: t.Any) -> dict:
         """Record the call; return the canned report, or the terms and a note."""
         self.report_calls.append((mech_address, metadata))
-        self.report_muted.append(getattr(mech_rpc._LISTING, "active", False))
         if self.report_fallback is not None:
             return {**self.terms, "report_note": self.report_fallback}
         return {**self.terms, **self.report}
 
-    def _fetch_mech_info(self, mech: str) -> tuple:
+    def mech_info(self, mech: str) -> MechInfo:
         """Return the canned (payment_type, service_id, max_delivery_rate)."""
-        return self.mech_info
+        payment_type, service_id, rate = self.info
+        return MechInfo(mech, service_id, payment_type, rate)
 
-    def _get_marketplace_contract(self) -> FakeMarketplaceContract:
-        """Return the contract stand-in (the private helper the code pins)."""
+    def marketplace_contract(self) -> FakeMarketplaceContract:
+        """Return the contract stand-in."""
         return self.contract
 
     async def send_request(self, **kwargs: object) -> dict:
@@ -1902,27 +2083,87 @@ class FakeMarketplaceService:
         exercise end to end.
         """
         self.calls.append(kwargs)
-        if self.raises is not None:
+        hook = kwargs.get("on_request_id")
+        if isinstance(hook, PreSignHook):
+            hook.mark_received()  # on entry, as mech-client marks it
+        # the mech's own answer to a POST comes after signing, as it does live
+        answered = isinstance(
+            self.raises, (OffchainRequestRejected, OffchainTopUpFailed)
+        )
+        if self.raises is not None and not (answered and kwargs.get("use_offchain")):
             raise self.raises
+        max_price = kwargs.get("max_price")
+        if isinstance(max_price, int) and self.info[2] > max_price:
+            # mech-client's cap: refused before any deposit, signature or POST
+            self.calls.pop()
+            self.priced_out.append(kwargs)
+            raise MechPriceExceeded(
+                "over the cap", price=self.info[2], max_price=max_price
+            )
         if kwargs.get("use_offchain") and self.signer is not None:
             prompts = t.cast(tuple, kwargs["prompts"])
             tools = t.cast(tuple, kwargs["tools"])
             extra = t.cast(dict, kwargs.get("extra_attributes") or {})
             data_hash, _, _ = ipfs_metadata.fetch_ipfs_hash(prompts[0], tools[0], extra)
+            # mech-client#272: the caller's nonce, else mapNonces as before
+            nonces = t.cast(list, kwargs.get("nonces") or [self.contract.nonce])
             request_id = self.contract.functions.getRequestId(
                 kwargs["priority_mech"],
                 self.safe_address,
                 bytes.fromhex(data_hash.removeprefix("0x")),
-                self.mech_info[2],
-                bytes.fromhex(self.mech_info[0].value),
-                self.contract.nonce,
+                self.info[2],
+                bytes.fromhex(self.info[0].value),
+                nonces[0],
             ).call()
+            local = request_digest(
+                domain_separator=self.contract.domain_separator,
+                marketplace=self.contract.address,
+                mech=t.cast(str, kwargs["priority_mech"]),
+                requester=t.cast(str, self.safe_address),
+                data=bytes.fromhex(data_hash.removeprefix("0x")),
+                delivery_rate=self.info[2],
+                payment_type=bytes.fromhex(self.info[0].value),
+                nonce=nonces[0],
+            )
+            if bytes(request_id) != local:  # mech-client's own check, pre-hook
+                raise RequestIdMismatch(
+                    "mismatch",
+                    expected=local.hex(),
+                    reported=bytes(request_id).hex(),
+                    nonce=nonces[0],
+                )
+            if callable(hook):
+                hook(local, nonces[0])  # just before signing, as #274 does
             self.signer.sign_safe_message(
                 self.safe_address,
                 self.mech_config.ledger_config.chain_id,
-                request_id,
+                local,
             )
+            if isinstance(hook, PreSignHook):
+                hook.mark_posting()  # signed: the POST is next
+            if answered:
+                raise t.cast(Exception, self.raises)
+            if self.top_up is not None and kwargs.get("auto_deposit"):
+                deposit = exec_transaction_calldata(TRACKER, value=self.top_up)
+                try:
+                    self.signer.send_transaction(
+                        {"to": self.safe_address, "data": deposit}
+                    )
+                except SignerError as e:
+                    raise _executor_wrapped(e) from e
+            if self.raises_after_signing is not None:
+                raise self.raises_after_signing
         return self.result
+
+
+def _executor_wrapped(failure: Exception) -> Exception:
+    """Wrap a signer failure as mech-client's agent-mode executor does."""
+    try:
+        raise failure
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        wrapped = Exception(f"Failed to execute Safe transfer transaction: {e}")
+        wrapped.__cause__ = e
+        return wrapped
 
 
 REAL_MANIFEST: dict = {
@@ -1957,7 +2198,7 @@ def _wire_real_report(
     manager.chain_config = "gnosis"
     manager.mech_config = SimpleNamespace(ledger_config=SimpleNamespace(chain_id=100))
     patched_mech.tool_manager = SimpleNamespace(
-        fetch_tools_metadata=lambda service_id: metadata,
+        read_tools_metadata=lambda service_id: metadata_read(metadata),
         terms_report=manager.terms_report,
         mech_report_or_terms=manager.mech_report_or_terms,
     )
@@ -2009,6 +2250,10 @@ def _wire_real_report(
     return calls
 
 
+def _admit_every_transaction(_chain: str, _to: str, _data: str) -> None:
+    """Admit every transaction: the MechSigner check of its own tests."""
+
+
 class TestMech:
     """MechSigner adapter and MechService orchestration."""
 
@@ -2016,17 +2261,42 @@ class TestMech:
         self, test_signer: Signer, fake_w3: FakeW3
     ) -> None:
         """Bytes data, missing value/gas and address pass through correctly."""
-        mech_signer = MechSigner(test_signer, "testchain")
+        mech_signer = MechSigner(test_signer, "testchain", _admit_every_transaction)
         assert mech_signer.address == test_signer.address
         tx_hash = mech_signer.send_transaction(
             {"to": OTHER, "data": b"\x01\x02", "value": None}
         )
         assert tx_hash.startswith("0x")
         assert fake_w3.eth.sent
+        # a paying transaction, built by the server: it skips the intent gate
+        mech_signer.send_transaction({"to": OTHER, "data": "0x", "value": 10**15})
+        assert len(fake_w3.eth.sent) == 2
+        assert fake_w3.provider.simulated == []
+
+    def test_no_mech_signer_or_request_is_built_without_its_top_up_bound(
+        self, test_signer: Signer, mech_service: MechService
+    ) -> None:
+        """A top-up's check and its budget are always named, never defaulted.
+
+        A caller with no token passes None for the budget on purpose.
+        """
+        with pytest.raises(TypeError, match="check"):
+            MechSigner(test_signer, "testchain")  # type: ignore[call-arg]
+        with pytest.raises(TypeError, match="top_up_budget"):
+            mech_service.request("q", "tool", chain="testchain")  # type: ignore[call-arg]
+        allowances = mech_service._allowances  # pylint: disable=protected-access
+        priced = PricedMech(OTHER, 42, 10**16, NATIVE_PAYMENT_TYPE)
+        with pytest.raises(TypeError, match="budget"):
+            with allowances.auto_deposit_armed(  # type: ignore[call-arg]
+                "testchain", priced, auto_deposit=True, max_payment=6
+            ):
+                pass
 
     def test_mech_signer_signs_digests(self, test_signer: Signer) -> None:
         """sign_message returns the raw 65-byte signature."""
-        signature = MechSigner(test_signer, "testchain").sign_message(b"\x22" * 32)
+        signature = MechSigner(
+            test_signer, "testchain", _admit_every_transaction
+        ).sign_message(b"\x22" * 32)
         assert len(signature) == 65
 
     def test_mech_signer_signs_safe_messages(self, test_signer: Signer) -> None:
@@ -2037,9 +2307,9 @@ class TestMech:
         recovery mirrors what the safe's fallback handler checks on-chain.
         """
         digest = b"\x22" * 32
-        signature = MechSigner(test_signer, "testchain").sign_safe_message(
-            SAFE, 31337, digest
-        )
+        signature = MechSigner(
+            test_signer, "testchain", _admit_every_transaction
+        ).sign_safe_message(SAFE, 31337, digest)
         assert len(signature) == 65
         wrapped = safe_message_hash(SAFE, 31337, digest)
         # pylint: disable-next=protected-access,no-value-for-parameter
@@ -2062,7 +2332,7 @@ class TestMech:
         strings, field order, or the keccak(digest) shortcut breaks every
         restricted-mode off-chain signature; without this, only the
         RPC-gated fork test would catch it. Companion to
-        test_request_digest_matches_deployed_marketplace.
+        mech-client's own request_digest tests.
         """
         safe = "0x" + "ab" * 20
         assert (
@@ -2085,6 +2355,7 @@ class TestMech:
             """Capture the MechSigner and safe the service would sign with."""
             fake.signer = kwargs.get("signer")
             fake.safe_address = t.cast(str, kwargs.get("safe_address"))
+            fake.rpc_url = t.cast(str, kwargs.get("rpc_url"))
             return fake
 
         monkeypatch.setattr(mech_module, "MarketplaceService", _construct)
@@ -2112,18 +2383,23 @@ class TestMech:
 
         patched_mech.send_request = sending  # type: ignore[method-assign]
         out = mech_service.request(
-            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+            "q",
+            "prediction-online",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert order == ["report", "send"]
         # the default off-chain flow reuses the document its pre-flight read
         assert patched_mech.report_calls == [(OTHER, patched_mech.metadata)]
-        # its indexer reads must not warn that MECHX_CHAIN_RPC is for another chain
-        assert patched_mech.report_muted == [True]
         assert not patched_mech.terms_calls
         assert out["valory_operated"] is True
         assert out["terms"] == VALORY_TERMS_NOTICE
         assert out["delivery"] == {"received_requests": 120}
-        assert out["payment"] == {"type": "native"}
+        # the report's asset label and the amount paid are two fields
+        assert out["payment_info"] == {"type": "native"}
+        assert out["payment"] == 10**16
+        assert isinstance(out["payment"], int)
 
     def test_request_goes_out_when_the_report_falls_back_to_the_terms(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -2135,7 +2411,11 @@ class TestMech:
         patched_mech.terms = {"valory_operated": True, "terms": VALORY_TERMS_NOTICE}
         patched_mech.report_fallback = "record unreadable; only the terms"
         out = mech_service.request(
-            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+            "q",
+            "prediction-online",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert out["terms"] == VALORY_TERMS_NOTICE
         assert "delivery" not in out
@@ -2153,6 +2433,7 @@ class TestMech:
             chain="testchain",
             priority_mech=OTHER,
             legacy_on_chain=True,
+            top_up_budget=None,
         )
         assert patched_mech.terms_calls == [(OTHER, None)]
         assert not patched_mech.report_calls
@@ -2168,17 +2449,12 @@ class TestMech:
         """The check runs before any allowance is armed, so its failure spends nothing."""
         armed: list[str] = []
         allowances = mech_service._allowances  # pylint: disable=protected-access
-        monkeypatch.setattr(
-            allowances,
-            "register_offchain_digest",
-            lambda *a, **k: armed.append("digest"),
-        )
 
         def arm_deposit(*_args: t.Any, **_kwargs: t.Any) -> bool:
             armed.append("deposit")
             return True
 
-        monkeypatch.setattr(allowances, "arm_auto_deposit", arm_deposit)
+        monkeypatch.setattr(allowances, "_arm_deposit", arm_deposit)
 
         def broken(mech: str, doc: t.Any) -> dict:
             raise RuntimeError("executor shut down")
@@ -2186,7 +2462,11 @@ class TestMech:
         patched_mech.tool_manager.mech_report_or_terms = broken
         with pytest.raises(RuntimeError, match="executor shut down"):
             mech_service.request(
-                "q", "prediction-online", chain="testchain", priority_mech=OTHER
+                "q",
+                "prediction-online",
+                chain="testchain",
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert not armed
         assert not patched_mech.calls
@@ -2200,21 +2480,15 @@ class TestMech:
             "identification_note": "Could not check whether Valory operates this mech.",
         }
         out = mech_service.request(
-            "q", "prediction-online", chain="testchain", priority_mech=OTHER
+            "q",
+            "prediction-online",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert out["valory_operated"] is False
         assert "terms" not in out
         assert out["identification_note"].startswith("Could not check")
-
-    def test_a_refused_request_never_checks_the_terms(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
-    ) -> None:
-        """A request refused on price spends no DNS lookups either."""
-        patched_mech.mech_info = native_mech_info(10**18)
-        with pytest.raises(MechError, match="max_payment"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
-        assert not patched_mech.terms_calls
-        assert not patched_mech.report_calls
 
     def test_request_maps_arguments(
         self,
@@ -2232,6 +2506,7 @@ class TestMech:
             priority_mech=OTHER,
             auto_deposit=False,
             timeout=42,
+            top_up_budget=None,
         )
         # the resolved chain travels with the result, so a caller that omitted
         # it can still tell which chain was paid
@@ -2244,7 +2519,8 @@ class TestMech:
         assert call["use_offchain"] is False
         assert call["priority_mech"] == OTHER
         assert call["auto_deposit"] is False
-        assert call["timeout"] == 42
+        # a short wait under the queue's lock; the delivery is watched after
+        assert call["timeout"] == mech_module.ACK_WAIT_SECONDS
         assert "mech_request" in audit_kinds(store_path)
         # the service is cached per chain
         mech_service.request(
@@ -2253,6 +2529,7 @@ class TestMech:
             chain="testchain",
             legacy_on_chain=True,
             priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 2
 
@@ -2261,7 +2538,12 @@ class TestMech:
     ) -> None:
         """An answered request must not be offered for polling."""
         result = mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert "pending_request_ids" not in result
         with pytest.raises(MechError, match="nothing is awaiting delivery"):
@@ -2280,7 +2562,7 @@ class TestMech:
         """
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             # AttributeDict, not a dict literal: that is what web3 really
             # hands back, and it is NOT a dict subclass — stubbing a plain
@@ -2288,10 +2570,13 @@ class TestMech:
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
         result = mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
-        # normalized: the two flows disagree about the 0x prefix, and the id
-        # the caller is handed has to be the one mech_result accepts
         assert result["pending_request_ids"] == ["ab"]
 
         watched: dict = {}
@@ -2326,6 +2611,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
             request_id=request_id,
+            top_up_budget=None,
         )
 
     def test_replaying_a_request_id_does_not_pay_twice(
@@ -2352,7 +2638,7 @@ class TestMech:
         """Picking up the answer the first call gave up on is the point."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -2390,7 +2676,7 @@ class TestMech:
         """A replayed id is exactly the case that needs the answer locatable."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -2415,7 +2701,7 @@ class TestMech:
         """An id cannot be both delivered and reported as a failed read."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -2449,8 +2735,8 @@ class TestMech:
         """mech-client says delivered-but-unreadable; that is not a null answer."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
-            "deliveries": {"0xAB": DeliveryResult("0xAB", None, "ipfs://later")},
+            "request_ids": ["ab"],
+            "deliveries": {"ab": DeliveryResult("ab", None, "ipfs://later")},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
         first = self._job(mech_service, "job-unreadable")
@@ -2477,7 +2763,7 @@ class TestMech:
         """Popping it here would strand a request its payment already bought."""
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -2517,6 +2803,7 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=OTHER,
                 request_id="job-chain",
+                top_up_budget=None,
             )
         with pytest.raises(
             MechError, match="prompt, tool, chain, mech, flow or context"
@@ -2528,6 +2815,7 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=WHITELISTED,
                 request_id="job-chain",
+                top_up_budget=None,
             )
         assert len(patched_mech.calls) == 1
 
@@ -2543,6 +2831,7 @@ class TestMech:
             priority_mech=OTHER,
             request_id="job-ctx",
             request_context={"market_prob": 0.4},
+            top_up_budget=None,
         )
         assert first.get("replayed") is not True
         with pytest.raises(
@@ -2556,6 +2845,7 @@ class TestMech:
                 priority_mech=OTHER,
                 request_id="job-ctx",
                 request_context={"market_prob": 0.9},
+                top_up_budget=None,
             )
         again = mech_service.request(
             "q",
@@ -2565,6 +2855,7 @@ class TestMech:
             priority_mech=OTHER,
             request_id="job-ctx",
             request_context={"market_prob": 0.4},
+            top_up_budget=None,
         )
         assert again["replayed"] is True
         assert len(patched_mech.calls) == 1
@@ -2581,6 +2872,7 @@ class TestMech:
             priority_mech=OTHER,
             request_id="job-ctx-order",
             request_context={"market_prob": 0.4, "market_id": "m1"},
+            top_up_budget=None,
         )
         again = mech_service.request(
             "q",
@@ -2590,6 +2882,7 @@ class TestMech:
             priority_mech=OTHER,
             request_id="job-ctx-order",
             request_context={"market_id": "m1", "market_prob": 0.4},
+            top_up_budget=None,
         )
         assert again["replayed"] is True
         assert len(patched_mech.calls) == 1
@@ -2609,6 +2902,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
             request_context=context,
+            top_up_budget=None,
         )
         assert patched_mech.calls[0]["extra_attributes"] == {"request_context": context}
         entry = next(
@@ -2621,7 +2915,12 @@ class TestMech:
     ) -> None:
         """A context-less on-chain request must not publish a null key."""
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert patched_mech.calls[0]["extra_attributes"] is None
 
@@ -2635,7 +2934,12 @@ class TestMech:
         caller to use a new id, which pays again.
         """
         first = mech_service.request(
-            "q", "t", legacy_on_chain=True, priority_mech=OTHER, request_id="job-spell"
+            "q",
+            "t",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            request_id="job-spell",
+            top_up_budget=None,
         )
         again = mech_service.request(
             "q",
@@ -2644,6 +2948,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER.upper(),
             request_id="job-spell",
+            top_up_budget=None,
         )
         assert again.get("replayed") is True
         assert again["request_ids"] == first["request_ids"]
@@ -2745,14 +3050,14 @@ class TestMech:
         monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
         again = self._job(mech_service, "job-5")
         assert again["pending_request_ids"] == ["ab"]
-        assert "gateway timed out" in again["replay_errors"]["ab"]
+        assert UNSAID in again["replay_errors"]["ab"]  # the gateway's text: log only
         assert "unrecoverable_request_ids" not in again
 
     def test_a_failure_before_the_paying_call_frees_its_id(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """A refusal reached before any payment must not burn the id."""
-        with pytest.raises(MechError, match="above max_payment"):
+        with pytest.raises(MechNotSent, match="above max_payment"):
             mech_service.request(
                 "q",
                 "t",
@@ -2761,7 +3066,9 @@ class TestMech:
                 priority_mech=OTHER,
                 request_id="job-6",
                 max_payment=0,
+                top_up_budget=None,
             )
+        assert patched_mech.priced_out[-1]["max_price"] == 0  # mech-client's cap
         assert not patched_mech.calls
         assert self._job(mech_service, "job-6")["delivery_results"] == {
             "ab": {"answer": "42"}
@@ -2780,7 +3087,7 @@ class TestMech:
         agent is told to make, and buy a second answer.
         """
         patched_mech.raises = RuntimeError("gateway fell over")
-        with pytest.raises(MechError, match="gateway fell over"):
+        with pytest.raises(MechError, match="cause is in Connect's log"):
             self._job(mech_service, "job-7")
         patched_mech.raises = None
         with pytest.raises(MechError, match="cannot tell whether it was paid"):
@@ -2794,7 +3101,7 @@ class TestMech:
         assert [(e["request_id"], e["reason"]) for e in refusals] == [
             ("job-7", "spend-uncertain")
         ]
-        assert "gateway fell over" in refusals[0]["detail"]
+        assert UNSAID in refusals[0]["detail"]
 
     def test_reusing_an_id_for_a_different_question_is_refused(
         self,
@@ -2837,6 +3144,7 @@ class TestMech:
                 legacy_on_chain=False,
                 priority_mech=OTHER,
                 request_id="job-9",
+                top_up_budget=None,
             )
         assert len(patched_mech.calls) == 1
 
@@ -2933,17 +3241,22 @@ class TestMech:
         """
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {
-                "0xAB": DeliveryResult(
-                    request_id="0xAB",
+                "ab": DeliveryResult(
+                    request_id="ab",
                     data={"result": '{"p_yes": 0.38}'},
                     url="https://gateway.example/ipfs/f0170122ab/42",
                 )
             },
         }
         report = mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert report["delivery_results"] == {"ab": {"result": '{"p_yes": 0.38}'}}
         assert report["delivery_urls"] == {
@@ -2951,36 +3264,6 @@ class TestMech:
         }
         assert "deliveries" not in report
         assert "pending_request_ids" not in report
-
-    def test_every_id_in_one_response_is_spelled_the_same_way(
-        self,
-        store_path: Path,
-        mech_service: MechService,
-        patched_mech: FakeMarketplaceService,
-    ) -> None:
-        """One id must not appear 0x-prefixed in one key and bare in another.
-
-        mech-client 0x-prefixes on-chain request_ids but not the
-        delivery_results keys, so a caller handed both raw cannot tell that
-        they name the same request. The audit record carries them too: if the
-        harness abandons the call, the log is the only place naming what was
-        paid for.
-        """
-        patched_mech.result = {
-            "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB", "0xCD"],
-            "deliveries": {
-                "ab": DeliveryResult(request_id="ab", data={"answer": "42"}, url=None)
-            },
-        }
-        result = mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
-        )
-        assert result["request_ids"] == ["ab", "cd"]
-        assert list(result["delivery_results"]) == ["ab"]
-        assert result["pending_request_ids"] == ["cd"]
-        recorded = [e for e in audit_entries(store_path) if e["kind"] == "mech_request"]
-        assert recorded[-1]["request_ids"] == ["ab", "cd"]
 
     def test_poll_reports_a_delivery_that_has_not_arrived(
         self,
@@ -2995,7 +3278,12 @@ class TestMech:
             "deliveries": {},
         }
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
 
         async def _watch(
@@ -3019,7 +3307,12 @@ class TestMech:
         """A watcher blow-up becomes a MechError; the timeout stays bounded."""
         patched_mech.result = {"request_ids": ["ab"], "deliveries": {}}
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         seen: dict = {}
 
@@ -3058,7 +3351,7 @@ class TestMech:
                 get_offchain_url=lambda service_id: "https://mech.example/offchain"
             ),
             ledger_api=object(),
-            _get_marketplace_contract=lambda: "contract",
+            marketplace_contract=lambda: "contract",
         )
         pending = PendingDelivery("testchain", OTHER, 42, offchain, 99)
         out = asyncio.run(MechService._watch(service, pending, "ab", 5.0))
@@ -3093,6 +3386,7 @@ class TestMech:
             chain="testchain",
             legacy_on_chain=True,
             priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert result["chain"] == "testchain"
         assert result["tx_hash"] == patched_mech.result["tx_hash"]
@@ -3143,7 +3437,9 @@ class TestMech:
         service, _ = self._restricted_mech_service(
             account, app_config, activity, settings_store
         )
-        result = service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        result = service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert result["chain"] == "testchain"
         assert result["tx_hash"] == patched_mech.result["tx_hash"]
         assert result["delivery_results"] == {"ab": {"answer": "42"}}
@@ -3195,6 +3491,7 @@ class TestMech:
             chain="testchain",
             priority_mech=OTHER,
             request_context=context,
+            top_up_budget=None,
         )
         extras = patched_mech.calls[0]["extra_attributes"]
         assert extras.keys() == {"nonce", "request_context"}
@@ -3219,6 +3516,7 @@ class TestMech:
                 priority_mech=OTHER,
                 request_id="job-bad-ctx",
                 request_context={"seen": {1, 2}},
+                top_up_budget=None,
             )
         with pytest.raises(MechError, match="could not be encoded"):
             mech_service.request(
@@ -3227,6 +3525,7 @@ class TestMech:
                 chain="testchain",
                 priority_mech=OTHER,
                 request_context={"seen": {1, 2}},
+                top_up_budget=None,
             )
         # on-chain without a request id reaches no stamp, so only the plan's
         # own check stands between a bad context and the payment boundary
@@ -3238,6 +3537,7 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=OTHER,
                 request_context={"seen": {1, 2}},
+                top_up_budget=None,
             )
         # mixed-type keys encode as metadata but not as a sorted fingerprint,
         # and the trail sorts them after the send: refuse before paying
@@ -3249,10 +3549,12 @@ class TestMech:
                 legacy_on_chain=True,
                 priority_mech=OTHER,
                 request_context={1: "a", "b": 2},
+                top_up_budget=None,
             )
         assert not patched_mech.calls
         assert "mech_request_failed" not in audit_kinds(store_path)
 
+    @pytest.mark.parametrize("restricted", [True, False])
     def test_offchain_digest_mismatch_is_refused(  # pylint: disable=too-many-arguments
         self,
         account: LocalAccount,
@@ -3261,21 +3563,76 @@ class TestMech:
         settings_store: SettingsStore,
         store_path: Path,
         patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        restricted: bool,
     ) -> None:
-        """A request id the server did not derive is not signed.
+        """A lying RPC's request id is refused, and nothing is signed.
 
-        This is the lying-RPC case: mech-client asks the contract for the id
-        over eth_call, so a hostile RPC can hand back any 32 bytes — a safe
-        transaction hash included. The local derivation turns that into a
-        mismatch, and the mismatch into a refusal.
+        mech-client derives the id locally and raises RequestIdMismatch before
+        the pre-sign hook when getRequestId disagrees; Connect reports that as
+        not sent, in every mode, with no digest armed.
         """
         patched_mech.contract.request_id_override = b"\xee" * 32
         service, _ = self._restricted_mech_service(
             account, app_config, activity, settings_store
         )
-        with pytest.raises(SignerError, match="digest signing is disabled"):
-            service.request("q", "tool", chain="testchain", priority_mech=OTHER)
-        assert "blocked" in audit_kinds(store_path)
+        if not restricted:  # the default mode: the guard signs any digest
+            settings_store.save(
+                Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={}))
+            )
+        signed: list[bytes] = []
+
+        def sign_digest(digest: bytes) -> str:
+            signed.append(digest)
+            return "0x"
+
+        monkeypatch.setattr(
+            service._signer,  # pylint: disable=protected-access
+            "sign_digest",
+            sign_digest,
+        )
+        with pytest.raises(MechNotSent, match="not sent: mismatch"):
+            service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+        assert "mech_offchain_digest" not in audit_kinds(store_path)
+        assert signed == []
+
+    def test_an_unreachable_rpc_in_id_derivation_keeps_its_words(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """mech-client's RequestIdRpcError names only the error class: it is said.
+
+        It is raised before anything is signed, so the request is not sent and
+        its request_id is free for the retry an RPC blip calls for.
+        """
+        words = (
+            "Failed to derive the request id for nonce 5 (ConnectionError); "
+            "see the log or the chained cause."
+        )
+        patched_mech.raises = RequestIdRpcError(words)
+        with pytest.raises(MechNotSent) as refused:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
+            )
+        assert str(refused.value) == f"mech request not sent: {words}"
+        patched_mech.raises = None
+        assert (
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
+            ).get("replayed")
+            is None
+        )
 
     def test_restricted_auto_deposit_is_armed_via_allowance(  # pylint: disable=too-many-arguments
         self,
@@ -3301,7 +3658,20 @@ class TestMech:
         service, guard = self._restricted_mech_service(
             account, app_config, activity, settings_store
         )
-        service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        deposit = exec_transaction_calldata(TRACKER, value=10**16)
+        send_request = patched_mech.send_request
+
+        async def topped_up(**kwargs: t.Any) -> dict:
+            # the 402 top-up mech-client sends inside the request
+            guard.check_transaction("testchain", SAFE, 0, deposit)  # the one top-up
+            with pytest.raises(GuardError, match="do not allow the safe to call"):
+                guard.check_transaction("testchain", SAFE, 0, deposit)
+            return await send_request(**kwargs)
+
+        monkeypatch.setattr(patched_mech, "send_request", topped_up)
+        service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert patched_mech.calls[0]["auto_deposit"] is True
         armed = [
             entry
@@ -3310,10 +3680,236 @@ class TestMech:
         ]
         assert armed[0]["tracker"] == TRACKER
         assert armed[0]["amount_cap"] == str(_MAX_AUTO_DEPOSIT_RATIO * 10**16)
+
+    def test_a_top_up_spends_only_its_own_request_s_grant(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B is planned before A, A sends first: both 402 top-ups still pass.
+
+        The guard consumes a deposit grant by its shape, not by who armed it.
+        Armed when a request was planned, before the queue's lock, A's top-up
+        spent B's grant, A's exit withdrew its own unused one, and B's top-up
+        was then refused.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        service, guard = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
         deposit = exec_transaction_calldata(TRACKER, value=10**16)
-        guard.check_transaction("testchain", SAFE, 0, deposit)  # the one top-up
+        send_request = patched_mech.send_request
+
+        async def topped_up(**kwargs: t.Any) -> dict:
+            guard.check_transaction("testchain", SAFE, 0, deposit)  # its 402 top-up
+            return await send_request(**kwargs)
+
+        monkeypatch.setattr(patched_mech, "send_request", topped_up)
+        plan_b = service._prepare(  # pylint: disable=protected-access
+            "tool",
+            chain="testchain",
+            legacy_on_chain=False,
+            priority_mech=OTHER,
+            auto_deposit=True,
+            max_payment=None,
+            request_context=None,
+            top_up_budget=None,
+        )
+        service.request(
+            "a", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        service._dispatch(  # pylint: disable=protected-access
+            plan_b, "b", timeout=1, request_id=None
+        )
+        assert [call["prompts"] for call in patched_mech.calls] == [("a",), ("b",)]
+        assert not guard._deposit_allowances  # pylint: disable=protected-access
+
+    @pytest.mark.parametrize(
+        "case", ["price", "id-mismatch", "map-nonces", "rejected", "lost", "sent"]
+    )
+    def test_a_request_leaves_no_allowance_once_it_ends(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        case: str,
+    ) -> None:
+        """Every exit of the send withdraws the top-up armed for it.
+
+        mech-client's price cap (MechPriceExceeded), its id check
+        (RequestIdMismatch), a failed mapNonces read (MechNotSent), the mech's
+        refusal (NonceRefused), a lost answer (MechAnswerUnknown) and a request
+        sent with no 402: none may leave an allowance behind.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        service, guard = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        if case == "price":
+            patched_mech.info = native_mech_info(10**18)  # above the default budget
+        if case == "id-mismatch":
+            patched_mech.contract.request_id_override = b"\xee" * 32
+        if case == "map-nonces":
+
+            def down(*_args: t.Any) -> int:
+                raise ConnectionError("no RPC")
+
+            monkeypatch.setattr(mech_module, "read_map_nonces", down)
+        if case == "rejected":
+            patched_mech.raises = OffchainRequestRejected(
+                "HTTP 402",
+                request_id="0x01",
+                nonce=5,
+                status=402,
+                reason="Payment Required",
+                unsent=[],
+            )
+        if case == "lost":
+            patched_mech.raises_after_signing = ConnectionError("POST timed out")
+        if case == "sent":
+            service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+        else:
+            expected = {"lost": MechAnswerUnknown, "rejected": MechRefused}.get(
+                case, MechNotSent
+            )
+            with pytest.raises(expected):
+                service.request(
+                    "q",
+                    "tool",
+                    chain="testchain",
+                    priority_mech=OTHER,
+                    top_up_budget=None,
+                )
+        deposit = exec_transaction_calldata(TRACKER, value=10**16)
         with pytest.raises(GuardError, match="do not allow the safe to call"):
             guard.check_transaction("testchain", SAFE, 0, deposit)
+
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_a_refused_top_up_after_the_402_keeps_the_posted_nonce_held(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        wrapped: bool,
+    ) -> None:
+        """The mech answered 402 and the signer refused the top-up: nothing was bought.
+
+        The request was posted, so its nonce stays held and the next request
+        takes the next one; Connect reports the mech's refusal, keeps no id
+        pending, and withdraws what it armed. mech-client's agent-mode
+        executor wraps the refusal in a bare Exception, which Connect unwraps.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        service, guard = self._restricted_mech_service(
+            account, app_config, activity, settings_store
+        )
+        refusal = SignerError("the operator's guardrail settings do not allow it")
+        patched_mech.raises_after_signing = (
+            _executor_wrapped(refusal) if wrapped else refusal
+        )
+        with pytest.raises(MechRefused, match="guardrail") as refused:
+            service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+        assert "nonce stays held" in str(refused.value)
+        assert "mech_request_rejected" in audit_kinds(app_config.store_path)
+        assert not service._pending  # pylint: disable=protected-access
+        deposit = exec_transaction_calldata(TRACKER, value=10**16)
+        with pytest.raises(GuardError, match="do not allow the safe to call"):
+            guard.check_transaction("testchain", SAFE, 0, deposit)
+        nonces = service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
+        ) as slot:
+            assert slot.nonce == patched_mech.contract.nonce + 1  # n stays held
+
+    @pytest.mark.parametrize("request_id", [None, "dep-1"])
+    def test_a_top_up_deposit_that_may_have_landed_is_spend_uncertain(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        request_id: str | None,
+    ) -> None:
+        """The 402 top-up's broadcast went unanswered: audited, never "not sent".
+
+        The request was posted, so its nonce stays held; the deposit may have
+        landed, so the error names its hash and makes no replay promise, and
+        a caller's request_id is held as spend-uncertain rather than freed for
+        a resend that could top up again.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        deposit = "0x" + "d0" * 32
+        patched_mech.raises_after_signing = _executor_wrapped(
+            SendUnknown(deposit, held=False)
+        )
+        with pytest.raises(MechDepositUnknown) as lost:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id=request_id,
+                top_up_budget=None,
+            )
+        assert deposit in str(lost.value)
+        assert "request_id" not in str(lost.value)
+        (audited,) = [
+            e
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_deposit_unconfirmed"
+        ]
+        assert audited["tx_hash"] == deposit
+        assert not mech_service._pending  # pylint: disable=protected-access
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
+        ) as slot:
+            assert slot.nonce == patched_mech.contract.nonce + 1  # the POST holds n
+            slot.answered("not_accepted", mech=OTHER, salt="", posted=False)
+        if request_id is None:
+            return
+        sent = len(patched_mech.calls)
+        patched_mech.raises_after_signing = None
+        with pytest.raises(MechError, match="cannot tell whether it was paid for"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id=request_id,
+                top_up_budget=None,
+            )
+        assert len(patched_mech.calls) == sent
 
     def test_auto_deposit_cap_matches_mech_client(self) -> None:
         """The armed cap multiplies by the exact bound mech-client enforces.
@@ -3324,9 +3920,7 @@ class TestMech:
         """
         assert _MAX_AUTO_DEPOSIT_RATIO == 10
 
-    def test_deposit_tracker_reads_mech_client_constants(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_deposit_tracker_reads_mech_client_constants(self) -> None:
         """(tracker, is_token) resolves per payment type and fails closed."""
         native, is_token = deposit_tracker("gnosis", PaymentType.NATIVE.value)
         assert native is not None
@@ -3339,11 +3933,8 @@ class TestMech:
         assert deposit_tracker("gnosis", PaymentType.USDC_TOKEN.value) == (None, False)
         # NVM subscription types are deliberately unsupported, like mech-client
         assert deposit_tracker("gnosis", PaymentType.NATIVE_NVM.value) == (None, False)
+        # a chain mech-client does not know fails closed
         assert deposit_tracker("testchain", PaymentType.NATIVE.value) == (None, False)
-        # broken constants fail closed; patched on connect.mech, the binding
-        # the function actually reads since the imports were hoisted
-        monkeypatch.setattr("connect.mech_allowances.CHAIN_NAME_TO_ID", None)
-        assert deposit_tracker("gnosis", PaymentType.NATIVE.value) == (None, False)
 
     def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
         self,
@@ -3355,9 +3946,11 @@ class TestMech:
         """Unrestricted mode passes auto_deposit through, and still audits.
 
         The audit record is written in every mode, but the allowance itself
-        is armed only while restricted — see _arm_auto_deposit for why.
+        is armed only while restricted — see auto_deposit_armed for why.
         """
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert patched_mech.calls[0]["auto_deposit"] is True
         assert "mech_offchain_digest" in audit_kinds(store_path)
         # nothing armed: no grant survives a flip back to restricted
@@ -3378,77 +3971,29 @@ class TestMech:
             "deposit_tracker",
             lambda chain, payment_type: (TRACKER, False),
         )
-        mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert "mech_deposit_allowance" in audit_kinds(store_path)
         assert not guard._deposit_allowances  # pylint: disable=protected-access
 
-    def test_register_offchain_digest_needs_a_safe(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
-    ) -> None:
-        """The requester of record is the safe; without one there is no digest.
-
-        Unreachable through request() — _service refuses safe-less chains
-        first — but the invariant must fail loudly, not silently, if the
-        call order ever changes.
-        """
-        # pylint: disable-next=protected-access
-        mech_service._config.chains["testchain"].safe_address = None
-        with pytest.raises(MechError, match="no service safe"):
-            # pylint: disable-next=protected-access
-            mech_service._allowances.register_offchain_digest(
-                t.cast(t.Any, patched_mech),
-                chain="testchain",
-                priced=PricedMech(
-                    mech=OTHER,
-                    service_id=42,
-                    rate=10**16,
-                    payment_type=NATIVE_PAYMENT_TYPE,
-                ),
-                prompt="q",
-                tool="t",
-                extra_attributes={"nonce": "s"},
-            )
-
-    def test_offchain_context_failure_is_a_mech_error(
+    def test_a_marketplace_contract_failure_is_not_sent(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A failing domain/nonce read refuses before any request is sent."""
+        """No marketplace contract, no mapNonces: refused before anything is sent."""
 
         def _boom() -> None:
             raise RuntimeError("rpc down")
 
-        monkeypatch.setattr(patched_mech, "_get_marketplace_contract", _boom)
-        with pytest.raises(MechError, match="could not derive the off-chain"):
-            mech_service.request("q", "tool", chain="testchain", priority_mech=OTHER)
+        monkeypatch.setattr(patched_mech, "marketplace_contract", _boom)
+        with pytest.raises(MechNotSent, match="could not read the marketplace"):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert not patched_mech.calls
-
-    def test_request_digest_matches_deployed_marketplace(self) -> None:
-        """Golden vector recorded from the deployed gnosis marketplace.
-
-        domainSeparator() and getRequestId(...) were called on
-        0x735FAAb1c4Ec41128c367AFb5c3baC73509f70bB (2026-07-23) with these
-        synthetic inputs; the local derivation must reproduce the contract's
-        answer byte for byte, or restricted-mode off-chain requests break.
-        """
-        digest = request_digest(
-            domain_separator=bytes.fromhex(
-                "58fbb2508b962bcf6e2708fdfc23222115504128df851ae75ef8c66f2e0bdade"
-            ),
-            marketplace=GNOSIS_MARKETPLACE,
-            mech="0x" + "11" * 20,
-            requester="0x" + "22" * 20,
-            data_hash=bytes.fromhex("33" * 32),
-            delivery_rate=7,
-            payment_type=bytes.fromhex("44" * 32),
-            nonce=9,
-        )
-        assert (
-            digest.hex()
-            == "512e9b1dd2d2d253ba226f6d47af046720b1d97a09ae71e4ecc3f640f33bf36b"
-        )
 
     def test_request_refuses_an_unreachable_offchain_mech(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3461,11 +4006,18 @@ class TestMech:
         """
         patched_mech.metadata = {"tools": ["prediction-online"]}
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert not patched_mech.calls
         # the same mech is fine on-chain, which is what the error recommends
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -3473,7 +4025,9 @@ class TestMech:
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """The pre-flight passes a healthy mech straight through to the flow."""
-        mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        mech_service.request(
+            "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
         assert patched_mech.calls[0]["use_offchain"] is True
 
     def test_unreadable_metadata_blocks_the_offchain_flow(
@@ -3482,7 +4036,9 @@ class TestMech:
         """A mech that never published metadata cannot be reached off-chain."""
         patched_mech.metadata = None
         with pytest.raises(MechError, match="metadata unreadable"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert not patched_mech.calls
 
     def test_chain_defaults_to_one_holding_a_safe(
@@ -3498,12 +4054,16 @@ class TestMech:
         # it here cannot leak. Widening their scope would break that.
         chains = mech_service._config.chains
         assert "gnosis" not in chains  # the preferred default is not configured
-        mech_service.request("q", "t", legacy_on_chain=True, priority_mech=OTHER)
+        mech_service.request(
+            "q", "t", legacy_on_chain=True, priority_mech=OTHER, top_up_budget=None
+        )
         assert patched_mech.calls  # resolved to testchain, the only funded chain
 
         chains["testchain"].safe_address = None
         with pytest.raises(MechError, match="no configured chain has a service safe"):
-            mech_service.request("q", "t", legacy_on_chain=True, priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", legacy_on_chain=True, priority_mech=OTHER, top_up_budget=None
+            )
 
     def test_listing_still_works_with_no_safe_anywhere(
         self, mech_service: MechService, monkeypatch: pytest.MonkeyPatch
@@ -3566,13 +4126,14 @@ class TestMech:
     ) -> None:
         """mech-client exceptions surface as structured MechError + audit entry."""
         patched_mech.raises = RuntimeError("subgraph down")
-        with pytest.raises(MechError, match="subgraph down"):
+        with pytest.raises(MechError, match="cause is in Connect's log"):
             mech_service.request(
                 "q",
                 "tool",
                 chain="testchain",
                 legacy_on_chain=True,
                 priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert "mech_request_failed" in audit_kinds(store_path)
 
@@ -3591,16 +4152,23 @@ class TestMech:
         attempted, and the rules must be distinguishable from each other.
         """
         # 1. price cap
-        patched_mech.mech_info = native_mech_info(10**18)
+        patched_mech.info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         # 2. mech unreachable off-chain
-        patched_mech.mech_info = native_mech_info(10**16)
+        patched_mech.info = native_mech_info(10**16)
         patched_mech.metadata = {"tools": ["prediction-online"]}
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
 
         blocked = [
             entry
@@ -3615,22 +4183,31 @@ class TestMech:
         assert not patched_mech.calls  # nothing was ever sent
 
     def test_price_cap_binds_the_offchain_flow_too(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+        self,
+        store_path: Path,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
     ) -> None:
-        """The cap is checked for the default flow, before any metadata read.
+        """max_payment goes to mech-client as max_price on the default flow too.
 
-        Ordering matters: an over-priced mech is disqualified on price alone,
-        so the pre-flight's network fetch is never reached.
+        Its cap refuses before any deposit, signature or POST, so the nonce is
+        free again and no digest was ever armed.
         """
-        patched_mech.mech_info = native_mech_info(10**18)
-        patched_mech.tool_manager = SimpleNamespace(
-            fetch_tools_metadata=lambda service_id: pytest.fail(
-                "priced out already; the metadata fetch should not be reached"
+        patched_mech.info = native_mech_info(10**18)
+        with pytest.raises(MechNotSent, match="max_payment"):
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
             )
-        )
-        with pytest.raises(MechError, match="max_payment"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+        (priced_out,) = patched_mech.priced_out
+        assert priced_out["use_offchain"] is True
+        assert priced_out["max_price"] == 10**17
         assert not patched_mech.calls
+        assert "mech_offchain_digest" not in audit_kinds(store_path)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
+        ) as slot:
+            assert slot.nonce == patched_mech.contract.nonce  # freed
 
     def test_request_passes_signer_errors_through(
         self,
@@ -3646,6 +4223,7 @@ class TestMech:
                 chain="testchain",
                 legacy_on_chain=True,
                 priority_mech=OTHER,
+                top_up_budget=None,
             )
 
     def test_tools_lists_mechs(
@@ -3715,6 +4293,7 @@ class TestMech:
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A subgraph failure surfaces as a structured MechError."""
         monkeypatch.setattr(
@@ -3722,8 +4301,9 @@ class TestMech:
             "query_mm_mechs_info",
             lambda chain: (_ for _ in ()).throw(RuntimeError("subgraph down")),
         )
-        with pytest.raises(MechError, match="subgraph down"):
+        with pytest.raises(MechError, match="cause is in Connect's log"):
             mech_service.tools(chain="testchain")
+        assert "could not list mechs for 'testchain'" in caplog.text
 
     def test_tools_for_one_mech(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3751,7 +4331,6 @@ class TestMech:
         }
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert patched_mech.report_calls == [(OTHER, patched_mech.metadata)]
-        assert patched_mech.report_muted == [True]
         assert not patched_mech.terms_calls
         assert info["valory_operated"] is True
         assert info["terms"] == VALORY_TERMS_NOTICE
@@ -3923,8 +4502,8 @@ class TestMech:
         the off-chain flow will go through with a known tool name.
         """
         patched_mech.tool_manager = SimpleNamespace(
-            fetch_tools_metadata=lambda service_id: (_ for _ in ()).throw(
-                TimeoutError("slow")
+            read_tools_metadata=lambda service_id: MetadataRead.failed(
+                "TimeoutError: slow"
             ),
             terms_report=patched_mech.tool_manager.terms_report,
             mech_report_or_terms=patched_mech.tool_manager.mech_report_or_terms,
@@ -3937,9 +4516,6 @@ class TestMech:
         # a transient timeout is permanent
         assert "TimeoutError: slow" in info["offchain_note"]
         assert "may be transient" in info["offchain_note"]
-        # an unreadable fetch may clear on its own, so paying for gas is the
-        # second move, not the first
-        assert "retry before paying" in info["offchain_note"]
 
     def test_the_two_blockers_advise_differently(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3956,24 +4532,22 @@ class TestMech:
 
         patched_mech.metadata = None  # unreadable
         unreadable = mech_service.tools(chain="testchain", priority_mech=OTHER)
-        assert "retry before paying" in unreadable["offchain_note"]
+        assert "may be transient" in unreadable["offchain_note"]
 
     def test_unreadable_metadata_verdict_never_claims_permanence(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
-        """A miss with no cause must not be reported as a permanent one.
+        """An unreadable document must not be reported as a permanent miss.
 
-        mech-client swallows the common transport failures and returns a bare
-        None, so nothing here knows whether the mech never published metadata
-        or the gateway simply timed out. An earlier version asserted the
-        former outright, which sends an operator on-chain for good over what
-        may be a blip.
+        Its cause (only an exception type, as mech-client names it) cannot
+        tell a mech that never published metadata from a gateway that timed
+        out; asserting the former sends an operator on-chain over a blip.
         """
         patched_mech.metadata = None
         note = mech_service.tools(chain="testchain", priority_mech=OTHER)[
             "offchain_note"
         ]
-        assert "no cause reported" in note  # stands in for the absent cause
+        assert "TimeoutError" in note  # the cause travels with the verdict
         # hedged, not asserted: "may be" is what keeps this honest
         assert "may be transient or never published" in note
 
@@ -4048,7 +4622,9 @@ class TestMech:
         info = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert info["offchain_capable"] is False
         with pytest.raises(MechError, match="cannot serve off-chain requests"):
-            mech_service.request("q", "t", chain="testchain", priority_mech=OTHER)
+            mech_service.request(
+                "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
         assert not patched_mech.calls
 
     def test_tools_report_a_mech_that_published_no_endpoint(
@@ -4093,10 +4669,15 @@ class TestMech:
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """A mech pricing above max_payment is refused before any work."""
-        patched_mech.mech_info = native_mech_info(10**18)
+        patched_mech.info = native_mech_info(10**18)
         with pytest.raises(MechError, match="max_payment"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert not patched_mech.calls
         # an explicitly raised cap accepts the same price
@@ -4107,6 +4688,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
             max_payment=10**19,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -4129,14 +4711,24 @@ class TestMech:
     ) -> None:
         """0.1 of the asset, pinned per type: a dropped key must fail here."""
         assert set(mech_budget.DEFAULT_MAX_PAYMENT) == set(PaymentType)
-        patched_mech.mech_info = (kind, 42, budget + 1)
+        patched_mech.info = (kind, 42, budget + 1)
         with pytest.raises(MechError, match=f"above max_payment={budget}"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
-        patched_mech.mech_info = (kind, 42, budget)
+        patched_mech.info = (kind, 42, budget)
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -4169,7 +4761,7 @@ class TestMech:
         self, kind: PaymentType, chain: str, token: t.Optional[str]
     ) -> None:
         """A known chain without the token and an unknown chain both say None."""
-        assert mech_budget.payment_token(kind, chain) == token
+        assert mech_budget.payment_report(kind, chain)["payment_token"] == token
 
     def test_the_report_keeps_its_keys_when_there_is_no_default(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4185,14 +4777,24 @@ class TestMech:
     ) -> None:
         """0.1 of a 6-decimal token is 10**5, not the native 10**17."""
         usdc = PaymentType.USDC_TOKEN
-        patched_mech.mech_info = (usdc, 42, 10**5 + 1)
+        patched_mech.info = (usdc, 42, 10**5 + 1)
         with pytest.raises(MechError, match="above max_payment=100000"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
-        patched_mech.mech_info = (usdc, 42, 10**5)
+        patched_mech.info = (usdc, 42, 10**5)
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -4206,7 +4808,12 @@ class TestMech:
         monkeypatch.delitem(mech_budget.DEFAULT_MAX_PAYMENT, PaymentType.NATIVE)
         with pytest.raises(MechError, match="no default budget"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert not patched_mech.calls
         mech_service.request(
@@ -4216,6 +4823,7 @@ class TestMech:
             legacy_on_chain=True,
             priority_mech=OTHER,
             max_payment=10**17,
+            top_up_budget=None,
         )
         assert len(patched_mech.calls) == 1
 
@@ -4227,7 +4835,7 @@ class TestMech:
         mech_service._config.chains["robinhood"] = ChainConfig(
             rpc_url="http://127.0.0.1:9", safe_address=SAFE
         )
-        patched_mech.mech_info = (
+        patched_mech.info = (
             PaymentType.USDC_TOKEN,
             1,
             10000,
@@ -4238,62 +4846,6 @@ class TestMech:
         assert info["default_max_payment"] == "100000"
         unknown_chain = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert unknown_chain["payment_token"] is None
-
-    @pytest.mark.parametrize("before", [None, "http://another-chain"])
-    def test_listing_never_touches_the_rpc_variable(
-        self,
-        before: t.Optional[str],
-        mech_service: MechService,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Only a request's own flow may move it; a listing merely reads it."""
-        if before is None:
-            monkeypatch.delenv("MECHX_CHAIN_RPC", raising=False)
-        else:
-            monkeypatch.setenv("MECHX_CHAIN_RPC", before)
-        seen: list[t.Optional[str]] = []
-
-        def _query(chain: str) -> list:
-            """Record what mech-client would read."""
-            seen.append(mech_module.os.environ.get("MECHX_CHAIN_RPC"))
-            return []
-
-        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
-        mech_service.tools(chain="testchain")
-        assert seen == [before]
-        assert mech_module.os.environ.get("MECHX_CHAIN_RPC") == before
-
-    def test_the_mismatch_warning_is_dropped_only_while_listing(
-        self,
-        mech_service: MechService,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A stale RPC during a listing is noise; during construction it is a fault."""
-        warner = logging.getLogger(
-            "mech_client.mech_client.infrastructure.config.chain_config"
-        )
-        # mech-client turns propagation off on its root logger at import, so
-        # the records reach caplog only if an earlier test ran main(). Hand
-        # them to caplog here, once, whatever ran before.
-        monkeypatch.setattr(warner, "handlers", [caplog.handler])
-        monkeypatch.setattr(warner, "propagate", False)
-
-        def _query(chain: str) -> list:
-            """Warn the way mech-client does when the variable names another chain."""
-            warner.warning("MECHX_CHAIN_RPC mismatch detected!\n  during listing")
-            warner.warning("an unrelated warning during listing")
-            return []
-
-        monkeypatch.setattr(mech_module, "query_mm_mechs_info", _query)
-        with caplog.at_level(logging.WARNING, logger=warner.name):
-            mech_service.tools(chain="testchain")
-            warner.warning("MECHX_CHAIN_RPC mismatch detected!\n  outside listing")
-        messages = [r.getMessage() for r in caplog.records if r.name == warner.name]
-        assert messages == [
-            "an unrelated warning during listing",
-            "MECHX_CHAIN_RPC mismatch detected!\n  outside listing",
-        ]
 
     def test_a_slow_listing_holds_up_no_other_mech_work(
         self,
@@ -4308,7 +4860,7 @@ class TestMech:
         """
         patched_mech.result = {
             "tx_hash": "0x" + "11" * 32,
-            "request_ids": ["0xAB"],
+            "request_ids": ["ab"],
             "deliveries": {},
             "receipt": AttributeDict({"blockNumber": 4321}),
         }
@@ -4345,6 +4897,7 @@ class TestMech:
                         chain="testchain",
                         legacy_on_chain=True,
                         priority_mech=OTHER,
+                        top_up_budget=None,
                     )
                     outcome["polled"] = mech_service.result("ab")
                 except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -4362,29 +4915,25 @@ class TestMech:
             release.set()
             listing.join(10)
 
-    def test_a_request_points_mech_client_at_its_own_chain(
+    def test_each_chain_s_service_talks_to_its_own_rpc(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """An auto-deposit rebuilds a mech-client service mid-send and rereads it."""
-        seen: list[str] = []
-        original = patched_mech.send_request
-
-        async def _send(**kwargs: object) -> dict:
-            """Record the RPC visible while the request is in flight."""
-            seen.append(mech_module.os.environ["MECHX_CHAIN_RPC"])
-            return await original(**kwargs)
-
-        monkeypatch.setattr(patched_mech, "send_request", _send)
-        mech_service._service("testchain")  # pylint: disable=protected-access
-        monkeypatch.setenv("MECHX_CHAIN_RPC", "http://a-chain-listed-since")
+        """rpc_url per service; the process-global MECHX_CHAIN_RPC is never set."""
+        monkeypatch.delenv("MECHX_CHAIN_RPC", raising=False)
         mech_service.request(
-            "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
         )
         # pylint: disable=protected-access
-        assert seen == [mech_service._config.chain("testchain").rpc_url]
+        assert patched_mech.rpc_url == mech_service._config.chain("testchain").rpc_url
+        assert "MECHX_CHAIN_RPC" not in os.environ
 
     def test_request_wraps_pricing_failures(
         self,
@@ -4395,12 +4944,17 @@ class TestMech:
         """A failing price lookup surfaces as MechError, not a raw exception."""
         monkeypatch.setattr(
             patched_mech,
-            "_fetch_mech_info",
+            "mech_info",
             lambda mech: (_ for _ in ()).throw(RuntimeError("rpc down")),
         )
         with pytest.raises(MechError, match="could not price"):
             mech_service.request(
-                "q", "t", chain="testchain", legacy_on_chain=True, priority_mech=OTHER
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                priority_mech=OTHER,
+                top_up_budget=None,
             )
         assert not patched_mech.calls
 
@@ -4423,12 +4977,16 @@ class TestMech:
                 }
             ],
         )
-        mech_service.request("q", "t", chain="testchain", legacy_on_chain=True)
+        mech_service.request(
+            "q", "t", chain="testchain", legacy_on_chain=True, top_up_budget=None
+        )
         assert patched_mech.calls[0]["priority_mech"] == OTHER
         # an empty listing is a structured error, not an opaque one
         monkeypatch.setattr(mech_module, "query_mm_mechs_info", lambda chain: [])
         with pytest.raises(MechError, match="no live mechs"):
-            mech_service.request("q", "t", chain="testchain", legacy_on_chain=True)
+            mech_service.request(
+                "q", "t", chain="testchain", legacy_on_chain=True, top_up_budget=None
+            )
 
     def test_tools_listing_wraps_malformed_entries(
         self,
@@ -4444,27 +5002,1491 @@ class TestMech:
             mech_service.tools(chain="testchain")
 
     def test_request_timeout_is_clamped(
-        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A huge or non-positive timeout cannot pin the worker thread."""
+        waits: list[float] = []
+
+        def result(key: str, timeout: float) -> dict:
+            waits.append(timeout)
+            return {"delivered": False}
+
+        monkeypatch.setattr(mech_service, "result", result)
+        patched_mech.result = {**patched_mech.result, "deliveries": {}}
+        for asked, bound in ((10**9, MAX_DELIVERY_TIMEOUT), (-5, 1.0)):
+            waits.clear()
+            mech_service.request(
+                "q",
+                "t",
+                chain="testchain",
+                legacy_on_chain=True,
+                timeout=asked,
+                priority_mech=OTHER,
+                top_up_budget=None,
+            )
+            # the send waits only ACK_WAIT_SECONDS of the clamped timeout
+            assert patched_mech.calls[-1]["timeout"] == min(
+                bound, mech_module.ACK_WAIT_SECONDS
+            )
+            assert all(wait <= bound for wait in waits)
+            if bound > 1:  # with 1 s, a coarse clock may or may not leave a wait
+                assert waits
+
+    def test_an_on_chain_report_claims_no_off_chain_validity(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Only an off-chain request is reported as carrying no deadline."""
+        report = mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            legacy_on_chain=True,
+            top_up_budget=None,
+        )
+        assert "expires" not in report
+
+    def test_offchain_request_signs_the_nonce_connect_allocated(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """mech-client is handed the allocated nonce and the verifying hook (T3)."""
+        report = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        call = patched_mech.calls[-1]
+        assert call["nonces"] == [patched_mech.contract.nonce]
+        assert callable(call["on_request_id"])
+        assert report["expires"] is None  # an off-chain request has no deadline
+        second = mech_service.request(
+            "q2", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        # the first is accepted but unsettled, so the next nonce is taken
+        assert patched_mech.calls[-1]["nonces"] == [patched_mech.contract.nonce + 1]
+        assert second["expires"] is None
+
+    def test_the_delivery_wait_runs_off_the_nonce_lock(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under the lock the send waits only ACK_WAIT_SECONDS; the rest resumes after."""
+        patched_mech.result["deliveries"] = {}  # nothing yet when the POST returns
+        answers = [{}, {"ab": DeliveryResult(request_id="ab", data={"a": 1}, url=None)}]
+
+        async def watch(*_args: t.Any) -> dict:
+            return answers.pop(0)
+
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(watch))
+        still = mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=30,
+            top_up_budget=None,
+        )
+        assert patched_mech.calls[-1]["timeout"] == mech_module.ACK_WAIT_SECONDS
+        assert still["pending_request_ids"] == ["ab"]  # the resumed watch saw none
+        patched_mech.contract.nonce += 1
+        done = mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=30,
+            top_up_budget=None,
+        )
+        assert done["delivery_results"] == {"ab": {"a": 1}}
+        assert "pending_request_ids" not in done
+        patched_mech.contract.nonce += 1
+        short = mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=0.5,
+            top_up_budget=None,
+        )
+        assert short["pending_request_ids"] == ["ab"]  # no time left to resume
+
+    def test_a_chat_tool_reports_the_completion_and_usage(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Messages JSON in; completion text plus usage out (the shared contract)."""
+        patched_mech.result["deliveries"] = {
+            "ab": DeliveryResult(
+                request_id="ab",
+                data={
+                    "result": json.dumps(
+                        {
+                            "content": "Hello",
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+                        }
+                    )
+                },
+                url=None,
+            )
+        }
+        report = mech_service.request(
+            json.dumps([{"role": "user", "content": "hi"}]),
+            "chat",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
+        )
+        assert report["completion"] == "Hello"
+        assert report["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
+
+    def test_a_rejected_request_names_its_rule(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """The mech's answer becomes a refusal naming the nonce rule.
+
+        It bought nothing, so the caller's request_id is free to send again.
+        """
+        patched_mech.raises = OffchainRequestRejected(
+            "HTTP 402",
+            request_id="0x01",
+            nonce=5,
+            status=402,
+            reason="Payment Required",
+            unsent=[],
+        )
+        with pytest.raises(MechRefused, match="rule 'mech-request-rejected'"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
+            )
+        (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert refusal["rule"] == "mech-request-rejected"
+        assert "mech_deposit" not in audit_kinds(store_path)  # nothing was deposited
+        patched_mech.raises = None
+        report = mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            request_id="r1",
+            top_up_budget=None,
+        )
+        assert report.get("replayed") is None
+
+    def test_a_deposit_before_a_second_402_is_audited(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """The top-up landed but the mech refused anyway: the deposit is on record."""
+        patched_mech.raises = OffchainRequestRejected(
+            "HTTP 402",
+            request_id="0x01",
+            nonce=5,
+            status=402,
+            reason="Payment Required",
+            unsent=[],
+            deposited=7,
+        )
+        with pytest.raises(MechRefused, match="rule 'mech-request-rejected'"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
+            )
+        (deposit,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_deposit"
+        ]
+        assert deposit["amount"] == "7"
+        assert deposit["chain"] == "testchain"
+        assert deposit["request_id"] == "r1"
+
+    def test_a_top_up_above_max_payment_is_refused_before_any_deposit(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One request deposits at most its max_payment, within mech-client's ratio.
+
+        The mech asks for more than max_payment (yet within 10x its price):
+        nothing is deposited, the audit shows no deposit, and the mech's
+        refusal names the bound.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        patched_mech.top_up = 6 * 10**16  # the mech's price is 10**16
+        with pytest.raises(MechRefused, match="above the 50000000000000000"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=5 * 10**16,
+                top_up_budget=None,
+            )
+        assert not fake_w3.eth.sent
+        kinds = audit_kinds(store_path)
+        assert "transaction" not in kinds
+        assert "mech_deposit" not in kinds
+        (allowance,) = [
+            e
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_deposit_allowance"
+        ]
+        assert allowance["amount_cap"] == str(5 * 10**16)
+        (refused,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_deposit_refused"
+        ]
+        assert refused["amount"] == str(6 * 10**16)
+        patched_mech.top_up = 5 * 10**16  # at the bound: deposited
         mech_service.request(
             "q",
-            "t",
+            "tool",
             chain="testchain",
-            legacy_on_chain=True,
-            timeout=10**9,
             priority_mech=OTHER,
+            max_payment=5 * 10**16,
+            top_up_budget=None,
         )
-        assert patched_mech.calls[-1]["timeout"] == MAX_DELIVERY_TIMEOUT
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_a_top_up_stays_within_mech_client_s_ratio_of_the_price_under_a_larger_max_payment(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A max_payment 100x the price arms a cap of only the ratio times the price.
+
+        The mech asks for more than that ratio (yet within max_payment):
+        nothing is deposited, and the refusal names the ratio's bound.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        ratio_cap = _MAX_AUTO_DEPOSIT_RATIO * 10**16  # the mech's price is 10**16
+        patched_mech.top_up = ratio_cap + 1
+        with pytest.raises(MechRefused, match=f"above the {ratio_cap} "):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=10**18,
+                top_up_budget=None,
+            )
+        assert not fake_w3.eth.sent
+        (allowance,) = [
+            e
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_deposit_allowance"
+        ]
+        assert allowance["amount_cap"] == str(ratio_cap)
+        assert "mech_deposit" not in audit_kinds(store_path)
+
+    def test_only_the_safe_s_call_to_the_tracker_is_held_as_a_top_up(
+        self,
+        mech_service: MechService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every other transaction the flow sends passes the top-up's bound untouched.
+
+        A token's top-up is its deposit(uint256) amount; an approve of the
+        token, a call that is not the safe's, and bytes that do not decode
+        are not top-ups (the guard judges those).
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, True),
+        )
+        allowances = mech_service._allowances  # pylint: disable=protected-access
+        priced = PricedMech(OTHER, 42, 10**16, NATIVE_PAYMENT_TYPE)
+        deposit = bytes.fromhex(DEPOSIT_SELECTOR) + abi_encode(["uint256"], [7])
+        with allowances.auto_deposit_armed(
+            "testchain", priced, auto_deposit=True, max_payment=6, budget=None
+        ):
+            for to, data in (
+                (OTHER, exec_transaction_calldata(TRACKER, data=deposit)),
+                (SAFE, "0x"),
+                (SAFE, "0x" + EXEC_TRANSACTION_SELECTOR + "00"),
+                (
+                    SAFE,
+                    exec_transaction_calldata(
+                        PAYMENT_TOKEN, data=approve_data(TRACKER)
+                    ),
+                ),
+            ):
+                allowances.check_top_up("testchain", to, data)
+            with pytest.raises(SignerError, match="the top-up of 7 is above the 6"):
+                allowances.check_top_up(
+                    "testchain", SAFE, exec_transaction_calldata(TRACKER, data=deposit)
+                )
+        # disarmed once the send ends: nothing is held as a top-up
+        allowances.check_top_up(
+            "testchain", SAFE, exec_transaction_calldata(TRACKER, data=deposit)
+        )
+
+    def test_prices_and_top_ups_stay_within_the_mech_session_cap(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A session's mech payments, request prices and top-ups together, stay capped.
+
+        Each request draws its max_payment as it is authorized, and its 402
+        top-up as it is sent: the top-up that would pass the session cap is
+        refused, naming it, before anything is deposited.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+        grants = grant_store("root")
+        token = grants.mint(
+            "root",
+            auth_module.TokenGrant(
+                scopes=("mech",),
+                max_mech_payment_per_session=9 * 10**16,
+                expires_at=TOKEN_EXPIRES_AT,
+            ),
+        )
+
+        def budget(amount: int) -> str | None:
+            try:
+                grants.draw_mech_top_up(token, amount)
+            except auth_module.GrantRefused as e:
+                return e.message
+            return None
+
+        patched_mech.top_up = 2 * 10**16
+        price = 3 * 10**16
+
+        def request() -> dict:
+            # as the mount does
+            grants.authorize(token, "mech_request", {"max_payment": price})
+            return mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=price,
+                top_up_budget=budget,
+            )
+
+        request()  # 3 drawn for the price, 2 for the top-up: 5 of 9
+        with pytest.raises(MechRefused, match="rule 'token-mech-session-cap'") as e:
+            request()  # 8 for the price, and the top-up would make it 10
+        assert "request prices and top-ups together" in str(e.value)
+        assert len(fake_w3.eth.sent) == 1  # the first top-up only
+
+    def test_a_failed_top_up_after_the_post_keeps_the_nonce_held(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """mech-client's top-up failed after the POST: refused, its nonce held."""
+        patched_mech.raises = OffchainTopUpFailed(
+            "deposit reverted", request_id="0x01", nonce=5, unsent=[]
+        )
+        with pytest.raises(MechRefused, match="auto top-up for nonce 5 failed"):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+        (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert refusal["rule"] == "mech-request-rejected"
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+            assert slot.nonce == 6  # held until it settles
+
+    @pytest.mark.parametrize(
+        ("status", "reason"),
+        [(502, "Bad Gateway"), (401, "nonce already used")],  # a reworded 401 too
+    )
+    def test_a_lost_answer_is_possibly_paid_not_a_refusal(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        status: int,
+        reason: str,
+    ) -> None:
+        """A 5xx or an unrecognised 401: the mech may hold it, so the id is not freed."""
+        patched_mech.raises = OffchainRequestRejected(
+            f"HTTP {status}",
+            request_id="0x01",
+            nonce=5,
+            status=status,
+            reason=reason,
+            unsent=[],
+        )
+        with pytest.raises(MechError, match="rule 'mech-answer-unknown'") as raised:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r9",
+                top_up_budget=None,
+            )
+        assert not isinstance(raised.value, MechNotSent)
+        kinds = audit_kinds(store_path)
+        assert "mech_request_failed" in kinds
+        assert "refusal" not in kinds
+        # the id the pre-sign hook would have checked, so mech_result can
+        # collect a delivery the safe may have paid for
+        (held,) = t.cast(MechAnswerUnknown, raised.value).pending_request_ids
+        assert held in str(raised.value)
+        (failed,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request_failed"
+        ]
+        assert failed["pending_request_ids"] == [held]
+        patched_mech.raises = None
+        with pytest.raises(MechError, match=f"{held}.*cannot tell whether it was paid"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r9",
+                top_up_budget=None,
+            )
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            assert pending.offchain
+            assert pending.mech == OTHER
+            return {key: DeliveryResult(key, {"answer": "42"}, None)}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        assert mech_service.result(held, timeout=1)["result"] == {"answer": "42"}
+
+    def test_a_lost_answer_after_a_top_up_records_its_deposit(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """A 5xx after the top-up landed: the deposit is on record, the id pending."""
+        patched_mech.raises = OffchainRequestRejected(
+            "HTTP 502",
+            request_id="0x01",
+            nonce=5,
+            status=502,
+            reason="Bad Gateway",
+            unsent=[],
+            deposited=7,
+        )
+        with pytest.raises(MechAnswerUnknown) as raised:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r3",
+                top_up_budget=None,
+            )
+        assert raised.value.deposited == 7
+        (deposit,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_deposit"
+        ]
+        assert (deposit["amount"], deposit["request_id"]) == ("7", "r3")
+
+    def test_a_transport_error_after_signing_keeps_the_id_pending(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Signed, then the connection dropped: the mech may hold it, so its id waits."""
+        patched_mech.raises_after_signing = ConnectionError("connection reset")
+        with pytest.raises(
+            MechAnswerUnknown, match="cause is in Connect's log"
+        ) as raised:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r7",
+                top_up_budget=None,
+            )
+        (held,) = raised.value.pending_request_ids
+        (failed,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request_failed"
+        ]
+        assert failed["pending_request_ids"] == [held]
+        assert "refusal" not in audit_kinds(store_path)
+        signed = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_offchain_digest"
+        ]
+        assert signed[-1]["request_id"].removeprefix("0x") == held  # the armed id
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            return {key: DeliveryResult(key, {"answer": "42"}, None)}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        assert mech_service.result(held, timeout=1)["result"] == {"answer": "42"}
+
+    @pytest.fixture(name="operator")
+    def operator_fixture(  # pylint: disable=too-many-arguments
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        keystore_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> t.Iterator[TestClient]:
+        """Return the operator's client, with the keystore at cwd as in production."""
+        monkeypatch.chdir(keystore_dir)
+        with TestClient(
+            make_app(test_signer, app_config, activity, token="tok"),  # nosec B106
+            base_url="http://127.0.0.1:8716",
+        ) as client:
+            yield client
+
+    @staticmethod
+    def _stall(mech_service: MechService, for_seconds: float) -> None:
+        """Hold one accepted slot, then stall the queue `for_seconds` ago."""
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+            # another signer took it
+            slot.answered("taken", mech=OTHER, salt="", posted=True)
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        queue.stalled_at = time.time() - for_seconds
+
+    def test_hard_cancel_needs_the_password_never_a_token(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+    ) -> None:
+        """It pays a mech from the safe: the session's bearer token proves nothing."""
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        sent = len(patched_mech.calls)
+        bearer = {"Authorization": "Bearer tok"}
+        for body, reason in (
+            ({"chain": "testchain"}, "missing password"),
+            ({"chain": "testchain", "password": "wrong"}, "bad password"),  # nosec B105
+        ):
+            refused = operator.post(
+                "/mech-queue/hard-cancel", json=body, headers=bearer
+            )
+            assert refused.status_code == 401
+            failed = [
+                e for e in audit_entries(store_path) if e["kind"] == "auth_failed"
+            ]
+            assert (failed[-1]["reason"], failed[-1]["path"]) == (
+                reason,
+                "/mech-queue/hard-cancel",
+            )
+        assert len(patched_mech.calls) == sent  # nothing was sent
+        assert (
+            operator.post(
+                "/mech-queue/hard-cancel",
+                json={"chain": "testchain", "password": TEST_PASSWORD, "mech": OTHER},
+            ).status_code
+            == 422
+        )  # strict: only {chain, password}
+
+    def test_hard_cancel_waits_for_the_stall_to_be_old_enough(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+    ) -> None:
+        """Stalled, but not for MECH_HARD_CANCEL_AFTER: refused by rule, nothing sent."""
+        self._stall(mech_service, app_config.mech_hard_cancel_after - 60)
+        sent = len(patched_mech.calls)
+        refused = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert refused.status_code == 409
+        assert "mech-queue-not-stalled" in refused.json()["detail"]
+        assert len(patched_mech.calls) == sent
+        (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert refusal["rule"] == "mech-queue-not-stalled"
+        assert operator.get("/mech-queue").json()["testchain"] == {
+            "stalled": True,
+            "stalled_since": pytest.approx(
+                time.time() - app_config.mech_hard_cancel_after + 60, abs=30
+            ),
+            "hard_cancel_available": False,
+        }
+
+    def test_hard_cancel_sends_one_on_chain_request_to_the_stuck_mech(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Once available, the reports say so; the operator's confirmation sends one."""
+
+        async def no_delivery(*_args: t.Any) -> dict:
+            return {}
+
+        monkeypatch.setattr(
+            mech_module.MechService, "_watch", staticmethod(no_delivery)
+        )
+        patched_mech.result["deliveries"] = {}  # the first request stays pending
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        available = mech_queue_module.HARD_CANCEL_AVAILABLE
+        assert mech_service.result("ab", timeout=1)["hard_cancel"] == available
+        assert operator.get("/mech-queue").json()["testchain"]["hard_cancel_available"]
+        sent = len(patched_mech.calls)
+        done = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert done.status_code == 200
+        assert done.json() == {
+            "tx_hash": patched_mech.result["tx_hash"],
+            "nonce": 5,
+            "mech": Web3.to_checksum_address(OTHER),
+            "paid": str(10**16),
+        }
+        (call,) = patched_mech.calls[sent:]  # exactly one request
+        assert call["use_offchain"] is False
+        assert call["priority_mech"] == Web3.to_checksum_address(OTHER)
+        assert call["max_price"] == 10**17  # the mech's default max_payment
+        assert call["tools"] == ("prediction-online",)
+        (audited,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_hard_cancel"
+        ]
+        assert audited["nonce"] == 5
+        # the stall clock restarts: a second cancel needs its own window
+        again = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert again.status_code == 409
+
+    def test_a_hard_cancel_after_shutdown_is_unavailable_not_a_conflict(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+    ) -> None:
+        """A closed allocator refuses as mech-queue-closed: 503, nothing sent."""
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        mech_service.queue.close()
+        sent = len(patched_mech.calls)
+        refused = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert refused.status_code == 503
+        assert "rule 'mech-queue-closed'" in refused.json()["detail"]
+        assert len(patched_mech.calls) == sent
+        (refusal,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert refusal["rule"] == "mech-queue-closed"
+
+    def test_a_request_after_shutdown_is_refused_and_arms_nothing(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        guard: Guard,
+    ) -> None:
+        """mech-queue-closed is a refusal before the POST: nothing sent or armed."""
+        mech_service.queue.close()
+        with pytest.raises(MechNotSent, match="rule 'mech-queue-closed'"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
+            )
+        assert patched_mech.calls == []
+        assert not guard._allowed_digests  # pylint: disable=protected-access
+        assert not guard._deposit_allowances  # pylint: disable=protected-access
+
+    def test_a_hard_cancel_on_a_taken_nonce_goes_to_the_mech_that_holds_it(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """No slot of ours, only mech-client's taken marker: that mech is stuck."""
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, WHITELISTED, lambda: 5, timeout=1
+        ) as slot:
+            slot.answered("taken", mech=WHITELISTED, salt="", posted=True)
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
+        sent = len(patched_mech.calls)
+        done = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert done.status_code == 200
+        assert done.json()["mech"] == Web3.to_checksum_address(WHITELISTED)
+        (call,) = patched_mech.calls[sent:]
+        assert call["priority_mech"] == Web3.to_checksum_address(WHITELISTED)
+
+    @pytest.mark.parametrize(
+        ("case", "status", "rule", "says"),
+        [
+            ("unknown-chain", 400, "unknown-chain", "unknown chain"),
+            ("no-safe", 400, "no-safe", "no service safe"),
+            ("no-slot", 400, "hard-cancel-no-slot", "holds no off-chain slot"),
+            ("no-tool", 400, "hard-cancel-no-tool", "publishes no tool"),
+            ("unreadable", 400, "hard-cancel-no-tool", "unreadable: TimeoutError"),
+            ("over-budget", 400, "over-max-payment", "above its default max_payment"),
+            ("info-down", 502, None, "cause is in Connect's log"),
+        ],
+    )
+    def test_a_hard_cancel_refused_before_sending_keeps_the_window(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        case: str,
+        status: int,
+        rule: str | None,
+        says: str,
+    ) -> None:
+        """Nothing sent: Connect's own words, audited, and the stall clock untouched.
+
+        The allocator restarts the clock whenever its context exits, so a
+        refusal settled inside it would cost the operator a whole window.
+        """
+        app_config.chains["nosafe"] = ChainConfig(rpc_url="http://127.0.0.1:9")
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        if case == "no-slot":  # stalled, with no slot held at all
+            queue = nonces._queue(  # pylint: disable=protected-access
+                nonces.key("testchain", SAFE)
+            )
+            queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
+        else:
+            self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        since = nonces.stalled_since("testchain", SAFE)
+        if case == "no-tool":
+            patched_mech.metadata = {"tools": [None, {"name": "x"}, " "]}
+        if case == "unreadable":
+            monkeypatch.setattr(
+                patched_mech.tool_manager,
+                "read_tools_metadata",
+                lambda sid: MetadataRead.failed("TimeoutError: slow"),
+            )
+        if case == "over-budget":
+            patched_mech.info = native_mech_info(10**18)
+        if case == "info-down":
+            monkeypatch.setattr(
+                patched_mech,
+                "mech_info",
+                lambda mech: (_ for _ in ()).throw(
+                    RuntimeError("with url: /v2/SECRETKEY")
+                ),
+            )
+        sent = len(patched_mech.calls)
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={
+                "chain": {"unknown-chain": "atlantis", "no-safe": "nosafe"}.get(
+                    case, "testchain"
+                ),
+                "password": TEST_PASSWORD,
+            },
+        )
+        assert answer.status_code == status
+        assert says in answer.json()["detail"]
+        assert "SECRETKEY" not in answer.text
+        assert len(patched_mech.calls) == sent
+        assert nonces.stalled_since("testchain", SAFE) == since
+        if rule is not None:
+            (refusal,) = [
+                e for e in audit_entries(store_path) if e["kind"] == "refusal"
+            ]
+            assert refusal["rule"] == rule
+        else:
+            (failed,) = [
+                e
+                for e in audit_entries(store_path)
+                if e["kind"] == "mech_hard_cancel_failed"
+            ]
+            assert failed["error"] == "RuntimeError"
+        assert "nosafe" not in operator.get("/mech-queue").json()
+
+    def test_a_hard_cancel_on_a_chain_with_no_safe_names_its_rule(
+        self,
+        mech_service: MechService,
+        app_config: AppConfig,
+        patched_mech: FakeMarketplaceService,
+    ) -> None:
+        """Any caller of MechService.hard_cancel reads `no-safe`, never a bare MechError."""
+        app_config.chains["nosafe"] = ChainConfig(rpc_url="http://127.0.0.1:9")
+        with pytest.raises(mech_queue_module.HardCancelRefused) as refused:
+            mech_service.hard_cancel("NoSafe")
+        assert refused.value.rule == "no-safe"
+        assert str(refused.value) == "no service safe is configured for chain 'nosafe'"
+        assert not patched_mech.calls
+
+    @pytest.mark.parametrize(
+        "case",
+        ["guardrail", "guardrail-wrapped", "mech-cap", "rpc-down", "broadcast-failed"],
+    )
+    def test_a_hard_cancel_that_fails_sending_says_what_it_touched(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+        case: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A refusal names its rule; a failure that may have paid names nonce and mech.
+
+        Its log line carries the answer's redaction: no RPC key.
+        """
+        caplog.set_level("WARNING", logger="agent")
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        if case == "guardrail":
+            refused = SignerError("the operator's guardrail settings do not allow it")
+            refused.__cause__ = GuardError("not whitelisted")
+            patched_mech.raises = refused
+        if case == "guardrail-wrapped":  # as mech-client's agent-mode executor does
+            refused = SignerError("the operator's guardrail settings do not allow it")
+            refused.__cause__ = GuardError("not whitelisted")
+            wrapped = Exception(f"Failed to execute Safe transaction: {refused}")
+            wrapped.__cause__ = refused
+            patched_mech.raises = wrapped
+        if case == "mech-cap":
+            patched_mech.raises = MechPriceExceeded("over", price=2, max_price=1)
+        if case == "rpc-down":
+            patched_mech.raises = RuntimeError("https://rpc.example/v3/SECRETKEY down")
+        if case == "broadcast-failed":  # the signer's, but no guard refusal
+            patched_mech.raises = SignerError(SEND_FAILED)
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert "SECRETKEY" not in answer.text
+        assert "SECRETKEY" not in caplog.text
+        audited = audit_entries(store_path)
+        if case in ("rpc-down", "broadcast-failed"):
+            assert answer.status_code == 502
+            (failed,) = [e for e in audited if e["kind"] == "mech_hard_cancel_failed"]
+            assert (failed["nonce"], failed["mech"]) == (
+                5,
+                Web3.to_checksum_address(OTHER),
+            )
+            assert failed["error"] in ("RuntimeError", "SignerError")
+            return
+        assert answer.status_code == 400
+        rule = "over-max-payment" if case == "mech-cap" else "guardrail"
+        assert answer.json()["detail"].startswith(f"rule '{rule}'")
+        (refusal,) = [e for e in audited if e["kind"] == "refusal"]
+        assert refusal["rule"] == rule
+
+    def test_a_failed_hard_cancel_s_log_locates_the_code_that_failed(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A hard cancel that fails sending logs where it was raised, keyless."""
+        caplog.set_level("WARNING", logger="agent")
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        patched_mech.raises = RuntimeError("https://rpc.example/v3/SECRETKEY down")
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert answer.status_code == 502
+        (record,) = [
+            r
+            for r in caplog.records
+            if r.message.startswith("the hard cancel on testchain (nonce")
+        ]
+        assert "RuntimeError raised at:" in record.message
+        assert f'"{__file__}", line ' in record.message
+        assert "in send_request" in record.message
+        assert "SECRETKEY" not in record.message
+
+    @pytest.mark.parametrize(("rate", "status"), [(10**17, 200), (10**17 + 1, 400)])
+    def test_a_hard_cancel_pays_up_to_its_default_budget_and_no_more(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        rate: int,
+        status: int,
+    ) -> None:
+        """At the cap it pays, as mech-client's own `price > max_price` agrees; past it, refused."""
+        self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
+        patched_mech.info = native_mech_info(rate)
+        sent = len(patched_mech.calls)
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert answer.status_code == status
+        if status == 400:
+            assert answer.json()["detail"].startswith("rule 'over-max-payment'")
+            assert len(patched_mech.calls) == sent
+            return
+        (call,) = patched_mech.calls[sent:]
+        assert call["max_price"] == 10**17
+
+    def test_a_hard_cancel_ignores_a_slot_mapnonces_has_passed(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """Slot 4 settled but not yet synced, 6 held, mapNonces 5: 6's mech is paid."""
+        mech_b = Web3.to_checksum_address("0x" + "b2" * 20)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        for mech in (OTHER, OTHER, mech_b):  # slots 4, 5 and 6
+            with nonces.reserve("testchain", SAFE, OTHER, lambda: 4, timeout=1) as slot:
+                slot.answered("accepted", mech=mech, salt="", posted=True)
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        del queue.slots[5]
+        queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
+        sent = len(patched_mech.calls)
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["mech"] == mech_b
+        (call,) = patched_mech.calls[sent:]
+        assert call["priority_mech"] == mech_b
+
+    def test_a_hard_cancel_whose_stuck_slot_moved_sends_nothing(  # pylint: disable=too-many-arguments
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A mapNonces that moved past the slot it was prepared for: refused, nothing sent."""
+        mech_a = Web3.to_checksum_address("0x" + "a1" * 20)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        for mech in (OTHER, mech_a):  # slots 5 and 6
+            with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+                slot.answered("accepted", mech=mech, salt="", posted=True)
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
+        reads = iter([5, 6, 6])  # prepared at 5; settled to 6 by the time it holds
+        monkeypatch.setattr(
+            mech_queue_module, "read_map_nonces", lambda contract, safe: next(reads)
+        )
+        sent = len(patched_mech.calls)
+        answer = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert answer.status_code == 400
+        assert "hard-cancel-moved" in answer.json()["detail"]
+        assert len(patched_mech.calls) == sent
+
+    def test_a_hard_cancel_pays_the_lowest_held_slot_s_mech(
+        self,
+        operator: TestClient,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """Another signer took mapNonces; the safe's next held slot names the mech."""
+        mech_a = Web3.to_checksum_address("0x" + "a1" * 20)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        for mech in (mech_a, OTHER):  # slots 6 and 7; n = 5 is no slot of ours
+            with nonces.reserve(
+                "testchain", SAFE, mech_a, lambda: 6, timeout=1
+            ) as slot:
+                slot.answered("accepted", mech=mech, salt="", posted=True)
+        queue.stalled_at = time.time() - app_config.mech_hard_cancel_after - 1
+        done = operator.post(
+            "/mech-queue/hard-cancel",
+            json={"chain": "testchain", "password": TEST_PASSWORD},
+        )
+        assert done.status_code == 200
+        assert (done.json()["mech"], done.json()["nonce"]) == (mech_a, 5)
+        assert patched_mech.calls[-1]["priority_mech"] == mech_a
+
+    def test_a_stalled_queue_is_reported(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mech_request and mech_result both say mech_queue_stalled."""
+
+        async def no_delivery(*_args: t.Any) -> dict:
+            return {}
+
+        monkeypatch.setattr(
+            mech_module.MechService, "_watch", staticmethod(no_delivery)
+        )
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        patched_mech.result["deliveries"] = {}  # the answer is still pending
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+            # another signer took it
+            slot.answered("taken", mech=OTHER, salt="", posted=True)
+        assert nonces.stalled("testchain", SAFE)
+        assert mech_service.result("ab", timeout=1)["mech_queue_stalled"] is True
+        # the probe at mapNonces is refused outright, so the stall stands
+        patched_mech.raises = OffchainRequestRejected(
+            "HTTP 402",
+            request_id="0x01",
+            nonce=5,
+            status=402,
+            reason="Payment Required",
+            unsent=[],
+        )
+        with pytest.raises(MechError, match="mech_queue_stalled"):
+            mech_service.request(
+                "q2", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+
+    def test_an_on_chain_request_waits_for_held_offchain_slots(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An on-chain request would take mapNonces, which a held slot claims."""
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        monkeypatch.setattr(mech_nonces_module, "POLL_SECONDS", 0.01, raising=True)
+        with pytest.raises(MechError, match="rule 'mech-in-flight'"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                legacy_on_chain=True,
+                timeout=1,
+                top_up_budget=None,
+            )
+        patched_mech.contract.nonce += 1  # the off-chain one settled
         mech_service.request(
             "q",
-            "t",
+            "tool",
             chain="testchain",
-            legacy_on_chain=True,
-            timeout=-5,
             priority_mech=OTHER,
+            legacy_on_chain=True,
+            top_up_budget=None,
         )
-        assert patched_mech.calls[-1]["timeout"] == 1.0
+        assert "nonces" not in patched_mech.calls[-1]
+
+    def test_a_delivery_starts_its_slots_settle_clock(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """The allocator learns which held nonce was delivered, and when."""
+        patched_mech.result["nonces"] = [patched_mech.contract.nonce]
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        assert queue.slots[patched_mech.contract.nonce].delivered_at is not None
+        assert nonces.gap_retries == app_config.mech_gap_retries
+        # pylint: disable-next=protected-access
+        assert nonces._settle_timeout == app_config.mech_settle_timeout
+
+    @pytest.mark.parametrize(
+        ("request_ids", "deliveries", "delivered"),
+        [
+            (["ab"], {}, False),  # still pending: its clock waits for the timeout
+            (["ab"], {"ab": {"a": 1}}, True),
+        ],
+    )
+    def test_only_a_delivered_request_starts_its_settle_clock(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        request_ids: list,
+        deliveries: dict,
+        delivered: bool,
+    ) -> None:
+        """The allocator hears of a delivery only for the nonce that got one."""
+
+        async def nothing(*_args: t.Any) -> dict:
+            return {}
+
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(nothing))
+        nonce = patched_mech.contract.nonce
+        patched_mech.result = {
+            **patched_mech.result,
+            "request_ids": request_ids,
+            "nonces": [nonce],
+            "deliveries": {
+                key: DeliveryResult(request_id=key, data=data, url=None)
+                for key, data in deliveries.items()
+            },
+        }
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        queue = nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
+        assert (queue.slots[nonce].delivered_at is not None) is delivered
+
+    def test_a_plain_prompt_gets_no_chat_report(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Only a messages-list prompt is read as chat, whatever the delivery says."""
+        patched_mech.result["deliveries"] = {
+            "ab": DeliveryResult(request_id="ab", data={"content": "Hi"}, url=None)
+        }
+        report = mech_service.request(
+            "plain question",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
+        )
+        assert "completion" not in report
+
+    def test_a_chat_delivery_that_cannot_be_read_keeps_the_paid_payload(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Paid and delivered: a chat parse failure is reported, never raised."""
+
+        def broken(_data: t.Any) -> dict:
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(mech_module, "chat_report", broken)
+        report = mech_service.request(
+            json.dumps([{"role": "user", "content": "hi"}]),
+            "chat",
+            chain="testchain",
+            priority_mech=OTHER,
+            top_up_budget=None,
+        )
+        assert report["delivery_results"] == {"ab": {"answer": "42"}}
+        assert "maximum recursion" in report["chat_error"]
+
+    def test_a_failed_resumed_watch_keeps_the_paid_payload(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Paid for by now: a read error leaves the id pending, never loses it."""
+        patched_mech.result["deliveries"] = {}
+
+        def unreadable(key: str, timeout: float) -> dict:
+            raise MechError("the gateway timed out")
+
+        monkeypatch.setattr(mech_service, "result", unreadable)
+        report = mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            request_id="r1",
+            top_up_budget=None,
+        )
+        assert report["pending_request_ids"] == ["ab"]
+        assert report["watch_errors"] == {"ab": "the gateway timed out"}
+        assert report["tx_hash"] == patched_mech.result["tx_hash"]
+
+    @pytest.mark.parametrize("readable", [False, True])
+    def test_a_resumed_watch_reports_the_delivery_url(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        readable: bool,
+    ) -> None:
+        """A delivery collected after the nonce lock still names its url."""
+        patched_mech.result["deliveries"] = {}
+
+        async def _watch(
+            service: object, pending: PendingDelivery, key: str, timeout: float
+        ) -> dict:
+            data = {"answer": "42"} if readable else None
+            return {"ab": DeliveryResult("ab", data, "ipfs://later")}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        report = mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=30,
+            top_up_budget=None,
+        )
+        assert report["delivery_urls"] == {"ab": "ipfs://later"}
+        if readable:
+            assert report["delivery_results"] == {"ab": {"answer": "42"}}
+            assert "pending_request_ids" not in report
+        else:
+            assert report["pending_request_ids"] == ["ab"]
+
+    def test_a_refusal_before_sending_frees_the_request_id(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        store_path: Path,
+    ) -> None:
+        """Nothing reached the mech, so the same id may be sent again."""
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        monkeypatch.setattr(mech_nonces_module, "POLL_SECONDS", 0.01, raising=True)
+        on_chain: dict[str, t.Any] = {
+            "chain": "testchain",
+            "priority_mech": OTHER,
+            "legacy_on_chain": True,
+            "request_id": "r1",
+            "timeout": 1,
+        }
+        with pytest.raises(MechNotSent, match="rule 'mech-in-flight'"):
+            mech_service.request("q", "tool", **on_chain, top_up_budget=None)
+        assert "mech_request_uncertain" not in audit_kinds(store_path)
+        patched_mech.contract.nonce += 1  # the off-chain one settled
+        mech_service.request(
+            "q", "tool", **on_chain, top_up_budget=None
+        )  # same id, not refused
+
+    @pytest.mark.parametrize("legacy_on_chain", [True, False])
+    def test_every_mech_send_path_record_carries_the_message_s_redaction(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        legacy_on_chain: bool,
+    ) -> None:
+        """A library's failure naming a URL keeps its path out of every record.
+
+        The caller reads UNSAID; the audit record and the log line keep the
+        failure's class and its URL's host, and none of them the opaque path.
+        """
+        secret = "v3/" + "9f1c" * 16
+        patched_mech.raises = ConnectionError(
+            f"Max retries exceeded with url: https://rpc.example/{secret}"
+        )
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(MechError) as e:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                legacy_on_chain=legacy_on_chain,
+                top_up_budget=None,
+            )
+        assert UNSAID in str(e.value)
+        records = audit_entries(store_path)
+        kind = "mech_request_failed" if legacy_on_chain else "mech_request_not_sent"
+        assert kind in [r["kind"] for r in records]
+        assert secret not in json.dumps(records)
+        assert "ConnectionError: Max retries exceeded" in caplog.text
+        assert "https://rpc.example/..." in caplog.text
+        assert secret not in caplog.text
+
+    def test_an_unsaid_mech_failure_s_log_locates_the_code_that_failed(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A library failure the caller reads as UNSAID logs where it was raised."""
+        secret = "v3/" + "9f1c" * 16
+        patched_mech.raises = ConnectionError(f"https://rpc.example/{secret} down")
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(MechError):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+        (record,) = [r for r in caplog.records if r.message.startswith("mech request")]
+        assert "ConnectionError raised at:" in record.message
+        assert f'"{__file__}", line ' in record.message
+        assert "in send_request" in record.message
+        assert secret not in record.message
+
+    def test_a_failure_before_signing_frees_the_nonce(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An RPC error before mech-client's pre-sign hook: n was never sent."""
+        patched_mech.raises = ConnectionError("the RPC is down")
+        with pytest.raises(MechNotSent, match="cause is in Connect's log"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r2",
+                top_up_budget=None,
+            )
+        assert "mech_request_not_sent" in audit_kinds(store_path)
+        # the log says which request failed, so two concurrent ones differ
+        (logged,) = [
+            r
+            for r in caplog.records
+            if "ConnectionError: the RPC is down" in r.getMessage()
+        ]
+        assert f"mech request to {OTHER} on testchain (tool tool" in logged.getMessage()
+        patched_mech.raises = None
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            request_id="r2",
+            top_up_budget=None,
+        )
+        # the same nonce: the failed attempt held nothing
+        assert patched_mech.calls[-1]["nonces"] == [patched_mech.contract.nonce]
+
+    def test_a_marketplace_read_failure_is_not_sent(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A mapNonces or contract read that fails comes before any send."""
+
+        def down(*_args: t.Any) -> t.Any:
+            raise ConnectionError("no RPC")
+
+        monkeypatch.setattr(mech_module, "read_map_nonces", down)
+        for legacy_on_chain in (True, False):
+            with pytest.raises(
+                MechNotSent, match="marketplace nonce: mech-client failed"
+            ):
+                mech_service.request(
+                    "q",
+                    "tool",
+                    chain="testchain",
+                    priority_mech=OTHER,
+                    legacy_on_chain=legacy_on_chain,
+                    top_up_budget=None,
+                )
+        monkeypatch.setattr(patched_mech, "marketplace_contract", down)
+        with pytest.raises(MechNotSent, match="could not read the marketplace"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                legacy_on_chain=True,
+                top_up_budget=None,
+            )
+        assert patched_mech.calls == []
+
+    def test_an_on_chain_delivery_wait_runs_off_the_nonce_lock(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The on-chain send waits briefly under the lock; the watch resumes after."""
+        patched_mech.result["deliveries"] = {}
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        queue = nonces._queue(
+            nonces.key("testchain", SAFE)
+        )  # pylint: disable=protected-access
+        held: list[bool] = []
+
+        def watched(key: str, timeout: float) -> dict:
+            held.append(queue.lock.locked())
+            return {"delivered": False}
+
+        monkeypatch.setattr(mech_service, "result", watched)
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            legacy_on_chain=True,
+            timeout=30,
+            top_up_budget=None,
+        )
+        assert patched_mech.calls[-1]["timeout"] == mech_module.ACK_WAIT_SECONDS
+        assert held == [False]
 
 
 class TestSettingsEndpoints:
@@ -5144,7 +7166,9 @@ def _build_tools(  # pylint: disable=too-many-arguments
     test must monkeypatch the flag *before* build_mcp runs, which fixture
     ordering cannot express.
     """
-    from connect.server.mcp_tools import build_mcp
+    from connect.server.mcp_tools import (  # pylint: disable=import-outside-toplevel
+        build_mcp,
+    )
 
     mcp = build_mcp(
         test_signer,
@@ -5153,6 +7177,7 @@ def _build_tools(  # pylint: disable=too-many-arguments
         guard=guard,
         mech=mech_service,
         settings_store=settings_store,
+        grants=grant_store("workspace-token"),
     )
     manager = mcp._tool_manager  # pylint: disable=protected-access
     return {tool.name: tool.fn for tool in manager.list_tools()}
@@ -5225,11 +7250,11 @@ class TestMcpGuardrailTools:
         """via_safe decides which call is being asked about, so it must arrive."""
         calls: list[dict] = []
 
-        def fake_reason(chain: str, target: str, **kwargs: object) -> str | None:
+        def fake_check(chain: str, target: str, **kwargs: object) -> tuple:
             calls.append({"chain": chain, "target": target, **kwargs})
-            return None
+            return None, []
 
-        monkeypatch.setattr(test_signer, "refusal_reason", fake_reason)
+        monkeypatch.setattr(test_signer, "check", fake_check)
         assert await tools["preflight_transaction"](
             "testchain", OTHER, 5, "0xab", via_safe=False
         ) == {"allowed": True}
@@ -5239,6 +7264,8 @@ class TestMcpGuardrailTools:
             "value": 5,
             "data": "0xab",
             "via_safe": False,
+            # called in-process, with no token: held as capped (fail closed)
+            "intent": Capped(None),
         }
 
     async def test_preflight_tool_carries_the_refusal(
@@ -5249,7 +7276,7 @@ class TestMcpGuardrailTools:
     ) -> None:
         """A refusal must arrive verbatim: it is the whole answer."""
         monkeypatch.setattr(
-            test_signer, "refusal_reason", lambda *a, **k: "the guardrail said no"
+            test_signer, "check", lambda *a, **k: ("the guardrail said no", [])
         )
         assert await tools["preflight_transaction"]("testchain", OTHER) == {
             "allowed": False,
@@ -5361,3 +7388,183 @@ class TestMcpGuardrailTools:
         monkeypatch.setattr(mech_service, "result", fake_result)
         assert await tools["mech_result"]("ab", timeout=5) == {"delivered": True}
         assert calls[0] == {"request_id": "ab", "timeout": 5}
+
+
+MARKETPLACE = "0x" + "4d" * 20
+# a marketplace call no mech flow composed: request(...) with arbitrary words
+AGENT_COMPOSED = bytes.fromhex("12345678") + b"\x00" * 32
+
+
+@pytest.mark.parametrize("mode", [MODE_RESTRICTED, MODE_UNRESTRICTED])
+def test_the_marketplace_takes_a_safe_call_only_from_the_server_built_mech_flow(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    guard: Guard,
+    settings_store: SettingsStore,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Every agent-facing send path is refused at the marketplace, in every mode.
+
+    Whitelisted or not, the marketplace takes only what the mech flow
+    composes: the safe's call, an EOA execTransaction carrying it, an EOA
+    call to it and the dry run are refused, while the mech flow's own
+    request goes through on the same settings.
+    """
+    monkeypatch.setitem(MECH_MARKETPLACES, "testchain", frozenset({MARKETPLACE}))
+    settings_store.save(
+        Settings(
+            protected=Protected(mode=mode, whitelist={"testchain": (MARKETPLACE,)})
+        )
+    )
+    test_signer.set_guard(guard)
+    wrapped = exec_transaction_calldata(MARKETPLACE, data=AGENT_COMPOSED)
+    agent_sends = (
+        lambda: test_signer.send_via_safe(
+            "testchain", MARKETPLACE, data="0x" + AGENT_COMPOSED.hex(), intent={}
+        ),
+        lambda: test_signer.send("testchain", SAFE, data=wrapped, intent={}),
+        lambda: test_signer.send(
+            "testchain", MARKETPLACE, data="0x" + AGENT_COMPOSED.hex(), intent={}
+        ),
+    )
+    for agent_send in agent_sends:
+        with pytest.raises(SignerError, match="mech marketplace"):
+            agent_send()
+    reason = test_signer.refusal_reason(
+        "testchain", MARKETPLACE, data="0x" + AGENT_COMPOSED.hex()
+    )
+    assert reason is not None
+    assert "mech marketplace" in reason
+    assert not fake_w3.eth.sent
+    MechSigner(test_signer, "testchain", _admit_every_transaction).send_transaction(
+        {"to": SAFE, "data": wrapped}
+    )
+    assert len(fake_w3.eth.sent) == 1
+
+
+@pytest.mark.parametrize("mode", [MODE_RESTRICTED, MODE_UNRESTRICTED])
+def test_an_agent_call_to_the_marketplace_is_refused_when_mech_client_s_config_is_unreadable(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    guard: Guard,
+    settings_store: SettingsStore,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """The marketplace rule fails closed: mech-client's file is not what it reads."""
+    monkeypatch.setitem(MECH_MARKETPLACES, "testchain", frozenset({MARKETPLACE}))
+    monkeypatch.setattr(settings_module, "_mech_system_addresses", lambda: {})
+    settings_store.save(
+        Settings(
+            protected=Protected(mode=mode, whitelist={"testchain": (MARKETPLACE,)})
+        )
+    )
+    test_signer.set_guard(guard)
+    with pytest.raises(SignerError, match="mech marketplace"):
+        test_signer.send_via_safe(
+            "testchain", MARKETPLACE, data="0x" + AGENT_COMPOSED.hex(), intent={}
+        )
+    assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize("mode", [MODE_RESTRICTED, MODE_UNRESTRICTED])
+def test_a_marketplace_a_pin_moved_away_from_stays_refused_to_agent_calls(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    guard: Guard,
+    settings_store: SettingsStore,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """A persisted whitelist holding the retired address admits no agent call to it."""
+    retired = "0x" + "4e" * 20
+    monkeypatch.setitem(
+        MECH_MARKETPLACES, "testchain", frozenset({MARKETPLACE, retired})
+    )
+    settings_store.save(
+        Settings(protected=Protected(mode=mode, whitelist={"testchain": (retired,)}))
+    )
+    test_signer.set_guard(guard)
+    with pytest.raises(SignerError, match=f"mech marketplace {retired}"):
+        test_signer.send_via_safe(
+            "testchain", retired, data="0x" + AGENT_COMPOSED.hex(), intent={}
+        )
+    assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize(
+    "spelling", [str.lower, Web3.to_checksum_address, lambda a: "0X" + a[2:]]
+)
+def test_a_direct_call_to_the_marketplace_is_refused_however_its_address_is_spelled(
+    test_signer: Signer,
+    guard: Guard,
+    fake_w3: FakeW3,
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: t.Callable[[str], str],
+) -> None:
+    """The EOA's own call to the marketplace, checksummed or 0X-prefixed, is refused."""
+    monkeypatch.setitem(MECH_MARKETPLACES, "testchain", frozenset({MARKETPLACE}))
+    test_signer.set_guard(guard)
+    with pytest.raises(SignerError, match="mech marketplace"):
+        test_signer.send(
+            "testchain",
+            spelling(MARKETPLACE),
+            data="0x" + AGENT_COMPOSED.hex(),
+            intent={},
+        )
+    assert not fake_w3.eth.sent
+
+
+def test_every_marketplace_the_pinned_mech_client_names_is_refused_to_agent_calls() -> (
+    None
+):
+    """Connect's marketplace table holds each one mech-client configures.
+
+    A pin bump that moves a marketplace fails here until the new address is
+    added beside the one it replaces, which stays.
+    """
+    named = {
+        chain: address.lower()
+        for chain, address in chains_module._marketplaces().items()  # pylint: disable=protected-access
+        if address.lower() != ZERO_ADDRESS
+    }
+    connect_name = {v: k for k, v in chains_module.MECH_CLIENT_CHAIN_NAMES.items()}
+    assert named
+    for chain, address in named.items():
+        assert address in MECH_MARKETPLACES[connect_name.get(chain, chain)], chain
+    assert MECH_MARKETPLACES["gnosis"] == {GNOSIS_MARKETPLACE}
+
+
+@pytest.mark.parametrize("variable", ["MECHX_LEDGER_CHAIN_ID", "MECHX_GAS_LIMIT"])
+def test_a_tracker_table_mech_client_cannot_configure_is_unreadable_not_empty(
+    monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    """A malformed mech-client setting raises: it never reads as "none deployed"."""
+    monkeypatch.setenv(variable, "not-a-number")
+    with pytest.raises(ValueError, match="not-a-number"):
+        prepaid_balance_trackers("gnosis")
+    assert prepaid_balance_trackers("testchain") == {}  # still a chain it lacks
+
+
+def test_an_unreadable_tracker_table_refuses_mech_token_approvals_with_a_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The guard's approve targets fail closed, and log.txt says why."""
+    monkeypatch.setenv("MECHX_LEDGER_CHAIN_ID", "not-a-number")
+    with caplog.at_level(logging.WARNING):
+        assert token_approve_targets("polygon") == {}
+    assert "could not load mech token payment addresses" in caplog.text
+    assert "not-a-number" in caplog.text
+
+
+def test_the_prepaid_balance_trackers_are_mech_client_s_deposit_trackers() -> None:
+    """Each tracker a top-up pays, with its asset; none where it deploys none."""
+    gnosis = prepaid_balance_trackers("gnosis")
+    native = str(mech_balance_tracker("gnosis", PaymentType.NATIVE)).lower()
+    olas = str(mech_balance_tracker("gnosis", PaymentType.OLAS_TOKEN)).lower()
+    assert gnosis == {
+        native: "native",
+        olas: str(mech_payment_token(PaymentType.OLAS_TOKEN, "gnosis")).lower(),
+    }
+    assert prepaid_balance_trackers("testchain") == {}

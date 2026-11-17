@@ -35,14 +35,18 @@ from aea_ledger_ethereum import rpc_rotation
 from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mech_client import NonceAllocator
 from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 
 from connect import __main__ as main_module
 from connect import ocb
 from connect import settings as settings_module
 from connect import signer as signer_module
-from connect import wallet, workspace
+from connect import wallet
+from connect import workspace
+from connect import workspace as workspace_module
 from connect.activity import ActivityLog, MAX_LOG_BYTES
 from connect.config import (
     AppConfig,
@@ -58,12 +62,20 @@ from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
 from connect.run_goal import RunGoal
+from connect.server import receipts
 from connect.server.auth import AuthFailureLimiter, AuthMiddleware
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError, _IdempotencyCache
 
-from tests.conftest import FakeW3, TEST_PASSWORD, audit_entries, audit_kinds
+from tests.conftest import (
+    FakeW3,
+    TEST_PASSWORD,
+    audit_entries,
+    audit_kinds,
+    grant_store,
+    pay,
+)
 
 
 class StubServer:
@@ -445,6 +457,21 @@ class TestMain:
         monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
         assert main_module.main(["--password", "x"]) == 1
 
+    def test_main_exits_with_a_reason_when_another_connect_holds_the_store(
+        self,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A second Connect on one STORE_PATH: logged for Pearl's log.txt, exit 1."""
+        holder = NonceAllocator(boot_env, settle_timeout=1, gap_retries=0)
+        try:
+            assert main_module.main(["--password", TEST_PASSWORD]) == 1
+        finally:
+            holder.close()
+        assert not served
+        assert "mech queue store is locked" in caplog.text
+
     def test_main_happy_path(
         self,
         boot_env: Path,
@@ -503,7 +530,9 @@ class TestMain:
         )
         assert state.workspace.open_session("ocb_cli") == "ocb_cli"
         assert opened == [
-            ocb.ocb_command(Path("/opt/ocb-agent"), mech, boot_env),
+            ocb.ocb_command(
+                Path("/opt/ocb-agent"), mech, boot_env, workspace_module.skill_hashes()
+            ),
         ]
 
     def test_main_without_a_chat_mech_offers_no_ocb(
@@ -1048,13 +1077,16 @@ class TestAuthMiddlewareASGI:
         async def send(message: dict) -> None:
             sent.append(message)
 
-        await middleware(scope, None, send)
+        async def receive() -> dict:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await middleware(scope, receive, send)
         return sent, passed
 
     async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
         """Lifespan scopes bypass auth."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         _, passed = await self._run(middleware, {"type": "lifespan"})
         assert passed == ["lifespan"]
@@ -1062,7 +1094,7 @@ class TestAuthMiddlewareASGI:
     async def test_bad_origin_rejected(self, activity: ActivityLog) -> None:
         """Cross-origin requests get 403."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         scope = {
             "type": "http",
@@ -1075,7 +1107,7 @@ class TestAuthMiddlewareASGI:
     async def test_bad_token_rejected(self, activity: ActivityLog) -> None:
         """Missing token gets 401."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         sent, passed = await self._run(middleware, {"type": "http", "headers": []})
         assert sent[0]["status"] == 401
@@ -1084,7 +1116,7 @@ class TestAuthMiddlewareASGI:
     async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
         """Websocket scopes never reach the inner app; the handshake is closed."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
         assert not passed
@@ -1093,7 +1125,7 @@ class TestAuthMiddlewareASGI:
     async def test_valid_request_passes(self, activity: ActivityLog) -> None:
         """Correct token reaches the inner app."""
         middleware = AuthMiddleware(
-            lambda *a: None, "tok", activity, AuthFailureLimiter()
+            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
         )
         scope = {"type": "http", "headers": [(b"authorization", b"Bearer tok")]}
         _, passed = await self._run(middleware, scope)
@@ -1121,6 +1153,7 @@ class TestMcpTools:
             guard=guard,
             mech=mech_service,
             settings_store=settings_store,
+            grants=grant_store("workspace-token"),
         )
         manager = mcp._tool_manager  # pylint: disable=protected-access
         return {tool.name: tool.fn for tool in manager.list_tools()}
@@ -1163,7 +1196,10 @@ class TestMcpTools:
     ) -> None:
         """The tool names the inner call; the server wraps it and broadcasts."""
         result = await tools["safe_transaction"](
-            "testchain", "0x" + "aa" * 20, value=10**18
+            "testchain",
+            "0x" + "aa" * 20,
+            value=10**18,
+            intent=pay("0x" + "aa" * 20, 10**18),
         )
         assert result["tx_hash"].startswith("0x")
         assert len(fake_w3.eth.sent) == 1
@@ -1227,7 +1263,7 @@ class TestMcpTools:
         assert fake_w3.eth.sent  # the premise: it really was broadcast first
         assert result["status"] == "pending"
         assert result["tx_hash"].startswith("0x")
-        assert "rpc dropped" in result["receipt_error"]
+        assert result["receipt_error"] == receipts.RECEIPT_ERROR  # not the RPC's text
 
     async def test_safe_transaction_rejects_a_negative_value(
         self, tools: dict[str, t.Callable]
@@ -1454,7 +1490,7 @@ class TestSignerExtras:
         """A gas-estimation revert surfaces as SignerError, not a raw exception."""
 
         def reverting_estimate(tx: dict) -> int:
-            raise RuntimeError("execution reverted: not enough funds")
+            raise ContractLogicError("execution reverted: not enough funds")
 
         fake_w3.eth.estimate_gas = reverting_estimate  # type: ignore[method-assign]
         with pytest.raises(SignerError, match="execution reverted"):
@@ -1651,9 +1687,9 @@ class TestWalletExtras:
         )
         overview = wallet.wallet_overview(app_config, test_signer)
         entry = overview["chains"]["testchain"]
-        assert entry["balances"] == {"error": "down"}
+        assert entry["balances"] == {"error": wallet.BALANCE_READ_FAILED}
         assert entry["actionable"] is False
-        assert "down" in entry["not_actionable_because"]
+        assert "balances unreadable" in entry["not_actionable_because"]
         assert overview["actionable_chains"] == []
 
     def test_overview_separates_undeployed_from_unfunded_chains(
@@ -1779,7 +1815,12 @@ class TestSignerRoutesExtras:
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             response = client.post(
                 "/sign-and-send",
-                json={"chain": "testchain", "to": "0x" + "aa" * 20, "value": 5},
+                json={
+                    "chain": "testchain",
+                    "to": "0x" + "aa" * 20,
+                    "value": 5,
+                    "intent": pay("0x" + "aa" * 20, 5),
+                },
                 headers={"Authorization": "Bearer tok"},
             )
         assert response.status_code == 200

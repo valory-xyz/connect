@@ -41,7 +41,7 @@ from eth_account.signers.local import LocalAccount
 from eth_typing import URI
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from mech_client.infrastructure.blockchain.abi_loader import get_abi
+from mech_client import MetadataRead
 from mech_client.infrastructure.config import PaymentType
 from safe_eth.eth import EthereumClient
 from safe_eth.safe import Safe
@@ -52,7 +52,7 @@ from connect.activity import ActivityLog
 from connect.config import AGENT_HTTP_PORT, AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechError, MechService
-from connect.mech_allowances import deposit_tracker, request_digest
+from connect.mech_allowances import deposit_tracker
 from connect.server.app import create_app
 from connect.settings import (
     MODE_UNRESTRICTED,
@@ -60,7 +60,6 @@ from connect.settings import (
     SETTINGS_FILE,
     Settings,
     SettingsStore,
-    _mech_system_addresses,
     derive_mac_key,
 )
 from connect.signer import Signer
@@ -350,6 +349,7 @@ def test_sign_and_send_mines_on_fork(
             "to": account.address,
             "value": 10**15,
             "data": "0x",
+            "intent": {"spend": {"native": 10**15}},
             "request_id": request_id,
         }
         headers = {"Authorization": f"Bearer {token}"}
@@ -397,8 +397,14 @@ def test_safe_transaction_mines_a_server_composed_call_on_fork(
             "/safe-transaction",
             json={
                 "chain": "gnosis",
-                "to": recipient,  # the call the *safe* makes
+                "target": recipient,  # the call the *safe* makes
                 "value": 10**17,
+                # value-moving, so it says what it may do; the gate simulates
+                # it on the fork over eth_simulateV1 before signing
+                "intent": {
+                    "spend": {"native": 10**17},
+                    "recipients": [recipient.lower()],
+                },
                 "request_id": f"it-{secrets.token_hex(8)}",
             },
             headers={"Authorization": f"Bearer {token}"},
@@ -519,7 +525,12 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
 
         allowed = client.post(
             "/sign-and-send",
-            json={"chain": "gnosis", "to": account.address, "value": 1},
+            json={
+                "chain": "gnosis",
+                "to": account.address,
+                "value": 1,
+                "intent": {"spend": {"native": 1}},
+            },
             headers=headers,
         )
         assert allowed.status_code == 200, allowed.text
@@ -531,7 +542,7 @@ def test_restricted_mode_and_settings_flip(  # pylint: disable=too-many-argument
         safe_address = fork_config.chains["gnosis"].safe_address
         self_call = client.post(
             "/safe-transaction",
-            json={"chain": "gnosis", "to": safe_address, "data": "0x610b5925"},
+            json={"chain": "gnosis", "target": safe_address, "data": "0x610b5925"},
             headers=headers,
         )
         assert self_call.status_code == 400
@@ -703,6 +714,7 @@ def test_offchain_preflight_refuses_an_unreachable_mech_on_fork(
             priority_mech=mech_address,
             timeout=30,
             max_payment=10**18,
+            top_up_budget=None,
         )
     # refused before payment: nothing was broadcast, so no nonce was consumed
     assert w3.eth.get_transaction_count(eoa) == nonce_before
@@ -750,7 +762,8 @@ def test_mech_request_on_fork_restricted_mode(
         legacy_on_chain=True,
         priority_mech=mech_address,
         timeout=30,  # no delivery will come on a fork; don't wait the default 5m
-        max_payment=10**18,  # live mech prices vary; the cap itself is unit-tested
+        max_payment=10**18,
+        top_up_budget=None,  # live mech prices vary; the cap itself is unit-tested
     )
     assert result["tx_hash"], result
     assert result["request_ids"], result
@@ -774,42 +787,6 @@ def test_mech_request_on_fork_restricted_mode(
     assert polled["delivered"] is False
     assert polled["mech"] == mech_address
     assert mech_service.result(pending_id, timeout=5)["delivered"] is False
-
-
-def test_offchain_request_digest_matches_contract_on_fork(rpc_url: str) -> None:
-    """The locally derived request digest equals the contract's getRequestId.
-
-    Restricted-mode off-chain requests sign only the digest the server
-    recomputes itself (connect.mech_allowances.request_digest); if the deployed
-    marketplace's derivation ever drifts from it — a redeploy, a VERSION
-    bump — the allowance would stop matching and every restricted off-chain
-    request would be refused. This pins the two against each other on the
-    real (forked) contract, with the unit-test golden vector as the offline
-    fallback.
-    """
-    marketplace = Web3.to_checksum_address(_mech_system_addresses()["gnosis"][0])
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
-    contract = w3.eth.contract(address=marketplace, abi=get_abi("MechMarketplace.json"))
-
-    mech = Web3.to_checksum_address("0x" + "11" * 20)
-    requester = Web3.to_checksum_address("0x" + "22" * 20)
-    data_hash = bytes.fromhex("33" * 32)
-    rate, payment_type, nonce = 7, bytes.fromhex("44" * 32), 9
-
-    onchain = contract.functions.getRequestId(
-        mech, requester, data_hash, rate, payment_type, nonce
-    ).call()
-    local = request_digest(
-        domain_separator=bytes(contract.functions.domainSeparator().call()),
-        marketplace=marketplace,
-        mech=mech,
-        requester=requester,
-        data_hash=data_hash,
-        delivery_rate=rate,
-        payment_type=payment_type,
-        nonce=nonce,
-    )
-    assert local == bytes(onchain)
 
 
 class _LocalMechEndpoint:
@@ -1008,8 +985,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
 
     # price the mech as the flow will, and resolve the tracker our way
     service = mech_service._service("gnosis")  # pylint: disable=protected-access
-    # pylint: disable-next=protected-access
-    _, service_id, rate = service._fetch_mech_info(mech_address)
+    _, service_id, _, rate = service.mech_info(mech_address)
     tracker, is_token = deposit_tracker("gnosis", PaymentType.NATIVE.value)
     assert tracker is not None
     assert is_token is False
@@ -1017,8 +993,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     w3 = signer.w3("gnosis")
     endpoint = _LocalMechEndpoint(
         w3=w3,
-        # pylint: disable-next=protected-access
-        marketplace_contract=service._get_marketplace_contract(),
+        marketplace_contract=service.marketplace_contract(),
         mech=mech_address,
         payment_type_hex="0x" + PaymentType.NATIVE.value,
         tracker=tracker,
@@ -1032,8 +1007,8 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
         # endpoint, and reachability pre-flight + send both read it
         monkeypatch.setattr(
             service.tool_manager,
-            "fetch_tools_metadata",
-            lambda sid: {"tools": [tool], "url": url},
+            "read_tools_metadata",
+            lambda sid: MetadataRead.ok({"tools": [tool], "url": url}),
         )
         monkeypatch.setattr(service.tool_manager, "get_offchain_url", lambda sid: url)
         first = mech_service.request(
@@ -1043,6 +1018,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
             priority_mech=mech_address,
             timeout=60,
             max_payment=10**18,
+            top_up_budget=None,
         )
         second = mech_service.request(
             f"integration offchain {secrets.token_hex(4)}",
@@ -1051,6 +1027,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
             priority_mech=mech_address,
             timeout=60,
             max_payment=10**18,
+            top_up_budget=None,
         )
 
     # the mech-side validation a real mech performs all passed

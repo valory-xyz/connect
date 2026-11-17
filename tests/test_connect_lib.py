@@ -213,7 +213,14 @@ def test_to_base_units_reads_native_decimals_without_a_call() -> None:
 def test_weth_deposit_carries_the_value_it_wraps() -> None:
     """deposit() takes no argument; the amount is the call's value."""
     call = evm.weth_deposit_call(WETH, 7)
-    assert call == {"to": WETH, "data": "0xd0e30db0", "what": "wrap ETH", "value": 7}
+    assert call == {
+        "to": WETH,
+        "data": "0xd0e30db0",
+        "what": "wrap ETH",
+        "value": 7,
+        # what the signer re-checks: 7 native out, at least 7 WETH back
+        "intent": {"spend": {"native": 7}, "receive_min": {WETH.lower(): 7}},
+    }
 
 
 def test_weth_withdraw_encodes_the_amount_and_sends_no_value() -> None:
@@ -508,6 +515,11 @@ def test_router_swap_with_the_native_coin_needs_no_approval(
     assert call["to"] == WHERE["universal_router"]
     assert call["value"] == 10
     assert uniswap.permit_action_in(call["data"]) is None
+    # spend at most the amount in, receive at least the slippage floor out
+    assert call["intent"] == {
+        "spend": {"native": 10},
+        "receive_min": {TOKEN.lower(): 9},
+    }
 
 
 def test_router_swap_folds_the_permit_for_a_token(
@@ -523,6 +535,18 @@ def test_router_swap_folds_the_permit_for_a_token(
     assert routed.deadline == 1_000 + router.DEADLINE_S + 2 * evm.RECEIPT_TIMEOUT_S
     assert [c["what"] for c in routed.calls] == ["approve Permit2", "swap"]
     assert all("value" not in c for c in routed.calls)
+    assert routed.calls[1]["intent"] == {
+        "spend": {TOKEN.lower(): 10},
+        "receive_min": {"native": 9},
+        # the signed permit is Permit2's own grant of the token to the router
+        "approvals": [
+            {
+                "token": TOKEN.lower(),
+                "spender": WHERE["universal_router"].lower(),
+                "amount": 10,
+            }
+        ],
+    }
     assert asked[0][1] == CHAIN_ID
     assert asked[0][3:] == (
         SAFE,
@@ -1508,3 +1532,27 @@ def test_constant_product_in_refuses_to_exhaust_the_reserve(reserve_out: int) ->
     """An output at or past the reserve is refused, not divided by."""
     with pytest.raises(evm.SwapError, match="cannot cover a 10-unit output"):
         uniswap.constant_product_in(10, 10**18, reserve_out)
+
+
+def test_calls_carry_the_intent_the_signer_checks() -> None:
+    """Approvals declare the grant; unwraps the spend and the floor (OPE-2035 T5)."""
+    spender = "0x" + "5E" * 20
+    approve = evm.erc20_approval_call(WETH, spender, 9, "approve")
+    assert approve["intent"] == {
+        "approvals": [{"token": WETH.lower(), "spender": spender.lower(), "amount": 9}]
+    }
+    unwrap = evm.weth_withdraw_call(WETH, 4)
+    assert unwrap["intent"] == {
+        "spend": {WETH.lower(): 4},
+        "receive_min": {"native": 4},
+    }
+    assert evm.intent_token(NATIVE) == "native"
+    assert evm.intent_token(WETH) == WETH.lower()
+
+
+def test_a_permit2_approval_call_declares_its_grant() -> None:
+    """Permit2.approve is a grant of the token to the spender: its intent says so."""
+    call = permit.approval_call(WHERE["permit2"], TOKEN, SAFE, 10, 99)
+    assert call["intent"] == {
+        "approvals": [{"token": TOKEN.lower(), "spender": SAFE.lower(), "amount": 10}]
+    }

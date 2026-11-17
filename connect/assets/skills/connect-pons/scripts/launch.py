@@ -343,6 +343,7 @@ def build_launch_call(
             "data": "0x" + data.hex(),
             "value": fee,
             "what": "launch",
+            "intent": {"spend": {"native": fee}},
         }
     args = [params, config_id, pair, buy.quote_in, buy.min_tokens_out]
     data = evm.encode_call(
@@ -355,6 +356,13 @@ def build_launch_call(
         "data": "0x" + data.hex(),
         "value": fee + (buy.quote_in if evm.is_native(pair) else 0),
         "what": "launch and buy",
+        "intent": {
+            "spend": (
+                {"native": fee + buy.quote_in}
+                if evm.is_native(pair)
+                else {"native": fee, pair.lower(): buy.quote_in}
+            )
+        },
     }
 
 

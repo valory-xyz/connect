@@ -27,26 +27,40 @@ import logging
 import typing as t
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import Field, field_validator
 
 from connect import settings as settings_config
 from connect import wallet
+from connect.server.auth import (
+    GrantRefused,
+    TokenGrant,
+    authorize_route,
+    refused_route,
+    request_token,
+)
+from connect.server.receipts import settled
+from connect.server.strict import StrictBody
 from connect.signer import SignerError
 
 logger = logging.getLogger("agent")
 
+
 router = APIRouter()
 
 
-class SignAndSendRequest(BaseModel):
-    """SignAndSendRequest."""
+class _SendBody(StrictBody):
+    """Fields both signing routes share; unknown ones are refused by name."""
 
     chain: str
-    to: str
     value: int = Field(default=0, ge=0)
     data: str = "0x"
     request_id: str | None = None
     gas: int | None = Field(default=None, ge=0)
+    # what the call may do; required when it moves value
+    intent: dict | None = None
+    # as the MCP send tools take them: wait up to `timeout` s for the receipt
+    wait_for_receipt: bool = False
+    timeout: int = Field(default=60, ge=0)
 
     @field_validator("value", "gas", mode="before")
     @classmethod
@@ -57,52 +71,103 @@ class SignAndSendRequest(BaseModel):
         return v
 
 
-class SignMessageRequest(BaseModel):
+class SignAndSendRequest(_SendBody):
+    """A transaction the agent EOA sends: `to` is its recipient."""
+
+    to: str
+
+
+class SafeTransactionRequest(_SendBody):
+    """A call the service safe makes: `target` is what the safe calls.
+
+    The same name as the safe_transaction MCP tool's, so the two surfaces
+    cannot be confused for one another.
+    """
+
+    target: str
+
+
+class SignMessageRequest(StrictBody):
     """SignMessageRequest."""
 
     digest: str = Field(description="0x-hex 32-byte digest, signed unprefixed")
 
 
-def _dispatch(method: t.Callable[..., str], body: SignAndSendRequest) -> dict:
+def _dispatch(  # pylint: disable=too-many-arguments
+    request: Request,
+    method: t.Callable[..., str],
+    body: _SendBody,
+    address: str,
+    *,
+    replay_only: bool,
+) -> dict:
     """Run one signer method and map its input errors to a 400.
 
     The address is passed positionally: `send` reads it as the EOA's outer
     recipient, `send_via_safe` as the safe's call target — the one field whose
-    meaning the two endpoints deliberately keep distinct.
+    meaning the two endpoints deliberately keep distinct. A value-capped
+    token's intent is `intent.Capped`: no position may leave under it.
+    `replay_only` is set for a retry whose draw was spared (`_authorize`).
     """
+    intent = request.app.state.grants.intent_for(request_token(request), body.intent)
     try:
         tx_hash = method(
             body.chain,
-            body.to,
+            address,
             value=body.value,
             data=body.data,
             request_id=body.request_id,
             gas=body.gas,
+            intent=intent,
+            replay_only=replay_only,
         )
     except (SignerError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"tx_hash": tx_hash}
+    return settled(
+        request.app.state.signer,
+        body.chain,
+        tx_hash,
+        body.wait_for_receipt,
+        body.timeout,
+    )
+
+
+def _authorize(request: Request, action: str, body: _SendBody | None = None) -> bool:
+    """Hold this request's token to its grant; return whether it is a spared retry."""
+    arguments = {} if body is None else body.model_dump()
+    return authorize_route(request, request.app.state.activity, action, arguments)
 
 
 @router.post("/sign-and-send")
 def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
     """Sign and send one transaction from the agent EOA."""
-    return _dispatch(request.app.state.signer.send, body)
+    replay_only = _authorize(request, "send_transaction", body)
+    return _dispatch(
+        request, request.app.state.signer.send, body, body.to, replay_only=replay_only
+    )
 
 
 @router.post("/safe-transaction")
-def safe_transaction(body: SignAndSendRequest, request: Request) -> dict:
+def safe_transaction(body: SafeTransactionRequest, request: Request) -> dict:
     """Have the service safe make one call; the server composes the safe's tx.
 
-    The same body as /sign-and-send, read one level in: `to`, `value` and `data`
-    are the call the *safe* makes, and the value leaves the safe.
+    `target`, `value` and `data` are the call the *safe* makes, and the value
+    leaves the safe.
     """
-    return _dispatch(request.app.state.signer.send_via_safe, body)
+    replay_only = _authorize(request, "safe_transaction", body)
+    return _dispatch(
+        request,
+        request.app.state.signer.send_via_safe,
+        body,
+        body.target,
+        replay_only=replay_only,
+    )
 
 
 @router.post("/sign-message")
 def sign_message(body: SignMessageRequest, request: Request) -> dict:
     """Sign message."""
+    _authorize(request, "sign_message")
     try:
         digest = bytes.fromhex(body.digest.removeprefix("0x"))
         signature = request.app.state.signer.sign_digest(digest)
@@ -114,9 +179,25 @@ def sign_message(body: SignMessageRequest, request: Request) -> dict:
 @router.get("/wallet")
 def wallet_info(request: Request) -> dict:
     """Wallet info."""
+    _authorize(request, "wallet_info")
     overview = wallet.wallet_overview(
         request.app.state.config, request.app.state.signer
     )
     if settings_config.EXPOSE_MODE_TO_AGENT:
         overview["mode"] = request.app.state.guard.mode()
     return overview
+
+
+@router.post("/tokens")
+def mint_token(grant: TokenGrant, request: Request) -> dict:
+    """Mint a token no wider than the one presented, for a harness's scripts.
+
+    A wider grant is refused (rule "token-scope"): a token can narrow its own
+    powers, never extend them.
+    """
+    try:
+        token = request.app.state.grants.mint(request_token(request), grant)
+    except GrantRefused as e:
+        raise refused_route(request, request.app.state.activity, e) from e
+    request.app.state.activity.record("token_minted", scopes=list(grant.scopes))
+    return {"token": token, "grant": grant.model_dump()}

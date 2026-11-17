@@ -20,6 +20,7 @@
 
 """OCB CLI: availability, install, launch and the routes that drive them."""
 
+import hashlib
 import json
 import os
 import shlex
@@ -280,6 +281,29 @@ def test_ocb_runs_by_path_in_this_workspace_with_the_chat_mech() -> None:
         "--model-budget",
         "1",
     ]
+    with_skills = ocb.ocb_command(
+        Path("/opt/ocb-agent"), MECH, Path("/d"), ["a" * 64, "b" * 64]
+    )
+    assert shlex.split(with_skills)[-4:] == [
+        "--trusted-skill-hash",
+        "a" * 64,
+        "--trusted-skill-hash",
+        "b" * 64,
+    ]
+
+
+def test_the_launch_line_trusts_each_bundled_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OCB is told the digest of every skill Connect ships, so it reads them as instructions."""
+    bundled = sorted(
+        hashlib.sha256(skill.read_bytes()).hexdigest()
+        for skill in (workspace.assets_dir() / "skills").glob("*/SKILL.md")
+    )
+    assert bundled
+    assert workspace.skill_hashes() == bundled
+    monkeypatch.setattr(workspace, "assets_dir", lambda: tmp_path / "no-bundle")
+    assert workspace.skill_hashes() == []
 
 
 def test_ocb_is_never_launched_or_installed_without_a_mech(store_path: Path) -> None:
@@ -928,7 +952,9 @@ def test_ocb_opens_a_terminal_running_the_installed_agent(
     monkeypatch.setattr(workspace, "_open_terminal", terminal)
     agent = Path("/opt/ocb/bin/ocb-agent")
     assert ocb_workspace(store_path, agent).open_session(HARNESS_OCB_CLI) == "ocb_cli"
-    assert opened == [(store_path, ocb.ocb_command(agent, MECH, store_path))]
+    assert opened == [
+        (store_path, ocb.ocb_command(agent, MECH, store_path, workspace.skill_hashes()))
+    ]
 
 
 @pytest.mark.parametrize("fallback", [False, True])
