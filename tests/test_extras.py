@@ -539,6 +539,26 @@ class TestMain:
         harnesses = served[0].config.app.state.settings_store.harnesses()
         assert harnesses[-1]["available"] is False
         assert "no single instance chain" in caplog.text
+        assert (
+            "OCB_CHAT_MECH_GNOSIS has no effect: no single instance chain"
+            in caplog.text
+        )
+
+    def test_main_says_when_the_instance_chain_has_no_chat_mech(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Today's case on every chain: a chain, no override, nothing shipped."""
+        monkeypatch.setenv(
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
+        )
+        monkeypatch.setenv(SAFES_ENV, json.dumps({"gnosis": "0x" + "22" * 20}))
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert "gnosis has no confirmed one" in caplog.text
+        assert "OCB_CHAT_MECH_GNOSIS is not set" in caplog.text
 
     def test_main_keeps_ocb_off_native_windows(
         self, monkeypatch: pytest.MonkeyPatch, boot_env: Path, served: list[StubServer]

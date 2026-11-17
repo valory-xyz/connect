@@ -619,9 +619,10 @@ def test_an_up_to_date_install_is_not_rerun_on_selection(
 def test_a_joined_install_reports_its_own_error(
     installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A later start() must not wipe the failure an earlier install ended with."""
+    """A later start() must not wipe the failure the joined install ended with."""
     release = threading.Event()
     outcomes = iter([InstallError("uv download failed"), None])
+    reads: list[int] = []
 
     def install(self: OcbInstaller, timeout: float) -> Path:
         outcome = next(outcomes)
@@ -630,14 +631,18 @@ def test_a_joined_install_reports_its_own_error(
         release.wait(5)
         raise InstallError("second attempt")
 
+    def path(self: OcbInstaller) -> None:
+        # ensure()'s check after the join: another caller starts a new
+        # attempt just then, between the join and the raise
+        reads.append(1)
+        if len(reads) == 3:
+            self.start()
+
     monkeypatch.setattr(OcbInstaller, "_install", install)
-    first = installer.start()
-    first.join(5)
-    second = installer.start()  # another caller starts the next attempt
-    assert second is not first
-    assert str(first.error) == "uv download failed"
+    monkeypatch.setattr(OcbInstaller, "path", path)
+    with pytest.raises(InstallError, match="uv download failed"):
+        installer.ensure(5)
     release.set()
-    second.join(5)
 
 
 def test_an_unexpected_background_failure_reaches_the_log_and_the_session(

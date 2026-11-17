@@ -224,14 +224,26 @@ def test_ocb_chat_mech_overrides_are_read_per_chain(tmp_path: Path) -> None:
     """OCB_CHAT_MECH_<CHAIN> fills that chain's mech; empty means unset."""
     mech = "0x" + "ab" * 20
     env = base_env(tmp_path) | {
-        "OCB_CHAT_MECH_GNOSIS": f" {mech} ",
+        "OCB_CHAT_MECH_GNOSIS": f" {mech} ",  # all lowercase: no checksum to fail
         "OCB_CHAT_MECH_POLYGON": "",
     }
     assert load_config(env).ocb_chat_mech_overrides == {"gnosis": mech}
     assert load_config(base_env(tmp_path)).ocb_chat_mech_overrides == {}
+    checksummed = "0xABaBaBaBABabABabAbAbABAbABabababaBaBABaB"
+    env = base_env(tmp_path) | {"OCB_CHAT_MECH_GNOSIS": checksummed}
+    assert load_config(env).ocb_chat_mech_overrides == {"gnosis": checksummed}
 
 
-@pytest.mark.parametrize("value", ["0x1234", "gnosis", "0x" + "zz" * 20])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0x1234",
+        "gnosis",
+        "0x" + "zz" * 20,
+        "ab" * 20,  # hex without the 0x prefix
+        "0x" + "aB" * 20,  # mixed case with a bad checksum
+    ],
+)
 def test_an_ocb_chat_mech_override_must_be_an_address(
     tmp_path: Path, value: str
 ) -> None:

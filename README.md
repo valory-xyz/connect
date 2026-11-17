@@ -192,7 +192,9 @@ address is a configuration error), else that chain's entry in
 `OCB_CHAT_MECHS` (`connect/settings.py`), where `None` means no confirmed
 chat mech. `__main__.resolve_ocb_mech` resolves it once at boot, and both
 this rule and the launch line read that value. When it finds none it logs
-why: no single chain carries a safe, or an override names another chain. `PATCH /settings` and `POST /session`
+why: no single chain carries a safe, or the instance chain has no confirmed
+mech and no override; an override for any other chain is logged as having no
+effect. An override must be a `0x` address, checksummed if mixed case. `PATCH /settings` and `POST /session`
 refuse an unavailable harness with a 400, and a saved `ocb_cli` that has
 become unavailable (a settings file copied between machines) loads as the
 default, logged once.

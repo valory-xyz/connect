@@ -94,13 +94,18 @@ class AppConfig:
     ocb_chat_mech_overrides: dict[str, str] = field(default_factory=dict)
 
     @property
+    def safe_chains(self) -> list[str]:
+        """The configured chains that carry a safe, in configuration order."""
+        return [name for name, chain in self.chains.items() if chain.safe_address]
+
+    @property
     def instance_chain(self) -> str | None:
         """The one chain this instance runs on: the chain carrying its safe.
 
         Pearl configures an RPC for every chain but a safe for one, so a
         config with no safe, or with several, names no instance chain.
         """
-        chains = [name for name, chain in self.chains.items() if chain.safe_address]
+        chains = self.safe_chains
         return chains[0] if len(chains) == 1 else None
 
     def chain(self, name: str) -> ChainConfig:
@@ -229,6 +234,18 @@ def _parse_minutes_per_run(raw: str) -> int:
         ) from e
 
 
+def _is_mech_address(value: str) -> bool:
+    """Whether `value` is a 0x address, checksummed whenever it is mixed case.
+
+    Web3.is_address alone takes bare hex and does not check a mixed-case
+    checksum, and a typo here becomes OCB's model.
+    """
+    if not (value.startswith("0x") and Web3.is_address(value)):
+        return False
+    digits = value[2:]
+    return digits in (digits.lower(), digits.upper()) or Web3.is_checksum_address(value)
+
+
 def _parse_ocb_chat_mechs(env: dict[str, str]) -> dict[str, str]:
     """Collect OCB_CHAT_MECH_<CHAIN> overrides; an unset or empty one is ignored.
 
@@ -238,8 +255,7 @@ def _parse_ocb_chat_mechs(env: dict[str, str]) -> dict[str, str]:
     for key, value in env.items():
         if not key.startswith(OCB_CHAT_MECH_ENV_PREFIX) or not value.strip():
             continue
-        # the same address rule as the settings whitelist, checksum included
-        if not Web3.is_address(value.strip()):
+        if not _is_mech_address(value.strip()):
             raise ValueError(f"{key} is not an address: {value!r}")
         chain = key[len(OCB_CHAT_MECH_ENV_PREFIX) :].lower()
         overrides[chain] = value.strip()

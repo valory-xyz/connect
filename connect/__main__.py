@@ -177,24 +177,34 @@ def resolve_ocb_mech(config: AppConfig) -> str | None:
     """Return OCB's model here: the instance chain's chat mech, override first.
 
     Called once at boot; the availability rule and the launch line both read
-    its answer. When there is none, say why: an operator who set an override
-    otherwise sees only `model_unavailable`.
+    its answer. When there is none, it logs why, since the operator otherwise
+    sees only `model_unavailable`; an override that cannot apply is logged too.
     """
     logger = logging.getLogger("agent")
     chain = config.instance_chain
-    if chain is None:
-        logger.warning(
-            "OCB has no chat mech: no single instance chain (chains with a "
-            "safe: %s)",
-            sorted(n for n, c in config.chains.items() if c.safe_address) or "none",
-        )
     for other in sorted(set(config.ocb_chat_mech_overrides) - {chain}):
         logger.warning(
-            "OCB_CHAT_MECH_%s has no effect: this instance runs on %s",
+            "OCB_CHAT_MECH_%s has no effect: %s",
             other.upper(),
-            chain,
+            (
+                "no single instance chain"
+                if chain is None
+                else f"this instance runs on {chain}"
+            ),
         )
-    return ocb_chat_mech(chain, config.ocb_chat_mech_overrides)
+    mech = ocb_chat_mech(chain, config.ocb_chat_mech_overrides)
+    if chain is None:
+        logger.warning(
+            "OCB has no chat mech: no single instance chain (chains with a safe: %s)",
+            config.safe_chains or "none",
+        )
+    elif mech is None:
+        logger.warning(
+            "OCB has no chat mech: %s has no confirmed one and OCB_CHAT_MECH_%s is not set",
+            chain,
+            chain.upper(),
+        )
+    return mech
 
 
 def main(argv: list[str] | None = None) -> int:

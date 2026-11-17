@@ -79,9 +79,14 @@ def ocb_command(path: Path, mech: str, store_path: Path) -> str:
     )
 
 
+def _requirement(target: str) -> str:
+    """Return the package, with its extra, at `target`; one shape for both uses."""
+    return f"{OCB_PACKAGE}[{OCB_EXTRA}] @ {target}"
+
+
 def ocb_agent_spec(wheel: Path) -> str:
     """Return the requirement install.sh installs: the bundled wheel, with its extra."""
-    return f"{OCB_PACKAGE}[{OCB_EXTRA}] @ {wheel.as_uri()}"
+    return _requirement(wheel.as_uri())
 
 
 def install_identity(wheel: Path) -> str:
@@ -90,7 +95,7 @@ def install_identity(wheel: Path) -> str:
     Not ocb_agent_spec: its URI holds the bundle's location, which in the
     packaged binary is a fresh extraction directory on every start.
     """
-    return f"{OCB_PACKAGE}[{OCB_EXTRA}] @ {wheel.name}"
+    return _requirement(wheel.name)
 
 
 class _Attempt:
@@ -184,11 +189,11 @@ class OcbInstaller:
             bundled = install_identity(_bundled_ocb(self._bundle_dir)[1])
         except InstallError:
             return installed  # nothing newer to install
-        if record.get("installed") != bundled:
+        if record.get("requirement") != bundled:
             logger.info(
                 "bundled OCB is now %s (installed: %s); reinstalling",
                 bundled,
-                record.get("installed"),
+                record.get("requirement"),
             )
             return None
         return installed
@@ -261,7 +266,7 @@ class OcbInstaller:
             write_private(
                 self._record,
                 json.dumps(
-                    {"path": str(installed), "installed": install_identity(wheel)}
+                    {"path": str(installed), "requirement": install_identity(wheel)}
                 ),
             )
         except OSError as e:
