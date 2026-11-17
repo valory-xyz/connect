@@ -247,7 +247,7 @@ class OcbInstaller:
             env={**self._env(), "OCB_AGENT_SPEC": ocb_agent_spec(wheel)},
             timeout=timeout,
         )
-        installed = None if returncode else _executable(stdout.strip())
+        installed = None if returncode else _executable(_last_line(stdout))
         if installed is None:
             logger.error(
                 "OCB installer exited %s; stdout: %s; stderr: %s",
@@ -306,6 +306,12 @@ def _run_installer(
         process.communicate()
         raise InstallError(f"the OCB installer did not finish: {e}") from e
     return process.returncode, stdout, stderr
+
+
+def _last_line(stdout: str) -> str:
+    """Return the last non-empty line of `stdout`: where install.sh puts the path."""
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
 def _executable(reported: str) -> Path | None:

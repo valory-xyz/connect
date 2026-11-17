@@ -219,9 +219,11 @@ Python of its own, prints the absolute path of `ocb-agent` on success, and a
 one-line reason on stderr otherwise; that line becomes `/session`'s `error`.
 Connect records the path, with the requirement it installed
 (`olas-ocb-agent[facilitator] @ <wheel file name>`), in `.ocb-agent.json` in
-its own working directory (beside `log.txt`), outside the workspace and
+STORE_PATH's parent (the service's own folder), outside the workspace and
 readable by its owner alone, so the session cannot point the next launch at
-another program. A record naming another requirement than the bundled one
+another program, and outside Connect's working directory, which Pearl
+rebuilds on every service start, so a restart does not install again. The
+path is the last non-empty line the script prints. A record naming another requirement than the bundled one
 installs again, so a release with a newer wheel, or a different extra,
 reaches existing installs; the bundle's own location is left out, since the
 packaged binary extracts it somewhere new on every start. One install runs

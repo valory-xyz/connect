@@ -310,14 +310,17 @@ class Workspace:
         """Start unprovisioned: the first ensure() is what makes it real.
 
         `ocb_mech` is OCB's model, the instance chain's chat mech; `record_dir`
-        keeps OCB's install record, by default Connect's own working directory.
+        keeps OCB's install record, by default STORE_PATH's parent (the
+        service's own folder): outside the workspace, and unlike Connect's
+        working directory (the deployment, which Pearl rebuilds on every
+        service start) it survives a restart.
         """
         self.path = store_path
         self._token = token
         self._ocb_mech = ocb_mech
         self.ocb = OcbInstaller(
             store_path,
-            record_dir or Path.cwd(),
+            record_dir or store_path.parent,
             bundle_dir=lambda: assets_dir() / OCB_ASSETS_SUBDIR,
             env=harness_env,
         )

@@ -22,6 +22,7 @@
 
 import json
 import shlex
+import shutil
 import sys
 import threading
 import time
@@ -299,17 +300,39 @@ def test_the_install_record_stays_out_of_the_workspace(
 
 
 @POSIX_ONLY
-def test_a_workspace_records_in_connect_s_own_directory(
+def test_a_workspace_records_in_the_service_folder(
     store_path: Path, record_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """By default the record sits in the process cwd, beside log.txt."""
+    """By default the record sits beside STORE_PATH, not in the process cwd."""
     monkeypatch.chdir(record_dir)
-    agent = record_dir / "ocb-agent"
+    agent = store_path.parent / "ocb-agent"
     agent.write_text("#!/bin/sh\n")
     agent.chmod(0o755)
-    (record_dir / ocb.OCB_RECORD_FILE).write_text(json.dumps({"path": str(agent)}))
+    (store_path.parent / ocb.OCB_RECORD_FILE).write_text(
+        json.dumps({"path": str(agent)})
+    )
     monkeypatch.setattr(workspace, "assets_dir", lambda: record_dir / "no-bundle")
     assert Workspace(store_path, "tok").ocb.path() == agent  # nosec B106
+
+
+@POSIX_ONLY
+def test_a_restart_that_rebuilds_the_deployment_does_not_reinstall(
+    bundle: Path, store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pearl wipes Connect's working directory on every service start."""
+    deployment = tmp_path / "deployment"
+    deployment.mkdir()
+    monkeypatch.chdir(deployment)
+    installed = Workspace(store_path, "tok").ocb.ensure(30)  # nosec B106
+    monkeypatch.chdir(tmp_path)
+    shutil.rmtree(deployment)  # the middleware's rebuild of the deployment
+    deployment.mkdir()
+    monkeypatch.chdir(deployment)
+    restarted = Workspace(store_path, "tok").ocb  # nosec B106
+    assert restarted.path() == installed
+    assert restarted.ensure(30) == installed
+    log = (store_path / "installs.log").read_text().splitlines()
+    assert len(log) == 1
 
 
 @POSIX_ONLY
@@ -430,6 +453,7 @@ def test_an_unreadable_record_means_reinstall(
         ),
         ("echo /nonexistent/ocb-agent\n", "no ocb-agent executable"),
         ("echo\n", "no ocb-agent executable"),
+        ("echo /nonexistent/ocb-agent\necho relative\n", "no ocb-agent executable"),
     ],
 )
 def test_a_failed_install_says_why(
@@ -758,6 +782,33 @@ def test_ocb_token_shim_is_kept_out_of_git_and_transcripts() -> None:
     """OCB copies the bearer token into ocb-agent/ in the workspace."""
     assert "ocb-agent/" in workspace.GITIGNORE_ENTRIES
     assert "Read(./ocb-agent/**)" in workspace.TOKEN_DENY_RULES
+
+
+@POSIX_ONLY
+def test_only_the_last_line_the_installer_prints_is_the_path(
+    tmp_path: Path, installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chatter before the path, and blank lines after it, are ignored."""
+    agent = tmp_path / "bin" / "ocb-agent"
+    script = installer_script(agent).replace(
+        "#!/bin/sh\n", "#!/bin/sh\necho 'resolved 12 packages'\n"
+    )
+    bundle = write_bundle(tmp_path, script + "echo\necho '  '\n")
+    (tmp_path / "bin").mkdir()
+    monkeypatch.setattr(workspace, "assets_dir", lambda: bundle.parent)
+    assert installer.ensure(30) == agent
+
+
+def test_this_build_bundles_ocb() -> None:
+    """The shipped bundle resolves: deleting the script or the wheel fails here."""
+    bundle = workspace.assets_dir() / ocb.OCB_ASSETS_SUBDIR
+    script, wheel = ocb._bundled_ocb(lambda: bundle)
+    assert script == bundle / ocb.OCB_INSTALL_SCRIPT
+    assert wheel.name.startswith("olas_ocb_agent-")
+    assert wheel.stat().st_size > 0
+    version = (bundle / "VERSION").read_text(encoding="utf-8").strip()
+    assert version
+    assert wheel.name == f"olas_ocb_agent-{version.lstrip('v')}-py3-none-any.whl"
 
 
 def test_the_bundle_directory_says_what_goes_in_it() -> None:
