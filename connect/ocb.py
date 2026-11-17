@@ -97,12 +97,20 @@ def ocb_agent_spec(wheel: Path) -> str:
 
 
 def install_identity(wheel: Path) -> str:
-    """Return what an install is recorded as: the requirement, by wheel name.
+    """Return what an install is recorded as: the requirement and the wheel's sha256.
 
-    Not ocb_agent_spec: its URI holds the bundle's location, which in the
-    packaged binary is a fresh extraction directory on every start.
+    The requirement names the wheel by file name; the sha256 makes a rebuilt
+    wheel under the same name install again. Not ocb_agent_spec: its URI holds
+    the bundle's location, which in the packaged binary is a fresh extraction
+    directory on every start.
+
+    :raises InstallError: when the bundled wheel cannot be read.
     """
-    return _requirement(wheel.name)
+    try:
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    except OSError as e:
+        raise InstallError(f"could not read the bundled {wheel.name}: {e}") from e
+    return f"{_requirement(wheel.name)} sha256:{digest}"
 
 
 class _Attempt:
@@ -151,8 +159,9 @@ class OcbInstaller:
     The script brings uv and a Python of its own, installs the bundled wheel
     and prints the absolute path of `ocb-agent`, which is launched by path:
     uv's tool directory is not always on the login PATH. The path is recorded
-    with the requirement it came from (install_identity), so a Connect release
-    bundling another wheel, or asking for another extra, installs again. The
+    with the requirement it came from and the wheel's sha256 (install_identity),
+    so a Connect release bundling another wheel, a rebuilt one under the same
+    name, or asking for another extra, installs again. The
     record lives in `record_dir`, outside the workspace, and carries a MAC
     keyed off the agent key, so neither the session nor anything else that
     can write the file can point Connect's next launch at another program: an

@@ -420,6 +420,49 @@ def test_a_moved_bundle_does_not_reinstall(
 
 
 @POSIX_ONLY
+def test_a_rebuilt_wheel_under_the_same_name_installs_again(
+    bundle: Path, installer: OcbInstaller, store_path: Path
+) -> None:
+    """Same file name and version, other bytes: the install on disk is stale."""
+    installed = installer.ensure(30)
+    (bundle / WHEEL).write_bytes(b"the same bytes")
+    assert installer.path() is None
+    installer.ensure(30)
+    (bundle / WHEEL).write_bytes(b"the same bytes")  # rewritten, unchanged
+    assert installer.path() == installed
+    assert len((store_path / "installs.log").read_text().splitlines()) == 2
+
+
+@POSIX_ONLY
+def test_a_record_by_wheel_name_alone_installs_once_more(
+    bundle: Path, installer: OcbInstaller, record_dir: Path, store_path: Path
+) -> None:
+    """A record from before the sha256 was part of the identity is stale once."""
+    installed = installer.ensure(30)
+    by_name = ocb.install_identity(bundle / WHEEL).split(" sha256:", maxsplit=1)[0]
+    (record_dir / ocb.OCB_RECORD_FILE).write_text(
+        installer._signed_record(installed, by_name)  # pylint: disable=W0212
+    )
+    assert installer.path() is None
+    assert installer.ensure(30) == installed
+    assert installer.path() == installed
+    assert len((store_path / "installs.log").read_text().splitlines()) == 2
+
+
+@POSIX_ONLY
+def test_an_unreadable_bundled_wheel_keeps_the_recorded_install(
+    bundle: Path, installer: OcbInstaller
+) -> None:
+    """Nothing readable to install is no reason to drop the one installed."""
+    installed = installer.ensure(30)
+    (bundle / WHEEL).unlink()
+    (bundle / WHEEL).mkdir()  # read -> OSError
+    assert installer.path() == installed
+    with pytest.raises(InstallError, match="could not read the bundled"):
+        ocb.install_identity(bundle / WHEEL)
+
+
+@POSIX_ONLY
 def test_the_install_record_is_private(
     bundle: Path, installer: OcbInstaller, record_dir: Path
 ) -> None:
