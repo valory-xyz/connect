@@ -253,6 +253,15 @@ def test_ocb_is_never_launched_without_a_mech() -> None:
 # --- install ---------------------------------------------------------------
 
 
+def test_the_wheel_installs_with_the_facilitator_extra() -> None:
+    """ocb-agent's CLI imports the facilitator at startup; a plain wheel crashes."""
+    wheel = Path("/opt/connect/assets/ocb dir") / WHEEL
+    assert ocb.ocb_agent_spec(wheel) == (
+        "olas-ocb-agent[facilitator] @ "
+        "file:///opt/connect/assets/ocb%20dir/olas_ocb_agent-0.4.1-py3-none-any.whl"
+    )
+
+
 @POSIX_ONLY
 def test_install_runs_the_bundled_script_once(
     bundle: Path, installer: OcbInstaller, store_path: Path, tmp_path: Path
@@ -263,7 +272,7 @@ def test_install_runs_the_bundled_script_once(
     assert installed == tmp_path / "bin" / "ocb-agent"
     assert installer.ensure(30) == installed
     log = (store_path / "installs.log").read_text().splitlines()
-    assert log == [str(bundle / WHEEL)]
+    assert log == [f"olas-ocb-agent[facilitator] @ {(bundle / WHEEL).as_uri()}"]
 
 
 @POSIX_ONLY
@@ -309,7 +318,7 @@ def test_a_newer_bundled_wheel_installs_again(
     assert installer.path() is None
     installer.ensure(30)
     log = (store_path / "installs.log").read_text().splitlines()
-    assert log == [str(old / WHEEL), str(new / new_wheel)]
+    assert log == [ocb.ocb_agent_spec(old / WHEEL), ocb.ocb_agent_spec(new / new_wheel)]
 
 
 @POSIX_ONLY

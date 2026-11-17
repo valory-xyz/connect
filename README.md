@@ -206,7 +206,9 @@ starts one, and waits for it at most `OCB_SESSION_WAIT_SECONDS` (240 s,
 inside Pearl's ~300 s request): past that it answers `install_failed` ("still
 being installed") while the install goes on, so a Retry finds it done. The
 script runs as `sh install.sh` in STORE_PATH, in its own session, with stdin
-closed, `harness_env()` plus `OCB_AGENT_SPEC=<the bundled wheel>`, and the
+closed, `harness_env()` plus `OCB_AGENT_SPEC=olas-ocb-agent[facilitator] @
+<the bundled wheel's file:// URI>` (the CLI imports the facilitator at
+startup, so the extra is required), and the
 `OCB_INSTALL_TIMEOUT_SECONDS` timeout (`connect/ocb.py`), after which its
 whole process group is killed, uv and curl included. It brings uv and a
 Python of its own, prints the absolute path of `ocb-agent` on success, and a

@@ -51,6 +51,10 @@ OCB_RECORD_FILE = ".ocb-agent.json"
 OCB_INSTALL_TIMEOUT_SECONDS = 600.0
 # how long POST /session waits for an install: Pearl gives up at ~300s
 OCB_SESSION_WAIT_SECONDS = 240.0
+# ocb-agent's CLI imports the facilitator at startup, so the wheel installs
+# with that extra; without it every launch dies on a missing eth_abi
+OCB_PACKAGE = "olas-ocb-agent"
+OCB_EXTRA = "facilitator"
 # how much of the installer's output a failure log keeps
 OCB_INSTALL_LOG_CHARS = 2000
 
@@ -77,6 +81,11 @@ def ocb_command(path: Path, mech: str | None, store_path: Path) -> str:
             str(OCB_MODEL_BUDGET_USD),
         ]
     )
+
+
+def ocb_agent_spec(wheel: Path) -> str:
+    """Return the requirement install.sh installs: the bundled wheel, with its extra."""
+    return f"{OCB_PACKAGE}[{OCB_EXTRA}] @ {wheel.as_uri()}"
 
 
 def _bundled_ocb(bundle_dir: t.Callable[[], Path]) -> tuple[Path, Path]:
@@ -205,7 +214,7 @@ class OcbInstaller:
         returncode, stdout, stderr = _run_installer(
             ["sh", str(script)],
             cwd=self._store_path,
-            env={**self._env(), "OCB_AGENT_SPEC": str(wheel)},
+            env={**self._env(), "OCB_AGENT_SPEC": ocb_agent_spec(wheel)},
             timeout=timeout,
         )
         installed = None if returncode else _executable(stdout.strip())
