@@ -35,8 +35,12 @@ RECEIPT_POLL_SECONDS = 2
 MAX_RECEIPT_TIMEOUT = 300
 RECEIPT_ERROR = (
     "the transaction was sent, but its receipt could not be read (the cause is "
-    "in Connect's log); check it with transaction_status before resending"
+    "in Connect's log); transaction_status answers not_found until it is mined, "
+    "which does not mean it was not sent: resend only under the same request_id"
 )
+
+# how a transaction settled, as the send tools and transaction_status say it
+SettlementStatus = t.Literal["success", "reverted", "pending", "not_found"]
 
 logger = logging.getLogger("agent")
 
@@ -68,13 +72,13 @@ def settled(
         # either, so a malformed one is reported pending, not raised
         return mined_result(tx_hash, receipt)
     except TimeExhausted:
-        return {"tx_hash": tx_hash, "status": "pending"}
+        return _status(tx_hash, "pending")
     except Exception:  # pylint: disable=broad-exception-caught
         # the send already happened; a receipt-read hiccup must not lose the
         # hash. Its text is the RPC library's (an RPC URL may carry a key), so
         # it goes to the log, and the caller gets Connect's own words.
         logger.warning("could not read the receipt of %s", tx_hash, exc_info=True)
-        return {"tx_hash": tx_hash, "status": "pending", "receipt_error": RECEIPT_ERROR}
+        return {**_status(tx_hash, "pending"), "receipt_error": RECEIPT_ERROR}
 
 
 def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
@@ -86,11 +90,19 @@ def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
     """
     info = _receipt_to_dict(receipt)
     return {
-        "tx_hash": tx_hash,
-        "status": "success" if info["status"] == 1 else "reverted",
+        **_status(tx_hash, "success" if info["status"] == 1 else "reverted"),
         "block": info["block_number"],
         "receipt": info,
     }
+
+
+def not_found(tx_hash: str) -> dict:
+    """Return the answer for a hash with no receipt: unknown, malformed or unmined."""
+    return _status(tx_hash, "not_found")
+
+
+def _status(tx_hash: str, status: SettlementStatus) -> dict:
+    return {"tx_hash": tx_hash, "status": status}
 
 
 def _receipt_to_dict(receipt: t.Mapping[str, t.Any]) -> dict:

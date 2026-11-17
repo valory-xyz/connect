@@ -88,10 +88,13 @@ other non-aea agent. It:
      answer (`serverInfo` `{"name": "connect", "version": "0.1.0"}`, no
      `instructions`) and error texts OnchainBench's reference ones (see
      [Bench parity](#bench-parity)): a failed tool call reads the refusing
-     code's own text, with no `Error executing tool` prefix, an unknown tool
+     code's own text, with no `Error executing tool` prefix (an error Connect
+     did not word for the caller reads `<tool> failed (the cause is in
+     Connect's log)` instead, its cause logged), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
      of `target`. `transaction_status` answers `success` (with its `block`),
-     `reverted` or `not_found` (an unknown or malformed hash); a send that
+     `reverted` or `not_found` (a hash with no receipt: unknown, malformed or
+     not mined yet, so `not_found` never means a broadcast did not happen); a send that
      waited reports `success` / `reverted` / `pending`. The tools are `wallet_info`,
      `safe_transaction`, `send_transaction`, `preflight_transaction`,
      `simulate_transaction`, `transaction_status`, `chain_call`, `get_abi`,
@@ -264,8 +267,10 @@ intent allows <m>`; `receive-min`: `<symbol>: receives <n>, intent needs <m>`;
 `undeclared-recipient`: the address; `undeclared-approval`: `<symbol> to
 <spender>, <amount>`; `reverts`: the revert reason), a token named by its
 `symbol()` where it has one. `simulate_transaction`'s `problems` are the same
-strings; with no intent it answers `fits_intent: null` and no problems, a
-revert showing only in the diff's `ok` and `revert`. Only the CELO face's `Transfer` is native:
+strings; a call simulated with no intent answers `fits_intent: null` and no
+problems, a revert showing only in the diff's `ok` and `revert` (a call that
+cannot be simulated, or an EOA call refused before simulation, still answers
+`fits_intent: false` with its problem). Only the CELO face's `Transfer` is native:
 its `Approval` is an approval like any other, and an intent naming the face in
 `spend` or `receive_min` means `"native"` (naming both is `bad-intent`). Under a
 value-capped token the gate also refuses any ERC-721/1155 position leaving the
@@ -328,8 +333,8 @@ are bounded by `max_payment` and the top-up plan, and while restricted by their
 single-use allowances. The diff names each token's `symbol()` for the reader
 (display only: nothing is checked against it, and a token without one reads
 as `""`). `simulate_transaction` takes the same `intent` and reports the
-gate's `problems` without signing; `preflight_transaction` runs no gate at
-all (below).
+gate's `problems` without signing; `preflight_transaction` checks no intent
+rules and simulates nothing (below).
 
 The gate holds **transactions**. `sign_message` signs a raw digest for the
 uncapped workspace token in the default mode, and a digest can be a safe
@@ -487,9 +492,12 @@ bytes the send would and runs them past the same guardrail, answering
 refusal the real call would have raised — the calling token's caps included,
 checked first as the MCP mount checks the send, without drawing on its
 session budget. As in OnchainBench's reference, it is the guardrail's verdict
-on these bytes and nothing more: nothing is simulated and the intent gate does
-not run, so `permitted` does not mean the call will succeed on-chain or pass
-the gate (`simulate_transaction` answers that). Nothing is signed or
+on these bytes and nothing more: nothing is simulated and the intent rules are
+not checked; only calldata that is not strictly hex is refused first, as the
+gate's `bad-calldata`. So `permitted` does not mean the call will succeed
+on-chain or pass the gate (`simulate_transaction` answers that). The token
+check before it is the scoped-token feature's, which keeps its production
+position until that feature gets its switch. Nothing is signed or
 broadcast, and no single-use allowance is spent — the reasoning for that is at
 the top of `connect/guard.py`.
 

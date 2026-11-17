@@ -29,66 +29,33 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.guard import Guard
 from connect.intent import parse_intent
 from connect.mech import MechService
 from connect.server.auth import TOOL_AMOUNTS, TOOL_CAPS
-from connect.server.mcp_tools import build_mcp
 from connect.server.strict import (
     audit_unknown_parameters,
     unknown_parameters_message,
 )
-from connect.settings import SettingsStore
 from connect.signer import Signer
 from connect.switches import Switches
 
-from tests.conftest import FakeW3, audit_entries, grant_store
+from tests.conftest import FakeW3, audit_entries
 
 TOKEN = "strict-test-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
 
 
 @pytest.fixture
-def mcp(  # pylint: disable=too-many-arguments
-    test_signer: Signer,
-    app_config: AppConfig,
-    activity: ActivityLog,
-    guard: Guard,
-    mech_service: MechService,
-    settings_store: SettingsStore,
-) -> FastMCP:
+def mcp(make_mcp: t.Callable[..., FastMCP]) -> FastMCP:
     """Return the MCP server built with the strict_parameters switch on."""
-    return build_mcp(
-        test_signer,
-        app_config,
-        activity,
-        guard=guard,
-        mech=mech_service,
-        settings_store=settings_store,
-        grants=grant_store("workspace-token"),
-        switches=Switches(strict_parameters=True),
-    )
+    return make_mcp(Switches(strict_parameters=True))
 
 
-async def test_an_unknown_parameter_is_ignored_with_the_switch_off(  # pylint: disable=too-many-arguments
-    test_signer: Signer,
-    app_config: AppConfig,
-    activity: ActivityLog,
-    guard: Guard,
-    mech_service: MechService,
-    settings_store: SettingsStore,
-    fake_w3: FakeW3,
+async def test_an_unknown_parameter_is_ignored_with_the_switch_off(
+    make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
 ) -> None:
-    """The strict_parameters switch is off in production: the call goes on without the key."""
-    lenient = build_mcp(
-        test_signer,
-        app_config,
-        activity,
-        guard=guard,
-        mech=mech_service,
-        settings_store=settings_store,
-        grants=grant_store("workspace-token"),
-    )
+    """The strict_parameters switch is off in production: the key is dropped."""
+    lenient = make_mcp()
     await lenient.call_tool(
         "safe_transaction",
         {"chain": "testchain", "target": RECIPIENT, "targett": RECIPIENT},

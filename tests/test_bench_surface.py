@@ -21,6 +21,7 @@
 """The MCP surface the agent sees is OnchainBench's reference surface."""
 
 import json
+import logging
 import typing as t
 
 import pytest
@@ -31,17 +32,16 @@ from mcp.server.fastmcp.exceptions import ToolError
 from connect import texts
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.guard import Guard
-from connect.mech import MechService
-from connect.server.mcp_tools import build_mcp, with_aliases
-from connect.settings import SettingsStore
-from connect.signer import Signer
+from connect.server.auth import ACTION_SCOPES
+from connect.server.mcp_tools import TOOL_FAILED, with_aliases
+from connect.signer import Signer, SignerError
 from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
 
-from tests.conftest import FakeW3, grant_store
+from tests.conftest import FakeW3
 
 TOKEN = "surface-test-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
+SAFE = "0x" + "22" * 20  # the test chain's service safe
 MCP_HEADERS = {
     "Accept": "application/json, text/event-stream",
     "Authorization": f"Bearer {TOKEN}",
@@ -49,24 +49,9 @@ MCP_HEADERS = {
 
 
 @pytest.fixture
-def mcp(  # pylint: disable=too-many-arguments
-    test_signer: Signer,
-    app_config: AppConfig,
-    activity: ActivityLog,
-    guard: Guard,
-    mech_service: MechService,
-    settings_store: SettingsStore,
-) -> FastMCP:
+def mcp(make_mcp: t.Callable[..., FastMCP]) -> FastMCP:
     """Return the MCP server as Pearl builds it."""
-    return build_mcp(
-        test_signer,
-        app_config,
-        activity,
-        guard=guard,
-        mech=mech_service,
-        settings_store=settings_store,
-        grants=grant_store("workspace-token"),
-    )
+    return make_mcp()
 
 
 @pytest.fixture
@@ -76,7 +61,7 @@ def client(
     activity: ActivityLog,
     make_app: t.Callable,
 ) -> t.Iterator[TestClient]:
-    """HTTP client with a valid token."""
+    """HTTP client with a valid token, over an app whose signer has its guard."""
     app = make_app(test_signer, app_config, activity, token=TOKEN)
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         yield client
@@ -96,38 +81,86 @@ def _rpc(client: TestClient, method: str, params: dict) -> dict:
     return json.loads(data[-1].removeprefix("data:"))
 
 
-def _tool_text(client: TestClient, name: str, arguments: dict) -> tuple[bool, str]:
-    """Call a tool over the transport; return (isError, the text the client reads)."""
+def _tool_error(client: TestClient, name: str, arguments: dict) -> str:
+    """Call a tool over the transport and return the error text the client reads."""
     result = _rpc(client, "tools/call", {"name": name, "arguments": arguments})[
         "result"
     ]
-    return result["isError"], result["content"][0]["text"]
+    assert result["isError"], result
+    return result["content"][0]["text"]
 
 
-def test_a_tool_error_reaches_the_client_with_no_transport_prefix(
-    client: TestClient,
+def test_a_guardrail_refusal_reads_as_its_constant_through_the_transport(
+    client: TestClient, fake_w3: FakeW3
 ) -> None:
-    """The client reads the refusing code's own text, not FastMCP's wrapper."""
-    is_error, text = _tool_text(
-        client, "safe_transaction", {"chain": "nochain", "target": RECIPIENT}
+    """A self-call reaches the client as the reference text, nothing prepended."""
+    text = _tool_error(
+        client, "safe_transaction", {"chain": "testchain", "target": SAFE}
     )
-    assert is_error
-    assert not text.startswith("Error executing tool")
+    assert text == texts.GUARD_NO_SELF_CALL
+    assert not fake_w3.eth.sent
+
+
+def test_a_gate_refusal_ends_not_sent_through_the_transport(
+    client: TestClient, fake_w3: FakeW3
+) -> None:
+    """A value-moving call with no intent reads as the gate's, ending not-sent."""
+    text = _tool_error(
+        client,
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "value": "5"},
+    )
+    assert text.startswith("intent gate: rule '")
+    assert text.endswith(texts.NOT_SENT_SUFFIX)
+    assert not fake_w3.eth.sent
+
+
+def test_an_unknown_tool_is_named_through_the_transport(client: TestClient) -> None:
+    """The mount passes an unknown name on, and the client reads the reference."""
+    assert _tool_error(client, "no_such_tool", {}) == texts.UNKNOWN_TOOL("no_such_tool")
+
+
+async def test_every_registered_tool_has_a_scope(mcp: FastMCP) -> None:
+    """The mount passes on only names it has no scope for, and no tool is one."""
+    assert {tool.name for tool in await mcp.list_tools()} <= set(ACTION_SCOPES)
 
 
 async def test_the_in_process_error_is_the_handler_s_own_text(
     mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, test_signer: Signer
 ) -> None:
-    """The raised text equals what the handler raised, character for character."""
+    """A refusal Connect wrote is raised character for character."""
 
     def refuse(*_: t.Any, **__: t.Any) -> str:
-        raise ValueError(texts.GUARD_NO_SELF_CALL)
+        raise SignerError(texts.GUARD_NO_SELF_CALL)
 
     monkeypatch.setattr(test_signer, "send_via_safe", refuse)
     with pytest.raises(ToolError) as raised:
         await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
     assert str(raised.value) == texts.GUARD_NO_SELF_CALL
-    assert isinstance(raised.value.__cause__, ValueError)
+    assert isinstance(raised.value.__cause__, SignerError)
+
+
+async def test_an_unexpected_error_is_logged_and_never_forwarded(
+    mcp: FastMCP,
+    monkeypatch: pytest.MonkeyPatch,
+    test_signer: Signer,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A library's text (which may name an RPC key) stays in the log."""
+    rpc = "https://rpc.example/v2/" + "SECRETKEY"  # kept off the raising line
+
+    def broken(*_: t.Any, **__: t.Any) -> str:
+        raise RuntimeError(f"{rpc} is down")
+
+    monkeypatch.setattr(test_signer, "send_via_safe", broken)
+    with caplog.at_level(logging.ERROR, logger="agent"):
+        with pytest.raises(ToolError) as raised:
+            await mcp.call_tool(
+                "safe_transaction", {"chain": "testchain", "target": RECIPIENT}
+            )
+    assert str(raised.value) == TOOL_FAILED.format(tool="safe_transaction")
+    assert "tool safe_transaction failed: RuntimeError" in caplog.text
+    assert "SECRETKEY" not in caplog.text
 
 
 async def test_an_unknown_tool_is_named_in_the_reference_s_words(
@@ -155,7 +188,7 @@ def test_initialize_reports_the_reference_s_server_info(client: TestClient) -> N
 
 
 async def test_every_published_description_is_the_reference_s(mcp: FastMCP) -> None:
-    """The 13 tools publish the texts module's descriptions and nothing else."""
+    """Every tool publishes the texts module's description and nothing else."""
     tools = await mcp.list_tools()
     assert {tool.name: tool.description for tool in tools} == texts.TOOL_DESCRIPTIONS
 
@@ -169,6 +202,14 @@ async def test_to_reaches_the_signer_as_a_safe_call_s_target(
     assert bytes.fromhex(RECIPIENT[2:]) in fake_w3.eth.sent[0]
 
 
+async def test_preflight_takes_to_as_its_target(mcp: FastMCP) -> None:
+    """A preflight with `to` and no `target` is answered, not refused."""
+    content = await mcp.call_tool(
+        "preflight_transaction", {"chain": "testchain", "to": RECIPIENT}
+    )
+    assert json.loads(content[0].text) == {"permitted": True}  # type: ignore[index]
+
+
 def test_target_wins_over_to_and_other_tools_are_left_alone() -> None:
     """The alias fills `target` only when absent, and only on the safe-call tools."""
     other = "0x" + "bb" * 20
@@ -179,14 +220,6 @@ def test_target_wins_over_to_and_other_tools_are_left_alone() -> None:
         assert with_aliases(tool, {"to": other}) == {"target": other}
     assert with_aliases("send_transaction", {"to": other}) == {"to": other}
     assert with_aliases("simulate_transaction", {"chain": "c"}) == {"chain": "c"}
-
-
-async def test_preflight_takes_to_as_its_target(mcp: FastMCP) -> None:
-    """A preflight with `to` and no `target` is answered, not refused."""
-    content = await mcp.call_tool(
-        "preflight_transaction", {"chain": "testchain", "to": RECIPIENT}
-    )
-    assert json.loads(content[0].text) == {"permitted": True}  # type: ignore[index]
 
 
 def test_the_test_interface_takes_the_reference_s_positions() -> None:

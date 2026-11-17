@@ -25,90 +25,105 @@ agent reads the same text on the bench and in Pearl. The module is public:
 the bench imports it, so a rename here fails the bench's suite instead of
 drifting. Names the bench imports keep their reference spelling, upper-case
 formatters included.
+
+Not every text is emitted by Connect yet. `WEI_DESCRIPTION`, `MINED_PREFIX`,
+`MINED_REVERT`, `INTENT_UNKNOWN_TOKEN`, `LOST_RESPONSE`, `SIGNER_REFUSED`,
+`UNAUTHORIZED_BODY`, `INVALID_REQUEST`, `ADDRESS_INVALID`, `HEX_INVALID`,
+`AMOUNT_INEXACT`, `ABI_UNVERIFIED`, `UNKNOWN_SELECTOR` and the `MECH_*` texts
+are the reference's wording for behaviour still to be matched; until each is
+wired, Connect answers those cases in its own words.
 """
 
 # pylint: disable=invalid-name
+
+import typing as t
+from types import MappingProxyType
 
 WEI_DESCRIPTION = (
     "an integer amount in base units (wei), as a decimal string such as "
     '"9000000000000000000"'
 )
 
-SERVER_INFO = {"name": "connect", "version": "0.1.0"}
+# read-only: an importer must not change what the server publishes
+SERVER_INFO: t.Mapping[str, str] = MappingProxyType(
+    {"name": "connect", "version": "0.1.0"}
+)
 
-TOOL_DESCRIPTIONS = {
-    "wallet_info": (
-        "Agent EOA and per-chain safes, balances, known tokens and the chain's "
-        "read-only RPC URL. Start every on-chain task here; act only on "
-        "`actionable_chains`."
-    ),
-    "safe_transaction": (
-        "Make the service safe call `target`, the normal way to act on-chain. "
-        "`target`/`value`/`data` are the call the safe makes; any value carried "
-        "leaves the safe, not the EOA. Reusing a request_id replays the original "
-        "result instead of spending twice. Connect simulates the call first and "
-        "refuses it if it reverts; pass `intent` (spend, receive_min, recipients, "
-        "approvals) to also have the asset diff checked against what you mean."
-    ),
-    "send_transaction": (
-        "Sign and broadcast a transaction from the agent EOA, the rarer path. "
-        "`to` is the EOA's own recipient, not a call the safe makes, and the "
-        "EOA's funds are for gas: to spend or act on-chain use safe_transaction. "
-        "request_id semantics are safe_transaction's."
-    ),
-    "preflight_transaction": (
-        "Ask whether a safe call would be permitted, before you build on it: "
-        "answers {permitted}, plus the `rule` the real call would have been "
-        "refused with. Nothing is signed, broadcast or paid for, and nothing is "
-        "simulated: `permitted` means the guardrail permits these bytes, not "
-        "that the call will succeed on-chain."
-    ),
-    "simulate_transaction": (
-        "Simulate a safe call against the chain's current state and return the "
-        "asset diff: native and token balance changes of the safe, recipients, "
-        "approvals granted, contracts called, revert reason, gas. With `intent`, "
-        "also says whether the diff fits it. Nothing is sent."
-    ),
-    "chain_call": (
-        "eth_call against the chain (read a contract). `data` is ABI-encoded "
-        "calldata; returns the raw result."
-    ),
-    "get_abi": (
-        "The verified ABI of a contract, from a local cache of verified sources "
-        "(Sourcify/Blockscout). For a proxy, also the implementation and its "
-        "ABI. Unverified contracts return an error."
-    ),
-    "decode_calldata": (
-        "Decode calldata (or a function selector) using the target's ABI if "
-        "known, else a local signature list."
-    ),
-    "transaction_status": (
-        "Settlement of a transaction hash you already hold: success, reverted or "
-        "not_found."
-    ),
-    "sign_message": (
-        "Sign a raw 32-byte digest (0x-hex) with the agent EOA, unprefixed."
-    ),
-    "mech_tools": (
-        "Discover Olas mechs and the tools they serve, for use with mech_request. "
-        "Without priority_mech: the live mechs. With it: that mech's tool names "
-        "for mech_request's `tool`, its price (`max_delivery_rate`, base units "
-        "of `payment_token`), payment_token and whose terms apply."
-    ),
-    "mech_request": (
-        "Send a request to an Olas mech (AI service) and wait for its delivery. "
-        "The safe pays: off-chain by default, from the prepaid balance, topped "
-        "up from the safe with auto_deposit. Refused before paying if the mech's "
-        "price exceeds max_payment (base units of the mech's payment asset). "
-        "`request_id` is an id you invent before sending: repeating it never "
-        "pays again."
-    ),
-    "mech_result": (
-        "Check whether a mech has since answered a request whose wait timed out "
-        "(an id from `pending_request_ids`). Already paid for, so this resumes "
-        "the watch and never resends."
-    ),
-}
+TOOL_DESCRIPTIONS: t.Mapping[str, str] = MappingProxyType(
+    {
+        "wallet_info": (
+            "Agent EOA and per-chain safes, balances, known tokens and the chain's "
+            "read-only RPC URL. Start every on-chain task here; act only on "
+            "`actionable_chains`."
+        ),
+        "safe_transaction": (
+            "Make the service safe call `target`, the normal way to act on-chain. "
+            "`target`/`value`/`data` are the call the safe makes; any value carried "
+            "leaves the safe, not the EOA. Reusing a request_id replays the original "
+            "result instead of spending twice. Connect simulates the call first and "
+            "refuses it if it reverts; pass `intent` (spend, receive_min, recipients, "
+            "approvals) to also have the asset diff checked against what you mean."
+        ),
+        "send_transaction": (
+            "Sign and broadcast a transaction from the agent EOA, the rarer path. "
+            "`to` is the EOA's own recipient, not a call the safe makes, and the "
+            "EOA's funds are for gas: to spend or act on-chain use safe_transaction. "
+            "request_id semantics are safe_transaction's."
+        ),
+        "preflight_transaction": (
+            "Ask whether a safe call would be permitted, before you build on it: "
+            "answers {permitted}, plus the `rule` the real call would have been "
+            "refused with. Nothing is signed, broadcast or paid for, and nothing is "
+            "simulated: `permitted` means the guardrail permits these bytes, not "
+            "that the call will succeed on-chain."
+        ),
+        "simulate_transaction": (
+            "Simulate a safe call against the chain's current state and return the "
+            "asset diff: native and token balance changes of the safe, recipients, "
+            "approvals granted, contracts called, revert reason, gas. With `intent`, "
+            "also says whether the diff fits it. Nothing is sent."
+        ),
+        "chain_call": (
+            "eth_call against the chain (read a contract). `data` is ABI-encoded "
+            "calldata; returns the raw result."
+        ),
+        "get_abi": (
+            "The verified ABI of a contract, from a local cache of verified sources "
+            "(Sourcify/Blockscout). For a proxy, also the implementation and its "
+            "ABI. Unverified contracts return an error."
+        ),
+        "decode_calldata": (
+            "Decode calldata (or a function selector) using the target's ABI if "
+            "known, else a local signature list."
+        ),
+        "transaction_status": (
+            "Settlement of a transaction hash you already hold: success, reverted or "
+            "not_found."
+        ),
+        "sign_message": (
+            "Sign a raw 32-byte digest (0x-hex) with the agent EOA, unprefixed."
+        ),
+        "mech_tools": (
+            "Discover Olas mechs and the tools they serve, for use with mech_request. "
+            "Without priority_mech: the live mechs. With it: that mech's tool names "
+            "for mech_request's `tool`, its price (`max_delivery_rate`, base units "
+            "of `payment_token`), payment_token and whose terms apply."
+        ),
+        "mech_request": (
+            "Send a request to an Olas mech (AI service) and wait for its delivery. "
+            "The safe pays: off-chain by default, from the prepaid balance, topped "
+            "up from the safe with auto_deposit. Refused before paying if the mech's "
+            "price exceeds max_payment (base units of the mech's payment asset). "
+            "`request_id` is an id you invent before sending: repeating it never "
+            "pays again."
+        ),
+        "mech_result": (
+            "Check whether a mech has since answered a request whose wait timed out "
+            "(an id from `pending_request_ids`). Already paid for, so this resumes "
+            "the watch and never resends."
+        ),
+    }
+)
 
 # What the broker reads: a refusal that begins with the guardrail prefix or
 # ends with the not-sent suffix was not sent; one beginning MINED_PREFIX was.
@@ -191,7 +206,7 @@ def UNKNOWN_TOOL(tool: str) -> str:
     return f"unknown tool {tool}"
 
 
-UNAUTHORIZED_BODY = {"detail": "unauthorized"}
+UNAUTHORIZED_BODY: t.Mapping[str, str] = MappingProxyType({"detail": "unauthorized"})
 
 
 def INVALID_REQUEST(type_name: str, message: str) -> str:
@@ -242,7 +257,7 @@ MECH_NO_PREPAID = "insufficient prepaid balance and auto_deposit is off"
 
 
 def MECH_DEPOSIT_FAILED(asset: str) -> str:
-    """Return the refusal of a top-up the safe cannot cover (`native` or `USDC`)."""
+    """Return the refusal of a top-up the safe cannot cover, naming the payment asset."""
     return f"auto_deposit failed: the safe holds too little {asset}"
 
 

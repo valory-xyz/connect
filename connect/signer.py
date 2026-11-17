@@ -700,7 +700,8 @@ class Signer:
         texts = [intent_module.problem_text(p) for p in problems]
         if diff is None:
             return {"fits_intent": False, "problems": texts}
-        if parsed is None:  # a revert shows in the diff's own ok and revert
+        if parsed is None:  # no intent: no verdict and no problems, as the
+            # reference answers; a revert shows in the diff's ok and revert
             return {**diff, "fits_intent": None, "problems": []}
         return {**diff, "fits_intent": not problems, "problems": texts}
 

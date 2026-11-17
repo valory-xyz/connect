@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from mcp.server.fastmcp import FastMCP
 from web3 import Web3
 from web3.exceptions import Web3RPCError
 
@@ -36,9 +37,6 @@ from connect import signer as signer_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.mech import MechService
-from connect.server.mcp_tools import build_mcp
-from connect.settings import SettingsStore
 from connect.signer import SERVER_BUILT, Signer, SignerError
 from connect.signer_errors import (
     SEND_FAILED,
@@ -48,7 +46,7 @@ from connect.signer_errors import (
     logged_cause,
 )
 
-from tests.conftest import FakeW3, audit_entries, grant_store, pay
+from tests.conftest import FakeW3, audit_entries, pay
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -81,25 +79,12 @@ def _approval_log(amount: int) -> dict:
 
 
 @pytest.fixture
-def tools(  # pylint: disable=too-many-arguments
-    test_signer: Signer,
-    app_config: AppConfig,
-    activity: ActivityLog,
-    guard: Guard,
-    mech_service: MechService,
-    settings_store: SettingsStore,
+def tools(
+    test_signer: Signer, guard: Guard, make_mcp: t.Callable[..., FastMCP]
 ) -> dict[str, t.Callable]:
     """Return the registered MCP tool functions keyed by name."""
     test_signer.set_guard(guard)
-    mcp = build_mcp(
-        test_signer,
-        app_config,
-        activity,
-        guard=guard,
-        mech=mech_service,
-        settings_store=settings_store,
-        grants=grant_store("workspace-token"),
-    )
+    mcp = make_mcp()
     manager = mcp._tool_manager  # pylint: disable=protected-access
     return {tool.name: tool.fn for tool in manager.list_tools()}
 
@@ -199,7 +184,10 @@ class TestSignerGate:
         """Some RPCs answer the call's error as a string, not an object."""
         fake_w3.provider.status = "0x0"
         fake_w3.provider.error = "execution reverted"
-        with pytest.raises(SignerError, match=r"rule 'reverts' \(.*execution reverted"):
+        with pytest.raises(
+            SignerError,
+            match=r"^intent gate: rule 'reverts' \(execution reverted\)\. Nothing was sent\.$",
+        ):
             test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
         assert not fake_w3.eth.sent
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]

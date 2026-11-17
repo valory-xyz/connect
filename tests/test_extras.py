@@ -35,6 +35,7 @@ from aea_ledger_ethereum import rpc_rotation
 from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mcp.server.fastmcp import FastMCP
 from mech_client import NonceAllocator
 from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
@@ -58,14 +59,10 @@ from connect.config import (
     STORE_PATH_ENV,
     load_config,
 )
-from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
-from connect.mech import MechService
 from connect.run_goal import RunGoal
 from connect.server import receipts
 from connect.server.auth import AuthFailureLimiter, AuthMiddleware
-from connect.server.mcp_tools import build_mcp
-from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError, _IdempotencyCache
 from connect.switches import PRODUCTION, Switches
 
@@ -1154,25 +1151,9 @@ class TestMcpTools:
     """MCP tool behavior via the registered tool functions."""
 
     @pytest.fixture
-    def tools(  # pylint: disable=too-many-arguments
-        self,
-        test_signer: Signer,
-        app_config: AppConfig,
-        activity: ActivityLog,
-        guard: Guard,
-        mech_service: MechService,
-        settings_store: SettingsStore,
-    ) -> dict[str, t.Callable]:
+    def tools(self, make_mcp: t.Callable[..., FastMCP]) -> dict[str, t.Callable]:
         """Return the registered tool functions keyed by name."""
-        mcp = build_mcp(
-            test_signer,
-            app_config,
-            activity,
-            guard=guard,
-            mech=mech_service,
-            settings_store=settings_store,
-            grants=grant_store("workspace-token"),
-        )
+        mcp = make_mcp()
         manager = mcp._tool_manager  # pylint: disable=protected-access
         return {tool.name: tool.fn for tool in manager.list_tools()}
 
@@ -1348,9 +1329,8 @@ class TestMcpTools:
     ) -> None:
         """transaction_status reports not_found, then success, then reverted.
 
-        It speaks the same top-level status the send tools do, so a tx polled
-        here after a pending send is read the same way — a revert is not a
-        success-shaped dict a caller reads past.
+        `not_found` is any hash with no receipt, a broadcast not yet mined
+        included; a revert is its own status, never a success-shaped dict.
         """
         tx_hash = "0x" + "11" * 32
         unknown = await tools["transaction_status"]("testchain", tx_hash)

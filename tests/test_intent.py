@@ -984,6 +984,11 @@ SPENT = intent.Intent(spend={TOKEN: 4}, receive_min={}, recipients=[], approvals
             intent.Intent(spend={}, receive_min={}, recipients=[], approvals=[]),
             f"intent gate: rule 'undeclared-approval' (USDC to {CONTRACT}, 7)",
         ),
+        (
+            _diff(ok=False, revert="execution reverted"),
+            intent.Intent(spend={}, receive_min={}, recipients=[], approvals=[]),
+            "intent gate: rule 'reverts' (execution reverted)",
+        ),
     ],
 )
 def test_each_problem_reads_as_the_reference_words_it(

@@ -36,6 +36,7 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from eth_utils import to_checksum_address
 from hexbytes import HexBytes
+from mcp.server.fastmcp import FastMCP
 from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound, Web3RPCError
 
@@ -46,6 +47,7 @@ from connect.mech import MechService
 from connect.server import auth as auth_module
 from connect.server.app import create_app
 from connect.server.auth import GrantStore
+from connect.server.mcp_tools import build_mcp
 from connect.settings import (
     MODE_UNRESTRICTED,
     Protected,
@@ -600,6 +602,32 @@ def mech_service(
     service = MechService(test_signer, app_config, activity, guard)
     yield service
     service.queue.close()
+
+
+@pytest.fixture
+def make_mcp(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    guard: Guard,
+    mech_service: MechService,
+    settings_store: SettingsStore,
+) -> t.Callable[..., FastMCP]:
+    """Return a factory for the MCP server over the test wiring, per switch set."""
+
+    def _make(switches: Switches = PRODUCTION) -> FastMCP:
+        return build_mcp(
+            test_signer,
+            app_config,
+            activity,
+            guard=guard,
+            mech=mech_service,
+            settings_store=settings_store,
+            grants=grant_store("workspace-token"),
+            switches=switches,
+        )
+
+    return _make
 
 
 @pytest.fixture

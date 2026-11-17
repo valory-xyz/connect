@@ -26,6 +26,7 @@ that also serves the Pearl endpoints.
 """
 
 import asyncio
+import logging
 import typing as t
 
 from hexbytes import HexBytes
@@ -41,9 +42,10 @@ from connect import settings as settings_config
 from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.guard import Guard
+from connect.guard import Guard, GuardError
+from connect.idempotency import InFlightError
 from connect.intent import AgentIntent, parse_amount, parse_tool_amount
-from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
+from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
 from connect.server.auth import (
     GrantRefused,
@@ -51,10 +53,11 @@ from connect.server.auth import (
     is_replay,
     request_token,
 )
-from connect.server.receipts import mined_result, settled
+from connect.server.receipts import mined_result, not_found, settled
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
-from connect.signer import Signer
+from connect.signer import Signer, SignerError
+from connect.signer_errors import logged_cause
 from connect.switches import PRODUCTION, Switches
 from connect.texts import SERVER_INFO, TOOL_DESCRIPTIONS, UNKNOWN_TOOL
 
@@ -132,10 +135,24 @@ class ToolIntent(TypedDict, total=False):
     approvals: list[ToolApproval] | None
 
 
-# a safe call's target may be passed as `to`, as the reference accepts it
-TARGET_ALIASES = frozenset(
+# the tools whose `target` may be passed as `to`, as the reference accepts it
+TOOLS_TAKING_TO_FOR_TARGET = frozenset(
     {"safe_transaction", "preflight_transaction", "simulate_transaction"}
 )
+
+# errors whose text Connect wrote for the caller; any other is a library's or
+# a bug's, which may carry an RPC URL and key, so it is logged, not forwarded
+CALLER_ERRORS: tuple[type[Exception], ...] = (
+    ValueError,
+    SignerError,
+    GuardError,
+    GrantRefused,
+    MechError,
+    InFlightError,
+)
+TOOL_FAILED = "{tool} failed (the cause is in Connect's log)"
+
+logger = logging.getLogger("agent")
 
 
 def with_aliases(tool: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
@@ -143,7 +160,7 @@ def with_aliases(tool: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
 
     `target` wins when both are given, as in the reference.
     """
-    if tool not in TARGET_ALIASES or "to" not in arguments:
+    if tool not in TOOLS_TAKING_TO_FOR_TARGET or "to" not in arguments:
         return arguments
     aliased = {k: v for k, v in arguments.items() if k != "to"}
     aliased.setdefault("target", arguments["to"])
@@ -172,7 +189,10 @@ class ConnectMCP(FastMCP):
             return await super().call_tool(name, with_aliases(name, arguments))
         except ToolError as e:
             cause = e.__cause__ or e
-            raise ToolError(str(cause)) from cause
+            if isinstance(cause, (ToolError, *CALLER_ERRORS)):
+                raise ToolError(str(cause)) from cause
+            logger.error("tool %s failed: %s", name, logged_cause(cause))
+            raise ToolError(TOOL_FAILED.format(tool=name)) from cause
 
 
 def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-locals
@@ -361,14 +381,14 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         except ValueError:
             valid = False
         if not valid:  # a hash that can never resolve is simply not found
-            return {"tx_hash": tx_hash, "status": "not_found"}
+            return not_found(tx_hash)
 
         def _run() -> dict:
             w3 = signer.w3(chain)
             try:
                 receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
-            except TransactionNotFound:
-                return {"tx_hash": tx_hash, "status": "not_found"}
+            except TransactionNotFound:  # unknown, or not mined yet
+                return not_found(tx_hash)
             return mined_result(tx_hash, receipt)
 
         return await asyncio.to_thread(_run)

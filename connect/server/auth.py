@@ -860,6 +860,10 @@ class AuthMiddleware:
             arguments = params.get("arguments")
             arguments = arguments if isinstance(arguments, dict) else {}
             name = str(params.get("name"))
+            if name not in ACTION_SCOPES:
+                # no tool of that name: nothing is authorized by passing it
+                # on, and the MCP app answers it `texts.UNKNOWN_TOOL`
+                continue
             try:
                 check_tool_amounts(name, arguments)
                 if self._grants.authorize(token, name, arguments):

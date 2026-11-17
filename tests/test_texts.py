@@ -20,7 +20,9 @@
 
 """Every contract text equals OnchainBench's reference value, verbatim."""
 
+import ast
 import typing as t
+from pathlib import Path
 
 import pytest
 
@@ -120,6 +122,89 @@ FORMATTED = [
 ]
 
 
+# the reference's TOOLS table, onchainbench 40b9430 fork_connect.py, verbatim
+REFERENCE_DESCRIPTIONS = {
+    "wallet_info": (
+        "Agent EOA and per-chain safes, balances, known tokens and the chain's "
+        "read-only RPC URL. Start every on-chain task here; act only on "
+        "`actionable_chains`."
+    ),
+    "safe_transaction": (
+        "Make the service safe call `target`, the normal way to act on-chain. "
+        "`target`/`value`/`data` are the call the safe makes; any value carried"
+        " leaves the safe, not the EOA. Reusing a request_id replays the "
+        "original result instead of spending twice. Connect simulates the call "
+        "first and refuses it if it reverts; pass `intent` (spend, receive_min,"
+        " recipients, approvals) to also have the asset diff checked against "
+        "what you mean."
+    ),
+    "send_transaction": (
+        "Sign and broadcast a transaction from the agent EOA, the rarer path. "
+        "`to` is the EOA's own recipient, not a call the safe makes, and the "
+        "EOA's funds are for gas: to spend or act on-chain use "
+        "safe_transaction. request_id semantics are safe_transaction's."
+    ),
+    "preflight_transaction": (
+        "Ask whether a safe call would be permitted, before you build on it: "
+        "answers {permitted}, plus the `rule` the real call would have been "
+        "refused with. Nothing is signed, broadcast or paid for, and nothing is"
+        " simulated: `permitted` means the guardrail permits these bytes, not "
+        "that the call will succeed on-chain."
+    ),
+    "simulate_transaction": (
+        "Simulate a safe call against the chain's current state and return the "
+        "asset diff: native and token balance changes of the safe, recipients, "
+        "approvals granted, contracts called, revert reason, gas. With "
+        "`intent`, also says whether the diff fits it. Nothing is sent."
+    ),
+    "chain_call": (
+        "eth_call against the chain (read a contract). `data` is ABI-encoded "
+        "calldata; returns the raw result."
+    ),
+    "get_abi": (
+        "The verified ABI of a contract, from a local cache of verified sources"
+        " (Sourcify/Blockscout). For a proxy, also the implementation and its "
+        "ABI. Unverified contracts return an error."
+    ),
+    "decode_calldata": (
+        "Decode calldata (or a function selector) using the target's ABI if "
+        "known, else a local signature list."
+    ),
+    "transaction_status": (
+        "Settlement of a transaction hash you already hold: success, reverted "
+        "or not_found."
+    ),
+    "sign_message": (
+        "Sign a raw 32-byte digest (0x-hex) with the agent EOA, unprefixed."
+    ),
+    "mech_tools": (
+        "Discover Olas mechs and the tools they serve, for use with "
+        "mech_request. Without priority_mech: the live mechs. With it: that "
+        "mech's tool names for mech_request's `tool`, its price "
+        "(`max_delivery_rate`, base units of `payment_token`), payment_token "
+        "and whose terms apply."
+    ),
+    "mech_request": (
+        "Send a request to an Olas mech (AI service) and wait for its delivery."
+        " The safe pays: off-chain by default, from the prepaid balance, topped"
+        " up from the safe with auto_deposit. Refused before paying if the "
+        "mech's price exceeds max_payment (base units of the mech's payment "
+        "asset). `request_id` is an id you invent before sending: repeating it "
+        "never pays again."
+    ),
+    "mech_result": (
+        "Check whether a mech has since answered a request whose wait timed out"
+        " (an id from `pending_request_ids`). Already paid for, so this resumes"
+        " the watch and never resends."
+    ),
+}
+
+
+def test_every_tool_description_is_the_reference_s_literal() -> None:
+    """Each published description equals the reference's, word for word."""
+    assert texts.TOOL_DESCRIPTIONS == REFERENCE_DESCRIPTIONS
+
+
 @pytest.mark.parametrize(("constant", "reference"), CONSTANTS + FORMATTED)
 def test_text_equals_the_reference(constant: t.Any, reference: t.Any) -> None:
     """Each contract text is the reference's, character for character."""
@@ -160,3 +245,37 @@ def test_the_guardrail_texts_carry_the_prefix_the_broker_reads() -> None:
         texts.guard_not_allowed(ADDR, "gnosis"),
     ):
         assert text.startswith(texts.GUARDRAIL_PREFIX)
+
+
+# the modules whose refusals and answers read the texts module (B28)
+READERS = (
+    "guard.py",
+    "intent.py",
+    "signer.py",
+    "mech.py",
+    "chain_read.py",
+    "server/auth.py",
+    "server/mcp_tools.py",
+)
+
+
+def _string_constants() -> dict[str, str]:
+    """Return every plain string constant of the texts module, by name."""
+    return {
+        name: value
+        for name, value in vars(texts).items()
+        if name.isupper() and isinstance(value, str)
+    }
+
+
+@pytest.mark.parametrize("module", READERS)
+def test_no_reader_restates_a_text_inline(module: str) -> None:
+    """A text lives only in the texts module: no literal in a reader repeats one."""
+    source = Path(texts.__file__).parent / module
+    literals = {
+        node.value
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    restated = {n for n, v in _string_constants().items() if v in literals}
+    assert not restated, (module, sorted(restated))

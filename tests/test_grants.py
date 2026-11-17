@@ -814,9 +814,10 @@ class TestMcpMiddleware:
         middleware, reader = setup
         _, seen = await self._call(middleware, reader, b"{not json")
         assert seen[0] == b"{not json"
+        # a call naming no tool authorizes nothing, so the server answers it
         call = json.dumps({"method": "tools/call", "params": None}).encode()
-        sent, _ = await self._call(middleware, reader, call)
-        assert "token-scope" in json.loads(sent[1]["body"])["error"]["message"]
+        _, seen = await self._call(middleware, reader, call)
+        assert seen[0] == call
 
 
 async def test_a_disconnect_before_any_body_is_passed_on(activity: ActivityLog) -> None:
@@ -931,37 +932,46 @@ def test_mcp_capped_token_may_not_move_a_position(
     assert len(fake_w3.eth.sent) == 1
 
 
-# preflight is the guardrail's verdict alone and simulates nothing, so only the
-# simulation can see a position leave
-@pytest.mark.parametrize("tool", ["simulate_transaction"])
-def test_mcp_dry_runs_hold_a_capped_token_as_the_send_would(
-    client: TestClient, fake_w3: FakeW3, tool: str
+def test_mcp_simulation_holds_a_capped_token_as_the_send_would(
+    client: TestClient, fake_w3: FakeW3
 ) -> None:
-    """A capped token's preflight and simulation answer as its real call would."""
+    """A capped token's simulation sees the position leave, as its send would.
+
+    Preflight does not: it is the guardrail's verdict alone and simulates
+    nothing, so it permits the same call the send refuses by the position cap.
+    """
     fake_w3.provider.logs = [_position_out_log()]
-    call = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": tool,
-            "arguments": {
-                "chain": "testchain",
-                "target": POSITIONS,
-                "intent": {"recipients": [RECIPIENT]},
+    arguments = {"chain": "testchain", "target": POSITIONS}
+
+    def call(tool: str, token: str) -> str:
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": (
+                    {**arguments, "intent": {"recipients": [RECIPIENT]}}
+                    if tool == "simulate_transaction"
+                    else arguments
+                ),
             },
-        },
-    }
-    headers = {"Accept": "application/json, text/event-stream"}
+        }
+        headers = {"Accept": "application/json, text/event-stream"}
+        return client.post(
+            "/mcp/", json=body, headers={**headers, **_bearer(token)}
+        ).text
+
     capped = client.post(
         "/tokens",
         json={"scopes": ["read", "tx"], "max_value_per_tx": {"native": 5}, **LIVE},
         headers=_bearer(WORKSPACE),
     ).json()["token"]
-    refused = client.post("/mcp/", json=call, headers={**headers, **_bearer(capped)})
-    assert "token-cap-positions" in refused.text
-    allowed = client.post("/mcp/", json=call, headers={**headers, **_bearer(WORKSPACE)})
-    assert "token-cap-positions" not in allowed.text
+    assert "token-cap-positions" in call("simulate_transaction", capped)
+    assert "token-cap-positions" not in call("simulate_transaction", WORKSPACE)
+    preflight = call("preflight_transaction", capped)
+    assert '\\"permitted\\": true' in preflight
+    assert "token-cap-positions" not in preflight
     assert not fake_w3.eth.sent
 
 
