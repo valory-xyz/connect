@@ -17,12 +17,16 @@ the installer again.
 
 ## What is here now
 
-- Source: `valory-xyz/olas-ocb-agent` commit `879c5ff` (main, the merge of
-  olas-ocb-agent#68, release 0.5.0); `install.sh` copied byte for byte from it
-- Wheel: `olas_ocb_agent-0.5.0-py3-none-any.whl`, sha256
-  `07487bd77eaea6c2f09a6c877a04b77c3bd68c578d776b7fa95a1f0a6e41bd1f`
-- Built on Linux from `git archive 879c5ff` (LF line endings) with uv 0.13.8:
-  `SOURCE_DATE_EPOCH=$(git show -s --format=%ct 879c5ff) uv build --wheel`
+- Source: `valory-xyz/olas-ocb-agent` commit `e5ccec2` (main, the merge of
+  olas-ocb-agent#71, after #70 set the launch version 0.1.0); `install.sh`
+  copied byte for byte from it
+- Wheel: `olas_ocb_agent-0.1.0-py3-none-any.whl`, sha256
+  `98a68cd9e7ee62eb04412342f7d3c84da6004a91cc793e9c6eceaa8d7998846f`
+- Built on Linux from `git archive e5ccec2` (LF line endings) with uv 0.13.8:
+  `SOURCE_DATE_EPOCH=$(git show -s --format=%ct e5ccec2) uv build --wheel`
   (two builds gave the same sha256; the project names no build backend, so
   uv uses the latest setuptools)
-- `VERSION`: `v0.5.0`
+- `VERSION`: `v0.1.0`. It sorts below the 0.4.1 that earlier Connect
+  releases bundled; an install from those is still replaced, since Connect
+  reinstalls whenever the bundled wheel (name or sha256) changes and the
+  script installs the bundled wheel by URL
