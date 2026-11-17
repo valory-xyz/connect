@@ -123,8 +123,8 @@ async def test_a_misspelled_target_is_refused_by_name(
     # a model-level refusal has no argument to name before it
     assert str(refused.value) == (
         "invalid request: ValidationError: unknown parameter 'targett' (did you "
-        "mean 'target'?); this call takes chain, data, intent, request_id, "
-        "target, timeout, value, wait_for_receipt"
+        "mean 'target'?); this call takes chain, data, intent, operation, "
+        "request_id, target, timeout, value, wait_for_receipt"
     )
     assert not fake_w3.eth.sent
     (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
@@ -573,3 +573,29 @@ async def test_a_misspelled_intent_key_on_a_tool_is_refused_not_dropped(
     assert problem.startswith("intent gate: rule 'bad-intent' (")
     assert unknown in problem
     assert not fake_w3.eth.sent
+
+
+async def test_an_unread_intent_key_is_ignored_with_the_switch_off(
+    make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
+) -> None:
+    """B1: with the switch off, the intent is checked on the keys it carries."""
+    lenient = make_mcp()
+    intent = {
+        "recipients": [RECIPIENT],
+        "receive_minimum": {"native": "1000"},
+        "approvals": [
+            {"token": RECIPIENT, "spender": RECIPIENT, "amount": "1", "amout": "1"}
+        ],
+    }
+    await lenient.call_tool(
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+    )
+    assert len(fake_w3.eth.sent) == 1
+    (content,) = await lenient.call_tool(
+        "simulate_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+    )
+    answer = json.loads(content.text)  # type: ignore[union-attr]
+    assert answer["fits_intent"] is True
+    assert answer["problems"] == []

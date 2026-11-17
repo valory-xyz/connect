@@ -458,3 +458,55 @@ async def test_a_stringified_intent_is_taken_like_the_object(
         },
     )
     assert len(fake_w3.eth.sent) == 1
+
+
+def test_a_delegatecall_operation_is_refused_by_the_guardrail_s_rule(
+    client: TestClient, fake_w3: FakeW3
+) -> None:
+    """B1: `operation` is read, so the floor rule refuses it, not a parameter check."""
+    text = _tool_error(
+        client,
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "operation": 1},
+    )
+    assert text == texts.GUARD_NO_DELEGATECALL
+    assert not fake_w3.eth.sent
+    _rpc(
+        client,
+        "tools/call",
+        {
+            "name": "safe_transaction",
+            "arguments": {"chain": "testchain", "target": RECIPIENT, "operation": 0},
+        },
+    )
+    assert len(fake_w3.eth.sent) == 1
+
+
+@pytest.mark.parametrize("switches", [PRODUCTION, TEST_INTERFACE])
+def test_operation_is_accepted_but_not_published(
+    make_mcp: t.Callable[..., FastMCP], switches: Switches
+) -> None:
+    """The reference reads `operation` without publishing it."""
+    manager = make_mcp(switches)._tool_manager  # pylint: disable=protected-access
+    schema = manager.get_tool("safe_transaction").parameters
+    assert "operation" not in schema["properties"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "plain", "extra"),
+    [
+        ("wallet_info", {}, {"chain": "gnosis"}),
+        (
+            "decode_calldata",
+            {"data": "0xa9059cbb"},
+            {"address": RECIPIENT, "chain": "testchain"},
+        ),
+    ],
+)
+async def test_an_argument_the_handler_does_not_read_changes_nothing(
+    mcp: FastMCP, tool: str, plain: dict, extra: dict
+) -> None:
+    """B1: `chain` on wallet_info, `address`/`chain` on decode_calldata, ignored."""
+    (bare,) = await mcp.call_tool(tool, plain)
+    (carried,) = await mcp.call_tool(tool, {**plain, **extra})
+    assert json.loads(carried.text) == json.loads(bare.text)  # type: ignore[union-attr]

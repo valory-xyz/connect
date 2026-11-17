@@ -1163,7 +1163,7 @@ class TestTools:
             "result": "pending"
         }
         assert await tools["get_abi"]("testchain", EOA) == {"a": EOA}
-        decoded = await tools["decode_calldata"]("testchain", "0x095ea7b3")
+        decoded = await tools["decode_calldata"]("0x095ea7b3", chain="testchain")
         assert decoded["signature"] == "approve(address,uint256)"
 
 

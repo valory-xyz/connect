@@ -26,6 +26,7 @@ that also serves the Pearl endpoints.
 """
 
 import asyncio
+import functools
 import logging
 import typing as t
 
@@ -33,6 +34,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator, ConfigDict, Field, ValidationError, with_config
+from pydantic.json_schema import SkipJsonSchema
 from typing_extensions import TypedDict
 
 from connect import chain_read
@@ -303,8 +305,13 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     )
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["wallet_info"], annotations=READ_ONLY)
-    async def wallet_info() -> dict:
-        """Report the EOA, the safes and their balances."""
+    async def wallet_info(chain: str | None = None) -> dict:
+        """Report the EOA, the safes and their balances: every chain, whatever `chain`.
+
+        The reference takes `chain` and answers the same (B1), so it is accepted
+        and ignored.
+        """
+        del chain
 
         def _run() -> dict:
             overview = wallet.wallet_overview(config, signer)
@@ -326,10 +333,15 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
+        operation: SkipJsonSchema[int] = 0,
     ) -> dict:
-        """Have the service safe make one call."""
+        """Have the service safe make one call.
+
+        `operation` is read as the reference reads it, but not published: the
+        guardrail's floor refuses a DELEGATECALL by its own rule (B1).
+        """
         return await _dispatch(
-            signer.send_via_safe,
+            functools.partial(signer.send_via_safe, operation=operation),
             signer,
             chain=chain,
             address=target,
@@ -450,8 +462,15 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         return await asyncio.to_thread(chain_read.get_abi, signer.w3(chain), address)
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["decode_calldata"], annotations=READ_ONLY)
-    async def decode_calldata(chain: str, data: str) -> dict:
-        """Decode calldata against the signatures Connect ships."""
+    async def decode_calldata(
+        data: str, address: str | None = None, chain: str | None = None
+    ) -> dict:
+        """Decode calldata against the signatures Connect ships.
+
+        `address` and `chain` are the reference's and are accepted and ignored
+        (B1): what Connect ships does not depend on them.
+        """
+        del address, chain
         return chain_read.decode_calldata(data)
 
     @mcp.tool(description=TRANSACTION_STATUS_DESCRIPTION, annotations=READ_ONLY)

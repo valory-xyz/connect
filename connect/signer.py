@@ -467,7 +467,7 @@ class Signer:
         raise SignerError(intent_module.refusal_message(problems))
 
     def _compose_safe_call(
-        self, chain: str, target: str, value: int, data: str
+        self, chain: str, target: str, value: int, data: str, *, operation: int = 0
     ) -> tuple[str, str]:
         """Wrap one inner call for the safe; returns (safe address, calldata).
 
@@ -485,7 +485,7 @@ class Signer:
             )
         try:
             calldata = safe_module.exec_transaction(
-                target=target, value=value, data=data, owner=self.address
+                target, value, data, self.address, operation
             )
         except (EncodingError, ValueError, TypeError, OverflowError) as e:
             # composition fails on the caller's input, not the chain — a 400, the
@@ -505,6 +505,7 @@ class Signer:
         audit: bool = True,
         intent: t.Any = None,
         replay_only: bool = False,
+        operation: int = 0,  # a DELEGATECALL is the guard floor's to refuse
     ) -> str:
         """Act as the service safe: wrap one inner call and send it.
 
@@ -520,7 +521,9 @@ class Signer:
         problem = intent_module.calldata_problem(data)
         if problem is not None:  # composing it would fail on the same bytes
             self._refuse(chain, target, value, [problem], audit=audit)
-        safe, calldata = self._compose_safe_call(chain, target, value, data)
+        safe, calldata = self._compose_safe_call(
+            chain, target, value, data, operation=operation
+        )
         return self._send_guarded(
             chain,
             safe,
@@ -651,7 +654,8 @@ class Signer:
         problem = intent_module.calldata_problem(call.data)
         if problem is not None:
             return None, None, [problem]
-        parsed, problems = intent_module.parse_intent(raw_intent)
+        strict = self._switches.strict_parameters  # S2: unread keys refused
+        parsed, problems = intent_module.parse_intent(raw_intent, strict=strict)
         if problems:
             return None, None, problems
         held_to = parsed

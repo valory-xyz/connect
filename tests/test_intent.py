@@ -801,16 +801,33 @@ def test_parse_intent_normalises_and_refuses_bad_shapes() -> None:
         {"recipients": ["0x12"]},
         {"approvals": ["x"]},
         {"approvals": [{"token": TOKEN}]},
-        {"limit": 1},
     ):
         _, problems = intent.parse_intent(bad)
         assert rules(problems) == ["bad-intent"], bad
 
 
-def test_an_unknown_approval_key_is_refused_by_name() -> None:
-    """An approval with a key it does not know is bad-intent, naming the key."""
+def test_an_unread_intent_key_is_ignored_unless_strict() -> None:
+    """B1: the intent is read on the keys it carries; S2 refuses the rest."""
     approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": 2}
-    parsed, problems = intent.parse_intent({"approvals": [approval]})
+    raw = {"spend": {"native": 3}, "limit": 1, "approvals": [approval]}
+    parsed, problems = intent.parse_intent(raw)
+    assert problems == []
+    assert parsed == {
+        "spend": {"native": 3},
+        "receive_min": {},
+        "recipients": [],
+        "approvals": [{"token": TOKEN, "spender": SPENDER, "amount": 1}],
+    }
+    _, problems = intent.parse_intent({"limit": 1}, strict=True)
+    assert problems == [
+        intent.Problem(rule="bad-intent", detail="unknown intent keys ['limit']")
+    ]
+
+
+def test_an_unknown_approval_key_is_refused_by_name_under_strict() -> None:
+    """Under S2, an approval with a key it does not know is bad-intent, by name."""
+    approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": 2}
+    parsed, problems = intent.parse_intent({"approvals": [approval]}, strict=True)
     assert parsed is None
     assert problems == [
         intent.Problem(rule="bad-intent", detail="unknown intent approval keys ['max']")

@@ -150,11 +150,14 @@ def _hex_to_bytes(value: str) -> bytes:
     return bytes.fromhex(calldata_hex(value))
 
 
-def exec_transaction(target: str, value: int, data: str, owner: str) -> str:
-    """Return execTransaction calldata carrying one CALL out of the safe.
+def exec_transaction(
+    target: str, value: int, data: str, owner: str, operation: int = OPERATION_CALL
+) -> str:
+    """Return execTransaction calldata carrying one call out of the safe.
 
-    `target` is the address the safe calls. The fields the guard refuses to see
-    set are simply never set here.
+    `target` is the address the safe calls. The refund fields the guard refuses
+    to see set are never set here; `operation` is the caller's, so a
+    DELEGATECALL reaches the guard's floor and is refused by its rule there.
     """
     args = abi_encode(
         EXEC_TRANSACTION_TYPES,
@@ -162,7 +165,7 @@ def exec_transaction(target: str, value: int, data: str, owner: str) -> str:
             target,
             value,
             _hex_to_bytes(data or "0x"),
-            OPERATION_CALL,
+            operation,
             0,  # safeTxGas: the safe forwards what it was given
             0,  # baseGas
             0,  # gasPrice: no refund

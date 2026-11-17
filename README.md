@@ -97,7 +97,11 @@ other non-aea agent. It:
      `must be a 0x address` / `must be hex` text, checked before any tool
      runs), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
-     of `target`. Three texts stay Connect's own: `get_abi`'s description,
+     of `target`. Every argument the reference takes is taken: `wallet_info`'s
+     `chain` and `decode_calldata`'s `address` and `chain` are accepted and
+     ignored (`decode_calldata` needs only `data`), and `safe_transaction`
+     reads an unpublished `operation`, so a DELEGATECALL is refused by the
+     guardrail's `no-delegatecall` rule rather than by a parameter check. Three texts stay Connect's own: `get_abi`'s description,
      until its answers match the reference's; `transaction_status`'s, which
      names `pending` too; and the warning on
      `mech_request`'s `request_context` field that `legacy_on_chain=true`
@@ -310,9 +314,11 @@ RPC (`bad-calldata`), on a send, `preflight_transaction`
 and `simulate_transaction` alike, rather than reading as an RPC that cannot
 simulate. An RPC that cannot simulate is also logged to `log.txt` with the
 cause, since every agent send on that chain is refused until it can. A key
-an intent does not know, at its top level or in an approval, is `bad-intent`,
-naming the key, on every surface: a misspelled `receive_min` is refused, never
-dropped. An amount in an intent is a whole number
+an intent does not know, at its top level or in an approval, is ignored on
+every surface, as OnchainBench's reference ignores it: the intent is checked on
+the keys it does carry, so a misspelled `spend` allows no spend and a
+misspelled `receive_min` sets no floor. With the `strict_parameters` switch on
+(off in Pearl too) it is `bad-intent`, naming the key. An amount in an intent is a whole number
 of base units, never truncated. On the HTTP routes a float or a bool there is
 `bad-intent`. The MCP tools hold it to the `value` rule (a decimal or 0x-hex
 string, or a JSON integer up to 2^53 - 1) and refuse anything else as
@@ -980,7 +986,8 @@ Connect. Two public modules carry that contract:
   excludes `connect.testing`. So far: `no_intent_policy` (`strict` in Pearl,
   `simulate-only` for the bench; see [Intent gate](#intent-gate)),
   `strict_parameters` (off in both: an MCP
-  tool ignores an argument it does not take), `rest_signing_routes`
+  tool ignores an argument it does not take, and the gate an intent key it
+  does not read), `rest_signing_routes`
   (`POST /sign-and-send`; on in Pearl) and `agent_topup_at_boot` (the
   [Agent top-up](#agent-top-up); on in Pearl).
 

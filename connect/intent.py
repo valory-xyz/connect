@@ -659,30 +659,39 @@ def implied_intent(value: int, target: str, *, positions_locked: bool) -> Intent
     )
 
 
-def parse_intent(raw: t.Any) -> tuple[Intent | None, list[Problem]]:
-    """Validate a caller's intent; return it normalised, or a bad-intent problem."""
+def parse_intent(
+    raw: t.Any, *, strict: bool = False
+) -> tuple[Intent | None, list[Problem]]:
+    """Validate a caller's intent; return it normalised, or a bad-intent problem.
+
+    A key the gate does not read, in the intent or an approval, is ignored, as
+    the reference ignores it (B1, D11); `strict` (the `strict_parameters`
+    switch) refuses it instead. An ignored key declares nothing: a misspelled
+    `spend` leaves nothing to spend, and a misspelled `receive_min` sets no
+    floor.
+    """
     if not isinstance(raw, Capped):
-        return _parse(raw)
-    parsed, problems = _parse(raw.raw)
+        return _parse(raw, strict)
+    parsed, problems = _parse(raw.raw, strict)
     if parsed is not None:
         parsed["positions_locked"] = True
     return parsed, problems
 
 
-def _parse(raw: t.Any) -> tuple[Intent | None, list[Problem]]:
+def _parse(raw: t.Any, strict: bool) -> tuple[Intent | None, list[Problem]]:
     if raw is None:
         return None, []
     if not isinstance(raw, dict):
         return None, [_bad("the intent must be an object")]
     unknown = sorted(set(raw) - {"spend", "receive_min", "recipients", "approvals"})
-    if unknown:
+    if strict and unknown:
         return None, [_bad(f"unknown intent keys {unknown}")]
     try:
         intent = Intent(
             spend=_amounts(raw.get("spend") or {}, "spend"),
             receive_min=_amounts(raw.get("receive_min") or {}, "receive_min"),
             recipients=[_address(a) for a in raw.get("recipients") or []],
-            approvals=[_approval(a) for a in raw.get("approvals") or []],
+            approvals=[_approval(a, strict) for a in raw.get("approvals") or []],
         )
     except KeyError as e:
         return None, [_bad(f"an intent approval is missing {e}")]
@@ -793,11 +802,11 @@ def _amounts(raw: t.Any, where: str) -> dict[TokenKey, int]:
     return amounts
 
 
-def _approval(raw: t.Any) -> IntentApproval:
+def _approval(raw: t.Any, strict: bool) -> IntentApproval:
     if not isinstance(raw, dict):
         raise TypeError("each intent approval must be {token, spender, amount}")
     unknown = sorted(set(raw) - {"token", "spender", "amount"})
-    if unknown:
+    if strict and unknown:
         raise ValueError(f"unknown intent approval keys {unknown}")
     return IntentApproval(
         token=_token(raw["token"]),
