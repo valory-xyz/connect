@@ -84,7 +84,15 @@ other non-aea agent. It:
      one, as OnchainBench's reference does, unless the `strict_parameters`
      switch is on (off in Pearl too; see [Bench parity](#bench-parity));
      read-only tools carry `readOnlyHint`
-   - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
+   - MCP (streamable HTTP) at `/mcp`, its published descriptions, initialize
+     answer (`serverInfo` `{"name": "connect", "version": "0.1.0"}`, no
+     `instructions`) and error texts OnchainBench's reference ones (see
+     [Bench parity](#bench-parity)): a failed tool call reads the refusing
+     code's own text, with no `Error executing tool` prefix, an unknown tool
+     reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
+     of `target`. `transaction_status` answers `success` (with its `block`),
+     `reverted` or `not_found` (an unknown or malformed hash); a send that
+     waited reports `success` / `reverted` / `pending`. The tools are `wallet_info`,
      `safe_transaction`, `send_transaction`, `preflight_transaction`,
      `simulate_transaction`, `transaction_status`, `chain_call`, `get_abi`,
      `decode_calldata`,
@@ -307,8 +315,9 @@ agent top-up — pass the private `SERVER_BUILT` marker and skip the gate; they
 are bounded by `max_payment` and the top-up plan, and while restricted by their
 single-use allowances. The diff names each token's `symbol()` for the reader
 (display only: nothing is checked against it, and a token without one reads
-as `""`). `preflight_transaction` and `simulate_transaction` take
-the same `intent` and report the gate's `problems` without signing.
+as `""`). `simulate_transaction` takes the same `intent` and reports the
+gate's `problems` without signing; `preflight_transaction` runs no gate at
+all (below).
 
 The gate holds **transactions**. `sign_message` signs a raw digest for the
 uncapped workspace token in the default mode, and a digest can be a safe
@@ -448,11 +457,16 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   deposit allowance described above.
 
 The agent can ask before it spends: `preflight_transaction` composes the same
-bytes the send would and runs them past the same gate, answering `{allowed}`
-plus the refusal the real call would have raised — the calling token's caps
-included, checked first as the MCP mount checks the send, without drawing on its
-session budget. Nothing is signed or broadcast, and no single-use allowance is
-spent — the reasoning for that is at the top of `connect/guard.py`.
+bytes the send would and runs them past the same guardrail, answering
+`{"permitted": true}`, or `{"permitted": false, "rule": ...}` carrying the
+refusal the real call would have raised — the calling token's caps included,
+checked first as the MCP mount checks the send, without drawing on its
+session budget. As in OnchainBench's reference, it is the guardrail's verdict
+on these bytes and nothing more: nothing is simulated and the intent gate does
+not run, so `permitted` does not mean the call will succeed on-chain or pass
+the gate (`simulate_transaction` answers that). Nothing is signed or
+broadcast, and no single-use allowance is spent — the reasoning for that is at
+the top of `connect/guard.py`.
 
 Asking is not a new capability: a refused send never reached the chain either,
 because the gate runs before signing. What asking avoids is the audit entry, so

@@ -931,7 +931,9 @@ def test_mcp_capped_token_may_not_move_a_position(
     assert len(fake_w3.eth.sent) == 1
 
 
-@pytest.mark.parametrize("tool", ["preflight_transaction", "simulate_transaction"])
+# preflight is the guardrail's verdict alone and simulates nothing, so only the
+# simulation can see a position leave
+@pytest.mark.parametrize("tool", ["simulate_transaction"])
 def test_mcp_dry_runs_hold_a_capped_token_as_the_send_would(
     client: TestClient, fake_w3: FakeW3, tool: str
 ) -> None:
@@ -1391,10 +1393,10 @@ def test_mcp_preflight_answers_with_the_token_s_cap_and_draws_nothing(
         return client.post("/mcp/", json=body, headers=headers).text
 
     over = call("preflight_transaction", 6)
-    assert '\\"allowed\\": false' in over
+    assert '\\"permitted\\": false' in over
     assert "token-cap-per-tx" in over
     for _ in range(2):  # a dry run draws nothing on the session budget
-        assert '\\"allowed\\": true' in call("preflight_transaction", 5)
+        assert '\\"permitted\\": true' in call("preflight_transaction", 5)
     assert "tx_hash" in call("safe_transaction", 5)
     spent = call("preflight_transaction", 1)
     assert "token-cap-per-session" in spent
@@ -1424,7 +1426,7 @@ def test_mcp_preflight_answers_a_read_only_token_as_its_send_would(
     }
     headers = {"Accept": "application/json, text/event-stream", **_bearer(reader)}
     answer = client.post("/mcp/", json=body, headers=headers).text
-    assert '\\"allowed\\": false' in answer
+    assert '\\"permitted\\": false' in answer
     assert "token-scope" in answer
     (checked,) = [e for e in audit_entries(store_path) if e["kind"] == "checked"]
     assert "token-scope" in checked["reason"]

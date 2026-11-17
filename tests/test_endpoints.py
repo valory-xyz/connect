@@ -599,7 +599,7 @@ class TestAuth:
         }
         mined = client.post(path, json=body, headers=auth())
         assert mined.status_code == 200
-        assert mined.json()["status"] == "mined"
+        assert mined.json()["status"] == "success"
         assert mined.json()["receipt"]["status"] == 1
         assert fake_w3.eth.receipt_waits == [5]  # the body's timeout, forwarded
         huge = {

@@ -911,17 +911,16 @@ class TestTools:
         with pytest.raises(SignerError, match="missing-intent"):
             await tools["safe_transaction"]("testchain", EOA, 5)
 
-    async def test_preflight_reports_problems(
-        self, tools: dict[str, t.Callable]
+    async def test_preflight_runs_no_gate(
+        self, tools: dict[str, t.Callable], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A gate refusal comes back with its problems listed."""
-        refused = await tools["preflight_transaction"]("testchain", EOA, 5)
-        assert refused["allowed"] is False
-        assert refused["problems"][0]["rule"] == "missing-intent"
-        allowed = await tools["preflight_transaction"](
-            "testchain", EOA, 5, intent=pay(EOA, 5)
+        """A value-moving call with no intent is permitted, and nothing simulated."""
+        monkeypatch.setattr(
+            intent_module, "simulate", lambda *a, **k: pytest.fail("simulated")
         )
-        assert allowed == {"allowed": True}
+        assert await tools["preflight_transaction"]("testchain", EOA, 5) == {
+            "permitted": True
+        }
 
     async def test_simulate_transaction_tool(
         self, tools: dict[str, t.Callable]

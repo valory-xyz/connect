@@ -1342,15 +1342,15 @@ class TestMcpTools:
     async def test_transaction_status(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
-        """transaction_status reports pending, then mined, then reverted.
+        """transaction_status reports not_found, then success, then reverted.
 
         It speaks the same top-level status the send tools do, so a tx polled
         here after a pending send is read the same way — a revert is not a
         success-shaped dict a caller reads past.
         """
         tx_hash = "0x" + "11" * 32
-        pending = await tools["transaction_status"]("testchain", tx_hash)
-        assert pending["status"] == "pending"
+        unknown = await tools["transaction_status"]("testchain", tx_hash)
+        assert unknown == {"tx_hash": tx_hash, "status": "not_found"}
         fake_w3.eth.receipt = {
             "status": 1,
             "blockNumber": 7,
@@ -1358,8 +1358,8 @@ class TestMcpTools:
             "logs": [],
         }
         mined = await tools["transaction_status"]("testchain", tx_hash)
-        assert mined["status"] == "mined"
-        assert mined["receipt"]["block_number"] == 7
+        assert mined["status"] == "success"
+        assert mined["block"] == 7
         fake_w3.eth.receipt = {**fake_w3.eth.receipt, "status": 0}
         reverted = await tools["transaction_status"]("testchain", tx_hash)
         assert reverted["status"] == "reverted"
@@ -1367,11 +1367,12 @@ class TestMcpTools:
     async def test_transaction_status_rejects_malformed_hash(
         self, tools: dict[str, t.Callable]
     ) -> None:
-        """A hash that can never resolve raises instead of polling as pending."""
-        with pytest.raises(ValueError, match="32-byte"):
-            await tools["transaction_status"]("testchain", "0xzz")
-        with pytest.raises(ValueError, match="32-byte"):
-            await tools["transaction_status"]("testchain", "0x1234")
+        """A malformed hash is not_found, as the reference answers, never raised."""
+        for malformed in ("0xzz", "0x1234"):
+            assert await tools["transaction_status"]("testchain", malformed) == {
+                "tx_hash": malformed,
+                "status": "not_found",
+            }
 
     async def test_transaction_status_surfaces_rpc_errors(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3

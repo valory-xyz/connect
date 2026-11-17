@@ -51,7 +51,8 @@ cannot tell you is which to reach for:
 - `preflight_transaction` — ask whether a call would be permitted before you
   build on it. Reach for it when a plan depends on a call being allowed: a
   refusal here costs nothing, one discovered mid-flow can leave a
-  half-finished position.
+  half-finished position. It answers the guardrail's verdict only and
+  simulates nothing; `simulate_transaction` tells you what the call would do.
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.

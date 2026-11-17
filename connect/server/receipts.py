@@ -50,7 +50,7 @@ def settled(
 ) -> dict:
     """Return the hash, and how it settled if the caller waited.
 
-    When the caller waits, a top-level `status` says which of pending / mined /
+    When the caller waits, a top-level `status` says which of pending / success /
     reverted it is, so a reverted execTransaction is not read as success from a
     receipt whose 0/1 is buried a level down. And once the transaction is
     broadcast the hash is never dropped: a post-send RPC error is reported as
@@ -78,7 +78,7 @@ def settled(
 
 
 def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
-    """Return a settled receipt with `mined`/`reverted` lifted to a top-level status.
+    """Return a settled receipt with `success`/`reverted` and its block lifted up.
 
     Every tool that hands back a mined receipt goes through here, so a caller
     reads one field to tell success from a revert — the 0/1 is never left buried
@@ -87,7 +87,8 @@ def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
     info = _receipt_to_dict(receipt)
     return {
         "tx_hash": tx_hash,
-        "status": "mined" if info["status"] == 1 else "reverted",
+        "status": "success" if info["status"] == 1 else "reverted",
+        "block": info["block_number"],
         "receipt": info,
     }
 

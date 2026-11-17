@@ -129,15 +129,26 @@ def test_message_falls_back_to_the_closest_name_or_none() -> None:
     assert unknown_parameters_message({"value"}, {"value"}) is None
 
 
-async def test_mcp_tool_refuses_to_on_safe_transaction(
+async def test_a_misspelled_target_is_refused_by_name(
     mcp: FastMCP, fake_w3: FakeW3, store_path: t.Any
 ) -> None:
-    """`to` on safe_transaction was silently dropped; now it is refused by name."""
-    with pytest.raises(ToolError, match=r"'to' \(did you mean 'target'\?\)"):
-        await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
+    """`targett` beside `target` is refused and the message names `target`."""
+    with pytest.raises(ToolError, match=r"'targett' \(did you mean 'target'\?\)"):
+        await mcp.call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "targett": RECIPIENT},
+        )
     assert not fake_w3.eth.sent
     (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert entry == {**entry, "rule": "unknown-parameter", "tool": "safe_transaction"}
+
+
+async def test_to_is_an_alias_of_target_with_the_switch_on(
+    mcp: FastMCP, fake_w3: FakeW3
+) -> None:
+    """`to` aliases a safe call's `target`, so strictness does not refuse it."""
+    await mcp.call_tool("safe_transaction", {"chain": "testchain", "to": RECIPIENT})
+    assert len(fake_w3.eth.sent) == 1
 
 
 def _placeholder(schema: dict) -> t.Any:
@@ -395,7 +406,10 @@ async def test_the_tool_schema_declares_every_intent_amount_as_a_string(
         approval = _resolved(approvals["items"], defs)
         kinds = _schema_types(approval["properties"]["amount"], defs)
         assert kinds == {"string"}, (tool.name, approval)
-    assert sorted(with_intent) == sorted(TOOL_AMOUNTS.keys() - {"mech_request"})
+    # preflight answers the guardrail's verdict alone, so it takes no intent
+    assert sorted(with_intent) == sorted(
+        TOOL_AMOUNTS.keys() - {"mech_request", "preflight_transaction"}
+    )
 
 
 def _intent_with(where: str, amount: t.Any) -> dict:

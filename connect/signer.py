@@ -740,10 +740,12 @@ class Signer:
         data: str = "0x",
         via_safe: bool = True,
         intent: t.Any = None,
+        gate: bool = True,
     ) -> tuple[str | None, list[intent_module.Problem]]:
         """Ask the guardrail, then the intent gate, consuming and signing nothing.
 
         Returns the refusal (None if the call passes) and the gate's problems.
+        `gate=False` asks the guardrail alone: nothing is simulated.
         """
         probed_target, probed_value = target, value
         problems: list[intent_module.Problem] = []
@@ -756,7 +758,7 @@ class Signer:
                 self._sender(chain, via_safe)  # no safe / unknown chain refused
                 safe = t.cast(str, self._config.chain(chain).safe_address)
                 # built after the guard has answered, as the send builds it
-                gate: GateFactory = (
+                gate_call: GateFactory = (
                     partial(_GateCall, sender=safe, to=target, value=value, data=data)
                     if via_safe
                     else partial(self._eoa_gate, chain, target, value, data)
@@ -771,9 +773,9 @@ class Signer:
                 elif value < 0:
                     raise SignerError("value must be a non-negative amount in wei")
                 reason = self._refused_by_guard(chain, target, value, data)
-                if reason is None:
+                if reason is None and gate:
                     try:
-                        problems = self._gate_problems(chain, gate(), intent)
+                        problems = self._gate_problems(chain, gate_call(), intent)
                     except _GateRefused as e:
                         problems = [e.problem]
                     if problems:

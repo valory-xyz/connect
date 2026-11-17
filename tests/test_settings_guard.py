@@ -78,7 +78,6 @@ from connect.chains import MECH_MARKETPLACES
 from connect.config import AppConfig, ChainConfig
 from connect.guard import ALLOWANCE_TTL, Guard, GuardError
 from connect.idempotency import RequestLedger
-from connect.intent import Capped
 from connect.mech import (
     DEFAULT_DELIVERY_TIMEOUT,
     DEFAULT_MECH_CHAIN,
@@ -7257,15 +7256,15 @@ class TestMcpGuardrailTools:
         monkeypatch.setattr(test_signer, "check", fake_check)
         assert await tools["preflight_transaction"](
             "testchain", OTHER, 5, "0xab", via_safe=False
-        ) == {"allowed": True}
+        ) == {"permitted": True}
         assert calls[0] == {
             "chain": "testchain",
             "target": OTHER,
             "value": 5,
             "data": "0xab",
             "via_safe": False,
-            # called in-process, with no token: held as capped (fail closed)
-            "intent": Capped(None),
+            # the guardrail's verdict alone: nothing is simulated
+            "gate": False,
         }
 
     async def test_preflight_tool_carries_the_refusal(
@@ -7279,8 +7278,8 @@ class TestMcpGuardrailTools:
             test_signer, "check", lambda *a, **k: ("the guardrail said no", [])
         )
         assert await tools["preflight_transaction"]("testchain", OTHER) == {
-            "allowed": False,
-            "reason": "the guardrail said no",
+            "permitted": False,
+            "rule": "the guardrail said no",
         }
 
     async def test_preflight_tool_answers_through_the_real_guardrail(
@@ -7292,11 +7291,11 @@ class TestMcpGuardrailTools:
         """End to end, unmocked: the tool, the signer and the gate together."""
         test_signer.set_guard(guard)
         assert await tools["preflight_transaction"]("testchain", OTHER) == {
-            "allowed": True
+            "permitted": True
         }
         refused = await tools["preflight_transaction"]("testchain", SAFE)
-        assert refused["allowed"] is False
-        assert "may not call itself" in refused["reason"]
+        assert refused["permitted"] is False
+        assert "may not call itself" in refused["rule"]
 
     async def test_mech_tools_tool_delegates(
         self,
