@@ -33,8 +33,9 @@ not already accept. Every reset-to-defaults transition is audited once per episo
 The harness is a preference (a harness-only PATCH needs no password), but it
 is under the MAC too: with OCB it decides what an unnamed launch installs and
 runs, with no fallback, so an edited one must not apply. A version-1 file
-(MAC'd before the harness was) verifies its protected object once and loads
-with the default harness, then is rewritten under the current MAC.
+(MAC'd before the harness was) verifies its protected object once and keeps
+its harness unless it is ocb_cli, which no released version-1 file holds; it
+is then rewritten under the current MAC.
 Legitimate protected changes go through the password-gated settings PATCH,
 never through the agent session.
 """
@@ -548,9 +549,9 @@ class SettingsStore:
         migrated = self._verify_legacy(payload)
         if migrated is not None:
             logger.info(
-                "settings file %s predates the harness MAC; using %s",
+                "settings file %s predates the harness MAC; migrated with %s",
                 self._path,
-                DEFAULT_HARNESS,
+                migrated.harness,
             )
             return self._reset(migrated)
         logger.warning(
@@ -630,7 +631,9 @@ class SettingsStore:
         """Verify a version-1 file, MAC'd before the harness was; None otherwise.
 
         Only on the first load of a run, as for any file not written by this
-        process; its harness was never covered, so it loads as the default.
+        process. Its harness was never covered, but no released version-1 file
+        could hold ocb_cli, so any other harness is kept and ocb_cli (which only
+        a write outside Connect can have put there) becomes the default.
         """
         if payload.get("version") != 1 or self._expected_mac is not None:
             return None
@@ -639,6 +642,10 @@ class SettingsStore:
         ):
             return None
         try:
-            return Settings(protected=Protected.from_raw(payload["protected"]))
+            protected = Protected.from_raw(payload["protected"])
         except (ValueError, KeyError, TypeError, AttributeError):
             return None
+        harness = _harness_or_default(payload.get("harness", DEFAULT_HARNESS))
+        if harness == HARNESS_OCB_CLI:
+            harness = DEFAULT_HARNESS
+        return Settings(protected=protected, harness=harness)

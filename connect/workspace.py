@@ -35,7 +35,6 @@ environment scrub that keeps our own packaging out of the session it starts.
 import json
 import logging
 import os
-import secrets
 import shlex
 import shutil
 import subprocess  # nosec B404
@@ -308,7 +307,7 @@ class Workspace:
         ocb_mech: str | None = None,
         record_dir: Path | None = None,
         *,
-        record_key: bytes | None = None,
+        record_key: bytes,
     ) -> None:
         """Start unprovisioned: the first ensure() is what makes it real.
 
@@ -317,8 +316,8 @@ class Workspace:
         service's own folder): outside the workspace, and unlike Connect's
         working directory (the deployment, which Pearl rebuilds on every
         service start) it survives a restart. `record_key` signs that record
-        (Connect passes the settings MAC key); without one, a key of this
-        instance's own, so no record from elsewhere is trusted.
+        (Connect passes the settings MAC key), and is required so a caller
+        cannot leave the record unsigned by omission.
         """
         self.path = store_path
         self._token = token
@@ -328,7 +327,7 @@ class Workspace:
             record_dir or store_path.parent,
             bundle_dir=lambda: assets_dir() / OCB_ASSETS_SUBDIR,
             env=harness_env,
-            record_key=record_key or secrets.token_bytes(32),
+            record_key=record_key,
         )
         self._lock = threading.Lock()
         self._reason: str | None = "the workspace has not been provisioned yet"

@@ -603,18 +603,32 @@ class TestSettingsStore:
         store._path.write_text(json.dumps(payload))  # pylint: disable=protected-access
         return payload
 
-    def test_a_version_1_file_keeps_its_guardrail_and_drops_its_harness(
-        self, store_path: Path, store: SettingsStore
+    @pytest.mark.parametrize(
+        "harness", ["codex_cli", "claude_code_desktop", "codex_desktop"]
+    )
+    def test_a_version_1_file_keeps_its_guardrail_and_its_harness(
+        self, store_path: Path, store: SettingsStore, harness: str
     ) -> None:
-        """An upgrade is not a tamper: protected migrates, the unsigned harness does not."""
-        self._legacy_file(store)
+        """An upgrade is not a tamper: the operator's choices survive it."""
+        self._legacy_file(store, harness)
         loaded = store.load()
         assert loaded.protected.mode == MODE_RESTRICTED
-        assert loaded.harness == DEFAULT_HARNESS
+        assert loaded.harness == harness
         assert "settings_tampered" not in audit_kinds(store_path)
         rewritten = json.loads(store._path.read_text())  # pylint: disable=W0212
         assert rewritten["version"] == SETTINGS_VERSION
         assert store.load() == loaded  # verifies under the current MAC
+
+    def test_a_version_1_file_never_migrates_ocb_cli(
+        self, store_path: Path, store: SettingsStore
+    ) -> None:
+        """No released version-1 file held ocb_cli: one that does was written to."""
+        self._legacy_file(store, "ocb_cli")
+        loaded = store.load()
+        assert loaded.protected.mode == MODE_RESTRICTED
+        assert loaded.harness == DEFAULT_HARNESS
+        rewritten = json.loads(store._path.read_text())  # pylint: disable=W0212
+        assert rewritten["harness"] == DEFAULT_HARNESS
 
     def test_a_version_1_file_is_accepted_only_on_a_run_s_first_load(
         self, store_path: Path, store: SettingsStore

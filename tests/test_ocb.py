@@ -285,7 +285,7 @@ def test_ocb_runs_by_path_in_this_workspace_with_the_chat_mech() -> None:
 def test_ocb_is_never_launched_or_installed_without_a_mech(store_path: Path) -> None:
     """A None mech would hand OCB a model that does not exist; nothing installs."""
     agent_workspace = Workspace(
-        store_path, "tok", None, store_path.parent
+        store_path, "tok", None, store_path.parent, record_key=RECORD_KEY
     )  # nosec B106
     agent_workspace.ocb.ensure = pytest.fail  # type: ignore[method-assign]
     with pytest.raises(ValueError, match="chat mech"):
@@ -858,7 +858,7 @@ def test_an_install_that_cannot_be_recorded_fails(
 def ocb_workspace(store_path: Path, path: Path | None) -> Workspace:
     """Return a workspace with a chat mech whose installer yields `path` or fails."""
     agent_workspace = Workspace(
-        store_path, "tok", MECH, store_path.parent
+        store_path, "tok", MECH, store_path.parent, record_key=RECORD_KEY
     )  # nosec B106
 
     def ensure(wait: float) -> Path:

@@ -177,7 +177,7 @@ def _fork_app(
         guard=guard,
         settings_store=store,
         mech=MechService(signer, config, activity, guard),
-        workspace=Workspace(store_path, token),
+        workspace=Workspace(store_path, token, record_key=b"k" * 32),
     )
 
 
@@ -234,7 +234,7 @@ def test_signer_client_reaches_the_server_that_provisioned_it(
     fork_config.chains["gnosis"].safe_address = safe_address
 
     token = secrets.token_urlsafe(16)
-    provisioned = Workspace(store_path, token)
+    provisioned = Workspace(store_path, token, record_key=b"k" * 32)
     assert provisioned.ensure() is True, provisioned.reason
 
     # the file the server really wrote, parsed by the real client

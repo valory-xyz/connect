@@ -47,8 +47,10 @@ logger = logging.getLogger("agent")
 OCB_ASSETS_SUBDIR = "ocb"
 OCB_INSTALL_SCRIPT = "install.sh"
 OCB_WHEEL_GLOB = "olas_ocb_agent-*.whl"
-# the installed ocb-agent path and the wheel it came from, kept outside the
-# workspace in Connect's own directory, under a MAC keyed off the agent key
+# the installed ocb-agent path and the wheel it came from, kept beside
+# STORE_PATH (its parent, the service folder): outside the session's
+# workspace, and not in Connect's cwd, the deployment directory Pearl rebuilds
+# on every service start; HMAC'd with a key derived from the agent key
 OCB_RECORD_FILE = ".ocb-agent.json"
 _RECORD_KEY_INFO = b"pearl-connect ocb install record v1"
 # what uv names the tool and the executable a recorded path must resolve to

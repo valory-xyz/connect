@@ -1695,7 +1695,9 @@ class TestPearlRoutesExtras:
         it gets in the first has already succeeded — it has to see that, not
         redo the work.
         """
-        agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
+        agent_workspace = workspace.Workspace(
+            store_path, "tok", record_key=b"k" * 32
+        )  # nosec B106
         populated: list[int] = []
         monkeypatch.setattr(
             workspace.Workspace, "_provision", lambda self: populated.append(1)
@@ -1850,14 +1852,19 @@ class TestWorkspaceExtras:
         (assets / "skills").mkdir(parents=True)
         (assets / "lib").mkdir()
         monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
-        agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
+        agent_workspace = workspace.Workspace(
+            store_path, "tok", record_key=b"k" * 32
+        )  # nosec B106
         assert agent_workspace.ensure() is False
         assert "CLAUDE.md" in str(agent_workspace.reason)
 
     def test_invalid_mcp_json_rewritten(self, store_path: Path) -> None:
         """Corrupt .mcp.json is replaced rather than crashing."""
         (store_path / ".mcp.json").write_text("{corrupt")
-        assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
+        assert (
+            workspace.Workspace(store_path, "tok", record_key=b"k" * 32).ensure()
+            is True
+        )  # nosec B106
         config = json.loads((store_path / ".mcp.json").read_text())
         assert "pearl-connect" in config["mcpServers"]
 
@@ -1872,7 +1879,10 @@ class TestWorkspaceExtras:
         (skills / "stray.txt").write_text("not a skill")
         (tmp_path / "assets" / "CLAUDE.md").write_text("brief")  # populate requires it
         monkeypatch.setattr(workspace.sys, "_MEIPASS", str(tmp_path), raising=False)
-        assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
+        assert (
+            workspace.Workspace(store_path, "tok", record_key=b"k" * 32).ensure()
+            is True
+        )  # nosec B106
         installed = store_path / ".claude" / "skills"
         assert (installed / "my-skill" / "SKILL.md").exists()
         assert not (installed / "stray.txt").exists()

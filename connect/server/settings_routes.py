@@ -25,7 +25,9 @@ whitelist) are authenticated with the keystore password — NOT the bearer
 token: the agent session holds the token and must not be able to lift its own
 restrictions, while only the human operator knows the password. The password
 is verified by re-decrypting the keystore the server booted from. The
-`harness` preference is not protected and needs no password.
+`harness` preference needs no password: it is under the settings file's MAC
+(an edit to the file is caught), but this route, gated on a local origin like
+every other here, may change it.
 """
 
 import logging
@@ -108,9 +110,11 @@ def patch_settings(body: SettingsPatch, request: Request) -> dict:
 
     Omitted fields keep their current value. Changing `protected`
     (mode/whitelist) proves knowledge of the keystore password first; the
-    `harness` preference needs no password — it is not integrity-protected
-    and the worst a change can do is open the workspace in another harness.
-    Origin locality applies to everything via the router dependency.
+    `harness` preference needs no password — the file's MAC guards it
+    against edits on disk, and this route stays open to a local origin: the
+    worst a change can do is open the workspace in another harness (ocb_cli
+    included, which installs OCB on first use). Origin locality applies to
+    everything via the router dependency.
     """
     state = request.app.state
     if body.protected is None and body.harness is None:

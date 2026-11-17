@@ -52,7 +52,7 @@ def mcp_entry(store_path: Path) -> dict:
 
 def provisioned(store_path: Path, token: str = "tok") -> Workspace:  # nosec B107
     """Return a workspace that provisioned itself, as a healthy boot leaves it."""
-    agent_workspace = Workspace(store_path, token)
+    agent_workspace = Workspace(store_path, token, record_key=b"k" * 32)
     assert agent_workspace.ensure() is True, agent_workspace.reason
     return agent_workspace
 
@@ -325,7 +325,7 @@ def test_deep_links(store_path: Path) -> None:
     for url in (desktop, cli):
         assert parse_qs(urlparse(url).query)["q"] == [workspace.FIRST_PROMPT]
     # each harness resolves to exactly one link, and to its own
-    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", record_key=b"k" * 32)  # nosec B106
     assert agent_workspace.deep_link().startswith("claude-cli://")  # the default
     # named, and not the default, so the argument is what is under test here
     assert agent_workspace.deep_link("claude_code_desktop").startswith("claude://")
@@ -383,7 +383,7 @@ def test_load_ui_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_deep_link_rejects_an_unknown_harness(store_path: Path) -> None:
     """A harness with no link raises, instead of quietly opening the desktop."""
-    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", record_key=b"k" * 32)  # nosec B106
     with pytest.raises(ValueError, match="cursor"):
         agent_workspace.deep_link("cursor")
 
@@ -400,7 +400,7 @@ def test_an_unknown_harness_raises_even_with_a_fallback_offered(
     slipped past that sanitizing is a ValueError (a 400), not a quiet open of
     whatever else happens to be installed.
     """
-    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", record_key=b"k" * 32)  # nosec B106
     tried: list[str] = []
 
     def accept(url: str, _cwd: Path) -> bool:
@@ -458,7 +458,7 @@ def test_a_named_harness_never_falls_back(
     deliberately not DEFAULT_HARNESS, so what is under test is that the
     argument was honoured rather than that the default happened to match.
     """
-    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", record_key=b"k" * 32)  # nosec B106
     tried: list[str] = []
 
     def refuse(url: str, _cwd: Path) -> bool:
@@ -493,7 +493,7 @@ def test_an_unnamed_harness_falls_back_through_the_others(
     is tried *last* of the deep links, so every step of the order is exercised
     rather than the first one answering and the fallback never running.
     """
-    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", record_key=b"k" * 32)  # nosec B106
     tried: list[str] = []
 
     def only_the_desktop_app(url: str, _cwd: Path) -> bool:
@@ -627,7 +627,9 @@ def test_codex_gets_the_brief_skills_and_ignore_rule(store_path: Path) -> None:
 
 def test_codex_deep_link(store_path: Path) -> None:
     """The Codex link opens a new thread in the workspace, prompt pre-filled."""
-    url = Workspace(store_path, "tok").deep_link("codex_desktop")  # nosec B106
+    url = Workspace(store_path, "tok", record_key=b"k" * 32).deep_link(
+        "codex_desktop"
+    )  # nosec B106
     assert url.startswith("codex://threads/new?")
     assert parse_qs(urlparse(url).query) == {
         "path": [str(store_path)],
@@ -649,7 +651,7 @@ def test_codex_cli_opens_in_a_terminal(
     monkeypatch.setattr(workspace, "_resolves", lambda command: True)
     monkeypatch.setattr(workspace, "_open_terminal", terminal)
     monkeypatch.setattr(workspace, "_open_url", pytest.fail)
-    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", record_key=b"k" * 32)  # nosec B106
     assert agent_workspace.open_session("codex_cli") == "codex_cli"
     assert opened == [(store_path, "codex")]
 
@@ -807,7 +809,7 @@ def test_a_missing_codex_never_opens_a_terminal(
     monkeypatch.setattr(workspace, "_resolves", lambda command: False)
     monkeypatch.setattr(workspace, "_open_terminal", pytest.fail)
     monkeypatch.setattr(workspace, "_open_url", lambda url, cwd: False)
-    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", record_key=b"k" * 32)  # nosec B106
     with pytest.raises(workspace.LaunchError, match="is it installed"):
         agent_workspace.open_session("codex_cli")
     with pytest.raises(workspace.LaunchError, match="none of"):

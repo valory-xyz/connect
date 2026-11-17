@@ -79,7 +79,7 @@ def test_codex_cli_launches_in_the_workspace(
         return found
 
     monkeypatch.setattr(workspace, "terminal_launches", recorded)
-    agent_workspace = Workspace(store_path, "tok")  # nosec B106
+    agent_workspace = Workspace(store_path, "tok", record_key=b"k" * 32)  # nosec B106
     assert agent_workspace.open_session("codex_cli") == "codex_cli"
 
     marker = store_path / "codex-launched"
@@ -111,7 +111,9 @@ def test_ocb_cli_launches_the_installed_agent_with_its_model(
     record_dir = tmp_path / "deployment"
     record_dir.mkdir()
     monkeypatch.setattr(workspace, "assets_dir", lambda: record_dir / "no-bundle")
-    agent_workspace = Workspace(store_path, "tok", mech, record_dir)  # nosec B106
+    agent_workspace = Workspace(
+        store_path, "tok", mech, record_dir, record_key=b"k" * 32
+    )  # nosec B106
     (record_dir / ocb.OCB_RECORD_FILE).write_text(
         agent_workspace.ocb._signed_record(agent, "x"),  # pylint: disable=W0212
         encoding="utf-8",
