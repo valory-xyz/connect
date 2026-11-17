@@ -2317,7 +2317,10 @@ class TestMech:
         assert out["valory_operated"] is True
         assert out["terms"] == VALORY_TERMS_NOTICE
         assert out["delivery"] == {"received_requests": 120}
-        assert out["payment"] == {"type": "native"}
+        # the report's asset label and the amount paid are two fields
+        assert out["payment_info"] == {"type": "native"}
+        assert out["payment"] == 10**16
+        assert isinstance(out["payment"], int)
 
     def test_request_goes_out_when_the_report_falls_back_to_the_terms(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService

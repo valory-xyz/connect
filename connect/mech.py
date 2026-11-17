@@ -64,7 +64,7 @@ from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import Armed, MechAllowances, TopUpBudget, read_map_nonces
-from connect.mech_budget import DEFAULT_MAX_PAYMENT, payment_report, price_mech
+from connect.mech_budget import DEFAULT_MAX_PAYMENT, charged, payment_report, price_mech
 from connect.mech_queue import HardCancelRefused, MechQueue
 from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
@@ -683,7 +683,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             service_id=plan.priced.service_id,
             offchain=not plan.legacy_on_chain,
         )
-        payload.update(plan.terms)
+        payload.update(charged(plan.terms, plan.priced.rate, result))
         if plan.offchain:
             # nothing in the signed request expires it (mech-client sends no
             # deadline): it can settle whenever the mech delivers it, or the

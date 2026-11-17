@@ -85,3 +85,19 @@ def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
         "payment_token": _payment_token(payment_type, chain),
         "default_max_payment": None if default is None else str(default),
     }
+
+
+def charged(terms: dict, rate: int, result: dict) -> dict:
+    """The fields a request's answer carries about the mech and its charge.
+
+    `terms` is mech-client's mech report (or the terms alone). It labels the
+    mech's payment asset under `payment`; in the answer that key is the charge
+    the request accepted, `rate` for each request id the mech took, in base
+    units of the asset (settlement charges at most this), so the label moves
+    to `payment_info`.
+    """
+    fields = dict(terms)
+    if "payment" in fields:
+        fields["payment_info"] = fields.pop("payment")
+    fields["payment"] = rate * len(result.get("request_ids") or [])
+    return fields

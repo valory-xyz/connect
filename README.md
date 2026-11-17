@@ -741,8 +741,11 @@ the terms alone and says so in `report_note`.
 allowance is armed, so a session that skips `mech_tools` still learns whose
 mech it pays and whose terms apply: `valory_operated` and `terms` or
 `identification_note` on both flows, plus `operator`, `benchmarks`,
-`delivery`, `payment` and `terms_url` on the off-chain flow, which is the one
-that reads the manifest. Each report is its own check, resolver, indexer and
+`delivery`, `payment_info` and `terms_url` on the off-chain flow, which is the
+one that reads the manifest. `payment_info` is the report's `payment` label
+under another name: in the answer, `payment` is the charge the request
+accepted, the mech's per-request rate for each request id it took, as an
+integer in base units of its payment asset. Each report is its own check, resolver, indexer and
 proof fetch alike, so two reports in one flow can disagree after a DNS blip
 or an indexer hiccup; `mech_request`'s is the one that governs the request it
 sent. mech-client's warnings, including a check that could not complete, are
