@@ -1322,7 +1322,13 @@ class TestGuard:
                 exec_transaction_calldata(PAYMENT_TOKEN),
             ),
             ("marketplace", "testchain", FLOOR_MARKETPLACE, 0, "0x"),
-            ("bad-calldata", "testchain", SAFE, 0, "0x" + EXEC_TRANSACTION_SELECTOR),
+            (
+                "undecodable-exec-transaction",
+                "testchain",
+                SAFE,
+                0,
+                "0x" + EXEC_TRANSACTION_SELECTOR,
+            ),
         ],
     )
     def test_every_guardrail_refusal_names_its_rule(  # pylint: disable=too-many-arguments

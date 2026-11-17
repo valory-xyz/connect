@@ -95,8 +95,9 @@ other non-aea agent. It:
      address or hex argument the reference's `must be a 0x address` / `must
      be hex` text), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
-     of `target`. Two descriptions stay Connect's own for now: `get_abi`'s,
-     until its answers match the reference's, and the warning on
+     of `target`. Three texts stay Connect's own: `get_abi`'s description,
+     until its answers match the reference's; `transaction_status`'s, which
+     names `pending` too; and the warning on
      `mech_request`'s `request_context` field that `legacy_on_chain=true`
      publishes it to IPFS for good. `transaction_status` answers `success` (with its `block`),
      `reverted`, `pending` (a transaction the node holds but has not mined) or
@@ -460,7 +461,9 @@ Every guardrail refusal begins `guardrail: rule '<id>': `, the prefix
 OnchainBench's broker reads as "not sent". The floor and whitelist texts are
 the reference's, verbatim (`connect.texts`): `no-delegatecall`,
 `no-self-call` and `whitelist` (naming the safe's call target and the chain).
-Connect's own rules use the same form: `marketplace`, `bad-calldata` (an
+Connect's own rules use the same form, in every position, their texts in
+`connect.texts` beside the reference's: `marketplace`,
+`undecodable-exec-transaction` (an
 `execTransaction` it cannot decode) and, in restricted mode, `no-safe`,
 `safe-only`, `exec-transaction-only`, `outer-value`, `refund`,
 `payment-token-approve` and `raw-digest`.

@@ -43,6 +43,7 @@ from connect.server.mcp_tools import (
     GET_ABI_DESCRIPTION,
     REQUEST_CONTEXT_NOTE,
     TOOL_FAILED,
+    TRANSACTION_STATUS_DESCRIPTION,
     with_aliases,
 )
 from connect.signer import Signer, SignerError
@@ -220,11 +221,12 @@ def test_initialize_reports_the_reference_s_server_info(client: TestClient) -> N
 
 
 async def test_every_published_description_is_the_reference_s(mcp: FastMCP) -> None:
-    """Every tool publishes the texts module's description, get_abi aside."""
+    """Every tool publishes the texts module's description, two of Connect's aside."""
     tools = await mcp.list_tools()
     assert {tool.name: tool.description for tool in tools} == {
         **texts.TOOL_DESCRIPTIONS,
         "get_abi": GET_ABI_DESCRIPTION,
+        "transaction_status": TRANSACTION_STATUS_DESCRIPTION,
     }
 
 

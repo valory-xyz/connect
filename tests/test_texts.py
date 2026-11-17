@@ -205,6 +205,44 @@ def test_every_tool_description_is_the_reference_s_literal() -> None:
     assert texts.TOOL_DESCRIPTIONS == REFERENCE_DESCRIPTIONS
 
 
+# Connect's own guardrail rules, held in every position (not the reference's)
+CONNECT_GUARD = [
+    (
+        texts.GUARD_RAW_DIGEST,
+        "guardrail: rule 'raw-digest': raw digest signing is disabled by the "
+        "operator's guardrail settings; ask the operator to change them via the "
+        "agent UI if it is required",
+    ),
+    (
+        texts.GUARD_OUTER_VALUE,
+        "guardrail: rule 'outer-value': the guardrail forbids native value on the "
+        "outer transaction of an execTransaction call",
+    ),
+    (
+        texts.guard_undecodable("could not decode execTransaction calldata"),
+        "guardrail: rule 'undecodable-exec-transaction': could not decode "
+        "execTransaction calldata",
+    ),
+    (
+        texts.guard_marketplace(ADDR, "gnosis"),
+        f"guardrail: rule 'marketplace': the mech marketplace {ADDR} on gnosis "
+        "takes only the requests Connect composes; send a mech request with "
+        "mech_request",
+    ),
+    (
+        texts.guard_no_safe("base"),
+        "guardrail: rule 'no-safe': the operator's guardrail settings allow no "
+        "transactions on chain 'base' (no service safe is configured there)",
+    ),
+]
+
+
+@pytest.mark.parametrize(("constant", "expected"), CONNECT_GUARD)
+def test_connect_s_own_guardrail_texts(constant: str, expected: str) -> None:
+    """Connect's own rules keep their words, now that agents on the bench read them."""
+    assert constant == expected
+
+
 @pytest.mark.parametrize(("constant", "reference"), CONSTANTS + FORMATTED)
 def test_text_equals_the_reference(constant: t.Any, reference: t.Any) -> None:
     """Each contract text is the reference's, character for character."""

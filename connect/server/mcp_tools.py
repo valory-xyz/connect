@@ -148,6 +148,13 @@ GET_ABI_DESCRIPTION = (
     "interfaces a contract answers to; no explorer lookup."
 )
 
+# transaction_status answers pending too (a transaction the node holds unmined),
+# which the reference's description does not name, so it publishes Connect's own
+TRANSACTION_STATUS_DESCRIPTION = (
+    "Settlement of a transaction hash you already hold: success (mined, with its "
+    "block), reverted, pending (sent but not yet mined) or not_found."
+)
+
 # Pearl keeps this warning on the field, beside the reference's tool text
 REQUEST_CONTEXT_NOTE = (
     "optional dict handed to the tool alongside the prompt; it reaches the mech, "
@@ -417,9 +424,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         """Decode calldata against the signatures Connect ships."""
         return chain_read.decode_calldata(data)
 
-    @mcp.tool(
-        description=TOOL_DESCRIPTIONS["transaction_status"], annotations=READ_ONLY
-    )
+    @mcp.tool(description=TRANSACTION_STATUS_DESCRIPTION, annotations=READ_ONLY)
     async def transaction_status(chain: str, tx_hash: str) -> dict:
         """Report how a transaction settled."""
         return await asyncio.to_thread(lambda: settlement(signer.w3(chain), tx_hash))

@@ -159,6 +159,76 @@ def guard_not_allowed(target: str, chain: str) -> str:
     )
 
 
+# Connect's own guardrail rules, in every position and in the same form as
+# the reference's three: agents read them on the bench too
+GUARD_RAW_DIGEST = guard_refusal(
+    "raw-digest",
+    f"raw digest signing is disabled by the operator's guardrail settings; "
+    f"{ASK_OPERATOR}",
+)
+GUARD_OUTER_VALUE = guard_refusal(
+    "outer-value",
+    "the guardrail forbids native value on the outer transaction of an "
+    "execTransaction call",
+)
+GUARD_REFUND = guard_refusal(
+    "refund",
+    "the guardrail requires execTransaction refund fields to be zero "
+    "(gasPrice=0, gasToken=0x0, refundReceiver=0x0): a gas refund would pay "
+    "out of the safe past the allowed targets",
+)
+
+
+def guard_undecodable(detail: str) -> str:
+    """Return the refusal of execTransaction calldata the guardrail cannot read."""
+    return guard_refusal("undecodable-exec-transaction", detail)
+
+
+def guard_marketplace(marketplace: str, chain: str) -> str:
+    """Return the refusal of a call to a mech marketplace Connect did not compose."""
+    return guard_refusal(
+        "marketplace",
+        f"the mech marketplace {marketplace} on {chain} takes only the requests "
+        "Connect composes; send a mech request with mech_request",
+    )
+
+
+def guard_no_safe(chain: str) -> str:
+    """Return the refusal of a transaction on a chain with no service safe."""
+    return guard_refusal(
+        "no-safe",
+        "the operator's guardrail settings allow no transactions on chain "
+        f"'{chain}' (no service safe is configured there)",
+    )
+
+
+def guard_safe_only(safe: str, to: str) -> str:
+    """Return the refusal of a transaction that does not target the service safe."""
+    return guard_refusal(
+        "safe-only",
+        "the operator's guardrail settings only allow transactions targeting the "
+        f"service safe {safe}, not {to}",
+    )
+
+
+def guard_exec_transaction_only(selector: str, got: str) -> str:
+    """Return the refusal of a call to the safe that is not execTransaction."""
+    return guard_refusal(
+        "exec-transaction-only",
+        "the guardrail requires calls to the safe to be execTransaction "
+        f"(selector 0x{selector}), got 0x{got}",
+    )
+
+
+def guard_payment_token_approve(tracker: str, token: str) -> str:
+    """Return the refusal of a payment-token call other than approving the tracker."""
+    return guard_refusal(
+        "payment-token-approve",
+        f"the guardrail only allows approve(spender={tracker}) on the payment "
+        f"token {token}",
+    )
+
+
 def GATE_PROBLEM(rule: str, detail: str) -> str:
     """Return one intent-gate problem, as the gate's refusal joins them."""
     return f"intent gate: rule '{rule}' ({detail})"
