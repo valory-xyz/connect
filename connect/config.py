@@ -88,7 +88,7 @@ class ChainConfig:
 
 
 @dataclass
-class AppConfig:
+class AppConfig:  # pylint: disable=too-many-instance-attributes
     """AppConfig."""
 
     chains: dict[str, ChainConfig]

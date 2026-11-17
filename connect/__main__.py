@@ -208,7 +208,7 @@ def resolve_ocb_mech(config: AppConfig) -> str | None:
     return mech
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-locals
     """Run the agent server; return the process exit code."""
     password = resolve_password(argv)
     if password is None:
