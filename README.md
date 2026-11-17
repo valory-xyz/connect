@@ -124,7 +124,7 @@ other non-aea agent. It:
      `value`, so a client that cannot hold the number exactly passes it
      exactly; a JSON integer up to 2^53 - 1 is still taken, and a float, or
      an integer from 2^53 on, is refused (`bad-value`) at the mount, before any
-     budget is drawn on. `max_payment` is the one exception: it is a cap on a
+     budget is drawn on, in the tool's own words and as its error. `max_payment` is the one exception: it is a cap on a
      price that is checked exactly, never an amount that is spent, so it takes
      a whole JSON integer of any size too (OCB sends its model budget that
      way).
@@ -706,10 +706,14 @@ gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
 (a raw digest refused to a value-capped token),
 `token-mech-payment-cap`, `token-mech-session-cap`, and `bad-value` for an
 amount that is not a whole number >= 0, which the HTTP routes name `bad-intent`
-when it sits in an intent), come back as the HTTP 403/401 detail or the MCP tool
+when it sits in an intent), come back as the HTTP 403/401 detail or a JSON-RPC
 error, and are recorded as activity `refusal` entries. MCP calls are authorized
 in the mount's middleware, which reads each JSON-RPC `tools/call` before the
-MCP server does, and stamps the token on the request; whether its intent is
+MCP server does: it first runs the tool's own input check, so a malformed call
+(address, hex, amount, an unknown parameter under `strict_parameters`) is
+answered as the tool's error, in its words, and audited as `invalid-request`
+before any budget is drawn on; it refuses a batch body whole (the MCP server
+serves one message per request); and it stamps the token on the request; whether its intent is
 held as capped is decided from the token in one place (`GrantStore.intent_for`)
 for both surfaces, and a call with no known token is treated as capped. A mech
 payment never draws on `max_value_per_session`: its asset is the mech's,

@@ -37,6 +37,7 @@ from web3.exceptions import ContractLogicError
 
 from connect.input_errors import InputError, checked_address, checked_hex
 from connect.safe import calldata_hex
+from connect.texts import block_invalid, block_negative
 
 # EIP-1967: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
 IMPLEMENTATION_SLOT = int(
@@ -262,11 +263,9 @@ def _block(block: str) -> t.Any:
     try:
         number = int(block, 0)
     except (TypeError, ValueError) as e:
-        raise InputError(
-            f"block must be one of {', '.join(BLOCK_TAGS)} or a number, got '{block}'"
-        ) from e
+        raise InputError(block_invalid(BLOCK_TAGS, block)) from e
     if number < 0:
-        raise InputError(f"block must be >= 0, got {number}")
+        raise InputError(block_negative(number))
     return number
 
 

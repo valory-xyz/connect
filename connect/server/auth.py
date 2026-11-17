@@ -44,16 +44,16 @@ from collections import OrderedDict, deque
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
+from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import ConfigDict, Field, field_validator
 
 from connect import intent as intent_module
 from connect.activity import ActivityLog
 from connect.chain_read import UNIVERSAL_ROUTER_NAME, known_contract
 from connect.chains import chain_info
-from connect.input_errors import InputError, check_arguments
 from connect.server.strict import StrictBody
 from connect.signer import MAX_CACHED_RESULTS
-from connect.texts import AMOUNT_RULE, CAP_RULE
+from connect.texts import BATCH_REFUSED
 
 Scope = t.Literal["read", "mech", "tx"]
 SCOPES: tuple[Scope, ...] = ("read", "mech", "tx")
@@ -94,53 +94,6 @@ ACTION_SCOPES: dict[str, Scope] = {
     "send_transaction": "tx",
     "sign_message": "tx",
 }
-
-
-# the base-unit amounts each MCP tool takes, declared as strings in its schema
-# (`mcp_tools.Amount`) and read by `intent.parse_tool_amount` at the mount;
-# those inside an `intent` (`mcp_tools.ToolIntent`) are read the same way
-TOOL_AMOUNTS: dict[str, tuple[str, ...]] = {
-    "safe_transaction": ("value",),
-    "send_transaction": ("value",),
-    "preflight_transaction": ("value",),
-    "simulate_transaction": ("value",),
-}
-# the base-unit caps: a bound the mech's exact price is checked against, never
-# itself spent, so a JSON integer of any size is taken (`mcp_tools.Cap`,
-# `intent.parse_amount`); a float, a bool or a negative is still refused
-TOOL_CAPS: dict[str, tuple[str, ...]] = {
-    "mech_request": ("max_payment",),
-}
-
-
-def check_tool_amounts(tool: str, arguments: t.Mapping[str, t.Any]) -> None:
-    """Refuse a tool call whose amount a JSON number may already have rounded.
-
-    Every amount `TOOL_AMOUNTS` names, and every one inside the `intent`; a
-    cap `TOOL_CAPS` names need only be a whole number of base units.
-
-    :raises GrantRefused: `bad-value`, naming the argument, before any
-        budget is drawn on.
-    """
-    amounts = [(name, arguments.get(name)) for name in TOOL_AMOUNTS.get(tool, ())]
-    amounts += intent_module.intent_amounts(_intent_argument(arguments))
-    caps = [(name, arguments.get(name)) for name in TOOL_CAPS.get(tool, ())]
-    for reader, named in (
-        (intent_module.parse_tool_amount, amounts),
-        (intent_module.parse_amount, caps),
-    ):
-        for name, raw in named:
-            if raw is None:
-                continue
-            try:
-                reader(raw)
-            except (TypeError, ValueError) as e:
-                rule = (
-                    AMOUNT_RULE
-                    if reader is intent_module.parse_tool_amount
-                    else CAP_RULE
-                )
-                raise GrantRefused("bad-value", f"{name}: {rule}") from e
 
 
 def _intent_argument(arguments: t.Mapping[str, t.Any]) -> t.Any:
@@ -808,10 +761,14 @@ class RequireAuth:
         self._limiter.record_failure()
 
 
+# the audit rule of a call the mount refused on its input, before authorizing
+INPUT_REFUSED_RULE = "invalid-request"
+
+
 class AuthMiddleware:
     """Pure-ASGI equivalent of RequireAuth for mounted sub-apps (the MCP mount)."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         app: t.Callable,
         grants: GrantStore,
@@ -819,18 +776,22 @@ class AuthMiddleware:
         limiter: AuthFailureLimiter,
         *,
         tools: t.Collection[str],
+        check: t.Callable[[str, dict[str, t.Any]], object],
     ) -> None:
-        """Initialize; `tools` names the MCP app's tools.
+        """Initialize; `tools` names the MCP app's tools, `check` its input check.
 
         A call naming none of them authorizes nothing, so it is passed on
         unauthorized for the MCP app to answer as unknown. A registered tool
-        always meets `authorize`, so one with no scope is refused.
+        always meets `check` (`ConnectMCP.check_call`, raising `ToolError`)
+        and then `authorize`, so a malformed call never draws on a budget and
+        one with no scope is refused.
         """
         self._app = app
         self._grants = grants
         self._activity = activity
         self._limiter = limiter
         self._tools = frozenset(tools)
+        self._check = check
 
     async def __call__(self, scope: t.Any, receive: t.Any, send: t.Any) -> None:
         """Enforce Origin locality + bearer token, then delegate."""
@@ -869,51 +830,47 @@ class AuthMiddleware:
     def _refusal(
         self, token: str, body: bytes, replays: set[tuple[str, str]]
     ) -> dict | None:
-        """Return the answer to the first tool call this token may not make.
+        """Return the answer to a tool call this token may not make, if any.
 
-        A malformed address or hex argument is answered as the tool's own error
-        (the reference's `check_args` text); a grant refusal as a JSON-RPC error.
-
-        Each call relieved as a retry is added to `replays` as (tool, request id).
+        A batch is refused whole before anything is authorized: the MCP server
+        serves one message per body. A call's input refusal (the tool's own
+        `check_call`) is answered as the tool's error would be, and a grant
+        refusal as a JSON-RPC error. A call relieved as a retry is added to
+        `replays` as (tool, request id).
         """
+        call = _json_or_none(body)  # the MCP server answers a malformed body itself
+        if isinstance(call, list):
+            self._activity.record("refusal", rule="batch", reason=BATCH_REFUSED)
+            return _rpc_error(None, -32600, BATCH_REFUSED)
+        if not isinstance(call, dict) or call.get("method") != "tools/call":
+            return None
+        params = call.get("params")
+        params = params if isinstance(params, dict) else {}
+        arguments = params.get("arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        name = str(params.get("name"))
+        if name not in self._tools:
+            return None
         try:
-            message = json.loads(body or b"null")
-        except ValueError:
-            return None  # the MCP server answers a malformed body itself
-        for call in message if isinstance(message, list) else [message]:
-            if not isinstance(call, dict) or call.get("method") != "tools/call":
-                continue
-            params = call.get("params")
-            params = params if isinstance(params, dict) else {}
-            arguments = params.get("arguments")
-            arguments = arguments if isinstance(arguments, dict) else {}
-            name = str(params.get("name"))
-            if name not in self._tools:
-                continue
-            try:  # every input check runs before authorize draws on a budget
-                check_arguments(arguments)
-                check_tool_amounts(name, arguments)
-                if self._grants.authorize(token, name, arguments):
-                    replays.add((name, str(arguments["request_id"])))
-            except InputError as e:  # answered as the tool's own error would be
-                self._activity.record("refusal", tool=name, reason=str(e))
-                return {
-                    "jsonrpc": "2.0",
-                    "id": call.get("id"),
-                    "result": {
-                        "content": [{"type": "text", "text": str(e)}],
-                        "isError": True,
-                    },
-                }
-            except GrantRefused as e:
-                self._activity.record(
-                    "refusal", rule=e.rule, tool=params.get("name"), reason=str(e)
-                )
-                return {
-                    "jsonrpc": "2.0",
-                    "id": call.get("id"),
-                    "error": {"code": -32001, "message": e.message},
-                }
+            self._check(name, arguments)
+            if self._grants.authorize(token, name, arguments):
+                replays.add((name, str(arguments["request_id"])))
+        except ToolError as e:
+            reason = str(e)
+            self._activity.record(
+                "refusal", rule=INPUT_REFUSED_RULE, tool=name, reason=reason
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": call.get("id"),
+                "result": {
+                    "content": [{"type": "text", "text": reason}],
+                    "isError": True,
+                },
+            }
+        except GrantRefused as e:
+            self._activity.record("refusal", rule=e.rule, tool=name, reason=str(e))
+            return _rpc_error(call.get("id"), -32001, e.message)
         return None
 
     def _fail(self, path: str, reason: str) -> None:
@@ -927,6 +884,23 @@ def require_local_origin(request: Request) -> None:
         raise HTTPException(
             status_code=403, detail="cross-origin requests are not allowed"
         )
+
+
+def _json_or_none(body: bytes) -> t.Any:
+    """Return a request body as JSON, or None when it is not JSON."""
+    try:
+        return json.loads(body or b"null")
+    except ValueError:
+        return None
+
+
+def _rpc_error(call_id: t.Any, code: int, message: str) -> dict:
+    """Return a JSON-RPC error answer."""
+    return {
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "error": {"code": code, "message": message},
+    }
 
 
 async def _reject(send: t.Any, status: int, message: str) -> None:

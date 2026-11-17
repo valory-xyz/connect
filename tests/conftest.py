@@ -43,7 +43,7 @@ from web3.exceptions import TimeExhausted, TransactionNotFound, Web3RPCError
 from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
-from connect.intent import TRANSFER_SINGLE
+from connect.intent import APPROVAL, TRANSFER_SINGLE
 from connect.mech import MechService
 from connect.server import auth as auth_module
 from connect.server.app import create_app
@@ -442,9 +442,6 @@ NATIVE_LOG = "0x" + "ee" * 20
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
-APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
-
-
 def _hex_word(n: int) -> str:
     """Return a number as one 32-byte ABI word, without 0x."""
     return hex(n)[2:].rjust(64, "0")
@@ -459,7 +456,7 @@ def approval_log(token: str, owner: str, spender: str, amount: int) -> dict:
     """Return an ERC-20 Approval log: `owner` lets `spender` move `amount`."""
     return {
         "address": token,
-        "topics": [APPROVAL_TOPIC, _topic(owner), _topic(spender)],
+        "topics": [APPROVAL, _topic(owner), _topic(spender)],
         "data": "0x" + _hex_word(amount),
     }
 

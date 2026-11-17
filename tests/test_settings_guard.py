@@ -236,6 +236,19 @@ GUARD_RULE_CASES = [
         0,
         "0x" + EXEC_TRANSACTION_SELECTOR,
     ),
+    # a bytes length word past the index range: eth_abi raises OverflowError
+    (
+        "undecodable-exec-transaction",
+        "testchain",
+        SAFE,
+        0,
+        "0x"
+        + EXEC_TRANSACTION_SELECTOR
+        + "".join(
+            hex(0x140 if i in (2, 9) else 0)[2:].rjust(64, "0") for i in range(10)
+        )
+        + hex(2**255)[2:].rjust(64, "0"),
+    ),
 ]
 GUARD_REFUSALS = {
     "no-delegatecall": texts.GUARD_NO_DELEGATECALL,
@@ -1346,16 +1359,6 @@ class TestGuard:
             with pytest.raises(GuardError) as refused:
                 guard.check_transaction("testchain", SAFE, 0, self_call)
             assert str(refused.value) == texts.GUARD_NO_SELF_CALL
-
-    def test_the_whitelist_refusal_is_the_reference_s_text(
-        self, store: SettingsStore
-    ) -> None:
-        """The refusal names the safe's call target and the chain, verbatim."""
-        guard = make_guard(store, MODE_RESTRICTED, {"testchain": ()})
-        call = exec_transaction_calldata(WHITELISTED)
-        with pytest.raises(GuardError) as refused:
-            guard.check_transaction("testchain", SAFE, 0, call)
-        assert str(refused.value) == texts.guard_not_allowed(WHITELISTED, "testchain")
 
     @pytest.mark.parametrize(
         ("rule", "chain", "to", "value", "data"),
@@ -6017,11 +6020,11 @@ class TestMech:
         self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
         if case == "guardrail":
             refused = SignerError("the operator's guardrail settings do not allow it")
-            refused.__cause__ = GuardError("not whitelisted")
+            refused.__cause__ = GuardError(texts.guard_not_allowed(OTHER, "testchain"))
             patched_mech.raises = refused
         if case == "guardrail-wrapped":  # as mech-client's agent-mode executor does
             refused = SignerError("the operator's guardrail settings do not allow it")
-            refused.__cause__ = GuardError("not whitelisted")
+            refused.__cause__ = GuardError(texts.guard_not_allowed(OTHER, "testchain"))
             wrapped = Exception(f"Failed to execute Safe transaction: {refused}")
             wrapped.__cause__ = refused
             patched_mech.raises = wrapped

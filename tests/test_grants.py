@@ -27,10 +27,12 @@ import typing as t
 
 import pytest
 from fastapi.testclient import TestClient
+from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from connect import intent as intent_module
 from connect import signer as signer_module
+from connect import texts
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server import auth as auth_module
@@ -48,7 +50,7 @@ from connect.server.auth import (
 )
 from connect.signer import Signer
 from connect.switches import Switches
-from connect.texts import AMOUNT_RULE, CAP_RULE
+from connect.texts import AMOUNT_REFUSED, CAP_REFUSED
 
 from tests.conftest import (
     FakeW3,
@@ -773,6 +775,7 @@ class TestMcpMiddleware:
             activity,
             AuthFailureLimiter(),
             tools=["wallet_info", "safe_transaction"],
+            check=lambda name, arguments: None,
         )
         return middleware, reader
 
@@ -799,16 +802,12 @@ class TestMcpMiddleware:
         """The session reads the rule in the tool error; nothing reaches the server."""
         middleware, reader = setup
         body = json.dumps(
-            [
-                {"jsonrpc": "2.0", "method": "notifications/initialized"},
-                "junk",
-                {
-                    "jsonrpc": "2.0",
-                    "id": 7,
-                    "method": "tools/call",
-                    "params": {"name": "safe_transaction", "arguments": "x"},
-                },
-            ]
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {"name": "safe_transaction", "arguments": "x"},
+            }
         ).encode()
         sent, seen = await self._call(middleware, reader, body)
         assert seen == []
@@ -819,32 +818,73 @@ class TestMcpMiddleware:
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert entry["tool"] == "safe_transaction"
 
-    async def test_an_unknown_name_does_not_carry_a_batch_past_the_check(
-        self, setup: tuple[AuthMiddleware, str]
+    async def test_a_batch_is_refused_whole_before_anything_is_authorized(
+        self,
+        setup: tuple[AuthMiddleware, str],
+        monkeypatch: pytest.MonkeyPatch,
+        store_path: t.Any,
     ) -> None:
-        """Each call in a batch is checked; an unknown name only skips itself."""
+        """No call in a batch is checked, drawn on or passed: the server serves one."""
         middleware, reader = setup
-        body = json.dumps(
-            [
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {"name": "no_such_tool", "arguments": {}},
-                },
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {"name": "safe_transaction", "arguments": {}},
-                },
-            ]
-        ).encode()
+        authorized: list[str] = []
+        grants = middleware._grants  # pylint: disable=protected-access
+        monkeypatch.setattr(
+            grants, "authorize", lambda _t, name, _a, **_k: authorized.append(name)
+        )
+        call = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "safe_transaction", "arguments": {"value": 5}},
+        }
+        body = json.dumps([{**call, "id": 1}, {**call, "id": 2}]).encode()
         sent, seen = await self._call(middleware, reader, body)
         assert seen == []
+        assert authorized == []
         answer = json.loads(sent[1]["body"])
-        assert answer["id"] == 2
-        assert "token-scope" in answer["error"]["message"]
+        assert answer == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": texts.BATCH_REFUSED},
+        }
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry["rule"] == "batch"
+
+    async def test_an_input_refusal_is_the_tool_s_own_error(
+        self, activity: ActivityLog, store_path: t.Any
+    ) -> None:
+        """The mount runs the tool's input check first and answers it as isError."""
+
+        def check(name: str, arguments: dict) -> None:
+            raise ToolError(f"{name} refused {sorted(arguments)}")
+
+        middleware = AuthMiddleware(
+            lambda *a: None,
+            grant_store(WORKSPACE),
+            activity,
+            AuthFailureLimiter(),
+            tools=["safe_transaction"],
+            check=check,
+        )
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "safe_transaction", "arguments": {"target": "x"}},
+            }
+        ).encode()
+        sent, seen = await self._call(middleware, WORKSPACE, body)
+        assert seen == []
+        assert json.loads(sent[1]["body"]) == {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [
+                    {"type": "text", "text": "safe_transaction refused ['target']"}
+                ],
+                "isError": True,
+            },
+        }
 
     @pytest.mark.parametrize(
         ("tools", "name", "passed"),
@@ -863,7 +903,12 @@ class TestMcpMiddleware:
         """The mount fails closed: a registered tool with no scope is refused."""
         store = grant_store(WORKSPACE)
         middleware = AuthMiddleware(
-            lambda *a: None, store, activity, AuthFailureLimiter(), tools=tools
+            lambda *a: None,
+            store,
+            activity,
+            AuthFailureLimiter(),
+            tools=tools,
+            check=lambda name, arguments: None,
         )
         call = json.dumps(
             {"method": "tools/call", "params": {"name": name, "arguments": {}}}
@@ -902,6 +947,7 @@ async def test_a_disconnect_before_any_body_is_passed_on(activity: ActivityLog) 
         activity,
         AuthFailureLimiter(),
         tools=ACTION_SCOPES,
+        check=lambda name, arguments: None,
     )
     messages = [{"type": "http.disconnect"}, {"type": "http.disconnect"}]
 
@@ -1060,29 +1106,42 @@ def test_mcp_value_that_is_not_finite_is_a_bad_value_refusal(
         },
     )
     assert answer.status_code == 200
-    assert "rule 'bad-value'" in answer.text
+    assert _tool_error(answer) == (
+        f"invalid request: ValidationError: value: Value error, {AMOUNT_REFUSED}"
+    )
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-    assert rules == ["bad-value"]
+    assert rules == ["invalid-request"]
 
 
-@pytest.mark.parametrize("tool", sorted(auth_module.TOOL_AMOUNTS))
+def _tool_error(response: t.Any) -> str:
+    """Return the text of an `isError` tool result answered by the mount."""
+    result = response.json()["result"]
+    assert result["isError"] is True
+    return result["content"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "safe_transaction",
+        "send_transaction",
+        "preflight_transaction",
+        "simulate_transaction",
+    ],
+)
 def test_mcp_an_amount_from_2_53_on_is_refused_at_the_mount_before_any_draw(
     client: TestClient, fake_w3: FakeW3, store_path: t.Any, tool: str
 ) -> None:
-    """A JSON number from 2^53 on may already be rounded: refused, naming the rule."""
-    (name,) = auth_module.TOOL_AMOUNTS[tool]
-    arguments = (
-        {"prompt": "q", "tool": "t"}
-        if tool == "mech_request"
-        else {"chain": "testchain", "target": RECIPIENT}
+    """A JSON number from 2^53 on may be rounded: the tool's own refusal, no draw."""
+    key = "to" if tool == "send_transaction" else "target"
+    arguments = {"chain": "testchain", key: RECIPIENT, "value": 2**53}
+    refused = _mcp_call(client, WORKSPACE, tool, arguments)
+    assert _tool_error(refused) == (
+        f"invalid request: ValidationError: value: Value error, {AMOUNT_REFUSED}"
     )
-    refused = _mcp_call(client, WORKSPACE, tool, {**arguments, name: 2**53})
-    assert _refused_rule(refused) == "bad-value"
-    assert refused.json()["error"]["message"] == (
-        f"rule 'bad-value': {name}: {AMOUNT_RULE}"
-    )
-    rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-    assert rules == ["bad-value"]
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert entry["rule"] == "invalid-request"
+    assert entry["tool"] == tool
     assert not fake_w3.eth.sent
 
 
@@ -1105,16 +1164,15 @@ def test_mcp_a_malformed_amount_is_refused_without_echoing_it(
             {"prompt": "q", "tool": "t", "max_payment": marker},
         ),
     ]
-    messages = [answer.json()["error"]["message"] for answer in answers]
-    assert messages == [
-        f"rule 'bad-value': value: {AMOUNT_RULE}",
-        f"rule 'bad-value': max_payment: {CAP_RULE}",
+    assert [_tool_error(answer) for answer in answers] == [
+        f"invalid request: ValidationError: value: Value error, {AMOUNT_REFUSED}",
+        f"invalid request: ValidationError: max_payment: Value error, {CAP_REFUSED}",
     ]
     assert not fake_w3.eth.sent
 
 
 def test_mcp_a_malformed_address_is_refused_before_the_budget_is_drawn(
-    client: TestClient, fake_w3: FakeW3
+    client: TestClient, fake_w3: FakeW3, store_path: t.Any
 ) -> None:
     """The mount checks the arguments as sent before authorize draws on a budget."""
     capped = _session_capped(client)  # 10 native for the session
@@ -1122,11 +1180,15 @@ def test_mcp_a_malformed_address_is_refused_before_the_budget_is_drawn(
     refused = _mcp_call(
         client, capped, "safe_transaction", {**arguments, "target": "0x12"}
     )
-    result = refused.json()["result"]
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == (
-        "target must be a 0x address (40 hex digits), got '0x12'"
-    )
+    reason = "target must be a 0x address (40 hex digits), got '0x12'"
+    assert _tool_error(refused) == reason
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert entry == {
+        **entry,
+        "rule": "invalid-request",
+        "tool": "safe_transaction",
+        "reason": reason,
+    }
     whole = {"chain": "testchain", "value": 10, "intent": pay(RECIPIENT, 10)}
     sent = _mcp_call(client, capped, "safe_transaction", {**whole, "target": RECIPIENT})
     assert _refused_rule(sent) is None  # the session's 10 are all still there
@@ -1203,7 +1265,7 @@ def test_mcp_a_mech_cap_from_2_53_on_reaches_the_flow_exactly(
                     {"token": RECIPIENT, "spender": RECIPIENT, "amount": 2**53}
                 ]
             },
-            "intent.approvals[0].amount",
+            "intent.approvals.0.amount",
         ),
     ],
 )
@@ -1223,10 +1285,11 @@ def test_mcp_an_intent_amount_a_json_number_may_have_rounded_is_refused_at_the_m
         tool,
         {"chain": "testchain", "target": RECIPIENT, "intent": intent},
     )
-    assert _refused_rule(refused) == "bad-value"
-    assert refused.json()["error"]["message"].startswith(f"rule 'bad-value': {where}:")
+    assert _tool_error(refused) == (
+        f"invalid request: ValidationError: {where}: Value error, {AMOUNT_REFUSED}"
+    )
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-    assert rules == ["bad-value"]
+    assert rules == ["invalid-request"]
     assert not fake_w3.eth.sent
 
 
@@ -1620,9 +1683,15 @@ def _mcp_call(client: TestClient, token: str, tool: str, arguments: dict) -> t.A
 
 
 def _refused_rule(response: t.Any) -> str | None:
-    """Return the rule of a JSON-RPC -32001 refusal, or None if not refused."""
+    """Return the rule of a mount refusal, or None if not refused.
+
+    A grant refusal is a JSON-RPC -32001 naming its rule; an input refusal is
+    the tool's own `isError` answer, audited as `invalid-request`.
+    """
     if not response.headers["content-type"].startswith("application/json"):
         return None
+    if (response.json().get("result") or {}).get("isError"):
+        return "invalid-request"
     error = response.json().get("error") or {}
     if error.get("code") != -32001:
         return None
@@ -1666,14 +1735,14 @@ def test_mcp_mech_request_is_held_to_the_token_s_mech_caps(
 
     assert pay_mech(max_payment="101") == "token-mech-payment-cap"
     assert pay_mech() == "token-mech-payment-cap"  # omitted: the default is no cap
-    assert pay_mech(max_payment=1.5) == "bad-value"
+    assert pay_mech(max_payment=1.5) == "invalid-request"
     assert pay_mech(max_payment="100") is None
     assert pay_mech(max_payment="100") == "token-mech-session-cap"  # 200 > 150
     assert pay_mech(max_payment=50) is None
     assert asked == [100, 50]
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert rules == ["token-mech-payment-cap"] * 2 + [
-        "bad-value",
+        "invalid-request",
         "token-mech-session-cap",
     ]
 

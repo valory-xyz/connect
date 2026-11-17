@@ -61,7 +61,9 @@ from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
 from connect.signer_errors import logged_cause
 from connect.texts import (
+    AMOUNT_DESCRIPTION,
     AMOUNT_REFUSED,
+    CAP_DESCRIPTION,
     CAP_REFUSED,
     GET_ABI_DESCRIPTION,
     INVALID_REQUEST,
@@ -70,6 +72,8 @@ from connect.texts import (
     TOOL_DESCRIPTIONS,
     TRANSACTION_STATUS_DESCRIPTION,
     UNKNOWN_TOOL,
+    VALUE_REFUSED,
+    tool_failed,
 )
 
 # tools that read and never sign, broadcast or pay: harnesses may run them
@@ -93,7 +97,7 @@ def _amount_text(value: t.Any) -> str:
 Amount = t.Annotated[
     str,
     BeforeValidator(_amount_text),
-    Field(description="base units, as a decimal or 0x-hex string"),
+    Field(description=AMOUNT_DESCRIPTION),
 ]
 
 
@@ -115,7 +119,7 @@ def _cap_text(value: t.Any) -> str:
 Cap = t.Annotated[
     str,
     BeforeValidator(_cap_text),
-    Field(description="base units, as an integer or a decimal or 0x-hex string"),
+    Field(description=CAP_DESCRIPTION),
 ]
 
 
@@ -162,11 +166,6 @@ CALLER_ERRORS: tuple[type[Exception], ...] = (
     MechError,
     InFlightError,
 )
-
-
-def tool_failed(tool: str) -> str:
-    """Return what the caller reads for an error Connect did not word for it."""
-    return f"{tool} failed (the cause is in Connect's log)"
 
 
 logger = logging.getLogger("agent")
@@ -216,13 +215,21 @@ class ConnectMCP(FastMCP):
         """Return the names of the registered tools."""
         return frozenset(tool.name for tool in self._tool_manager.list_tools())
 
-    async def call_tool(self, name: str, arguments: dict[str, t.Any]) -> t.Any:
-        """Call a tool, raising its own error text with no transport prefix."""
+    def check_call(self, name: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
+        """Refuse a registered tool's malformed arguments; return them aliased.
+
+        The one input check: every address and hex argument as sent, then the
+        tool's own model (amounts, types, strictness). The MCP mount runs it
+        before authorizing, so a refused call never draws on a budget and
+        reads the same over the transport as in process.
+
+        :raises ToolError: the refusal, in the words the agent reads.
+        """
         tool = self._tool_manager.get_tool(name)
         if tool is None:
             raise ToolError(UNKNOWN_TOOL(name))
         try:  # the arguments' check is Connect's; one inside a tool body is not
-            check_arguments(arguments)  # as sent, before `to` is read as `target`
+            check_arguments(arguments)
             arguments = with_aliases(name, arguments)
             metadata = tool.fn_metadata
             metadata.arg_model.model_validate(metadata.pre_parse_json(arguments))
@@ -235,6 +242,11 @@ class ConnectMCP(FastMCP):
         except Exception as e:  # e.g. a JSON intent nested past the stack
             logger.error("tool %s failed: %s", name, logged_cause(e))
             raise ToolError(tool_failed(name)) from e
+        return arguments
+
+    async def call_tool(self, name: str, arguments: dict[str, t.Any]) -> t.Any:
+        """Call a tool, raising its own error text with no transport prefix."""
+        arguments = self.check_call(name, arguments)
         try:
             return await super().call_tool(name, arguments)
         except ToolError as e:
@@ -600,7 +612,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     try:
         amount = parse_amount(value)
     except (TypeError, ValueError) as e:
-        raise InputError(f"value must be a non-negative amount in wei: {e}") from e
+        raise InputError(VALUE_REFUSED) from e
 
     def _run() -> dict:
         tx_hash = method(

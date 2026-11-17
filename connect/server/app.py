@@ -256,6 +256,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
             activity,
             limiter,
             tools=mcp.tool_names(),
+            check=mcp.check_call,
         ),
     )
 

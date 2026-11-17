@@ -39,8 +39,7 @@ _HEX = re.compile(r"(?:0x)?(?:[0-9a-fA-F]{2})*", re.ASCII)
 _TX_HASH = re.compile(r"(?:0x)?[0-9a-fA-F]{64}", re.ASCII)
 
 
-# every tool's address and hex arguments, as the reference's `check_args` names
-# them; checked on the arguments as sent, before any alias is read
+# every tool's address and hex arguments, as the reference's `check_args` names them
 ADDRESS_ARGUMENTS = ("target", "to", "address", "priority_mech")
 HEX_ARGUMENTS = ("data", "digest")
 

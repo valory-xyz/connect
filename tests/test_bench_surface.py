@@ -39,16 +39,9 @@ from connect.idempotency import InFlightError
 from connect.input_errors import InputError
 from connect.mech import MechError
 from connect.server.auth import ACTION_SCOPES, GrantRefused
-from connect.server.mcp_tools import tool_failed, with_aliases
+from connect.server.mcp_tools import with_aliases
 from connect.signer import Signer, SignerError
 from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
-from connect.texts import (
-    AMOUNT_REFUSED,
-    CAP_REFUSED,
-    GET_ABI_DESCRIPTION,
-    REQUEST_CONTEXT_NOTE,
-    TRANSACTION_STATUS_DESCRIPTION,
-)
 
 from tests.conftest import FakeW3, approval_log
 
@@ -192,7 +185,7 @@ async def test_an_unexpected_error_is_logged_and_never_forwarded(
             await mcp.call_tool(
                 "safe_transaction", {"chain": "testchain", "target": RECIPIENT}
             )
-    assert str(raised.value) == tool_failed("safe_transaction")
+    assert str(raised.value) == texts.tool_failed("safe_transaction")
     assert f"tool safe_transaction failed: {error_type.__name__}" in caplog.text
     assert "SECRETKEY" not in caplog.text
 
@@ -226,8 +219,8 @@ async def test_every_published_description_is_the_reference_s(mcp: FastMCP) -> N
     tools = await mcp.list_tools()
     assert {tool.name: tool.description for tool in tools} == {
         **texts.TOOL_DESCRIPTIONS,
-        "get_abi": GET_ABI_DESCRIPTION,
-        "transaction_status": TRANSACTION_STATUS_DESCRIPTION,
+        "get_abi": texts.GET_ABI_DESCRIPTION,
+        "transaction_status": texts.TRANSACTION_STATUS_DESCRIPTION,
     }
 
 
@@ -277,7 +270,7 @@ async def test_request_context_warns_that_it_may_be_published(mcp: FastMCP) -> N
     """The IPFS warning rides on the field, since the tool text is the reference's."""
     (tool,) = [t for t in await mcp.list_tools() if t.name == "mech_request"]
     field = tool.inputSchema["properties"]["request_context"]
-    assert field["description"] == REQUEST_CONTEXT_NOTE
+    assert field["description"] == texts.REQUEST_CONTEXT_NOTE
 
 
 @pytest.mark.parametrize(
@@ -361,7 +354,7 @@ def test_an_unknown_no_intent_policy_is_refused() -> None:
 async def test_connect_s_input_refusals_reach_the_caller(
     mcp: FastMCP, tool: str, arguments: dict, expected: str
 ) -> None:
-    """Each InputError site reads as its own words, never as tool_failed."""
+    """Each InputError site reads as its own words, never as texts.tool_failed."""
     with pytest.raises(ToolError) as raised:
         await mcp.call_tool(tool, arguments)
     assert str(raised.value) == expected
@@ -378,7 +371,7 @@ async def test_a_malformed_argument_reads_as_the_reference_s_invalid_request(
             {"chain": "testchain", "target": RECIPIENT, "value": marker},
         )
     assert str(raised.value) == (
-        f"invalid request: ValidationError: value: Value error, {AMOUNT_REFUSED}"
+        f"invalid request: ValidationError: value: Value error, {texts.AMOUNT_REFUSED}"
     )
 
 
@@ -392,7 +385,7 @@ async def test_two_bad_arguments_are_named_in_order_joined(mcp: FastMCP) -> None
     assert str(raised.value) == (
         "invalid request: ValidationError: timeout: Input should be a valid "
         "number, unable to parse string as a number; "
-        f"max_payment: Value error, {CAP_REFUSED}"
+        f"max_payment: Value error, {texts.CAP_REFUSED}"
     )
 
 
@@ -424,7 +417,7 @@ async def test_every_address_and_hex_argument_is_checked_as_the_reference(
 async def test_a_failure_in_the_argument_check_itself_is_logged_not_forwarded(
     mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A deeply nested intent (RecursionError) reads tool_failed, cause logged."""
+    """A deeply nested intent (RecursionError) reads texts.tool_failed, cause logged."""
     manager = mcp._tool_manager  # pylint: disable=protected-access
     tool = manager.get_tool("safe_transaction")
 
@@ -437,7 +430,7 @@ async def test_a_failure_in_the_argument_check_itself_is_logged_not_forwarded(
             await mcp.call_tool(
                 "safe_transaction", {"chain": "testchain", "target": RECIPIENT}
             )
-    assert str(raised.value) == tool_failed("safe_transaction")
+    assert str(raised.value) == texts.tool_failed("safe_transaction")
     assert "tool safe_transaction failed: RecursionError" in caplog.text
 
 

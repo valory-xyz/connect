@@ -76,6 +76,7 @@ anything to switch.
 import logging
 import threading
 import time
+import typing as t
 from dataclasses import dataclass
 
 from connect.chains import MECH_MARKETPLACES
@@ -91,12 +92,15 @@ from connect.safe import (
 )
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
 from connect.texts import (
+    GUARDRAIL_PREFIX,
     GUARD_NO_DELEGATECALL,
     GUARD_NO_SELF_CALL,
     GUARD_OUTER_VALUE,
     GUARD_RAW_DIGEST,
     GUARD_REFUND,
     GUARD_UNDECODABLE,
+    GuardRule,
+    GuardText,
     guard_exec_transaction_only,
     guard_marketplace,
     guard_no_safe,
@@ -109,7 +113,16 @@ logger = logging.getLogger("agent")
 
 
 class GuardError(Exception):
-    """A transaction or signing request denied by the guardrail."""
+    """A transaction or signing request denied by the guardrail.
+
+    It takes only a `texts.GuardText`, which `guard_refusal` alone builds, so
+    every refusal carries the `guardrail: rule '<id>': ` prefix and `rule`.
+    """
+
+    def __init__(self, text: GuardText) -> None:
+        """Hold the refusal and the rule id it names."""
+        super().__init__(text)
+        self.rule = t.cast(GuardRule, text.removeprefix(GUARDRAIL_PREFIX).split("'")[1])
 
 
 # How long a registered allowance stays consumable. Arming must happen before

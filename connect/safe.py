@@ -230,7 +230,8 @@ class SafeExec:
         """Decode execTransaction calldata.
 
         :raises InputError: `NOT_EXEC_TRANSACTION`, or `EXEC_UNDECODABLE` from
-            the hex or eth_abi's decoding error (its words are a library's, so
+            the hex, eth_abi's decoding error or the `ArithmeticError` it
+            raises on a length past the index range (a library's words, so
             they are the cause, never the text). Anything else is a fault in
             this code, and propagates as itself.
         """
@@ -241,7 +242,7 @@ class SafeExec:
             decoded = tuple(
                 abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
             )
-        except (DecodingError, ValueError) as e:
+        except (DecodingError, ValueError, ArithmeticError) as e:
             raise InputError(EXEC_UNDECODABLE) from e
         return cls(
             to=str(decoded[0]),
@@ -264,23 +265,18 @@ class SafeExec:
 
 
 def decode_exec(data: str, *, chain: str, to: str) -> SafeExec:
-    """`SafeExec.decode`, logging undecodable calldata with where it was sent.
-
-    The guard and the EOA gate call this, so each refusal is logged once with
-    its chain and target; the mech flow's check reads `SafeExec.decode`
-    directly, since it leaves the refusal to the guard.
-    """
+    """`SafeExec.decode`, logging undecodable calldata with where it was sent."""
     try:
         return SafeExec.decode(data)
     except InputError as e:
-        if e.__cause__ is not None:  # the decoder's own failure, not the selector
+        if str(e) == EXEC_UNDECODABLE:
             logger.warning(
                 "%s to %s on %s (%d bytes): %s",
                 EXEC_UNDECODABLE,
                 to,
                 chain,
                 len(calldata_hex(data)) // 2,
-                cause_of(e.__cause__),
+                cause_of(e.__cause__ or e),
             )
         raise
 

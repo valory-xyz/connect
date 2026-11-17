@@ -260,6 +260,47 @@ CONNECT_GUARD = [
 ]
 
 
+# Connect's own texts outside the guardrail, pinned word for word
+CONNECT_OWN = [
+    (
+        texts.AMOUNT_REFUSED,
+        "rule 'bad-value': pass a decimal or 0x-hex string of base units, or a "
+        "JSON integer below 2^53",
+    ),
+    (
+        texts.CAP_REFUSED,
+        "rule 'bad-value': pass a whole number of base units, as an integer or a "
+        "decimal or 0x-hex string",
+    ),
+    (texts.AMOUNT_DESCRIPTION, "base units, as a decimal or 0x-hex string"),
+    (texts.CAP_DESCRIPTION, "base units, as an integer or a decimal or 0x-hex string"),
+    (texts.VALUE_REFUSED, "value must be a non-negative amount in wei"),
+    (
+        texts.BATCH_REFUSED,
+        "batch requests are not supported: send one message per request",
+    ),
+    (
+        texts.tool_failed("safe_transaction"),
+        "safe_transaction failed (the cause is in Connect's log)",
+    ),
+    (texts.block_negative(-1), "block must be >= 0, got -1"),
+    (
+        texts.block_invalid(("latest", "pending"), "soon"),
+        "block must be one of latest, pending or a number, got 'soon'",
+    ),
+    (
+        texts.gate_token_cap_positions(f"{ADDR} #7"),
+        f"moves {ADDR} #7 out, and a value-capped token may not move positions",
+    ),
+]
+
+
+@pytest.mark.parametrize(("constant", "expected"), CONNECT_OWN)
+def test_connect_s_own_texts(constant: str, expected: str) -> None:
+    """Connect's own texts keep their words: agents and the bench read them."""
+    assert constant == expected
+
+
 @pytest.mark.parametrize(("constant", "expected"), CONNECT_GUARD)
 def test_connect_s_own_guardrail_texts(constant: str, expected: str) -> None:
     """Connect's own rules keep their words: agents on the bench read them."""
@@ -290,15 +331,33 @@ def test_the_guardrail_texts_carry_the_prefix_the_broker_reads() -> None:
 
 
 # modules that must not restate a contract text inline
-READERS = (
-    "guard.py",
-    "intent.py",
-    "signer.py",
-    "mech.py",
-    "chain_read.py",
-    "server/auth.py",
-    "server/mcp_tools.py",
-)
+def _readers() -> list[str]:
+    """Return every module of `connect` that imports the texts module."""
+    package = Path(texts.__file__).parent
+    return sorted(
+        str(path.relative_to(package))
+        for path in package.rglob("*.py")
+        if path.name != "texts.py"
+        and "assets" not in path.parts
+        and "from connect.texts import" in path.read_text(encoding="utf-8")
+    )
+
+
+READERS = _readers()
+
+
+def test_the_readers_are_found() -> None:
+    """The scan sees every module that reads a text, so none escapes the check."""
+    assert {
+        "guard.py",
+        "intent.py",
+        "safe.py",
+        "signer.py",
+        "chain_read.py",
+        "input_errors.py",
+        "server/auth.py",
+        "server/mcp_tools.py",
+    } <= set(READERS)
 
 
 def _string_constants() -> dict[str, str]:

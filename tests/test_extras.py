@@ -1086,6 +1086,7 @@ class TestAuthMiddlewareASGI:
             activity,
             AuthFailureLimiter(),
             tools=ACTION_SCOPES,
+            check=lambda name, arguments: None,
         )
 
     @staticmethod

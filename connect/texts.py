@@ -153,9 +153,14 @@ GuardRule = t.Literal[
 GUARD_RULES: tuple[GuardRule, ...] = t.get_args(GuardRule)
 
 
-def guard_refusal(rule: GuardRule, detail: str) -> str:
+# a guardrail refusal built by `guard_refusal`, the only text `GuardError`
+# takes, so a refusal without a typed rule id fails the type check
+GuardText = t.NewType("GuardText", str)
+
+
+def guard_refusal(rule: GuardRule, detail: str) -> GuardText:
     """Return a guardrail refusal, in the reference's form."""
-    return f"{GUARDRAIL_PREFIX}'{rule}': {detail}"
+    return GuardText(f"{GUARDRAIL_PREFIX}'{rule}': {detail}")
 
 
 # the clause every operator-changeable refusal ends with
@@ -171,7 +176,7 @@ GUARD_NO_SELF_CALL = guard_refusal(
 )
 
 
-def guard_not_allowed(target: str, chain: str) -> str:
+def guard_not_allowed(target: str, chain: str) -> GuardText:
     """Return the whitelist refusal for a call to `target` on `chain`."""
     return guard_refusal(
         "whitelist",
@@ -180,8 +185,7 @@ def guard_not_allowed(target: str, chain: str) -> str:
     )
 
 
-# Connect's own guardrail rules, the same under every `Switches` position and
-# in the same form as the reference's three: agents read them on the bench too
+# Connect's own guardrail rules (see `GuardRule`)
 GUARD_RAW_DIGEST = guard_refusal(
     "raw-digest",
     "raw digest signing is disabled by the operator's guardrail settings; "
@@ -205,7 +209,7 @@ NOT_EXEC_TRANSACTION = "not execTransaction calldata"
 GUARD_UNDECODABLE = guard_refusal("undecodable-exec-transaction", EXEC_UNDECODABLE)
 
 
-def guard_marketplace(marketplace: str, chain: str) -> str:
+def guard_marketplace(marketplace: str, chain: str) -> GuardText:
     """Return the refusal of a call to a mech marketplace Connect did not compose."""
     return guard_refusal(
         "marketplace",
@@ -214,7 +218,7 @@ def guard_marketplace(marketplace: str, chain: str) -> str:
     )
 
 
-def guard_no_safe(chain: str) -> str:
+def guard_no_safe(chain: str) -> GuardText:
     """Return the refusal of a transaction on a chain with no service safe."""
     return guard_refusal(
         "no-safe",
@@ -223,7 +227,7 @@ def guard_no_safe(chain: str) -> str:
     )
 
 
-def guard_safe_only(safe: str, to: str) -> str:
+def guard_safe_only(safe: str, to: str) -> GuardText:
     """Return the refusal of a transaction that does not target the service safe."""
     return guard_refusal(
         "safe-only",
@@ -232,7 +236,7 @@ def guard_safe_only(safe: str, to: str) -> str:
     )
 
 
-def guard_exec_transaction_only(selector: str, got: str) -> str:
+def guard_exec_transaction_only(selector: str, got: str) -> GuardText:
     """Return the refusal of a call to the safe that is not execTransaction."""
     return guard_refusal(
         "exec-transaction-only",
@@ -241,7 +245,7 @@ def guard_exec_transaction_only(selector: str, got: str) -> str:
     )
 
 
-def guard_payment_token_approve(tracker: str, token: str) -> str:
+def guard_payment_token_approve(tracker: str, token: str) -> GuardText:
     """Return the refusal of a payment-token call other than approving the tracker."""
     return guard_refusal(
         "payment-token-approve",
@@ -347,14 +351,33 @@ def HEX_INVALID(field: str, value: object) -> str:
 
 # Connect's own refusal of a base-unit amount it cannot read exactly: it names
 # the rule and the form to send, never the value sent
-AMOUNT_RULE = (
-    "pass a decimal or 0x-hex string of base units, or a JSON integer below 2^53"
+AMOUNT_REFUSED = (
+    "rule 'bad-value': pass a decimal or 0x-hex string of base units, or a JSON "
+    "integer below 2^53"
 )
-CAP_RULE = (
-    "pass a whole number of base units, as an integer or a decimal or 0x-hex string"
+CAP_REFUSED = (
+    "rule 'bad-value': pass a whole number of base units, as an integer or a "
+    "decimal or 0x-hex string"
 )
-AMOUNT_REFUSED = f"rule 'bad-value': {AMOUNT_RULE}"
-CAP_REFUSED = f"rule 'bad-value': {CAP_RULE}"
+AMOUNT_DESCRIPTION = "base units, as a decimal or 0x-hex string"
+CAP_DESCRIPTION = "base units, as an integer or a decimal or 0x-hex string"
+VALUE_REFUSED = "value must be a non-negative amount in wei"
+BATCH_REFUSED = "batch requests are not supported: send one message per request"
+
+
+def tool_failed(tool: str) -> str:
+    """Return what the caller reads for an error Connect did not word for it."""
+    return f"{tool} failed (the cause is in Connect's log)"
+
+
+def block_invalid(tags: t.Iterable[str], block: str) -> str:
+    """Return the refusal of a `chain_call` block that is no tag and no number."""
+    return f"block must be one of {', '.join(tags)} or a number, got {block[:60]!r}"
+
+
+def block_negative(number: int) -> str:
+    """Return the refusal of a negative block number on `chain_call`."""
+    return f"block must be >= 0, got {number}"
 
 
 def AMOUNT_INEXACT(value: object) -> str:

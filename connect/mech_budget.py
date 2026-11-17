@@ -90,9 +90,9 @@ def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
 def payment_labelled(report: dict) -> dict:
     """Return mech-client's mech report with its `payment` label as `payment_info`.
 
-    The report labels the mech's payment asset under `payment`, an object; in
-    every mech answer `payment` is a JSON integer of base units (B12), so the
-    label moves aside.
+    The report labels the mech's payment asset under `payment`, an object;
+    where a mech answer carries `payment`, it is a JSON integer of base units,
+    so the label moves aside.
     """
     fields = dict(report)
     if "payment" in fields:

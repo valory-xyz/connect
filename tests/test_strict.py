@@ -33,7 +33,6 @@ from connect.config import AppConfig
 from connect.input_errors import ADDRESS_ARGUMENTS, HEX_ARGUMENTS
 from connect.intent import parse_intent
 from connect.mech import MechService
-from connect.server.auth import TOOL_AMOUNTS, TOOL_CAPS
 from connect.server.strict import (
     audit_unknown_parameters,
     unknown_parameters_message,
@@ -48,6 +47,13 @@ RECIPIENT = "0x" + "aa" * 20
 
 
 STRICT = Switches(strict_parameters=True)
+# the tools that take a base-unit `value`
+VALUE_TOOLS = (
+    "safe_transaction",
+    "send_transaction",
+    "preflight_transaction",
+    "simulate_transaction",
+)
 
 
 @pytest.fixture(name="test_signer")
@@ -288,7 +294,7 @@ async def test_the_tool_schema_declares_base_unit_amounts_as_strings(
 ) -> None:
     """Every value and max_payment is a string in the published schema.
 
-    The mount reads exactly these (`TOOL_AMOUNTS`), so no amount is missed.
+    The mount's input check validates each against the tool's own model.
     """
     declared: dict[str, list[str]] = {}
     for tool in await mcp.list_tools():
@@ -300,8 +306,8 @@ async def test_the_tool_schema_declares_base_unit_amounts_as_strings(
                 assert "string" in kinds, (tool.name, name, schema)
                 assert not kinds & {"integer", "number"}, (tool.name, name, schema)
                 declared.setdefault(tool.name, []).append(name)
-    assert declared == {
-        tool: list(names) for tool, names in (TOOL_AMOUNTS | TOOL_CAPS).items()
+    assert declared == {tool: ["value"] for tool in VALUE_TOOLS} | {
+        "mech_request": ["max_payment"]
     }
 
 
@@ -432,9 +438,7 @@ async def test_the_tool_schema_declares_every_intent_amount_as_a_string(
         kinds = _schema_types(approval["properties"]["amount"], defs)
         assert kinds == {"string"}, (tool.name, approval)
     # preflight answers the guardrail's verdict alone, so it takes no intent
-    assert sorted(with_intent) == sorted(
-        TOOL_AMOUNTS.keys() - {"preflight_transaction"}
-    )
+    assert sorted(with_intent) == sorted(set(VALUE_TOOLS) - {"preflight_transaction"})
 
 
 def _intent_with(where: str, amount: t.Any) -> dict:

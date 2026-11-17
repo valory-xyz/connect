@@ -56,6 +56,7 @@ from connect.signer_errors import (
     send_failure,
 )
 from connect.switches import PRODUCTION, Switches
+from connect.texts import VALUE_REFUSED
 
 logger = logging.getLogger("agent")
 
@@ -135,9 +136,8 @@ class _ChainPool:
                 request_kwargs={"timeout": 30},
             )
         )
-        # PoA chains (Polygon above all) pad extraData past 32 bytes, which
-        # web3's default block formatter refuses — making every send there
-        # fail at fee estimation. The middleware is a no-op on non-PoA chains.
+        # PoA chains (Polygon above all) pad extraData past 32 bytes, which web3
+        # refuses, failing every send at fee estimation; a no-op elsewhere.
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         state = _ChainState(w3=w3, lock=threading.Lock(), chain_id=w3.eth.chain_id)
         with self._lock:
@@ -786,7 +786,7 @@ class Signer:
                     target, data = self._compose_safe_call(chain, target, value, data)
                     value = 0
                 elif value < 0:
-                    raise SignerError("value must be a non-negative amount in wei")
+                    raise SignerError(VALUE_REFUSED)
                 reason = self._refused_by_guard(chain, target, value, data)
                 if reason is None and run_intent_gate:
                     try:
