@@ -4394,8 +4394,12 @@ class TestMech:
         assert info["payment_token"] == "native"
         assert info["default_max_payment"] == 10**17
         # the reference's integer amounts: a JSON number, never a string
-        assert type(info["default_max_payment"]) is int  # pylint: disable=unidiomatic-typecheck
-        assert type(info["max_delivery_rate"]) is int  # pylint: disable=unidiomatic-typecheck
+        assert (
+            type(info["default_max_payment"]) is int
+        )  # pylint: disable=unidiomatic-typecheck
+        assert (
+            type(info["max_delivery_rate"]) is int
+        )  # pylint: disable=unidiomatic-typecheck
         assert info["service_id"] == 42
         assert info["tools"] == ["prediction-online"]
         # this mech published an endpoint, so nothing bars the default flow
