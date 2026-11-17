@@ -88,7 +88,7 @@ def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
 
 
 def charged(terms: dict, rate: int, result: dict) -> dict:
-    """The fields a request's answer carries about the mech and its charge.
+    """Return the fields a request's answer carries about the mech and its charge.
 
     `terms` is mech-client's mech report (or the terms alone). It labels the
     mech's payment asset under `payment`; in the answer that key is the charge
