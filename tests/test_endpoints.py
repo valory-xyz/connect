@@ -255,7 +255,7 @@ class TestOpenEndpoints:
             )
         # the canonical shape it renders, exactly as GET /settings returns it
         served = client.get("/settings").json()
-        assert set(served) == {"protected", "harness"}
+        assert set(served) == {"protected", "harness", "harnesses"}
         assert set(served["protected"]) == {"mode", "whitelist"}
 
     def test_api_survives_a_bundle_without_a_ui(

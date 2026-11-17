@@ -626,7 +626,7 @@ def make_app(
             # unpopulated, as at boot: the first /healthcheck or /session
             # populates it — so a test that needs it broken breaks populate(),
             # rather than reaching into the app's state to fake a flag
-            workspace=Workspace(config.store_path, token),
+            workspace=Workspace(config.store_path, token, record_key=b"k" * 32),
         )
 
     return _make
