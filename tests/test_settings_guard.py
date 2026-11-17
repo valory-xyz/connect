@@ -95,10 +95,12 @@ from connect.settings import (
     DEFAULT_HARNESS,
     HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CLAUDE_CODE_DESKTOP,
+    LEGACY_MAC_FIELDS,
     MAC_FIELDS,
     MODE_RESTRICTED,
     MODE_UNRESTRICTED,
     Protected,
+    SETTINGS_VERSION,
     Settings,
     SettingsStore,
     default_whitelist,
@@ -253,15 +255,15 @@ class TestSettingsStore:
         The MAC covers an allowlist (MAC_FIELDS), so a field added to the
         canonical shape ships *unprotected* by default, silently. This test is
         the reminder: if it fails because you added a field, decide whether it
-        belongs under "protected" (integrity-checked, password-gated) or is a
-        preference like the harness (freely editable, survives a reset), then
-        pin that choice here.
+        belongs under "protected" (integrity-checked, password-gated), under the
+        MAC as a preference like the harness, or outside it, then pin that
+        choice here.
         """
         store.load()  # writes the defaults
         payload = json.loads(
             store._path.read_text()
         )  # pylint: disable=protected-access
-        assert set(payload) == set(MAC_FIELDS) | {"harness", "mac"}
+        assert set(payload) == set(MAC_FIELDS) | {"mac"}
 
     def test_concurrent_patches_lose_no_update(
         self, store: SettingsStore, monkeypatch: pytest.MonkeyPatch
@@ -534,38 +536,43 @@ class TestSettingsStore:
         path.write_text(json.dumps(payload))
         assert store.load().protected.mode == MODE_UNRESTRICTED  # not the forgery
 
-    def test_harness_edit_applies_without_the_key(self, store: SettingsStore) -> None:
-        """The harness is a preference: a plain file edit simply takes effect."""
+    def test_a_harness_edited_without_the_key_is_tampering(
+        self, store_path: Path, store: SettingsStore
+    ) -> None:
+        """With OCB the harness decides what an unnamed launch runs: under the MAC.
+
+        A written ocb_cli must not make the next launch install and open OCB.
+        """
         store.save(Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={})))
         path = store._path  # pylint: disable=protected-access
         payload = json.loads(path.read_text())
-        # not the default: an edit that was ignored would answer claude_code_cli
-        payload["harness"] = "codex_desktop"
+        payload["harness"] = "ocb_cli"
         path.write_text(json.dumps(payload))
         loaded = store.load()
-        assert loaded.harness == "codex_desktop"
-        assert loaded.protected.mode == MODE_RESTRICTED  # protected fields untouched
+        assert loaded.harness == DEFAULT_HARNESS
+        assert loaded.protected.mode == MODE_UNRESTRICTED  # reset like any tamper
+        assert "settings_tampered" in audit_kinds(store_path)
+        # the reset is written back under a fresh MAC
+        assert json.loads(path.read_text())["harness"] == DEFAULT_HARNESS
 
-    def test_invalid_harness_falls_back_without_tamper(
-        self, store_path: Path, store: SettingsStore, activity: ActivityLog
+    def test_a_signed_harness_this_build_does_not_know_falls_back_without_tamper(
+        self, store_path: Path, store: SettingsStore
     ) -> None:
-        """A bad harness value is not an integrity event."""
-        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
-        path = store._path  # pylint: disable=protected-access
-        payload = json.loads(path.read_text())
-        payload["harness"] = "cursor"
-        path.write_text(json.dumps(payload))
+        """A bad harness value under a valid MAC is not an integrity event."""
+        payload: dict = {
+            "version": SETTINGS_VERSION,
+            "protected": {"mode": MODE_RESTRICTED, "whitelist": {}},
+            "harness": "cursor",
+        }
+        payload["mac"] = store._mac(payload)  # pylint: disable=protected-access
+        store._path.write_text(json.dumps(payload))  # pylint: disable=protected-access
         loaded = store.load()
-        assert loaded.harness == "claude_code_cli"
-        assert (
-            loaded.protected.mode == MODE_UNRESTRICTED
-        )  # protected fields still verify
+        assert loaded.harness == DEFAULT_HARNESS
+        assert loaded.protected.mode == MODE_RESTRICTED  # protected still verifies
         assert "settings_tampered" not in audit_kinds(store_path)
 
-    def test_tampered_mode_preserves_the_harness_preference(
-        self, store: SettingsStore
-    ) -> None:
-        """A guardrail reset must not discard the unprotected preference."""
+    def test_tampered_mode_resets_the_harness_too(self, store: SettingsStore) -> None:
+        """The harness is covered by the same MAC, so it resets with the rest."""
         store.save(
             Settings(
                 protected=Protected(mode=MODE_RESTRICTED, whitelist={}),
@@ -578,8 +585,80 @@ class TestSettingsStore:
         path.write_text(json.dumps(payload))
         loaded = store.load()
         assert loaded.protected.mode == MODE_UNRESTRICTED  # reset to defaults
-        # not the default, so this says "preserved" and not merely "reset"
-        assert loaded.harness == "codex_desktop"  # preference survives
+        assert loaded.harness == DEFAULT_HARNESS
+
+    def _legacy_file(
+        self, store: SettingsStore, harness: str = "codex_desktop", **fields: object
+    ) -> dict:
+        """Write a version-1 file: MAC'd over the version and protected only."""
+        payload: dict = {
+            "version": 1,
+            "protected": {"mode": MODE_RESTRICTED, "whitelist": {}},
+            "harness": harness,
+            **fields,
+        }
+        payload["mac"] = store._mac(  # pylint: disable=protected-access
+            payload, LEGACY_MAC_FIELDS
+        )
+        store._path.write_text(json.dumps(payload))  # pylint: disable=protected-access
+        return payload
+
+    @pytest.mark.parametrize(
+        "harness", ["codex_cli", "claude_code_desktop", "codex_desktop"]
+    )
+    def test_a_version_1_file_keeps_its_guardrail_and_its_harness(
+        self, store_path: Path, store: SettingsStore, harness: str
+    ) -> None:
+        """An upgrade is not a tamper: the operator's choices survive it."""
+        self._legacy_file(store, harness)
+        loaded = store.load()
+        assert loaded.protected.mode == MODE_RESTRICTED
+        assert loaded.harness == harness
+        assert "settings_tampered" not in audit_kinds(store_path)
+        rewritten = json.loads(store._path.read_text())  # pylint: disable=W0212
+        assert rewritten["version"] == SETTINGS_VERSION
+        assert store.load() == loaded  # verifies under the current MAC
+
+    def test_a_version_1_file_never_migrates_ocb_cli(
+        self, store_path: Path, store: SettingsStore
+    ) -> None:
+        """No released version-1 file held ocb_cli: one that does was written to."""
+        self._legacy_file(store, "ocb_cli")
+        loaded = store.load()
+        assert loaded.protected.mode == MODE_RESTRICTED
+        assert loaded.harness == DEFAULT_HARNESS
+        rewritten = json.loads(store._path.read_text())  # pylint: disable=W0212
+        assert rewritten["harness"] == DEFAULT_HARNESS
+
+    def test_a_version_1_file_is_accepted_only_on_a_run_s_first_load(
+        self, store_path: Path, store: SettingsStore
+    ) -> None:
+        """Putting a version-1 file back mid-run is a replay, not a migration."""
+        store.save(Settings(protected=Protected(mode=MODE_UNRESTRICTED, whitelist={})))
+        self._legacy_file(store)
+        assert store.load().protected.whitelist != {}  # defaults, not the file
+        assert "settings_tampered" in audit_kinds(store_path)
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"mac": "0" * 64},  # not its MAC
+            {"protected": {"mode": "yolo", "whitelist": {}}},  # MAC'd, but malformed
+        ],
+    )
+    def test_a_version_1_file_that_does_not_verify_is_tampering(
+        self, store_path: Path, store: SettingsStore, fields: dict
+    ) -> None:
+        """Only a well-formed version-1 file under its own MAC migrates."""
+        payload = self._legacy_file(store)
+        payload.update(fields)
+        if "mac" not in fields:
+            payload["mac"] = store._mac(  # pylint: disable=protected-access
+                payload, LEGACY_MAC_FIELDS
+            )
+        store._path.write_text(json.dumps(payload))  # pylint: disable=W0212
+        assert store.load().harness == DEFAULT_HARNESS
+        assert "settings_tampered" in audit_kinds(store_path)
 
     def test_valid_mac_but_bad_mode_rejected(self, store: SettingsStore) -> None:
         """A MAC'd payload with an unknown mode still falls back to defaults."""
@@ -4415,6 +4494,13 @@ class TestSettingsEndpoints:
         assert body == {
             "protected": {"mode": "unrestricted", "whitelist": {}},
             "harness": "claude_code_cli",
+            "harnesses": [
+                {"id": "claude_code_desktop", "available": True},
+                {"id": "claude_code_cli", "available": True},
+                {"id": "codex_desktop", "available": True},
+                {"id": "codex_cli", "available": True},
+                {"id": "ocb_cli", "available": True},
+            ],
         }
 
     def test_wrong_password_is_throttled_401(
@@ -4581,6 +4667,7 @@ class TestSettingsEndpoints:
             "launched": False,
             "harness": "claude_code_cli",
             "requested": "claude_code_cli",
+            "reason": "not_installed",
             "error": "could not open claude_code_cli",
         }
         # the trail carries both harnesses on this outcome too

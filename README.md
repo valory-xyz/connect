@@ -30,14 +30,19 @@ other non-aea agent. It:
    - Settings: `GET /settings` (open) and `PATCH /settings` (merge-patch of
      the canonical shape; the keystore password gates the `protected`
      object — currently the mode; the whitelist is read-only until its
-     editing semantics are specced — while the `harness` preference needs none)
+     editing semantics are specced — while the `harness` preference needs none).
+     Both answer with `harnesses` too: every harness in display order as
+     `{id, available, unavailable_reason?}`, and a harness that is not
+     available is refused with a 400 (see [OCB](#ocb))
    - `POST /session` (origin-gated, no token): opens an agent session in the
      configured harness (`claude_code_cli` →
      `claude-cli://open?cwd=…`, `codex_desktop` →
      `codex://threads/new?path=…`, `claude_code_desktop` →
-     `claude://code/new?folder=…`, see [Codex](#codex)) and answers
-     `{launched, harness, requested, error?}` — `harness` is the one that
-     opened, `requested` the one it aimed for. An optional `{"harness": …}`
+     `claude://code/new?folder=…`, see [Codex](#codex) and [OCB](#ocb)) and
+     answers `{launched, harness, requested, reason?, error?}` — `harness` is
+     the one that opened, `requested` the one it aimed for, and `reason`
+     (only when nothing opened) is `not_installed`, or `install_failed` /
+     `launch_failed` for OCB. An optional `{"harness": …}`
      body overrides the saved preference for that launch alone, without
      rewriting what the operator chose
    - a bearer-authed signing surface: `POST /safe-transaction`,
@@ -57,7 +62,8 @@ guess, the Claude Code CLI — and fall back through the other harnesses in
 the order `DEEP_LINKS` then `TERMINAL_COMMANDS` declare them
 (`claude_code_cli`, `codex_desktop`, `claude_code_desktop`, `codex_cli`),
 rather than leave them with no session at all. A launch that *does* name one
-opens there or not at all: naming a harness is a choice.
+opens there or not at all: naming a harness is a choice. `ocb_cli` never
+falls back and is never a fallback ([OCB](#ocb)).
 
 What the session must *not* inherit is our own packaging. We ship as a
 PyInstaller one-file binary, whose bootloader puts its extraction directory at
@@ -168,6 +174,82 @@ for approval, as Claude Code's do without an allow rule. And there is no
 equivalent of the `Read` deny rule: the token in `.codex/config.toml` is
 gitignored, not kept out of transcripts.
 
+## OCB
+
+`ocb_cli` opens [OCB](https://github.com/valory-xyz/olas-ocb-agent)'s
+`ocb-agent` CLI. OCB finds the workspace's `.mcp.json` itself and writes its
+own shim, with the bearer token, under `ocb-agent/` — so Connect writes no OCB
+config, and only adds `ocb-agent/` to the workspace's `.gitignore` and the
+Claude `Read` deny rules.
+
+**Availability.** `GET /settings` reports `ocb_cli` unavailable with
+`windows_unsupported` on native Windows, where OCB runs unsandboxed and a
+session could read the keys in `~/.operate`. Elsewhere it is unavailable with
+`model_unavailable` unless the instance's chain (the one chain carrying the
+safe) has a chat mech: `OCB_CHAT_MECH_<CHAIN>` if set (e.g.
+`OCB_CHAT_MECH_GNOSIS=0x...`, a QA override Pearl never sets; anything but an
+address is a configuration error), else that chain's entry in
+`OCB_CHAT_MECHS` (`connect/settings.py`), which ships the deployed chat mech
+for gnosis, polygon, robinhood, base and optimism (a `None` entry would mean
+no confirmed chat mech on that chain). `__main__.resolve_ocb_mech` resolves it once at boot, and both
+this rule and the launch line read that value. When it finds none it logs
+why: no single chain carries a safe, or the instance chain has no confirmed
+mech and no override; an override for any other chain is logged as having no
+effect. An override must be a `0x` address, checksummed if mixed case. `PATCH /settings` and `POST /session`
+refuse an unavailable harness with a 400, and a saved `ocb_cli` that has
+become unavailable (a settings file copied between machines) loads as the
+default, logged once.
+
+**Install.** Connect installs from OCB's `install.sh` and one built
+`olas_ocb_agent-*.whl` under `connect/assets/ocb/` (its README says what goes
+there), which the OCB team supplies and which are committed as given. Until
+they are committed, every install fails with `install_failed`. Selecting
+`ocb_cli` in `PATCH /settings` starts the install in the background and
+returns. `POST /session` with `ocb_cli` joins an install already running, or
+starts one, and waits for it at most `OCB_SESSION_WAIT_SECONDS` (240 s,
+inside Pearl's ~300 s request): past that it answers `install_failed` ("still
+being installed") while the install goes on, so a Retry finds it done. The
+script runs as `sh install.sh` in STORE_PATH, in its own session, with stdin
+closed, `harness_env()` plus `OCB_AGENT_SPEC=olas-ocb-agent[facilitator] @
+<the bundled wheel's file:// URI>` (the CLI imports the facilitator at
+startup, so the extra is required), and the
+`OCB_INSTALL_TIMEOUT_SECONDS` timeout (`connect/ocb.py`), after which its
+whole process group is killed, uv and curl included. It brings uv and a
+Python of its own, prints the absolute path of `ocb-agent` on success, and a
+one-line reason on stderr otherwise; that line becomes `/session`'s `error`.
+Connect records the path, with the requirement it installed
+(`olas-ocb-agent[facilitator] @ <wheel file name> sha256:<the wheel's
+sha256>`), in `.ocb-agent.json` in STORE_PATH's parent (the service's own
+folder), outside the workspace and readable by its owner alone, so the
+session cannot point the next launch at another program, and outside
+Connect's working directory, which Pearl rebuilds on every service start, so
+a restart does not install again. The path is the last non-empty line the
+script prints. A record naming another requirement than the bundled one
+installs again, so a release with a newer wheel, a rebuilt wheel under the
+same name, or a different extra,
+reaches existing installs; the bundle's own location is left out, since the
+packaged binary extracts it somewhere new on every start. One install runs
+at a time. Nothing is
+installed for an operator who never selects `ocb_cli`.
+
+**Launch.** A terminal opens, the same way as for `codex_cli`, running
+
+```sh
+<recorded path> --dir <STORE_PATH> --model 'mech:chat@<the chat mech>' --model-budget <OCB_MODEL_BUDGET_USD>
+```
+
+by absolute path, without a PATH probe: uv's tool directory is not always on
+the login shell's PATH. `--dir` names this instance's workspace; without it
+`ocb-agent` takes the first Connect service it finds under `~/.operate`.
+OCB's REPL takes no opening prompt, so the session
+opens empty. Its model calls go through the `mech_request` MCP tool with that
+mech as `priority_mech`, so they are paid like any other mech request and pass
+the same guard. OCB's own guardrails apply unchanged. A failed install answers
+`reason: install_failed`; a terminal that would not open answers
+`reason: launch_failed`. Neither falls back to another harness: OCB is chosen
+for its spending guardrails, and landing in a tool without them must not
+happen unnoticed.
+
 ## Guardrail
 
 Two rules hold in **every** mode, and no setting lifts them: the safe may not
@@ -239,12 +321,15 @@ and verified on every read — an edit by the agent (or anything else without
 the key) fails verification and resets them to the defaults — deliberate,
 and audited; the reasoning lives in `connect/settings.py`'s module
 docstring. The
-`harness` preference is stored alongside without integrity checks and survives
-a guardrail reset. It is outside the MAC because it cannot move funds or widen
-the guardrail — every harness is only a way to open a coding agent on the
-operator's own machine, and editing the field just reorders which one is tried
-first. What a tamper can still do is mislead: leave the UI showing a preference
-the operator's sessions are not opening in.
+`harness` preference is under the same MAC: it cannot move funds or widen the
+guardrail, but with OCB a written `ocb_cli` would make the next unnamed launch
+install and open OCB, which never falls back. An edited harness fails
+verification like any other field and resets with them; a version-1 file
+(written before the harness was covered) keeps its verified guardrail and
+loads with the default harness, once, then is rewritten. OCB's install record
+(`.ocb-agent.json`) carries a MAC under the same key, and the path it names
+must be `ocb-agent` inside uv's tool directory for olas-ocb-agent; an
+unsigned, edited or foreign record installs OCB again.
 The MAC of the last file the server wrote is also pinned
 in memory, so replaying an *old* validly-MAC'd settings file (say, captured
 while the mode was unrestricted) fails the same way; only a replay staged
@@ -303,8 +388,10 @@ it opens in. Repeated auth failures are audited to the activity log and
 rate-limited (429) so a probed token is loud, not silent. The
 token itself is header-only, rotated per run, dies with the process, and the
 provisioned workspace ships a `.gitignore` so it is never committed and, for
-Claude Code, `Read` deny rules on `.mcp.json*` and `.codex/config.toml*` so it is
-not read into session transcripts.
+Claude Code, `Read` deny rules on `.mcp.json*`, `.codex/config.toml*` and
+`ocb-agent/**` (OCB's own copy of the token) so it is not read into session
+transcripts. Those rules bind Claude Code only: a Codex or OCB session can read
+the token, including the one in OCB's `ocb-agent/` shim.
 
 Out of scope for v1: SSH port forwarding or running on a shared/remote
 machine voids the loopback assumption entirely, and same-user local malware
@@ -438,7 +525,7 @@ tox -p -e flake8 -e pylint
 tox -p -e black-check -e isort-check -e bandit -e safety -e mypy
 tox -e unit-tests-coverage        # enforces 100% coverage
 GNOSIS_RPC=<gnosis-rpc-url> tox -e integration-tests
-tox -e launch-tests               # opens a real terminal for codex_cli (stand-in codex)
+tox -e launch-tests               # opens a real terminal for the terminal harnesses (stand-in binaries)
 ```
 
 Run standalone (mimicking the Pearl runner):

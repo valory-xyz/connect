@@ -22,6 +22,8 @@
 import io
 import json
 import logging
+import os
+import sys
 import threading
 import time as time_module
 import typing as t
@@ -37,6 +39,8 @@ from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
 
 from connect import __main__ as main_module
+from connect import ocb
+from connect import settings as settings_module
 from connect import signer as signer_module
 from connect import wallet, workspace
 from connect.activity import ActivityLog, MAX_LOG_BYTES
@@ -45,6 +49,7 @@ from connect.config import (
     ChainConfig,
     FUND_REQUIREMENTS_ENV,
     MINUTES_PER_RUN_ENV,
+    OCB_CHAT_MECH_ENV_PREFIX,
     SAFES_ENV,
     STORE_PATH_ENV,
     load_config,
@@ -99,6 +104,8 @@ def boot_env_fixture(
     monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
     monkeypatch.delenv(SAFES_ENV, raising=False)
     monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+    for key in [k for k in os.environ if k.startswith(OCB_CHAT_MECH_ENV_PREFIX)]:
+        monkeypatch.delenv(key)  # a QA override left in the shell
     return store_path
 
 
@@ -455,6 +462,119 @@ class TestMain:
         assert app.state.workspace.reason is None
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/healthcheck").json() == {"is_healthy": True}
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="OCB is off on Windows")
+    @pytest.mark.parametrize("source", ["shipped", "override"])
+    def test_main_offers_and_launches_ocb_on_the_instance_chain(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+        source: str,
+    ) -> None:
+        """The chain carrying the safe decides OCB's availability and its model.
+
+        The QA override reaches both exactly as a shipped mech does.
+        """
+        mech = "0x" + "ab" * 20
+        if source == "shipped":
+            monkeypatch.setitem(settings_module.OCB_CHAT_MECHS, "gnosis", mech)
+        else:
+            monkeypatch.setenv("OCB_CHAT_MECH_GNOSIS", mech)
+        monkeypatch.setenv(
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
+        )
+        monkeypatch.setenv(SAFES_ENV, json.dumps({"gnosis": "0x" + "22" * 20}))
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        state = served[0].config.app.state
+        assert state.settings_store.harnesses()[-1] == {
+            "id": "ocb_cli",
+            "available": True,
+        }
+        opened: list[str] = []
+
+        def terminal(path: Path, command: str) -> bool:
+            opened.append(command)
+            return True
+
+        monkeypatch.setattr(workspace, "_open_terminal", terminal)
+        monkeypatch.setattr(
+            state.workspace.ocb, "ensure", lambda wait: Path("/opt/ocb-agent")
+        )
+        assert state.workspace.open_session("ocb_cli") == "ocb_cli"
+        assert opened == [
+            ocb.ocb_command(Path("/opt/ocb-agent"), mech, boot_env),
+        ]
+
+    def test_main_without_a_chat_mech_offers_no_ocb(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An override for another chain does not make OCB available here."""
+        monkeypatch.setattr(main_module.sys, "platform", "linux")
+        monkeypatch.setitem(settings_module.OCB_CHAT_MECHS, "gnosis", None)
+        monkeypatch.setenv("OCB_CHAT_MECH_POLYGON", "0x" + "ab" * 20)
+        monkeypatch.setenv(
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
+        )
+        monkeypatch.setenv(SAFES_ENV, json.dumps({"gnosis": "0x" + "22" * 20}))
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        harnesses = served[0].config.app.state.settings_store.harnesses()
+        assert harnesses[-1]["unavailable_reason"] == "model_unavailable"
+        # QA sees why the override did nothing
+        assert "OCB_CHAT_MECH_POLYGON has no effect" in caplog.text
+
+    def test_main_without_an_instance_chain_says_so(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No safe means no instance chain, and the log names that cause."""
+        monkeypatch.setenv("OCB_CHAT_MECH_GNOSIS", "0x" + "ab" * 20)
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        harnesses = served[0].config.app.state.settings_store.harnesses()
+        assert harnesses[-1]["available"] is False
+        assert "no single instance chain" in caplog.text
+        assert (
+            "OCB_CHAT_MECH_GNOSIS has no effect: no single instance chain"
+            in caplog.text
+        )
+
+    def test_main_says_when_the_instance_chain_has_no_chat_mech(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A chain, no override, and nothing shipped for that chain."""
+        monkeypatch.setitem(settings_module.OCB_CHAT_MECHS, "gnosis", None)
+        monkeypatch.setenv(
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
+        )
+        monkeypatch.setenv(SAFES_ENV, json.dumps({"gnosis": "0x" + "22" * 20}))
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert "gnosis has no confirmed one" in caplog.text
+        assert "OCB_CHAT_MECH_GNOSIS is not set" in caplog.text
+
+    def test_main_keeps_ocb_off_native_windows(
+        self, monkeypatch: pytest.MonkeyPatch, boot_env: Path, served: list[StubServer]
+    ) -> None:
+        """The real platform reaches the rule: Windows wins over a confirmed mech."""
+        monkeypatch.setattr(main_module.sys, "platform", "win32")
+        monkeypatch.setenv("OCB_CHAT_MECH_GNOSIS", "0x" + "ab" * 20)
+        monkeypatch.setenv(
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
+        )
+        monkeypatch.setenv(SAFES_ENV, json.dumps({"gnosis": "0x" + "22" * 20}))
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        harnesses = served[0].config.app.state.settings_store.harnesses()
+        assert harnesses[-1]["unavailable_reason"] == "windows_unsupported"
 
     def test_populate_failure_serves_unhealthy(
         self,
@@ -1575,7 +1695,9 @@ class TestPearlRoutesExtras:
         it gets in the first has already succeeded — it has to see that, not
         redo the work.
         """
-        agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
+        agent_workspace = workspace.Workspace(
+            store_path, "tok", record_key=b"k" * 32
+        )  # nosec B106
         populated: list[int] = []
         monkeypatch.setattr(
             workspace.Workspace, "_provision", lambda self: populated.append(1)
@@ -1730,14 +1852,19 @@ class TestWorkspaceExtras:
         (assets / "skills").mkdir(parents=True)
         (assets / "lib").mkdir()
         monkeypatch.setattr(workspace, "assets_dir", lambda: assets)
-        agent_workspace = workspace.Workspace(store_path, "tok")  # nosec B106
+        agent_workspace = workspace.Workspace(
+            store_path, "tok", record_key=b"k" * 32
+        )  # nosec B106
         assert agent_workspace.ensure() is False
         assert "CLAUDE.md" in str(agent_workspace.reason)
 
     def test_invalid_mcp_json_rewritten(self, store_path: Path) -> None:
         """Corrupt .mcp.json is replaced rather than crashing."""
         (store_path / ".mcp.json").write_text("{corrupt")
-        assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
+        assert (
+            workspace.Workspace(store_path, "tok", record_key=b"k" * 32).ensure()
+            is True
+        )  # nosec B106
         config = json.loads((store_path / ".mcp.json").read_text())
         assert "pearl-connect" in config["mcpServers"]
 
@@ -1752,7 +1879,10 @@ class TestWorkspaceExtras:
         (skills / "stray.txt").write_text("not a skill")
         (tmp_path / "assets" / "CLAUDE.md").write_text("brief")  # populate requires it
         monkeypatch.setattr(workspace.sys, "_MEIPASS", str(tmp_path), raising=False)
-        assert workspace.Workspace(store_path, "tok").ensure() is True  # nosec B106
+        assert (
+            workspace.Workspace(store_path, "tok", record_key=b"k" * 32).ensure()
+            is True
+        )  # nosec B106
         installed = store_path / ".claude" / "skills"
         assert (installed / "my-skill" / "SKILL.md").exists()
         assert not (installed / "stray.txt").exists()
