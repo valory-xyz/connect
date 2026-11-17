@@ -20,11 +20,12 @@
 #   OCB_AGENT_VERSION   the release to install (the argument wins)
 #   OCB_AGENT_SPEC      the whole requirement instead, always reinstalled, e.g. a GitHub archive:
 #                       'olas-ocb-agent[facilitator] @ https://github.com/valory-xyz/olas-ocb-agent/archive/<ref>.tar.gz'
-#   OCB_UV_DIR          the script's own uv (default: $XDG_DATA_HOME/olas-ocb-agent/bin)
 #   UV_TOOL_DIR, UV_TOOL_BIN_DIR, UV_PYTHON_INSTALL_DIR, UV_CACHE_DIR   uv's own locations
 set -eu
 
 DEFAULT_VERSION="0.4.1"  # keep in step with pyproject.toml (tests/test_install_scripts.py checks)
+# Its dependencies resolve as PyPI stood at its release: bump with DEFAULT_VERSION.
+EXCLUDE_NEWER="2026-11-16T10:00:00Z"
 UV_VERSION="0.13.8"
 UV_INSTALLER_SHA256="4d8fa56e00f16b66feecacbd943773c61d61ab768b13856de350d86fd8740e2f"  # astral.sh/uv/0.13.8/install.sh
 
@@ -33,7 +34,8 @@ log="$(mktemp "${TMPDIR:-/tmp}/ocb-install.XXXXXX")" || {
     exit 1
 }
 installer=""
-trap 'rm -f "$installer"' EXIT
+shim=""
+trap 'rm -f "$installer"; rm -rf "$shim"' EXIT
 
 fail() {
     printf 'ocb-install: error: %s (details: %s)\n' "$1" "$log" >&2
@@ -46,7 +48,7 @@ say() {
 
 case "$(uname -s)" in
     Linux | Darwin) ;;
-    *) fail "unsupported OS $(uname -s); on native Windows use install.ps1" ;;
+    *) fail "unsupported OS $(uname -s); on Windows, run it in WSL2" ;;
 esac
 
 version="${1:-${OCB_AGENT_VERSION:-$DEFAULT_VERSION}}"
@@ -58,7 +60,7 @@ esac
 spec="${OCB_AGENT_SPEC:-olas-ocb-agent[facilitator]==$version}"
 
 # ---- uv ------------------------------------------------------------------------------------------
-uv_dir="${OCB_UV_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/olas-ocb-agent/bin}"
+uv_dir="${XDG_DATA_HOME:-$HOME/.local/share}/olas-ocb-agent/bin"
 own_uv="$uv_dir/uv"
 
 own_uv_current() {
@@ -89,18 +91,26 @@ bootstrap_uv() {
         fail "neither sha256sum nor shasum is available to check the uv installer"
     fi
     [ "$got" = "$UV_INSTALLER_SHA256" ] || fail "the uv installer from $url has sha256 $got, not the pinned one; not run"
+    # Astral's installer checks the uv archive it downloads only if `sha256sum` is on PATH, and otherwise skips
+    # the check: where there's only `shasum` (macOS), give it a `sha256sum` that is `shasum -a 256`.
+    installer_path="$PATH"
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        shim="$(mktemp -d "${TMPDIR:-/tmp}/ocb-sha256sum.XXXXXX")" || fail "can't create a temporary directory"
+        { printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' >"$shim/sha256sum" && chmod +x "$shim/sha256sum"; } \
+            || fail "can't create a sha256sum for the uv installer"
+        installer_path="$shim:$PATH"
+    fi
     # Unmanaged: flat into $uv_dir, no PATH edit, and no install receipt, so a uv the user installed with
     # Astral's script keeps its own receipt (`uv self update`). UV_DISABLE_UPDATE also skips the receipt.
-    UV_UNMANAGED_INSTALL="$uv_dir" UV_DISABLE_UPDATE=1 UV_NO_MODIFY_PATH=1 sh "$installer" >>"$log" 2>&1 \
-        || fail "the uv $UV_VERSION installer failed"
-    [ -x "$own_uv" ] || fail "uv isn't at $own_uv after installing it"
+    PATH="$installer_path" UV_UNMANAGED_INSTALL="$uv_dir" UV_DISABLE_UPDATE=1 UV_NO_MODIFY_PATH=1 \
+        sh "$installer" >>"$log" 2>&1 || fail "the uv $UV_VERSION installer failed"
     own_uv_current || fail "$own_uv isn't uv $UV_VERSION after installing it"
 }
 
 # Always the script's own pinned uv: a uv on PATH is never used (nothing unpinned runs).
 bootstrap_uv
 uv="$own_uv"
-bin_dir="$("$uv" tool dir --bin 2>>"$log")" || fail "$uv ($("$uv" --version 2>/dev/null)) couldn't report its tool bin directory"
+bin_dir="$("$uv" tool dir --bin 2>>"$log")" || fail "couldn't get uv's tool bin directory"
 say "using $("$uv" --version 2>/dev/null) at $uv"
 agent="$bin_dir/ocb-agent"
 
@@ -120,7 +130,7 @@ managed_312() {
     case "$(sed -n 's/^version_info *= *//p' "$cfg")" in 3.12.*) ;; *) return 1 ;; esac
     case "$home" in "$pythons"/*) return 0 ;; *) return 1 ;; esac
 }
-if [ -z "${OCB_AGENT_SPEC:-}" ] && [ -x "$agent" ] && managed_312 \
+if [ -z "${OCB_AGENT_SPEC:-}" ] && "$agent" --version >/dev/null 2>>"$log" && managed_312 \
     && "$uv" tool list --show-extras --show-version-specifiers 2>>"$log" \
     | grep -qxF "olas-ocb-agent v$version [required: ==$version] [extras: facilitator]"; then
     say "olas-ocb-agent[facilitator]==$version is already installed"
@@ -130,8 +140,13 @@ if [ -z "${OCB_AGENT_SPEC:-}" ] && [ -x "$agent" ] && managed_312 \
 fi
 
 say "installing $spec"
-"$uv" tool install --python 3.12 --force --reinstall-package olas-ocb-agent "$spec" >>"$log" 2>&1 \
-    || fail "$uv couldn't install $spec"
+# No --force: an ocb-agent, pearl or pmini that the user or another tool put in the bin directory is never
+# replaced (uv refuses, and that is the error). olas-ocb-agent itself is pinned by version, not by date.
+if ! "$uv" tool install --python 3.12 --reinstall-package olas-ocb-agent \
+    --exclude-newer "$EXCLUDE_NEWER" --exclude-newer-package olas-ocb-agent=false "$spec" >>"$log" 2>&1; then
+    reason="$(grep -m1 '^error: ' "$log" | cut -c8-)" || true
+    fail "$uv couldn't install $spec${reason:+: $reason}"
+fi
 
 [ -x "$agent" ] || fail "ocb-agent isn't at $agent after installing"
 installed="$("$agent" --version 2>>"$log")" || fail "$agent --version failed"
