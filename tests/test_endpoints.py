@@ -542,7 +542,7 @@ class TestAuth:
         make_app: t.Callable,
         fake_w3: FakeW3,
     ) -> None:
-        """With REST_SIGNING_ROUTES off the EOA route is unrouted and sends nothing."""
+        """With the rest_signing_routes switch off the EOA route is unrouted and sends nothing."""
         off = Switches(rest_signing_routes=False)
         app = make_app(test_signer, app_config, activity, token=TOKEN, switches=off)
         with TestClient(app, base_url="http://127.0.0.1:8716") as off_client:

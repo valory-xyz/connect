@@ -34,12 +34,12 @@ from dataclasses import dataclass
 class Switches:
     """One position per switch; the defaults are the production positions."""
 
-    # S2: refuse a tool argument the tool does not take, naming the ones it
+    # refuse a tool argument the tool does not take, naming the ones it
     # does. Off in both positions: unknown arguments are ignored.
     strict_parameters: bool = False
-    # S13: POST /sign-and-send, a signing route the reference does not serve
+    # POST /sign-and-send, a signing route the reference does not serve
     rest_signing_routes: bool = True
-    # S14: the native top-up from the safe to the agent EOA at startup
+    # the native top-up from the safe to the agent EOA at startup
     agent_topup_at_boot: bool = True
 
 

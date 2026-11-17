@@ -36,6 +36,7 @@ from connect.mech import MechService
 from connect.server.mcp_tools import build_mcp, with_aliases
 from connect.settings import SettingsStore
 from connect.signer import Signer
+from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
 
 from tests.conftest import FakeW3, grant_store
 
@@ -174,5 +175,24 @@ def test_target_wins_over_to_and_other_tools_are_left_alone() -> None:
     assert with_aliases("safe_transaction", {"target": RECIPIENT, "to": other}) == {
         "target": RECIPIENT
     }
+    for tool in ("preflight_transaction", "simulate_transaction"):
+        assert with_aliases(tool, {"to": other}) == {"target": other}
     assert with_aliases("send_transaction", {"to": other}) == {"to": other}
     assert with_aliases("simulate_transaction", {"chain": "c"}) == {"chain": "c"}
+
+
+async def test_preflight_takes_to_as_its_target(mcp: FastMCP) -> None:
+    """A preflight with `to` and no `target` is answered, not refused."""
+    content = await mcp.call_tool(
+        "preflight_transaction", {"chain": "testchain", "to": RECIPIENT}
+    )
+    assert json.loads(content[0].text) == {"permitted": True}  # type: ignore[index]
+
+
+def test_the_test_interface_takes_the_reference_s_positions() -> None:
+    """The bench's positions: no strict parameters, no EOA route, no boot top-up."""
+    assert TEST_INTERFACE == Switches(
+        strict_parameters=False, rest_signing_routes=False, agent_topup_at_boot=False
+    )
+    assert PRODUCTION.rest_signing_routes
+    assert PRODUCTION.agent_topup_at_boot

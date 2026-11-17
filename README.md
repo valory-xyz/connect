@@ -928,8 +928,8 @@ OnchainBench tests agents against a reference implementation of Connect's
 agent-visible surface, and Connect matches it so the bench can import real
 Connect. Two public modules carry that contract:
 
-- `connect.texts` — every agent-visible text whose wording is part of it (the
-  13 tool descriptions, the guardrail and intent-gate refusals, the markers the
+- `connect.texts` — every agent-visible text whose wording is part of it (every
+  tool description, the guardrail and intent-gate refusals, the markers the
   bench's broker classifies — `guardrail: rule `, `. Nothing was sent.`,
   `transaction 0x` — and the mech and transport errors), verbatim from the
   reference. The bench imports the module, so a rename fails its suite.

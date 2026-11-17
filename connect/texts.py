@@ -23,7 +23,8 @@
 The wording is OnchainBench's reference implementation's, verbatim, so an
 agent reads the same text on the bench and in Pearl. The module is public:
 the bench imports it, so a rename here fails the bench's suite instead of
-drifting. Formatters keep the upper-case names the bench imports.
+drifting. Names the bench imports keep their reference spelling, upper-case
+formatters included.
 """
 
 # pylint: disable=invalid-name
@@ -121,22 +122,25 @@ def guard_refusal(rule: str, detail: str) -> str:
     return f"{GUARDRAIL_PREFIX}'{rule}': {detail}"
 
 
-GUARD_NO_DELEGATECALL = (
-    "guardrail: rule 'no-delegatecall': the safe may not delegatecall; the "
-    "guardrail never allows it"
+# the clause every operator-changeable refusal ends with
+ASK_OPERATOR = "ask the operator to change them via the agent UI if it is required"
+
+GUARD_NO_DELEGATECALL = guard_refusal(
+    "no-delegatecall", "the safe may not delegatecall; the guardrail never allows it"
 )
-GUARD_NO_SELF_CALL = (
-    "guardrail: rule 'no-self-call': the safe may not call itself (owner, module "
-    "and guard changes are made that way); the guardrail never allows it"
+GUARD_NO_SELF_CALL = guard_refusal(
+    "no-self-call",
+    "the safe may not call itself (owner, module and guard changes are made that "
+    "way); the guardrail never allows it",
 )
 
 
 def guard_not_allowed(target: str, chain: str) -> str:
     """Return the whitelist refusal for a call to `target` on `chain`."""
-    return (
-        "guardrail: rule 'whitelist': the operator's guardrail settings do not "
-        f"allow the safe to call {target} on {chain}; ask the operator to change "
-        "them via the agent UI if it is required"
+    return guard_refusal(
+        "whitelist",
+        "the operator's guardrail settings do not allow the safe to call "
+        f"{target} on {chain}; {ASK_OPERATOR}",
     )
 
 

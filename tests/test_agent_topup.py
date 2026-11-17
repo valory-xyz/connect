@@ -654,7 +654,7 @@ class TestTopUpTask:
         make_app: t.Callable,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With AGENT_TOPUP_AT_BOOT off a cold start sends nothing."""
+        """With the agent_topup_at_boot switch off a cold start sends nothing."""
         monkeypatch.setattr(app_module, "AGENT_TOPUP_INTERVAL_SECONDS", 0.01)
         checks: list[tuple] = []
         monkeypatch.setattr(

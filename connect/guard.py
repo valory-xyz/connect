@@ -90,6 +90,7 @@ from connect.safe import (
 )
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
 from connect.texts import (
+    ASK_OPERATOR,
     GUARD_NO_DELEGATECALL,
     GUARD_NO_SELF_CALL,
     guard_not_allowed,
@@ -274,8 +275,7 @@ class Guard:
             guard_refusal(
                 "raw-digest",
                 "raw digest signing is disabled by the operator's guardrail "
-                "settings; ask the operator to change them via the agent UI if "
-                "it is required",
+                f"settings; {ASK_OPERATOR}",
             )
         )
 

@@ -57,7 +57,7 @@ def mcp(  # pylint: disable=too-many-arguments
     mech_service: MechService,
     settings_store: SettingsStore,
 ) -> FastMCP:
-    """Return the MCP server built with the STRICT_PARAMETERS switch on."""
+    """Return the MCP server built with the strict_parameters switch on."""
     return build_mcp(
         test_signer,
         app_config,
@@ -79,7 +79,7 @@ async def test_an_unknown_parameter_is_ignored_with_the_switch_off(  # pylint: d
     settings_store: SettingsStore,
     fake_w3: FakeW3,
 ) -> None:
-    """STRICT_PARAMETERS is off in production: the call goes on without the key."""
+    """The strict_parameters switch is off in production: the call goes on without the key."""
     lenient = build_mcp(
         test_signer,
         app_config,

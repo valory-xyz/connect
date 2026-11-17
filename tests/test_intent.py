@@ -946,3 +946,49 @@ def test_the_prepaid_read_is_mech_client_s_tracker_view() -> None:
         (view,) = [e for e in entries if e.get("name") == "mapRequesterBalances"]
         assert [i["type"] for i in view["inputs"]] == ["address"]
         assert [o["type"] for o in view["outputs"]] == ["uint256"]
+
+
+SPENT = intent.Intent(spend={TOKEN: 4}, receive_min={}, recipients=[], approvals=[])
+
+
+@pytest.mark.parametrize(
+    ("diff", "parsed", "expected"),
+    [
+        (
+            _diff(tokens={TOKEN: {"symbol": "USDC", "delta": "-5"}}),
+            SPENT,
+            "intent gate: rule 'overspend' (USDC: spends 5, intent allows 4)",
+        ),
+        (
+            _diff(tokens={TOKEN: {"symbol": "", "delta": "-5"}}),
+            SPENT,
+            f"intent gate: rule 'overspend' ({TOKEN}: spends 5, intent allows 4)",
+        ),
+        (
+            _diff(tokens={TOKEN: {"symbol": "USDC", "delta": "-3"}}),
+            intent.Intent(
+                spend={TOKEN: 3}, receive_min={TOKEN: 2}, recipients=[], approvals=[]
+            ),
+            "intent gate: rule 'receive-min' (USDC: receives -3, intent needs 2)",
+        ),
+        (
+            _diff(recipients=[{"address": EOA, "contract": False}]),
+            intent.Intent(spend={}, receive_min={}, recipients=[], approvals=[]),
+            f"intent gate: rule 'undeclared-recipient' ({EOA})",
+        ),
+        (
+            _diff(
+                tokens={TOKEN: {"symbol": "USDC", "delta": "0"}},
+                approvals=[{"token": TOKEN, "spender": CONTRACT, "amount": "7"}],
+            ),
+            intent.Intent(spend={}, receive_min={}, recipients=[], approvals=[]),
+            f"intent gate: rule 'undeclared-approval' (USDC to {CONTRACT}, 7)",
+        ),
+    ],
+)
+def test_each_problem_reads_as_the_reference_words_it(
+    diff: intent.AssetDiff, parsed: intent.Intent, expected: str
+) -> None:
+    """The detail names a token by its symbol, else its address, unclamped."""
+    (problem,) = intent.check_intent(diff, parsed)
+    assert intent.problem_text(problem) == expected

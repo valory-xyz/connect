@@ -46,7 +46,7 @@ logger = logging.getLogger("agent")
 
 
 router = APIRouter()
-# the EOA's own signing route, served only with the REST_SIGNING_ROUTES switch
+# the EOA's own signing route, served only with the rest_signing_routes switch
 eoa_router = APIRouter()
 
 

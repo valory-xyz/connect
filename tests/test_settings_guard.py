@@ -67,6 +67,7 @@ from web3 import Web3
 from web3.datastructures import AttributeDict
 
 from connect import chains as chains_module
+from connect import guard as guard_module
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
@@ -148,6 +149,7 @@ from tests.conftest import (
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
 OTHER = "0x" + "bb" * 20
+FLOOR_MARKETPLACE = "0x" + "5b" * 20
 AGENT = "0x" + "Ab" * 20  # the agent EOA; mixed case, as a checksum address is
 # A mech's on-chain record as the marketplace indexer counts it. A fixed
 # creation time keeps everything but the age independent of the clock.
@@ -1298,24 +1300,63 @@ class TestGuard:
             guard.check_transaction("testchain", SAFE, 0, call)
         assert str(refused.value) == texts.guard_not_allowed(WHITELISTED, "testchain")
 
-    def test_every_guardrail_refusal_names_its_rule(self, store: SettingsStore) -> None:
-        """Connect's own restricted rules carry the prefix the broker reads too."""
-        guard = make_guard(store, MODE_RESTRICTED, {"testchain": ()})
-        refusals = (
-            lambda: guard.check_transaction("testchain", WHITELISTED, 0, "0x"),
-            lambda: guard.check_transaction("testchain", SAFE, 0, "0x12345678"),
-            lambda: guard.check_transaction(
-                "testchain", SAFE, 1, exec_transaction_calldata(WHITELISTED)
+    @pytest.mark.parametrize(
+        ("rule", "chain", "to", "value", "data"),
+        [
+            ("no-safe", "nosafe", WHITELISTED, 0, "0x"),
+            ("safe-only", "testchain", WHITELISTED, 0, "0x"),
+            ("exec-transaction-only", "testchain", SAFE, 0, "0x12345678"),
+            ("outer-value", "testchain", SAFE, 1, exec_transaction_calldata(OTHER)),
+            (
+                "refund",
+                "testchain",
+                SAFE,
+                0,
+                exec_transaction_calldata(OTHER, gas_price=1),
             ),
-            lambda: guard.check_sign_digest(b"\x00" * 32),
-            lambda: guard.check_transaction(
-                "testchain", SAFE, 0, "0x" + EXEC_TRANSACTION_SELECTOR + "00"
+            (
+                "payment-token-approve",
+                "testchain",
+                SAFE,
+                0,
+                exec_transaction_calldata(PAYMENT_TOKEN),
             ),
+            ("marketplace", "testchain", FLOOR_MARKETPLACE, 0, "0x"),
+            ("bad-calldata", "testchain", SAFE, 0, "0x" + EXEC_TRANSACTION_SELECTOR),
+        ],
+    )
+    def test_every_guardrail_refusal_names_its_rule(  # pylint: disable=too-many-arguments
+        self,
+        store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+        rule: str,
+        chain: str,
+        to: str,
+        value: int,
+        data: str,
+    ) -> None:
+        """Connect's own rules carry the broker's prefix and their own rule id."""
+        monkeypatch.setattr(
+            guard_module,
+            "MECH_MARKETPLACES",
+            {"testchain": frozenset({FLOOR_MARKETPLACE})},
         )
-        for refuse in refusals:
-            with pytest.raises(GuardError) as refused:
-                refuse()
-            assert str(refused.value).startswith(texts.GUARDRAIL_PREFIX + "'")
+        monkeypatch.setattr(
+            guard_module,
+            "token_approve_targets",
+            lambda _chain: {PAYMENT_TOKEN.lower(): TRACKER.lower()},
+        )
+        guard = make_guard(store, MODE_RESTRICTED, {"testchain": ()})
+        with pytest.raises(GuardError) as refused:
+            guard.check_transaction(chain, to, value, data)
+        assert str(refused.value).startswith(f"guardrail: rule '{rule}': ")
+
+    def test_a_refused_raw_digest_names_its_rule(self, store: SettingsStore) -> None:
+        """The raw-digest refusal carries the broker's prefix and its rule id."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        with pytest.raises(GuardError) as refused:
+            guard.check_sign_digest(b"\x00" * 32)
+        assert str(refused.value).startswith("guardrail: rule 'raw-digest': ")
 
     def test_the_floor_holds_where_no_safe_is_configured(
         self, store: SettingsStore
