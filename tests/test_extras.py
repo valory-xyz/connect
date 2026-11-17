@@ -1327,14 +1327,17 @@ class TestMcpTools:
     async def test_transaction_status(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
-        """transaction_status reports not_found, then success, then reverted.
+        """transaction_status reports not_found, pending, success, then reverted.
 
-        `not_found` is any hash with no receipt, a broadcast not yet mined
-        included; a revert is its own status, never a success-shaped dict.
+        `pending` is a hash the node holds unmined, `not_found` one it does
+        not know; a revert is its own status, never a success-shaped dict.
         """
         tx_hash = "0x" + "11" * 32
         unknown = await tools["transaction_status"]("testchain", tx_hash)
         assert unknown == {"tx_hash": tx_hash, "status": "not_found"}
+        fake_w3.eth.mempool.add("11" * 32)
+        unmined = await tools["transaction_status"]("testchain", tx_hash)
+        assert unmined == {"tx_hash": tx_hash, "status": "pending"}
         fake_w3.eth.receipt = {
             "status": 1,
             "blockNumber": 7,

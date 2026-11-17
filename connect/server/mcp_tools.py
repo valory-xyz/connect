@@ -53,7 +53,7 @@ from connect.server.auth import (
     is_replay,
     request_token,
 )
-from connect.server.receipts import mined_result, not_found, settled
+from connect.server.receipts import mined_result, not_found, pending, settled
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
@@ -133,6 +133,25 @@ class ToolIntent(TypedDict, total=False):
     receive_min: dict[str, Amount] | None
     recipients: list[str] | None
     approvals: list[ToolApproval] | None
+
+
+# get_abi answers in Connect's own way until it matches the reference's
+# (unverified sources an error), so it publishes Connect's own description
+GET_ABI_DESCRIPTION = (
+    "Report what Connect can say about a contract's ABI, following EIP-1967. "
+    "Only ABIs Connect ships: well-known contracts by address on the chains they "
+    "are deployed to (`verified`, for the queried address alone; a proxy's "
+    "implementation has its own `implementation_verified`) and the standard "
+    "interfaces a contract answers to; no explorer lookup."
+)
+
+# Pearl keeps this warning on the field, beside the reference's tool text
+REQUEST_CONTEXT_NOTE = (
+    "optional dict handed to the tool alongside the prompt; it reaches the mech, "
+    "and legacy_on_chain=true also publishes it to IPFS for good: put nothing "
+    "private in it"
+)
+RequestContext = t.Annotated[dict | None, Field(description=REQUEST_CONTEXT_NOTE)]
 
 
 # the tools whose `target` may be passed as `to`, as the reference accepts it
@@ -361,7 +380,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             chain_read.chain_call, signer.w3(chain), to, data, block
         )
 
-    @mcp.tool(description=TOOL_DESCRIPTIONS["get_abi"], annotations=READ_ONLY)
+    @mcp.tool(description=GET_ABI_DESCRIPTION, annotations=READ_ONLY)
     async def get_abi(chain: str, address: str) -> dict:
         """Report the ABI Connect ships for a contract."""
         return await asyncio.to_thread(chain_read.get_abi, signer.w3(chain), address)
@@ -388,7 +407,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             try:
                 receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
             except TransactionNotFound:  # unknown, or not mined yet
-                return not_found(tx_hash)
+                try:
+                    w3.eth.get_transaction(HexBytes(tx_hash))
+                except TransactionNotFound:
+                    return not_found(tx_hash)
+                return pending(tx_hash)
             return mined_result(tx_hash, receipt)
 
         return await asyncio.to_thread(_run)
@@ -414,7 +437,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         timeout: float = 300,
         max_payment: Cap | None = None,
         request_id: str | None = None,
-        request_context: dict | None = None,
+        request_context: RequestContext = None,
         ctx: Context | None = None,
     ) -> dict:
         """Send a mech request and wait for its delivery."""

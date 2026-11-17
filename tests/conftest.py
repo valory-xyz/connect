@@ -354,6 +354,7 @@ class FakeEth:
         self.priority_fee_raises = False
         self.contracts: set[str] = set()
         self.receipt_waits: list[float] = []  # the timeout of each receipt wait
+        self.mempool: set[str] = set()  # hashes known to the node but unmined
         self._lock = threading.Lock()
 
     def get_balance(self, address: str) -> int:
@@ -369,6 +370,13 @@ class FakeEth:
         if self.receipt is None:
             raise TransactionNotFound(f"{tx_hash!r} not mined")
         return self.receipt
+
+    def get_transaction(self, tx_hash: object) -> dict:
+        """Return a transaction the node knows, or raise TransactionNotFound."""
+        key = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
+        if key.removeprefix("0x") not in self.mempool:
+            raise TransactionNotFound(f"{tx_hash!r} not found")
+        return {"hash": tx_hash}
 
     def wait_for_transaction_receipt(
         self, tx_hash: object, timeout: float = 120, poll_latency: float = 0.1

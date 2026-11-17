@@ -35,8 +35,7 @@ RECEIPT_POLL_SECONDS = 2
 MAX_RECEIPT_TIMEOUT = 300
 RECEIPT_ERROR = (
     "the transaction was sent, but its receipt could not be read (the cause is "
-    "in Connect's log); transaction_status answers not_found until it is mined, "
-    "which does not mean it was not sent: resend only under the same request_id"
+    "in Connect's log); check it with transaction_status before resending"
 )
 
 # how a transaction settled, as the send tools and transaction_status say it
@@ -72,13 +71,13 @@ def settled(
         # either, so a malformed one is reported pending, not raised
         return mined_result(tx_hash, receipt)
     except TimeExhausted:
-        return _status(tx_hash, "pending")
+        return pending(tx_hash)
     except Exception:  # pylint: disable=broad-exception-caught
         # the send already happened; a receipt-read hiccup must not lose the
         # hash. Its text is the RPC library's (an RPC URL may carry a key), so
         # it goes to the log, and the caller gets Connect's own words.
         logger.warning("could not read the receipt of %s", tx_hash, exc_info=True)
-        return {**_status(tx_hash, "pending"), "receipt_error": RECEIPT_ERROR}
+        return {**pending(tx_hash), "receipt_error": RECEIPT_ERROR}
 
 
 def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
@@ -96,8 +95,13 @@ def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
     }
 
 
+def pending(tx_hash: str) -> dict:
+    """Return the answer for a transaction sent but not yet mined."""
+    return _status(tx_hash, "pending")
+
+
 def not_found(tx_hash: str) -> dict:
-    """Return the answer for a hash with no receipt: unknown, malformed or unmined."""
+    """Return the answer for a hash the chain does not know, or a malformed one."""
     return _status(tx_hash, "not_found")
 
 

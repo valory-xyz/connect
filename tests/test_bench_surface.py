@@ -33,7 +33,12 @@ from connect import texts
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server.auth import ACTION_SCOPES
-from connect.server.mcp_tools import TOOL_FAILED, with_aliases
+from connect.server.mcp_tools import (
+    GET_ABI_DESCRIPTION,
+    REQUEST_CONTEXT_NOTE,
+    TOOL_FAILED,
+    with_aliases,
+)
 from connect.signer import Signer, SignerError
 from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
 
@@ -188,9 +193,13 @@ def test_initialize_reports_the_reference_s_server_info(client: TestClient) -> N
 
 
 async def test_every_published_description_is_the_reference_s(mcp: FastMCP) -> None:
-    """Every tool publishes the texts module's description and nothing else."""
+    """Every tool publishes the texts module's description, get_abi aside."""
     tools = await mcp.list_tools()
-    assert {tool.name: tool.description for tool in tools} == texts.TOOL_DESCRIPTIONS
+    # get_abi keeps Connect's own text until its answers match the reference's
+    assert {tool.name: tool.description for tool in tools} == {
+        **texts.TOOL_DESCRIPTIONS,
+        "get_abi": GET_ABI_DESCRIPTION,
+    }
 
 
 async def test_to_reaches_the_signer_as_a_safe_call_s_target(
@@ -229,3 +238,10 @@ def test_the_test_interface_takes_the_reference_s_positions() -> None:
     )
     assert PRODUCTION.rest_signing_routes
     assert PRODUCTION.agent_topup_at_boot
+
+
+async def test_request_context_warns_that_it_may_be_published(mcp: FastMCP) -> None:
+    """The IPFS warning rides on the field, since the tool text is the reference's."""
+    (tool,) = [t for t in await mcp.list_tools() if t.name == "mech_request"]
+    field = tool.inputSchema["properties"]["request_context"]
+    assert field["description"] == REQUEST_CONTEXT_NOTE

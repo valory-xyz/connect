@@ -92,9 +92,12 @@ other non-aea agent. It:
      did not word for the caller reads `<tool> failed (the cause is in
      Connect's log)` instead, its cause logged), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
-     of `target`. `transaction_status` answers `success` (with its `block`),
-     `reverted` or `not_found` (a hash with no receipt: unknown, malformed or
-     not mined yet, so `not_found` never means a broadcast did not happen); a send that
+     of `target`. Two descriptions stay Connect's own for now: `get_abi`'s,
+     until its answers match the reference's, and the warning on
+     `mech_request`'s `request_context` field that `legacy_on_chain=true`
+     publishes it to IPFS for good. `transaction_status` answers `success` (with its `block`),
+     `reverted`, `pending` (a transaction the node holds but has not mined) or
+     `not_found` (a hash the node does not know, or a malformed one); a send that
      waited reports `success` / `reverted` / `pending`. The tools are `wallet_info`,
      `safe_transaction`, `send_transaction`, `preflight_transaction`,
      `simulate_transaction`, `transaction_status`, `chain_call`, `get_abi`,
