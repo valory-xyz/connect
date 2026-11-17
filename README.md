@@ -270,10 +270,11 @@ as a maximum, even when revoking). A send with no intent is held to the
 reads it as declaring only what the call itself says (a spend of its own
 `value` in native, its target as the one recipient, no approvals and no
 position leaving) and refuses whatever goes beyond that by the rule it breaks,
-so a plain transfer needs no intent; a position leaving under a capped token
-is `token-cap-positions`, otherwise `overspend`. The bench's `simulate-only`
-refuses a no-intent send only when it reverts, except that a capped token's
-call still moves no position (`token-cap-positions`). A refusal is its problems in
+so a plain transfer needs no intent. The bench's `simulate-only` refuses a
+no-intent send only when it reverts. Under a capped token, which no cap could
+otherwise bound, a no-intent call is held to its own value and target under
+either policy, and a position leaving is `token-cap-positions`, not
+`overspend` (`intent.no_intent_hold`). A refusal is its problems in
 OnchainBench's reference words, joined with `; ` and closed with
 `. Nothing was sent.`: each problem reads `intent gate: rule '<id>' (<detail>)`,
 the detail as the reference words it (`overspend`: `<symbol>: spends <n>,
@@ -284,7 +285,8 @@ intent allows <m>`; `receive-min`: `<symbol>: receives <n>, intent needs <m>`;
 strings, and it answers a no-intent call as the send would: under `strict`
 the call is held to what it says, so `fits_intent` and `problems` are those
 of the implied intent; under `simulate-only` it answers `fits_intent: null`
-and no problems, a revert showing only in the diff's `ok` and `revert` (a
+and no problems, a revert showing only in the diff's `ok` and `revert`,
+except under a capped token, held as above, which gets a verdict (a
 call that cannot be simulated, or an EOA call refused before simulation,
 still answers `fits_intent: false` with its problem). Only the CELO face's `Transfer` is native:
 its `Approval` is an approval like any other, and an intent naming the face in

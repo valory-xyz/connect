@@ -441,10 +441,29 @@ NATIVE_LOG = "0x" + "ee" * 20
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
-def native_transfer_log(src: str, dst: str, amount: int) -> dict:
-    """Return the synthetic log eth_simulateV1's traceTransfers emits for value."""
+APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
+
+
+def _topic(address: str) -> str:
+    """Return an address as a log topic."""
+    return "0x" + address.lower().removeprefix("0x").rjust(64, "0")
+
+
+def approval_log(token: str, owner: str, spender: str, amount: int) -> dict:
+    """Return an ERC-20 Approval log: `owner` lets `spender` move `amount`."""
     return {
-        "address": NATIVE_LOG,
+        "address": token,
+        "topics": [APPROVAL_TOPIC, _topic(owner), _topic(spender)],
+        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
+    }
+
+
+def native_transfer_log(
+    src: str, dst: str, amount: int, address: str = NATIVE_LOG
+) -> dict:
+    """Return a Transfer log: the synthetic native one, or a token's at `address`."""
+    return {
+        "address": address,
         "topics": [
             TRANSFER_TOPIC,
             "0x" + src.lower().removeprefix("0x").rjust(64, "0"),

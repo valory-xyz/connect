@@ -52,7 +52,7 @@ from connect.server.auth import (
     is_replay,
     request_token,
 )
-from connect.server.receipts import not_found, settled, settlement
+from connect.server.receipts import settled, settlement
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
@@ -422,12 +422,6 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     )
     async def transaction_status(chain: str, tx_hash: str) -> dict:
         """Report how a transaction settled."""
-        try:
-            valid = len(bytes.fromhex(tx_hash.removeprefix("0x"))) == 32
-        except ValueError:
-            valid = False
-        if not valid:  # a hash that can never resolve is simply not found
-            return not_found(tx_hash)
         return await asyncio.to_thread(lambda: settlement(signer.w3(chain), tx_hash))
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["sign_message"])

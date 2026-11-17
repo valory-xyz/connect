@@ -62,7 +62,6 @@ from connect.config import (
 from connect.input_errors import InputError
 from connect.keystore import KeystoreError, load_account
 from connect.run_goal import RunGoal
-from connect.server import receipts
 from connect.server.auth import ACTION_SCOPES, AuthFailureLimiter, AuthMiddleware
 from connect.signer import Signer, SignerError, _IdempotencyCache
 from connect.switches import PRODUCTION, Switches
@@ -326,8 +325,7 @@ class TestMain:
         monkeypatch.setattr("sys.stdin", io.StringIO(TEST_PASSWORD + "\n"))
         assert main_module.main(["--password-stdin"]) == 0
         app = served[0].config.app
-        assert app.state.switches == PRODUCTION
-        assert app.state.signer.switches is app.state.switches  # one source
+        assert app.state.signer.switches == PRODUCTION  # the build's one source
         assert PRODUCTION == Switches()
 
     def test_the_binary_excludes_the_test_interface(self) -> None:
@@ -1285,7 +1283,11 @@ class TestMcpTools:
         assert fake_w3.eth.sent  # the premise: it really was broadcast first
         assert result["status"] == "pending"
         assert result["tx_hash"].startswith("0x")
-        assert result["receipt_error"] == receipts.RECEIPT_ERROR  # not the RPC's text
+        assert result["receipt_error"] == (  # not the RPC's text, and the replay advice
+            "the transaction was sent, but its receipt could not be read (the cause "
+            "is in Connect's log); check it with transaction_status: not_found does "
+            "not prove it was not sent, so resend only under the same request_id"
+        )
 
     async def test_safe_transaction_rejects_a_negative_value(
         self, tools: dict[str, t.Callable]

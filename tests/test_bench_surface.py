@@ -48,7 +48,7 @@ from connect.server.mcp_tools import (
 from connect.signer import Signer, SignerError
 from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
 
-from tests.conftest import FakeW3
+from tests.conftest import FakeW3, approval_log
 
 TOKEN = "surface-test-token"  # nosec B105
 RECIPIENT = "0x" + "aa" * 20
@@ -137,17 +137,7 @@ def test_a_no_intent_send_is_held_to_strict_through_the_transport(
 ) -> None:
     """Pearl's strict policy: a no-intent call that grants an approval is refused."""
     token, spender = "0x" + "70" * 20, "0x" + "5e" * 20
-    fake_w3.provider.logs = [
-        {
-            "address": token,
-            "topics": [
-                "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
-                "0x" + SAFE[2:].rjust(64, "0"),
-                "0x" + spender[2:].rjust(64, "0"),
-            ],
-            "data": "0x" + hex(10)[2:].rjust(64, "0"),
-        }
-    ]
+    fake_w3.provider.logs = [approval_log(token, SAFE, spender, 10)]
     text = _tool_error(
         client,
         "safe_transaction",
@@ -324,21 +314,11 @@ def test_an_app_built_at_the_test_interface_gates_at_its_positions(
 ) -> None:
     """One switch set per build: the app's signer runs the bench's simulate-only."""
     token, spender = "0x" + "70" * 20, "0x" + "5e" * 20
-    fake_w3.provider.logs = [
-        {
-            "address": token,
-            "topics": [
-                "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
-                "0x" + SAFE[2:].rjust(64, "0"),
-                "0x" + spender[2:].rjust(64, "0"),
-            ],
-            "data": "0x" + hex(10)[2:].rjust(64, "0"),
-        }
-    ]
+    fake_w3.provider.logs = [approval_log(token, SAFE, spender, 10)]
     app = make_app(
         test_signer, app_config, activity, token=TOKEN, switches=TEST_INTERFACE
     )
-    assert app.state.signer.switches is app.state.switches is TEST_INTERFACE
+    assert app.state.signer.switches is TEST_INTERFACE
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         answer = client.post(
             "/safe-transaction",

@@ -51,7 +51,7 @@ cannot tell you is which to reach for:
 - `preflight_transaction` — ask whether a call would be permitted before you
   build on it. Reach for it when a plan depends on a call being allowed: a
   refusal here costs nothing, one discovered mid-flow can leave a
-  half-finished position. It answers the guardrail's verdict only and
+  half-finished position. It checks your token and the guardrail and
   simulates nothing; `simulate_transaction` tells you what the call would do.
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
@@ -87,9 +87,10 @@ more than that. What a refusal won't tell you:
   existing allowance.
 - A call with no intent may spend only its own `value`, pay only its target
   and grant no approval; a call that moves nothing (a claim, a vote) needs
-  none.
+  none. This is the one statement of the rule; the rest of this skill points
+  here.
 - `simulation-unavailable` means Connect cannot simulate on that chain: no
-  value-moving call can be sent there.
+  call can be sent there until it can.
 
 The bundled skills attach the intents of the calls they build.
 
@@ -265,12 +266,9 @@ tx_hash = signer.send_transaction(                              # sent by the sa
 )
 ```
 
-A call with no intent may do only what it says: spend no more than its own
-`value`, pay no one but its target and grant no approval. Only
-`signer.send_transaction` carries an intent; `.transact()` and
-`w3.eth.send_transaction` send the bare call, so anything beyond that is
-refused by the intent gate rule it breaks (`overspend`,
-`undeclared-recipient`, `undeclared-approval`).
+Only `signer.send_transaction` carries an intent; `.transact()` and
+`w3.eth.send_transaction` send the bare call, which is held to what a call
+with no intent may do (see "Intents" above).
 
 Two things `connect()` handles that hand-rolled web3 code gets wrong: PoA
 chains (Polygon above all) pad `extraData` past 32 bytes and break every block

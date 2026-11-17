@@ -26,7 +26,6 @@ import typing as t
 from pathlib import Path
 
 import pytest
-from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from mcp.server.fastmcp import FastMCP
 from web3 import Web3
@@ -47,13 +46,13 @@ from connect.signer_errors import (
     cause_of,
     logged_cause,
 )
-from connect.switches import PRODUCTION, TEST_INTERFACE
+from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
 
 from tests.conftest import (
     FakeW3,
+    approval_log,
     audit_entries,
     native_transfer_log,
-    on_fake_chain,
     pay,
 )
 
@@ -75,18 +74,6 @@ def _rules(problems: list[str]) -> list[str]:
     return rules
 
 
-def _transfer_log(sender: str, to: str, amount: int) -> dict:
-    return {
-        "address": TOKEN,
-        "topics": [
-            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-            "0x" + sender[2:].rjust(64, "0"),
-            "0x" + to[2:].rjust(64, "0"),
-        ],
-        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
-    }
-
-
 def _position_out_log(holder: str = SAFE) -> dict:
     """Return an ERC-1155 TransferSingle moving one position out of `holder`."""
     return {
@@ -102,15 +89,7 @@ def _position_out_log(holder: str = SAFE) -> dict:
 
 
 def _approval_log(amount: int, owner: str = SAFE) -> dict:
-    return {
-        "address": TOKEN,
-        "topics": [
-            "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
-            "0x" + owner[2:].rjust(64, "0"),
-            "0x" + SPENDER[2:].rjust(64, "0"),
-        ],
-        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
-    }
+    return approval_log(TOKEN, owner, SPENDER, amount)
 
 
 @pytest.fixture
@@ -160,26 +139,16 @@ class TestSignerGate:
         assert not fake_w3.eth.sent
 
     @pytest.mark.parametrize("strict", [True, False])
-    def test_a_no_intent_token_spend_is_refused_only_under_strict(  # pylint: disable=too-many-arguments
+    def test_a_no_intent_token_spend_is_refused_only_under_strict(
         self,
-        account: LocalAccount,
-        app_config: AppConfig,
-        activity: ActivityLog,
+        signer_with: t.Callable[[Switches], Signer],
         fake_w3: FakeW3,
         strict: bool,
     ) -> None:
-        """S1's pair: strict names the implied limit; simulate-only sends it."""
-        signer = on_fake_chain(
-            Signer(
-                account,
-                app_config,
-                activity,
-                switches=PRODUCTION if strict else TEST_INTERFACE,
-            ),
-            fake_w3,
-        )
+        """Strict names the implied limit; simulate-only sends the same call."""
+        signer = signer_with(PRODUCTION if strict else TEST_INTERFACE)
         fake_w3.eth.contracts.add(SPENDER)  # paid to a contract: no recipient rule
-        fake_w3.provider.logs = [_transfer_log(SAFE, SPENDER, 4)]
+        fake_w3.provider.logs = [native_transfer_log(SAFE, SPENDER, 4, address=TOKEN)]
         if strict:
             with pytest.raises(SignerError) as refused:
                 signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
@@ -192,19 +161,46 @@ class TestSignerGate:
             signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
             assert len(fake_w3.eth.sent) == 1
 
+    @pytest.mark.parametrize("switches", [PRODUCTION, TEST_INTERFACE])
     def test_a_capped_token_moves_no_position_in_either_position(
         self,
-        account: LocalAccount,
-        app_config: AppConfig,
-        activity: ActivityLog,
+        signer_with: t.Callable[[Switches], Signer],
         fake_w3: FakeW3,
+        switches: Switches,
     ) -> None:
-        """Under simulate-only a capped token's no-intent call still keeps positions."""
-        signer = on_fake_chain(
-            Signer(account, app_config, activity, switches=TEST_INTERFACE), fake_w3
-        )
+        """A capped token's no-intent call keeps positions, under either policy."""
+        signer = signer_with(switches)
+        fake_w3.eth.contracts.add(EOA)  # the position's taker: no recipient rule
         fake_w3.provider.logs = [_position_out_log()]
-        with pytest.raises(SignerError, match="rule 'token-cap-positions'"):
+        with pytest.raises(SignerError) as refused:
+            signer.send_via_safe(
+                "testchain", TOKEN, data=TOKEN_CALL, intent=intent_module.Capped(None)
+            )
+        assert str(refused.value) == (
+            f"intent gate: rule 'token-cap-positions' (moves {TOKEN} #7 out, and a "
+            "value-capped token may not move positions). Nothing was sent."
+        )
+        assert not fake_w3.eth.sent
+
+    @pytest.mark.parametrize(
+        ("log", "rule"),
+        [
+            (native_transfer_log(SAFE, SPENDER, 4, address=TOKEN), "overspend"),
+            (approval_log(TOKEN, SAFE, SPENDER, 10), "undeclared-approval"),
+        ],
+    )
+    def test_a_capped_token_s_no_intent_call_is_held_under_simulate_only(
+        self,
+        signer_with: t.Callable[[Switches], Signer],
+        fake_w3: FakeW3,
+        log: dict,
+        rule: str,
+    ) -> None:
+        """No cap could bound it otherwise: its own value and target, nothing else."""
+        signer = signer_with(TEST_INTERFACE)
+        fake_w3.eth.contracts.add(SPENDER)
+        fake_w3.provider.logs = [log]
+        with pytest.raises(SignerError, match=f"rule '{rule}'"):
             signer.send_via_safe(
                 "testchain", TOKEN, data=TOKEN_CALL, intent=intent_module.Capped(None)
             )
@@ -233,16 +229,10 @@ class TestSignerGate:
         assert len(fake_w3.eth.sent) == 1
 
     def test_the_simulate_only_policy_refuses_only_a_revert(
-        self,
-        account: LocalAccount,
-        app_config: AppConfig,
-        activity: ActivityLog,
-        fake_w3: FakeW3,
+        self, signer_with: t.Callable[[Switches], Signer], fake_w3: FakeW3
     ) -> None:
         """The bench's policy: an undeclared approval mines, a revert is refused."""
-        signer = on_fake_chain(
-            Signer(account, app_config, activity, switches=TEST_INTERFACE), fake_w3
-        )
+        signer = signer_with(TEST_INTERFACE)
         fake_w3.provider.logs = [_approval_log(10)]
         signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
         assert len(fake_w3.eth.sent) == 1
@@ -1051,16 +1041,10 @@ class TestSimulate:
         assert _rules(reverted["problems"])[0] == "reverts"
 
     def test_simulate_only_answers_a_no_intent_call_with_no_verdict(
-        self,
-        account: LocalAccount,
-        app_config: AppConfig,
-        activity: ActivityLog,
-        fake_w3: FakeW3,
+        self, signer_with: t.Callable[[Switches], Signer], fake_w3: FakeW3
     ) -> None:
         """The bench's position: no verdict, and a revert shows in the diff alone."""
-        signer = on_fake_chain(
-            Signer(account, app_config, activity, switches=TEST_INTERFACE), fake_w3
-        )
+        signer = signer_with(TEST_INTERFACE)
         fake_w3.provider.logs = [_approval_log(10)]
         granted = signer.simulate("testchain", TOKEN, data=TOKEN_CALL)
         assert (granted["fits_intent"], granted["problems"]) == (None, [])
@@ -1070,6 +1054,21 @@ class TestSimulate:
         assert result["ok"] is False
         assert result["fits_intent"] is None
         assert result["problems"] == []
+
+    def test_a_capped_simulation_answers_as_the_send_would_under_simulate_only(
+        self, signer_with: t.Callable[[Switches], Signer], fake_w3: FakeW3
+    ) -> None:
+        """A capped token is held even here, so its dry run gives a verdict."""
+        signer = signer_with(TEST_INTERFACE)
+        fake_w3.eth.contracts.add(EOA)
+        fake_w3.provider.logs = [_position_out_log()]
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        result = signer.simulate(
+            "testchain", TOKEN, data=TOKEN_CALL, intent=intent_module.Capped(None)
+        )
+        assert result["fits_intent"] is False
+        assert _rules(result["problems"]) == ["reverts", "token-cap-positions"]
 
     def test_a_problem_is_the_reference_s_string(self, test_signer: Signer) -> None:
         """Each problem reads `intent gate: rule '<id>' (<detail>)`."""

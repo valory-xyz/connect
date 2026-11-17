@@ -477,8 +477,7 @@ def test_the_implied_intent_allows_the_call_s_own_value_and_target() -> None:
     moved = _diff(positions=[{"token": TOKEN, "id": "7", "delta": "-1"}])
     # one report per position: a capped token's lock names it, not overspend
     assert rules(intent.check_intent(moved, implied)) == ["token-cap-positions"]
-    unlocked = intent.implied_intent(0, EOA, positions_locked=False)
-    (problem,) = intent.check_intent(moved, unlocked)
+    (problem,) = intent.check_intent(moved, IMPLIED)
     assert problem == {
         "rule": "overspend",
         "detail": f"{TOKEN} #7: spends 1, intent allows 0",

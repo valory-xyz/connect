@@ -644,8 +644,9 @@ class Signer:
         """Simulate a call and check it: (diff, intent it was held to, problems).
 
         The one path the send-time gate and simulate_transaction share, so the
-        two cannot answer differently about the same call. The intent is None
-        for a no-intent call the policy checks for a revert alone.
+        two cannot answer differently about the same call. The intent is
+        `intent.no_intent_hold`'s for a call with none: None means a revert
+        check alone.
         """
         problem = intent_module.calldata_problem(call.data)
         if problem is not None:
@@ -653,12 +654,13 @@ class Signer:
         parsed, problems = intent_module.parse_intent(raw_intent)
         if problems:
             return None, None, problems
-        locked = intent_module.locks_positions(raw_intent)
         held_to = parsed
-        # fails closed: any position but simulate-only is held to the call
-        if parsed is None and self._switches.no_intent_policy != "simulate-only":
-            held_to = intent_module.implied_intent(
-                call.value, call.to, positions_locked=locked
+        if parsed is None:  # fails closed: any position but simulate-only is strict
+            held_to = intent_module.no_intent_hold(
+                raw_intent,
+                call.value,
+                call.to,
+                strict=self._switches.no_intent_policy != "simulate-only",
             )
         try:
             diff = self._simulate(chain, call)
@@ -683,10 +685,7 @@ class Signer:
                     )
                 ],
             )
-        problems = intent_module.check_intent(diff, held_to)
-        if held_to is None and locked:  # a capped token moves no position
-            problems += intent_module.position_lock_problems(diff)
-        return diff, held_to, problems
+        return diff, held_to, intent_module.check_intent(diff, held_to)
 
     def _gate_problems(
         self, chain: str, call: _GateCall, raw_intent: t.Any
@@ -712,10 +711,7 @@ class Signer:
             try:
                 call = self._eoa_gate(chain, target, value, data)
             except _GateRefused as e:
-                return {
-                    "fits_intent": False,
-                    "problems": [intent_module.problem_text(e.problem)],
-                }
+                return intent_module.simulation_answer(None, None, [e.problem])
         return intent_module.simulation_answer(*self._evaluate(chain, call, intent))
 
     def _sender(self, chain: str, via_safe: bool) -> str:

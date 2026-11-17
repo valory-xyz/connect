@@ -31,9 +31,9 @@ Usage:
         intent={"spend": {"native": 10**16}, "recipients": ["0x..."]},
     )
 
-A call with no intent may spend only its own value, pay only its target and
-grant no approval; only signer.send_transaction carries one, so
-w3.eth.send_transaction and .transact() suit calls that do no more.
+Only signer.send_transaction carries an intent; w3.eth.send_transaction and
+.transact() send the bare call, held to what a call with no intent may do
+("Intents" in SKILL.md).
 
 To run another script under a narrower token, mint one and hand it over in
 the environment; every .mcp.json reader here picks it up (see _signing_token):
@@ -174,8 +174,7 @@ class SignerClient:
             "data": tx.get("data", "0x"),
             "request_id": request_id,
         }
-        # what the call may do; with none, the server holds the call to its own
-        # value and target, after simulating it (see "Intents" in SKILL.md)
+        # what the call may do; see "Intents" in SKILL.md for a call with none
         intent = intent if intent is not None else tx.get("intent")
         if intent is not None:
             payload["intent"] = _exact_amounts(intent)

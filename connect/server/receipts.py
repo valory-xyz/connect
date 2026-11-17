@@ -27,6 +27,7 @@ import logging
 import typing as t
 
 from hexbytes import HexBytes
+from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from connect.signer import Signer
@@ -96,8 +97,17 @@ def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
     }
 
 
-def settlement(w3: t.Any, tx_hash: str) -> dict:
-    """Return how a hash settled: mined, held unmined (`pending`) or unknown."""
+def settlement(w3: Web3, tx_hash: str) -> dict:
+    """Return how a hash settled: mined, held unmined (`pending`) or unknown.
+
+    A malformed hash can never resolve, so it is simply `not_found`.
+    """
+    try:
+        valid = len(bytes.fromhex(tx_hash.removeprefix("0x"))) == 32
+    except ValueError:
+        valid = False
+    if not valid:
+        return not_found(tx_hash)
     try:
         receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
     except TransactionNotFound:

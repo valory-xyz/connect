@@ -31,8 +31,7 @@ never leaves `PRODUCTION`.
 import typing as t
 from dataclasses import dataclass
 
-# what a send with no intent is held to: `strict` is `intent.implied_intent`,
-# `simulate-only` refuses it only if it reverts
+# what a send with no intent is held to (`intent.no_intent_hold`)
 NoIntentPolicy = t.Literal["strict", "simulate-only"]
 
 
