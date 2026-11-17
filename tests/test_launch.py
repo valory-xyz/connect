@@ -19,7 +19,6 @@
 
 """Open a real terminal for the terminal harnesses, running stand-in binaries."""
 
-import json
 import os
 import shlex
 import sys
@@ -98,8 +97,11 @@ def test_ocb_cli_launches_the_installed_agent_with_its_model(
 ) -> None:
     """An ocb_cli session is a terminal running the installed ocb-agent by path."""
     mech = "0x" + "ab" * 20
-    agent = tmp_path / "uv tools" / "ocb-agent"  # a space: the path must be quoted
-    agent.parent.mkdir()
+    # a space: the path must be quoted
+    tools = tmp_path / "uv tools"
+    monkeypatch.setenv("UV_TOOL_DIR", str(tools))
+    agent = tools / "olas-ocb-agent" / "bin" / "ocb-agent"
+    agent.parent.mkdir(parents=True)
     agent.write_text(
         '#!/bin/sh\necho "$PWD $*" > launched.tmp && mv launched.tmp ocb-launched\n',
         encoding="utf-8",
@@ -108,12 +110,13 @@ def test_ocb_cli_launches_the_installed_agent_with_its_model(
     store_path.mkdir(parents=True, exist_ok=True)
     record_dir = tmp_path / "deployment"
     record_dir.mkdir()
-    (record_dir / ocb.OCB_RECORD_FILE).write_text(
-        json.dumps({"path": str(agent)}), encoding="utf-8"
-    )
     monkeypatch.setattr(workspace, "assets_dir", lambda: record_dir / "no-bundle")
-
     agent_workspace = Workspace(store_path, "tok", mech, record_dir)  # nosec B106
+    (record_dir / ocb.OCB_RECORD_FILE).write_text(
+        agent_workspace.ocb._signed_record(agent, "x"),  # pylint: disable=W0212
+        encoding="utf-8",
+    )
+
     assert agent_workspace.open_session("ocb_cli") == "ocb_cli"
 
     marker = store_path / "ocb-launched"

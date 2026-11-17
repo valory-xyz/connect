@@ -319,12 +319,15 @@ and verified on every read — an edit by the agent (or anything else without
 the key) fails verification and resets them to the defaults — deliberate,
 and audited; the reasoning lives in `connect/settings.py`'s module
 docstring. The
-`harness` preference is stored alongside without integrity checks and survives
-a guardrail reset. It is outside the MAC because it cannot move funds or widen
-the guardrail — every harness is only a way to open a coding agent on the
-operator's own machine, and editing the field just reorders which one is tried
-first. What a tamper can still do is mislead: leave the UI showing a preference
-the operator's sessions are not opening in.
+`harness` preference is under the same MAC: it cannot move funds or widen the
+guardrail, but with OCB a written `ocb_cli` would make the next unnamed launch
+install and open OCB, which never falls back. An edited harness fails
+verification like any other field and resets with them; a version-1 file
+(written before the harness was covered) keeps its verified guardrail and
+loads with the default harness, once, then is rewritten. OCB's install record
+(`.ocb-agent.json`) carries a MAC under the same key, and the path it names
+must be `ocb-agent` inside uv's tool directory for olas-ocb-agent; an
+unsigned, edited or foreign record installs OCB again.
 The MAC of the last file the server wrote is also pinned
 in memory, so replaying an *old* validly-MAC'd settings file (say, captured
 while the mode was unrestricted) fails the same way; only a replay staged

@@ -25,6 +25,8 @@ nothing from it.
 """
 
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -46,8 +48,11 @@ OCB_ASSETS_SUBDIR = "ocb"
 OCB_INSTALL_SCRIPT = "install.sh"
 OCB_WHEEL_GLOB = "olas_ocb_agent-*.whl"
 # the installed ocb-agent path and the wheel it came from, kept outside the
-# workspace in Connect's own directory
+# workspace in Connect's own directory, under a MAC keyed off the agent key
 OCB_RECORD_FILE = ".ocb-agent.json"
+_RECORD_KEY_INFO = b"pearl-connect ocb install record v1"
+# what uv names the tool and the executable a recorded path must resolve to
+OCB_EXECUTABLE = "ocb-agent"
 # the script fetches uv, a Python and the wheel's dependencies
 OCB_INSTALL_TIMEOUT_SECONDS = 600.0
 # how long POST /session waits for an install: Pearl gives up at ~300s
@@ -146,30 +151,65 @@ class OcbInstaller:
     uv's tool directory is not always on the login PATH. The path is recorded
     with the requirement it came from (install_identity), so a Connect release
     bundling another wheel, or asking for another extra, installs again. The
-    record lives in `record_dir`, outside the workspace, so the session cannot
-    point Connect's next launch at another program.
+    record lives in `record_dir`, outside the workspace, and carries a MAC
+    keyed off the agent key, so neither the session nor anything else that
+    can write the file can point Connect's next launch at another program: an
+    unsigned or tampered record reads as no record, and OCB installs again.
+    A recorded path must also be `ocb-agent` inside uv's tool directory for
+    olas-ocb-agent, or it is not launched.
     """
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         store_path: Path,
         record_dir: Path,
         bundle_dir: t.Callable[[], Path],
         env: t.Callable[[], dict[str, str]],
+        *,
+        record_key: bytes,
     ) -> None:
         """Hold where the script runs, its result is kept, and the bundle is.
 
-        `env` is the scrubbed environment the session's own programs get.
+        `env` is the scrubbed environment the session's own programs get;
+        `record_key` signs the install record.
         """
         self._store_path = store_path
         self._bundle_dir = bundle_dir
         self._env = env
         self._record = record_dir / OCB_RECORD_FILE
+        self._record_key = hmac.new(
+            record_key, _RECORD_KEY_INFO, hashlib.sha256
+        ).digest()
         self._lock = threading.Lock()
         self._attempt: _Attempt | None = None
 
+    def _mac(self, path: str, requirement: str) -> str:
+        """Return the record's MAC over exactly what it says."""
+        canonical = json.dumps(
+            {"path": path, "requirement": requirement},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hmac.new(
+            self._record_key, canonical.encode(), hashlib.sha256
+        ).hexdigest()
+
+    def _signed_record(self, path: Path, requirement: str) -> str:
+        """Return the record to write: the path, the requirement and their MAC."""
+        return json.dumps(
+            {
+                "path": str(path),
+                "requirement": requirement,
+                "mac": self._mac(str(path), requirement),
+            }
+        )
+
     def _read_record(self) -> dict:
-        """Return the install record, or {} when there is no usable one."""
+        """Return the verified install record, or {} when there is no usable one.
+
+        A record without a valid MAC (one written before records were signed,
+        or edited since) is treated as missing: OCB installs again.
+        """
         try:
             record = json.loads(self._record.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -177,12 +217,54 @@ class OcbInstaller:
         except (OSError, ValueError) as e:
             logger.warning("could not read %s (%s); reinstalling OCB", self._record, e)
             return {}
-        return record if isinstance(record, dict) else {}
+        if not isinstance(record, dict):
+            return {}
+        path, requirement = str(record.get("path", "")), str(
+            record.get("requirement", "")
+        )
+        if not hmac.compare_digest(
+            str(record.get("mac", "")), self._mac(path, requirement)
+        ):
+            logger.warning(
+                "%s is unsigned or was changed; reinstalling OCB", self._record
+            )
+            return {}
+        return record
+
+    def _tool_dir(self) -> Path:
+        """Return uv's tool directory for the installer's environment.
+
+        uv's own rule: UV_TOOL_DIR, else $XDG_DATA_HOME/uv/tools, else
+        ~/.local/share/uv/tools.
+        """
+        env = self._env()
+        if env.get("UV_TOOL_DIR"):
+            return Path(env["UV_TOOL_DIR"])
+        data = env.get("XDG_DATA_HOME") or str(
+            Path(env.get("HOME") or Path.home()) / ".local" / "share"
+        )
+        return Path(data) / "uv" / "tools"
+
+    def _ocb_agent(self, reported: str) -> Path | None:
+        """Return `reported` if it is uv's olas-ocb-agent `ocb-agent`, else None.
+
+        The path the script prints is uv's link in its bin directory; what it
+        resolves to must be `ocb-agent` inside the tool's own directory.
+        """
+        path = _executable(reported)
+        if path is None:
+            return None
+        target = path.resolve()
+        tool = (self._tool_dir() / OCB_PACKAGE).resolve()
+        if target.name != OCB_EXECUTABLE or not target.is_relative_to(tool):
+            logger.warning("%s is not %s's %s", path, OCB_PACKAGE, OCB_EXECUTABLE)
+            return None
+        return path
 
     def path(self) -> Path | None:
         """Return the installed `ocb-agent`, or None when it must be installed."""
         record = self._read_record()
-        installed = _executable(str(record.get("path", "")))
+        installed = self._ocb_agent(str(record.get("path", "")))
         if installed is None:
             return None
         try:
@@ -247,7 +329,7 @@ class OcbInstaller:
             env={**self._env(), "OCB_AGENT_SPEC": ocb_agent_spec(wheel)},
             timeout=timeout,
         )
-        installed = None if returncode else _executable(_last_line(stdout))
+        installed = None if returncode else self._ocb_agent(_last_line(stdout))
         if installed is None:
             logger.error(
                 "OCB installer exited %s; stdout: %s; stderr: %s",
@@ -265,9 +347,7 @@ class OcbInstaller:
         try:
             write_private(
                 self._record,
-                json.dumps(
-                    {"path": str(installed), "requirement": install_identity(wheel)}
-                ),
+                self._signed_record(installed, install_identity(wheel)),
             )
         except OSError as e:
             raise InstallError(f"could not record where OCB is installed: {e}") from e

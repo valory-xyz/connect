@@ -253,7 +253,9 @@ def main(argv: list[str] | None = None) -> int:
     # beats a crash loop the middleware just keeps restarting); the workspace
     # re-attempts its own population on every /healthcheck, so a condition that
     # clears by itself heals without a restart.
-    agent_workspace = workspace.Workspace(config.store_path, token, ocb_mech)
+    agent_workspace = workspace.Workspace(
+        config.store_path, token, ocb_mech, record_key=derive_mac_key(account)
+    )
     agent_workspace.ensure()
 
     # Pearl reads it whatever our health, so write it even on a degraded boot.

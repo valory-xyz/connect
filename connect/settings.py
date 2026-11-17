@@ -24,14 +24,17 @@ workspace — the agent can read it (nothing in it is secret) and could write
 it, so every read verifies an HMAC keyed off the agent private key before the
 content is trusted. The canonical shape nests the security-critical fields
 under "protected" ({"protected": {"mode", "whitelist"}, "harness"}) and the
-MAC covers exactly that object (plus the version); a failed verification
-resets it to the built-in defaults. Landing on the defaults (rather than a
+MAC covers that object, the harness and the version; a failed verification
+resets them to the built-in defaults. Landing on the defaults (rather than a
 narrower fail-closed state) is deliberate: a mistaken edit or deletion of
 the file must not brick the agent, and the defaults are exactly what a
 fresh install ships with — so the reset adds no exposure a new install does
 not already accept. Every reset-to-defaults transition is audited once per episode.
-Preference fields (harness) live outside "protected" without integrity
-checks: editing them simply applies, and they survive a protected reset.
+The harness is a preference (a harness-only PATCH needs no password), but it
+is under the MAC too: with OCB it decides what an unnamed launch installs and
+runs, with no fallback, so an edited one must not apply. A version-1 file
+(MAC'd before the harness was) verifies its protected object once and loads
+with the default harness, then is rewritten under the current MAC.
 Legitimate protected changes go through the password-gated settings PATCH,
 never through the agent session.
 """
@@ -55,19 +58,19 @@ from connect.safe import ZERO_ADDRESS
 logger = logging.getLogger("agent")
 
 SETTINGS_FILE = "pearl-connect.settings.json"
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
 
-# The MAC covers the version and the "protected" object of the canonical
-# shape — everything an attacker could profit from editing. The harness is
-# deliberately outside it: it cannot move funds or widen the guardrail. It is
-# not free of consequence, though — a tampered value is the preference the UI
-# shows and the harness /session reaches for first. What it cannot do is deny
-# a session (an unnamed launch falls back), so what it buys is a misleading
-# readout, visible in the UI and correctable there. A new top-level field
-# ships outside the MAC unless it is named here, so a test pins the file's
-# top-level keys against this tuple: adding one fails it until its integrity
-# coverage is a decision rather than an oversight.
-MAC_FIELDS = ("version", "protected")
+# The MAC covers the version, the "protected" object of the canonical shape
+# and the harness — everything an attacker could profit from editing. The
+# harness cannot move funds or widen the guardrail, but with OCB a written
+# value would make the next unnamed launch install and open OCB, which never
+# falls back, so it is covered too. A new top-level field ships outside the
+# MAC unless it is named here, so a test pins the file's top-level keys
+# against this tuple: adding one fails it until its integrity coverage is a
+# decision rather than an oversight.
+MAC_FIELDS = ("version", "protected", "harness")
+# what a version-1 file's MAC covered, accepted once to migrate it
+LEGACY_MAC_FIELDS = ("version", "protected")
 
 MODE_RESTRICTED = "restricted"
 MODE_UNRESTRICTED = "unrestricted"
@@ -542,15 +545,19 @@ class SettingsStore:
         if verified is not None:
             self._degraded = None  # healthy again: re-arm transition records
             return verified
+        migrated = self._verify_legacy(payload)
+        if migrated is not None:
+            logger.info(
+                "settings file %s predates the harness MAC; using %s",
+                self._path,
+                DEFAULT_HARNESS,
+            )
+            return self._reset(migrated)
         logger.warning(
             "settings file %s failed verification; restoring defaults", self._path
         )
         self._record_once("tampered", "settings_tampered", path=str(self._path))
-        fallback = defaults()
-        # the harness is a preference, not a security control: a tampered
-        # mode/whitelist resets those, but must not discard the harness
-        fallback.harness = _harness_or_default(payload.get("harness", DEFAULT_HARNESS))
-        return self._reset(fallback)
+        return self._reset(defaults())
 
     @staticmethod
     def _parse(raw: str) -> dict:
@@ -598,9 +605,9 @@ class SettingsStore:
             raise
         self._expected_mac = payload["mac"]
 
-    def _mac(self, payload: dict) -> str:
+    def _mac(self, payload: dict, fields: tuple[str, ...] = MAC_FIELDS) -> str:
         canonical = json.dumps(
-            {k: payload.get(k) for k in MAC_FIELDS},
+            {k: payload.get(k) for k in fields},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -618,3 +625,20 @@ class SettingsStore:
             return None
         self._expected_mac = mac
         return settings
+
+    def _verify_legacy(self, payload: dict) -> Settings | None:
+        """Verify a version-1 file, MAC'd before the harness was; None otherwise.
+
+        Only on the first load of a run, as for any file not written by this
+        process; its harness was never covered, so it loads as the default.
+        """
+        if payload.get("version") != 1 or self._expected_mac is not None:
+            return None
+        if not hmac.compare_digest(
+            str(payload.get("mac", "")), self._mac(payload, LEGACY_MAC_FIELDS)
+        ):
+            return None
+        try:
+            return Settings(protected=Protected.from_raw(payload["protected"]))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None

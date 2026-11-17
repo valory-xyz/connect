@@ -76,6 +76,14 @@ def write_bundle(root: Path, script: str, wheels: tuple[str, ...] = (WHEEL,)) ->
     return bundle
 
 
+def make_agent(path: Path) -> Path:
+    """Create an executable stand-in at `path`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def installer_script(executable: Path) -> str:
     """Return an install.sh honouring the contract: record the spec, print the path."""
     return (
@@ -85,6 +93,21 @@ def installer_script(executable: Path) -> str:
         f"chmod +x {shlex.quote(str(executable))}\n"
         f"echo {shlex.quote(str(executable))}\n"
     )
+
+
+RECORD_KEY = b"k" * 32
+
+
+def tool_agent(tmp_path: Path) -> Path:
+    """Return where uv installs olas-ocb-agent's ocb-agent under the test's tool dir."""
+    return tmp_path / "tools" / "olas-ocb-agent" / "bin" / "ocb-agent"
+
+
+@pytest.fixture(autouse=True)
+def uv_tool_dir_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point uv's tool directory, as the installer's environment names it, at tmp_path."""
+    monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "tools"))
+    return tmp_path / "tools"
 
 
 @pytest.fixture(name="record_dir")
@@ -99,14 +122,16 @@ def record_dir_fixture(tmp_path: Path) -> Path:
 def installer_fixture(store_path: Path, record_dir: Path) -> OcbInstaller:
     """Return an installer for the workspace, recording outside it."""
     store_path.mkdir(parents=True, exist_ok=True)
-    return Workspace(store_path, "tok", record_dir=record_dir).ocb  # nosec B106
+    return Workspace(
+        store_path, "tok", record_dir=record_dir, record_key=RECORD_KEY
+    ).ocb  # nosec B106
 
 
 @pytest.fixture(name="bundle")
 def bundle_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Return a bundle whose script installs a stand-in ocb-agent under tmp_path."""
-    bundle = write_bundle(tmp_path, installer_script(tmp_path / "bin" / "ocb-agent"))
-    (tmp_path / "bin").mkdir()
+    bundle = write_bundle(tmp_path, installer_script(tool_agent(tmp_path)))
+    tool_agent(tmp_path).parent.mkdir(parents=True)
     monkeypatch.setattr(workspace, "assets_dir", lambda: bundle.parent)
     return bundle
 
@@ -287,7 +312,7 @@ def test_install_runs_the_bundled_script_once(
     """The real wheel name is found and installed plain; a rerun installs nothing."""
     assert installer.path() is None
     installed = installer.ensure(30)
-    assert installed == tmp_path / "bin" / "ocb-agent"
+    assert installed == tool_agent(tmp_path)
     assert installer.ensure(30) == installed
     log = (store_path / "installs.log").read_text().splitlines()
     assert log == [f"olas-ocb-agent[facilitator] @ {(bundle / WHEEL).as_uri()}"]
@@ -305,18 +330,17 @@ def test_the_install_record_stays_out_of_the_workspace(
 
 @POSIX_ONLY
 def test_a_workspace_records_in_the_service_folder(
-    store_path: Path, record_dir: Path, monkeypatch: pytest.MonkeyPatch
+    store_path: Path, record_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """By default the record sits beside STORE_PATH, not in the process cwd."""
     monkeypatch.chdir(record_dir)
-    agent = store_path.parent / "ocb-agent"
-    agent.write_text("#!/bin/sh\n")
-    agent.chmod(0o755)
+    agent = make_agent(tool_agent(tmp_path))
+    installer = Workspace(store_path, "tok", record_key=RECORD_KEY).ocb  # nosec B106
     (store_path.parent / ocb.OCB_RECORD_FILE).write_text(
-        json.dumps({"path": str(agent)})
+        installer._signed_record(agent, "x")  # pylint: disable=protected-access
     )
     monkeypatch.setattr(workspace, "assets_dir", lambda: record_dir / "no-bundle")
-    assert Workspace(store_path, "tok").ocb.path() == agent  # nosec B106
+    assert installer.path() == agent
 
 
 @POSIX_ONLY
@@ -327,12 +351,14 @@ def test_a_restart_that_rebuilds_the_deployment_does_not_reinstall(
     deployment = tmp_path / "deployment"
     deployment.mkdir()
     monkeypatch.chdir(deployment)
-    installed = Workspace(store_path, "tok").ocb.ensure(30)  # nosec B106
+    installed = Workspace(store_path, "tok", record_key=RECORD_KEY).ocb.ensure(
+        30
+    )  # nosec B106
     monkeypatch.chdir(tmp_path)
     shutil.rmtree(deployment)  # the middleware's rebuild of the deployment
     deployment.mkdir()
     monkeypatch.chdir(deployment)
-    restarted = Workspace(store_path, "tok").ocb  # nosec B106
+    restarted = Workspace(store_path, "tok", record_key=RECORD_KEY).ocb  # nosec B106
     assert restarted.path() == installed
     assert restarted.ensure(30) == installed
     log = (store_path / "installs.log").read_text().splitlines()
@@ -347,8 +373,8 @@ def test_a_newer_bundled_wheel_installs_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A Connect release with another wheel reaches users who installed before."""
-    (tmp_path / "bin").mkdir()
-    script = installer_script(tmp_path / "bin" / "ocb-agent")
+    tool_agent(tmp_path).parent.mkdir(parents=True)
+    script = installer_script(tool_agent(tmp_path))
     old = write_bundle(tmp_path / "old", script)
     monkeypatch.setattr(workspace, "assets_dir", lambda: old.parent)
     installer.ensure(30)
@@ -382,8 +408,8 @@ def test_a_moved_bundle_does_not_reinstall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The packaged binary extracts its bundle somewhere new on every start."""
-    (tmp_path / "bin").mkdir()
-    script = installer_script(tmp_path / "bin" / "ocb-agent")
+    tool_agent(tmp_path).parent.mkdir(parents=True)
+    script = installer_script(tool_agent(tmp_path))
     first = write_bundle(tmp_path / "run1", script)
     monkeypatch.setattr(workspace, "assets_dir", lambda: first.parent)
     installed = installer.ensure(30)
@@ -410,7 +436,7 @@ def test_install_reruns_when_the_installed_binary_is_gone(
     """A start with the stored path gone installs again."""
     installer.ensure(30).unlink()
     assert installer.path() is None
-    assert installer.ensure(30) == tmp_path / "bin" / "ocb-agent"
+    assert installer.ensure(30) == tool_agent(tmp_path)
     assert len((store_path / "installs.log").read_text().splitlines()) == 2
 
 
@@ -433,6 +459,120 @@ def test_an_unusable_record_means_reinstall(
     """A record that is not one of ours is treated as not installed."""
     (record_dir / ocb.OCB_RECORD_FILE).write_text(record)
     assert installer.path() is None
+
+
+@POSIX_ONLY
+def test_a_record_without_a_valid_mac_means_reinstall(
+    bundle: Path,
+    installer: OcbInstaller,
+    record_dir: Path,
+    store_path: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Edited, unsigned (written before records were signed) or another key's."""
+    installed = installer.ensure(30)
+    record = record_dir / ocb.OCB_RECORD_FILE
+    signed = json.loads(record.read_text())
+    other = make_agent(tmp_path / "tools" / "olas-ocb-agent" / "x" / "ocb-agent")
+    stranger = Workspace(
+        store_path, "tok", record_dir=record_dir, record_key=b"o" * 32
+    ).ocb  # nosec B106
+    for written in (
+        {**signed, "path": str(other)},  # the path edited
+        {"path": signed["path"], "requirement": signed["requirement"]},  # unsigned
+        json.loads(
+            stranger._signed_record(  # pylint: disable=protected-access
+                installed, signed["requirement"]
+            )
+        ),
+    ):
+        record.write_text(json.dumps(written))
+        assert installer.path() is None
+    assert "unsigned or was changed; reinstalling OCB" in caplog.text
+    assert installer.ensure(30) == installed  # and it installs again
+    assert len((store_path / "installs.log").read_text().splitlines()) == 2
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize(
+    "where",
+    [
+        "elsewhere/ocb-agent",  # outside uv's tool dir
+        "tools/other-tool/bin/ocb-agent",  # another uv tool
+        "tools/olas-ocb-agent/bin/pearl",  # inside, but not ocb-agent
+    ],
+)
+def test_a_signed_record_must_name_uv_s_ocb_agent(
+    installer: OcbInstaller,
+    record_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+) -> None:
+    """Even a valid record launches only olas-ocb-agent's ocb-agent."""
+    monkeypatch.setattr(workspace, "assets_dir", lambda: tmp_path / "no-bundle")
+    agent = make_agent(tmp_path / where)
+    (record_dir / ocb.OCB_RECORD_FILE).write_text(
+        installer._signed_record(agent, "x")  # pylint: disable=protected-access
+    )
+    assert installer.path() is None
+
+
+@POSIX_ONLY
+def test_uv_s_link_in_its_bin_directory_is_launched_by_that_path(
+    installer: OcbInstaller,
+    record_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What install.sh prints: ~/.local/bin/ocb-agent, a link into the tool dir."""
+    monkeypatch.setattr(workspace, "assets_dir", lambda: tmp_path / "no-bundle")
+    link = tmp_path / "bin" / "ocb-agent"
+    link.parent.mkdir()
+    link.symlink_to(make_agent(tool_agent(tmp_path)))
+    (record_dir / ocb.OCB_RECORD_FILE).write_text(
+        installer._signed_record(link, "x")  # pylint: disable=protected-access
+    )
+    assert installer.path() == link
+
+
+@POSIX_ONLY
+def test_an_installer_reporting_another_program_fails_the_install(
+    tmp_path: Path, installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path outside uv's tool dir is never recorded, so never launched."""
+    agent = tmp_path / "elsewhere" / "ocb-agent"
+    agent.parent.mkdir()
+    bundle = write_bundle(tmp_path, installer_script(agent))
+    monkeypatch.setattr(workspace, "assets_dir", lambda: bundle.parent)
+    with pytest.raises(InstallError, match="no ocb-agent executable"):
+        installer.ensure(30)
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"UV_TOOL_DIR": "/t", "XDG_DATA_HOME": "/x", "HOME": "/h"}, "/t"),
+        ({"XDG_DATA_HOME": "/x", "HOME": "/h"}, "/x/uv/tools"),
+        ({"HOME": "/h"}, "/h/.local/share/uv/tools"),
+        ({}, None),  # no HOME in the environment: this user's home
+    ],
+)
+def test_uv_s_tool_dir_follows_uv_s_rule(
+    store_path: Path, env: dict[str, str], expected: str | None
+) -> None:
+    """UV_TOOL_DIR, else $XDG_DATA_HOME/uv/tools, else ~/.local/share/uv/tools."""
+    installer = OcbInstaller(
+        store_path,
+        store_path.parent,
+        bundle_dir=lambda: store_path,
+        env=lambda: env,
+        record_key=RECORD_KEY,
+    )
+    tool_dir = installer._tool_dir()  # pylint: disable=protected-access
+    want = Path(expected) if expected else Path.home() / ".local/share/uv/tools"
+    assert tool_dir == want
 
 
 def test_an_unreadable_record_means_reinstall(
@@ -796,12 +936,12 @@ def test_only_the_last_line_the_installer_prints_is_the_path(
     tmp_path: Path, installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Chatter before the path, and blank lines after it, are ignored."""
-    agent = tmp_path / "bin" / "ocb-agent"
+    agent = tool_agent(tmp_path)
     script = installer_script(agent).replace(
         "#!/bin/sh\n", "#!/bin/sh\necho 'resolved 12 packages'\n"
     )
     bundle = write_bundle(tmp_path, script + "echo\necho '  '\n")
-    (tmp_path / "bin").mkdir()
+    agent.parent.mkdir(parents=True)
     monkeypatch.setattr(workspace, "assets_dir", lambda: bundle.parent)
     assert installer.ensure(30) == agent
 
