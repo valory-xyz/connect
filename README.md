@@ -190,8 +190,9 @@ safe) has a chat mech: `OCB_CHAT_MECH_<CHAIN>` if set (e.g.
 `OCB_CHAT_MECH_GNOSIS=0x...`, a QA override Pearl never sets; anything but an
 address is a configuration error), else that chain's entry in
 `OCB_CHAT_MECHS` (`connect/settings.py`), where `None` means no confirmed
-chat mech. `__main__.instance_ocb_mech` resolves it once, and both this rule
-and the launch line read that value. `PATCH /settings` and `POST /session`
+chat mech. `__main__.resolve_ocb_mech` resolves it once at boot, and both
+this rule and the launch line read that value. When it finds none it logs
+why: no single chain carries a safe, or an override names another chain. `PATCH /settings` and `POST /session`
 refuse an unavailable harness with a 400, and a saved `ocb_cli` that has
 become unavailable (a settings file copied between machines) loads as the
 default, logged once.
@@ -213,11 +214,15 @@ startup, so the extra is required), and the
 whole process group is killed, uv and curl included. It brings uv and a
 Python of its own, prints the absolute path of `ocb-agent` on success, and a
 one-line reason on stderr otherwise; that line becomes `/session`'s `error`.
-Connect records the path with the wheel it came from in `.ocb-agent.json` in
-its own working directory (beside `log.txt`), outside the workspace, so the
-session cannot point the next launch at another program. A record naming
-another wheel than the one bundled installs again, so a release with a newer
-wheel reaches existing installs. One install runs at a time. Nothing is
+Connect records the path, with the requirement it installed
+(`olas-ocb-agent[facilitator] @ <wheel file name>`), in `.ocb-agent.json` in
+its own working directory (beside `log.txt`), outside the workspace and
+readable by its owner alone, so the session cannot point the next launch at
+another program. A record naming another requirement than the bundled one
+installs again, so a release with a newer wheel, or a different extra,
+reaches existing installs; the bundle's own location is left out, since the
+packaged binary extracts it somewhere new on every start. One install runs
+at a time. Nothing is
 installed for an operator who never selects `ocb_cli`.
 
 **Launch.** A terminal opens, the same way as for `codex_cli`, running
@@ -373,8 +378,10 @@ it opens in. Repeated auth failures are audited to the activity log and
 rate-limited (429) so a probed token is loud, not silent. The
 token itself is header-only, rotated per run, dies with the process, and the
 provisioned workspace ships a `.gitignore` so it is never committed and, for
-Claude Code, `Read` deny rules on `.mcp.json*` and `.codex/config.toml*` so it is
-not read into session transcripts.
+Claude Code, `Read` deny rules on `.mcp.json*`, `.codex/config.toml*` and
+`ocb-agent/**` (OCB's own copy of the token) so it is not read into session
+transcripts. Those rules bind Claude Code only: a Codex or OCB session can read
+the token, including the one in OCB's `ocb-agent/` shim.
 
 Out of scope for v1: SSH port forwarding or running on a shared/remote
 machine voids the loopback assumption entirely, and same-user local malware

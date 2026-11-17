@@ -19,18 +19,20 @@
 
 """Environment-driven configuration.
 
-All values arrive as environment variables injected by the Pearl middleware
-(from the service template / agent.json). This module is the only place that
-knows the env var names.
+Values arrive as environment variables, almost all injected by the Pearl
+middleware (from the service template / agent.json); the exception is the
+QA-only OCB_CHAT_MECH_<CHAIN>, which Pearl never sets. This module is the only
+place that knows the env var names.
 """
 
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
+
+from web3 import Web3
 
 from connect.run_goal import check_target
 
@@ -53,7 +55,6 @@ MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 # A QA override, never set by Pearl: OCB_CHAT_MECH_GNOSIS=0x... gives OCB that
 # chain's chat mech before the shipped table has a confirmed one
 OCB_CHAT_MECH_ENV_PREFIX = "OCB_CHAT_MECH_"
-ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 DEFAULT_LOG_LEVEL = "info"
@@ -237,7 +238,8 @@ def _parse_ocb_chat_mechs(env: dict[str, str]) -> dict[str, str]:
     for key, value in env.items():
         if not key.startswith(OCB_CHAT_MECH_ENV_PREFIX) or not value.strip():
             continue
-        if not ADDRESS_RE.fullmatch(value.strip()):
+        # the same address rule as the settings whitelist, checksum included
+        if not Web3.is_address(value.strip()):
             raise ValueError(f"{key} is not an address: {value!r}")
         chain = key[len(OCB_CHAT_MECH_ENV_PREFIX) :].lower()
         overrides[chain] = value.strip()

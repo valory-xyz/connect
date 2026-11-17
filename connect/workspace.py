@@ -56,6 +56,7 @@ from connect.ocb import (
     OcbInstaller,
     ocb_command,
 )
+from connect.private_files import write_private
 from connect.settings import (
     DEFAULT_HARNESS,
     HARNESS_CLAUDE_CODE_CLI,
@@ -444,7 +445,13 @@ class Workspace:
             self.ocb.start()
 
     def _open_ocb(self) -> str:
-        """Install OCB if it is missing, then open a terminal running it."""
+        """Install OCB if it is missing, then open a terminal running it.
+
+        :raises ValueError: with no chat mech — checked before any install,
+            so a launch that cannot happen never waits on one.
+        """
+        if self._ocb_mech is None:
+            raise ValueError("OCB has no confirmed chat mech on this instance's chain")
         command = ocb_command(
             self.ocb.ensure(OCB_SESSION_WAIT_SECONDS), self._ocb_mech, self.path
         )
@@ -487,7 +494,7 @@ class Workspace:
             "headers": {"Authorization": f"Bearer {self._token}"},
             "timeout": MCP_TOOL_TIMEOUT_MS,
         }
-        _write_private(path, json.dumps(config, indent=2))
+        write_private(path, json.dumps(config, indent=2))
 
     def _write_codex_config(self) -> None:
         """Merge our server entry into .codex/config.toml (0600), keeping the rest."""
@@ -504,7 +511,7 @@ class Workspace:
             "network_access", True
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write_private(path, tomli_w.dumps(config))
+        write_private(path, tomli_w.dumps(config))
 
     def _write_gitignore(self) -> None:
         """Keep the token file out of any repo the agent may init here."""
@@ -536,7 +543,7 @@ class Workspace:
             if rule not in deny:
                 deny.append(rule)
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write_private(path, json.dumps(config, indent=2))
+        write_private(path, json.dumps(config, indent=2))
 
     def _install_lib(self) -> None:
         """Overwrite the shared modules our skills import, beside each skills dir."""
@@ -625,16 +632,6 @@ def _load_config(path: Path, loads: t.Callable[[str], t.Any], *tables: str) -> d
         backup,
     )
     return {}
-
-
-def _write_private(path: Path, text: str) -> None:
-    """Atomically replace a file, readable by its owner alone."""
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.unlink(missing_ok=True)  # a stale tmp may have looser permissions
-    tmp.touch(mode=0o600)
-    tmp.write_text(text, encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
 
 
 def _login_shell() -> str:

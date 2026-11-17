@@ -120,9 +120,7 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
             if override is not None
             else state.settings_store.load().harness
         )
-        unavailable = state.settings_store.unavailable_reason(requested)
-        if unavailable is not None:
-            raise ValueError(f"harness {requested} is unavailable: {unavailable}")
+        state.settings_store.require_available(requested)
         # a harness the operator may choose but nobody can open is a bug, not a
         # server fault to 500 over: answer the caller the same way as any other
         # unusable harness (test_every_choosable_harness_can_be_opened pins

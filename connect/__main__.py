@@ -173,12 +173,28 @@ def resolve_password(argv: list[str] | None = None) -> str | None:
     return password
 
 
-def instance_ocb_mech(config: AppConfig) -> str | None:
+def resolve_ocb_mech(config: AppConfig) -> str | None:
     """Return OCB's model here: the instance chain's chat mech, override first.
 
-    One resolution for the availability rule and the launch line alike.
+    Called once at boot; the availability rule and the launch line both read
+    its answer. When there is none, say why: an operator who set an override
+    otherwise sees only `model_unavailable`.
     """
-    return ocb_chat_mech(config.instance_chain, config.ocb_chat_mech_overrides)
+    logger = logging.getLogger("agent")
+    chain = config.instance_chain
+    if chain is None:
+        logger.warning(
+            "OCB has no chat mech: no single instance chain (chains with a "
+            "safe: %s)",
+            sorted(n for n, c in config.chains.items() if c.safe_address) or "none",
+        )
+    for other in sorted(set(config.ocb_chat_mech_overrides) - {chain}):
+        logger.warning(
+            "OCB_CHAT_MECH_%s has no effect: this instance runs on %s",
+            other.upper(),
+            chain,
+        )
+    return ocb_chat_mech(chain, config.ocb_chat_mech_overrides)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -205,17 +221,17 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("configured chains: %s", sorted(config.chains) or "none")
 
     activity = ActivityLog(config.store_path, RunGoal(config.minutes_per_run))
+    ocb_mech = resolve_ocb_mech(config)
     settings_store = SettingsStore(
         config.store_path / SETTINGS_FILE,
         derive_mac_key(account),
         activity,
         unavailable=lambda harness: harness_unavailable_reason(
-            harness, instance_ocb_mech(config), sys.platform
+            harness, ocb_mech, sys.platform
         ),
     )
     guard = Guard(settings_store, config, agent_signer=account.address)
     signer = Signer(account=account, config=config, activity=activity, guard=guard)
-    mech = MechService(signer, config, activity, guard)
     logger.info("guardrail mode: %s", guard.mode())
     token = secrets.token_urlsafe(32)
 
@@ -227,9 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     # beats a crash loop the middleware just keeps restarting); the workspace
     # re-attempts its own population on every /healthcheck, so a condition that
     # clears by itself heals without a restart.
-    agent_workspace = workspace.Workspace(
-        config.store_path, token, instance_ocb_mech(config)
-    )
+    agent_workspace = workspace.Workspace(config.store_path, token, ocb_mech)
     agent_workspace.ensure()
 
     # Pearl reads it whatever our health, so write it even on a degraded boot.
@@ -244,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
         token=token,
         guard=guard,
         settings_store=settings_store,
-        mech=mech,
+        mech=MechService(signer, config, activity, guard),
         workspace=agent_workspace,
     )
 

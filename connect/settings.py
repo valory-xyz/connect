@@ -112,8 +112,10 @@ OCB_CHAT_MECHS: dict[str, str | None] = {
     "polygon": None,
     "robinhood": None,
 }
-UNAVAILABLE_WINDOWS = "windows_unsupported"
-UNAVAILABLE_MODEL = "model_unavailable"
+# the only reasons GET /settings may give; connect-ui renders each one
+UnavailableReason = t.Literal["windows_unsupported", "model_unavailable"]
+UNAVAILABLE_WINDOWS: UnavailableReason = "windows_unsupported"
+UNAVAILABLE_MODEL: UnavailableReason = "model_unavailable"
 
 _MAC_KEY_INFO = b"pearl-connect settings hmac v1"
 
@@ -169,7 +171,7 @@ def validate_harness(value: object) -> str:
 
 def harness_unavailable_reason(
     harness: str, ocb_mech: str | None, platform: str
-) -> str | None:
+) -> UnavailableReason | None:
     """Why `harness` cannot be used on this instance, or None when it can.
 
     OCB runs unsandboxed on native Windows, where a session could read the
@@ -193,7 +195,9 @@ def ocb_chat_mech(
     return (overrides or {}).get(chain) or OCB_CHAT_MECHS.get(chain)
 
 
-def harness_options(unavailable: t.Callable[[str], str | None]) -> list[dict]:
+def harness_options(
+    unavailable: t.Callable[[str], UnavailableReason | None],
+) -> list[dict]:
     """GET /settings' `harnesses`: each harness and why it is unavailable, if so."""
     options = []
     for harness in HARNESSES:
@@ -405,7 +409,7 @@ class SettingsStore:
         path: Path,
         mac_key: bytes,
         activity: ActivityLog,
-        unavailable: t.Callable[[str], str | None] = lambda _: None,
+        unavailable: t.Callable[[str], UnavailableReason | None] = lambda _: None,
     ) -> None:
         """Initialize; `unavailable` names why a harness is unusable here, or None."""
         self._path = path
@@ -422,9 +426,19 @@ class SettingsStore:
         with self._lock:
             return self._usable(self._load())
 
-    def unavailable_reason(self, harness: str) -> str | None:
+    def unavailable_reason(self, harness: str) -> UnavailableReason | None:
         """Why this instance cannot use `harness`, or None when it can."""
         return self._unavailable(harness)
+
+    def require_available(self, harness: str) -> None:
+        """Refuse a harness this instance cannot use.
+
+        :raises ValueError: naming the reason, for PATCH /settings and
+            POST /session alike.
+        """
+        reason = self.unavailable_reason(harness)
+        if reason is not None:
+            raise ValueError(f"harness {harness} is unavailable: {reason}")
 
     def harnesses(self) -> list[dict]:
         """Every harness with its availability on this instance."""
@@ -466,9 +480,7 @@ class SettingsStore:
         """
         harness = patch.get("harness")
         if harness is not None:
-            reason = self.unavailable_reason(validate_harness(harness))
-            if reason is not None:
-                raise ValueError(f"harness {harness} is unavailable: {reason}")
+            self.require_available(validate_harness(harness))
         with self._lock:
             # merged onto the stored harness, not the usable one: a patch of
             # something else must not overwrite a harness unavailable only here

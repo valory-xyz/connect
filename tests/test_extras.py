@@ -22,6 +22,7 @@
 import io
 import json
 import logging
+import os
 import sys
 import threading
 import time as time_module
@@ -48,6 +49,7 @@ from connect.config import (
     ChainConfig,
     FUND_REQUIREMENTS_ENV,
     MINUTES_PER_RUN_ENV,
+    OCB_CHAT_MECH_ENV_PREFIX,
     SAFES_ENV,
     STORE_PATH_ENV,
     load_config,
@@ -102,6 +104,8 @@ def boot_env_fixture(
     monkeypatch.setenv(STORE_PATH_ENV, str(store_path))
     monkeypatch.delenv(SAFES_ENV, raising=False)
     monkeypatch.delenv(FUND_REQUIREMENTS_ENV, raising=False)
+    for key in [k for k in os.environ if k.startswith(OCB_CHAT_MECH_ENV_PREFIX)]:
+        monkeypatch.delenv(key)  # a QA override left in the shell
     return store_path
 
 
@@ -503,9 +507,14 @@ class TestMain:
         ]
 
     def test_main_without_a_chat_mech_offers_no_ocb(
-        self, monkeypatch: pytest.MonkeyPatch, boot_env: Path, served: list[StubServer]
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """An override for another chain does not make OCB available here."""
+        monkeypatch.setattr(main_module.sys, "platform", "linux")
         monkeypatch.setenv("OCB_CHAT_MECH_POLYGON", "0x" + "ab" * 20)
         monkeypatch.setenv(
             "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
@@ -514,6 +523,36 @@ class TestMain:
         assert main_module.main(["--password", TEST_PASSWORD]) == 0
         harnesses = served[0].config.app.state.settings_store.harnesses()
         assert harnesses[-1]["unavailable_reason"] == "model_unavailable"
+        # QA sees why the override did nothing
+        assert "OCB_CHAT_MECH_POLYGON has no effect" in caplog.text
+
+    def test_main_without_an_instance_chain_says_so(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No safe means no instance chain, and the log names that cause."""
+        monkeypatch.setenv("OCB_CHAT_MECH_GNOSIS", "0x" + "ab" * 20)
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        harnesses = served[0].config.app.state.settings_store.harnesses()
+        assert harnesses[-1]["available"] is False
+        assert "no single instance chain" in caplog.text
+
+    def test_main_keeps_ocb_off_native_windows(
+        self, monkeypatch: pytest.MonkeyPatch, boot_env: Path, served: list[StubServer]
+    ) -> None:
+        """The real platform reaches the rule: Windows wins over a confirmed mech."""
+        monkeypatch.setattr(main_module.sys, "platform", "win32")
+        monkeypatch.setenv("OCB_CHAT_MECH_GNOSIS", "0x" + "ab" * 20)
+        monkeypatch.setenv(
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS", "http://127.0.0.1:9"
+        )
+        monkeypatch.setenv(SAFES_ENV, json.dumps({"gnosis": "0x" + "22" * 20}))
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        harnesses = served[0].config.app.state.settings_store.harnesses()
+        assert harnesses[-1]["unavailable_reason"] == "windows_unsupported"
 
     def test_populate_failure_serves_unhealthy(
         self,

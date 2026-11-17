@@ -36,6 +36,7 @@ import typing as t
 from pathlib import Path
 
 from connect.launch_errors import InstallError
+from connect.private_files import write_private
 from connect.settings import OCB_MODEL_BUDGET_USD
 
 logger = logging.getLogger("agent")
@@ -59,17 +60,12 @@ OCB_EXTRA = "facilitator"
 OCB_INSTALL_LOG_CHARS = 2000
 
 
-def ocb_command(path: Path, mech: str | None, store_path: Path) -> str:
+def ocb_command(path: Path, mech: str, store_path: Path) -> str:
     """Return the shell-quoted line running OCB in store_path with `mech` as model.
 
     `--dir` names this instance's workspace: without it ocb-agent picks the
     first Connect service it finds under ~/.operate.
-
-    :raises ValueError: when there is no confirmed chat mech — a launch must
-        never hand OCB a model that does not exist.
     """
-    if mech is None:
-        raise ValueError("OCB has no confirmed chat mech on this instance's chain")
     return shlex.join(
         [
             str(path),
@@ -86,6 +82,39 @@ def ocb_command(path: Path, mech: str | None, store_path: Path) -> str:
 def ocb_agent_spec(wheel: Path) -> str:
     """Return the requirement install.sh installs: the bundled wheel, with its extra."""
     return f"{OCB_PACKAGE}[{OCB_EXTRA}] @ {wheel.as_uri()}"
+
+
+def install_identity(wheel: Path) -> str:
+    """Return what an install is recorded as: the requirement, by wheel name.
+
+    Not ocb_agent_spec: its URI holds the bundle's location, which in the
+    packaged binary is a fresh extraction directory on every start.
+    """
+    return f"{OCB_PACKAGE}[{OCB_EXTRA}] @ {wheel.name}"
+
+
+class _Attempt:
+    """One background install, and the error it ended with, if any.
+
+    Kept per attempt so a caller joining one install reads that install's
+    error, even after a later start() has begun another.
+    """
+
+    def __init__(self, run: t.Callable[["_Attempt"], None]) -> None:
+        """Start running `run` on a daemon thread."""
+        self.error: InstallError | None = None
+        self._thread = threading.Thread(
+            target=run, args=(self,), name="ocb-install", daemon=True
+        )
+        self._thread.start()
+
+    def join(self, timeout: float) -> None:
+        """Wait up to `timeout` seconds for the install to end."""
+        self._thread.join(timeout)
+
+    def is_alive(self) -> bool:
+        """Return whether the install is still running."""
+        return self._thread.is_alive()
 
 
 def _bundled_ocb(bundle_dir: t.Callable[[], Path]) -> tuple[Path, Path]:
@@ -110,9 +139,10 @@ class OcbInstaller:
     The script brings uv and a Python of its own, installs the bundled wheel
     and prints the absolute path of `ocb-agent`, which is launched by path:
     uv's tool directory is not always on the login PATH. The path is recorded
-    with the wheel it came from, so a Connect release bundling another wheel
-    installs again. The record lives in `record_dir`, outside the workspace,
-    so the session cannot point Connect's next launch at another program.
+    with the requirement it came from (install_identity), so a Connect release
+    bundling another wheel, or asking for another extra, installs again. The
+    record lives in `record_dir`, outside the workspace, so the session cannot
+    point Connect's next launch at another program.
     """
 
     def __init__(
@@ -131,8 +161,7 @@ class OcbInstaller:
         self._env = env
         self._record = record_dir / OCB_RECORD_FILE
         self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._error: InstallError | None = None
+        self._attempt: _Attempt | None = None
 
     def _read_record(self) -> dict:
         """Return the install record, or {} when there is no usable one."""
@@ -152,28 +181,24 @@ class OcbInstaller:
         if installed is None:
             return None
         try:
-            bundled = _bundled_ocb(self._bundle_dir)[1].name
+            bundled = install_identity(_bundled_ocb(self._bundle_dir)[1])
         except InstallError:
             return installed  # nothing newer to install
-        if record.get("wheel") != bundled:
+        if record.get("installed") != bundled:
             logger.info(
-                "bundled OCB wheel is now %s (installed: %s); reinstalling",
+                "bundled OCB is now %s (installed: %s); reinstalling",
                 bundled,
-                record.get("wheel"),
+                record.get("installed"),
             )
             return None
         return installed
 
-    def start(self) -> threading.Thread:
+    def start(self) -> _Attempt:
         """Start an install in the background, or return the one running."""
         with self._lock:
-            if self._thread is None or not self._thread.is_alive():
-                self._error = None
-                self._thread = threading.Thread(
-                    target=self._install_in_background, name="ocb-install", daemon=True
-                )
-                self._thread.start()
-            return self._thread
+            if self._attempt is None or not self._attempt.is_alive():
+                self._attempt = _Attempt(self._install_in_background)
+            return self._attempt
 
     def ensure(self, wait: float) -> Path:
         """Return `ocb-agent`, installing it first if needed, waiting up to `wait`.
@@ -193,18 +218,18 @@ class OcbInstaller:
         installed = self.path()
         if installed is not None:
             return installed
-        raise self._error or InstallError("OCB could not be installed")
+        raise install.error or InstallError("OCB could not be installed")
 
-    def _install_in_background(self) -> None:
+    def _install_in_background(self, attempt: _Attempt) -> None:
         try:
             if self.path() is None:
                 self._install(OCB_INSTALL_TIMEOUT_SECONDS)
         except InstallError as e:
-            self._error = e
+            attempt.error = e
             logger.error("OCB install failed: %s", e)
         except Exception as e:  # pylint: disable=broad-exception-caught
             # a thread's own excepthook prints to stderr, not to log.txt
-            self._error = InstallError(f"OCB install failed unexpectedly: {e}")
+            attempt.error = InstallError(f"OCB install failed unexpectedly: {e}")
             logger.exception("OCB install failed unexpectedly")
 
     def _install(self, timeout: float) -> Path:
@@ -233,9 +258,11 @@ class OcbInstaller:
         if installed is None:
             raise InstallError("the OCB installer reported no ocb-agent executable")
         try:
-            self._record.write_text(
-                json.dumps({"path": str(installed), "wheel": wheel.name}),
-                encoding="utf-8",
+            write_private(
+                self._record,
+                json.dumps(
+                    {"path": str(installed), "installed": install_identity(wheel)}
+                ),
             )
         except OSError as e:
             raise InstallError(f"could not record where OCB is installed: {e}") from e

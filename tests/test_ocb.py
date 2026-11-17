@@ -48,6 +48,7 @@ from connect.settings import (
     SETTINGS_FILE,
     Settings,
     SettingsStore,
+    UnavailableReason,
     derive_mac_key,
     harness_unavailable_reason,
     ocb_chat_mech,
@@ -95,12 +96,7 @@ def record_dir_fixture(tmp_path: Path) -> Path:
 def installer_fixture(store_path: Path, record_dir: Path) -> OcbInstaller:
     """Return an installer for the workspace, recording outside it."""
     store_path.mkdir(parents=True, exist_ok=True)
-    return OcbInstaller(
-        store_path,
-        record_dir,
-        bundle_dir=lambda: workspace.assets_dir() / ocb.OCB_ASSETS_SUBDIR,
-        env=workspace.harness_env,
-    )
+    return Workspace(store_path, "tok", record_dir=record_dir).ocb  # nosec B106
 
 
 @pytest.fixture(name="bundle")
@@ -164,7 +160,10 @@ def test_the_chat_mech_is_the_override_then_the_shipped_one(
 
 
 def store_with(
-    path: Path, account: LocalAccount, activity: ActivityLog, reason: str | None
+    path: Path,
+    account: LocalAccount,
+    activity: ActivityLog,
+    reason: UnavailableReason | None,
 ) -> SettingsStore:
     """Return a settings store on which OCB is unavailable for `reason`, if any."""
     return SettingsStore(
@@ -217,6 +216,8 @@ def test_patching_to_an_unavailable_ocb_is_refused(
     store = store_with(store_path, account, activity, "model_unavailable")
     with pytest.raises(ValueError, match="model_unavailable"):
         store.patch({"harness": HARNESS_OCB_CLI})
+    # refused before anything is written: not even the defaults exist yet
+    assert not (store_path / SETTINGS_FILE).exists()
     assert store.load().harness == DEFAULT_HARNESS
     assert store.harnesses()[-1] == {
         "id": HARNESS_OCB_CLI,
@@ -244,15 +245,20 @@ def test_ocb_runs_by_path_in_this_workspace_with_the_chat_mech() -> None:
     ]
 
 
-def test_ocb_is_never_launched_without_a_mech() -> None:
-    """A None mech would hand OCB a model that does not exist."""
+def test_ocb_is_never_launched_or_installed_without_a_mech(store_path: Path) -> None:
+    """A None mech would hand OCB a model that does not exist; nothing installs."""
+    agent_workspace = Workspace(
+        store_path, "tok", None, store_path.parent
+    )  # nosec B106
+    agent_workspace.ocb.ensure = pytest.fail  # type: ignore[method-assign]
     with pytest.raises(ValueError, match="chat mech"):
-        ocb.ocb_command(Path("/bin/ocb-agent"), None, Path("/store"))
+        agent_workspace.open_session(HARNESS_OCB_CLI)
 
 
 # --- install ---------------------------------------------------------------
 
 
+@POSIX_ONLY
 def test_the_wheel_installs_with_the_facilitator_extra() -> None:
     """ocb-agent's CLI imports the facilitator at startup; a plain wheel crashes."""
     wheel = Path("/opt/connect/assets/ocb dir") / WHEEL
@@ -322,6 +328,48 @@ def test_a_newer_bundled_wheel_installs_again(
 
 
 @POSIX_ONLY
+def test_a_change_of_extra_installs_again(
+    bundle: Path, installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same wheel, another extra: the install on disk is not what is asked for.
+
+    How a machine that installed the plain wheel picks up [facilitator].
+    """
+    installer.ensure(30)
+    monkeypatch.setattr(ocb, "OCB_EXTRA", "something-else")
+    assert installer.path() is None
+
+
+@POSIX_ONLY
+def test_a_moved_bundle_does_not_reinstall(
+    tmp_path: Path,
+    installer: OcbInstaller,
+    store_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The packaged binary extracts its bundle somewhere new on every start."""
+    (tmp_path / "bin").mkdir()
+    script = installer_script(tmp_path / "bin" / "ocb-agent")
+    first = write_bundle(tmp_path / "run1", script)
+    monkeypatch.setattr(workspace, "assets_dir", lambda: first.parent)
+    installed = installer.ensure(30)
+    again = write_bundle(tmp_path / "run2", script)
+    monkeypatch.setattr(workspace, "assets_dir", lambda: again.parent)
+    assert installer.path() == installed
+    assert len((store_path / "installs.log").read_text().splitlines()) == 1
+
+
+@POSIX_ONLY
+def test_the_install_record_is_private(
+    bundle: Path, installer: OcbInstaller, record_dir: Path
+) -> None:
+    """It decides which program Connect launches; only its owner may read it."""
+    installer.ensure(30)
+    record = record_dir / ocb.OCB_RECORD_FILE
+    assert record.stat().st_mode & 0o777 == 0o600
+
+
+@POSIX_ONLY
 def test_install_reruns_when_the_installed_binary_is_gone(
     bundle: Path, installer: OcbInstaller, store_path: Path, tmp_path: Path
 ) -> None:
@@ -369,6 +417,10 @@ def test_an_unreadable_record_means_reinstall(
         ("echo 'no space left on device' >&2\nexit 3\n", "no space left on device"),
         ("exit 4\n", "exited 4"),
         ("echo relative/ocb-agent\n", "no ocb-agent executable"),
+        (  # a regular file, but not executable
+            ': > "$PWD/not-x" && echo "$PWD/not-x"\n',
+            "no ocb-agent executable",
+        ),
         ("echo /nonexistent/ocb-agent\n", "no ocb-agent executable"),
         ("echo\n", "no ocb-agent executable"),
     ],
@@ -555,9 +607,37 @@ def test_an_up_to_date_install_is_not_rerun_on_selection(
     installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Selecting OCB again with it installed runs nothing."""
+    calls: list[float] = []
     monkeypatch.setattr(OcbInstaller, "path", lambda self: Path("/opt/ocb-agent"))
-    monkeypatch.setattr(OcbInstaller, "_install", pytest.fail)
+    monkeypatch.setattr(
+        OcbInstaller, "_install", lambda self, timeout: calls.append(timeout)
+    )
     installer.start().join(5)
+    assert calls == []
+
+
+def test_a_joined_install_reports_its_own_error(
+    installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later start() must not wipe the failure an earlier install ended with."""
+    release = threading.Event()
+    outcomes = iter([InstallError("uv download failed"), None])
+
+    def install(self: OcbInstaller, timeout: float) -> Path:
+        outcome = next(outcomes)
+        if outcome is not None:
+            raise outcome
+        release.wait(5)
+        raise InstallError("second attempt")
+
+    monkeypatch.setattr(OcbInstaller, "_install", install)
+    first = installer.start()
+    first.join(5)
+    second = installer.start()  # another caller starts the next attempt
+    assert second is not first
+    assert str(first.error) == "uv download failed"
+    release.set()
+    second.join(5)
 
 
 def test_an_unexpected_background_failure_reaches_the_log_and_the_session(
@@ -680,7 +760,7 @@ def test_the_bundle_directory_says_what_goes_in_it() -> None:
 
 
 @pytest.fixture(name="ocb_reason")
-def ocb_reason_fixture() -> dict[str, str | None]:
+def ocb_reason_fixture() -> dict[str, UnavailableReason | None]:
     """Why OCB is unavailable in the route tests; mutable per test."""
     return {"reason": None}
 
@@ -690,7 +770,7 @@ def settings_store_fixture(
     account: LocalAccount,
     store_path: Path,
     activity: ActivityLog,
-    ocb_reason: dict[str, str | None],
+    ocb_reason: dict[str, UnavailableReason | None],
 ) -> SettingsStore:
     """Return the app's store, with OCB's availability under the test's control."""
     store = SettingsStore(
@@ -718,7 +798,7 @@ def client_fixture(
 
 
 def test_settings_list_ocb_with_its_reason(
-    client: TestClient, ocb_reason: dict[str, str | None]
+    client: TestClient, ocb_reason: dict[str, UnavailableReason | None]
 ) -> None:
     """The UI renders this list; the server owns the rule."""
     ocb_reason["reason"] = "windows_unsupported"
@@ -732,13 +812,18 @@ def test_settings_list_ocb_with_its_reason(
 
 
 def test_selecting_an_unavailable_ocb_is_a_400(
-    client: TestClient, ocb_reason: dict[str, str | None]
+    client: TestClient,
+    ocb_reason: dict[str, UnavailableReason | None],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Neither the preference nor a one-off launch can reach it."""
+    """Neither the preference nor a one-off launch can reach it, nor install it."""
+    started: list[bool] = []
+    monkeypatch.setattr(OcbInstaller, "start", lambda self: started.append(True))
     ocb_reason["reason"] = "model_unavailable"
     patched = client.patch("/settings", json={"harness": "ocb_cli"})
     assert patched.status_code == 400
     assert "model_unavailable" in patched.json()["detail"]
+    assert started == []
     launched = client.post("/session", json={"harness": "ocb_cli"})
     assert launched.status_code == 400
     assert "model_unavailable" in launched.json()["detail"]
