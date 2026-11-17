@@ -62,7 +62,8 @@ a = Analysis(
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=[],
+    # the bench's test interface is a library, never part of Pearl's binary
+    excludes=["connect.testing"],
     noarchive=False,
     # aea resolves its schema dir via inspect.getfile(currentframe()), which
     # inside the PYZ archive yields a relative path — ship it as source files.

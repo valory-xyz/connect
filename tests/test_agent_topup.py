@@ -38,6 +38,7 @@ from connect.server import app as app_module
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import Signer, SignerError, _ChainState
 from connect.signer_errors import SEND_FAILED
+from connect.switches import Switches
 from connect.wallet import AgentTopUp, plan_agent_topup
 
 from tests.conftest import FakeW3, audit_entries
@@ -644,6 +645,26 @@ class TestTopUpTask:
         at_shutdown = len(checks)
         time.sleep(0.1)
         assert len(checks) == at_shutdown
+
+    def test_is_not_started_with_the_switch_off(  # pylint: disable=too-many-arguments
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With AGENT_TOPUP_AT_BOOT off a cold start sends nothing."""
+        monkeypatch.setattr(app_module, "AGENT_TOPUP_INTERVAL_SECONDS", 0.01)
+        checks: list[tuple] = []
+        monkeypatch.setattr(
+            app_module, "top_up_agent_signer", lambda *a: checks.append(a)
+        )
+        off = Switches(agent_topup_at_boot=False)
+        app = make_app(test_signer, app_config, activity, switches=off)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            time.sleep(0.1)
+        assert not checks
 
     def test_funds_status_reads_the_task_s_outcomes(
         self,

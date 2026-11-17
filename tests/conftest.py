@@ -55,6 +55,7 @@ from connect.settings import (
     derive_mac_key,
 )
 from connect.signer import Signer, _ChainState
+from connect.switches import PRODUCTION, Switches
 from connect.workspace import Workspace
 
 TEST_PASSWORD = "test-password"  # nosec B105
@@ -612,6 +613,7 @@ def make_app(
         config: AppConfig,
         activity: ActivityLog,
         token: str = "tok",  # nosec B107
+        switches: Switches = PRODUCTION,
     ) -> t.Any:
         # the app's signing endpoints must honor the same guard the app serves
         signer.set_guard(guard)
@@ -627,6 +629,7 @@ def make_app(
             # populates it — so a test that needs it broken breaks populate(),
             # rather than reaching into the app's state to fake a flag
             workspace=Workspace(config.store_path, token, record_key=b"k" * 32),
+            switches=switches,
         )
 
     return _make

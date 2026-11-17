@@ -54,6 +54,7 @@ from connect.server.receipts import mined_result, settled
 from connect.server.strict import make_tools_strict
 from connect.settings import SettingsStore
 from connect.signer import Signer
+from connect.switches import PRODUCTION, Switches
 
 # tools that read and never sign, broadcast or pay: harnesses may run them
 # without asking the operator
@@ -113,6 +114,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     mech: MechService,
     settings_store: SettingsStore,
     grants: GrantStore,
+    switches: Switches = PRODUCTION,
 ) -> FastMCP:
     """Build mcp."""
     # Read once per build: tool registration happens here while wallet_info's
@@ -488,8 +490,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             """
             return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 
-    # a parameter a tool does not take is refused by name, never dropped
-    make_tools_strict(mcp, activity)
+    if switches.strict_parameters:
+        # a parameter a tool does not take is refused by name, never dropped
+        make_tools_strict(mcp, activity)
     return mcp
 
 

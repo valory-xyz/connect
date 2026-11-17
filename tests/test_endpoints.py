@@ -41,6 +41,7 @@ from connect.server import app as app_module
 from connect.server import receipts
 from connect.settings import HARNESSES
 from connect.signer import Signer
+from connect.switches import Switches
 
 from tests.conftest import FakeW3, audit_entries, audit_kinds, pay
 
@@ -532,6 +533,32 @@ class TestAuth:
         assert response.status_code == 200
         assert response.json()["tx_hash"].startswith("0x")
         assert len(fake_w3.eth.sent) == 1
+
+    def test_sign_and_send_is_not_routed_with_the_switch_off(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        fake_w3: FakeW3,
+    ) -> None:
+        """With REST_SIGNING_ROUTES off the EOA route is unrouted and sends nothing."""
+        off = Switches(rest_signing_routes=False)
+        app = make_app(test_signer, app_config, activity, token=TOKEN, switches=off)
+        with TestClient(app, base_url="http://127.0.0.1:8716") as off_client:
+            response = off_client.post(
+                "/sign-and-send",
+                json={"chain": "testchain", "to": "0x" + "aa" * 20},
+                headers=auth(),
+            )
+            unrouted = off_client.post("/no-such-route", json={}, headers=auth())
+        # answered as any path no POST route serves (the UI's GET catch-all
+        # makes that 405 rather than 404)
+        assert response.status_code == unrouted.status_code != 200
+        assert not fake_w3.eth.sent
+        paths = app.openapi()["paths"]
+        assert "/sign-and-send" not in paths
+        assert "/safe-transaction" in paths
 
     def test_safe_transaction(self, client: TestClient, fake_w3: FakeW3) -> None:
         """The route names the inner call; the server composes the safe's tx."""

@@ -40,6 +40,7 @@ from connect.server.strict import (
 )
 from connect.settings import SettingsStore
 from connect.signer import Signer
+from connect.switches import Switches
 
 from tests.conftest import FakeW3, audit_entries, grant_store
 
@@ -56,7 +57,7 @@ def mcp(  # pylint: disable=too-many-arguments
     mech_service: MechService,
     settings_store: SettingsStore,
 ) -> FastMCP:
-    """Return the MCP server as Connect builds it."""
+    """Return the MCP server built with the STRICT_PARAMETERS switch on."""
     return build_mcp(
         test_signer,
         app_config,
@@ -65,7 +66,34 @@ def mcp(  # pylint: disable=too-many-arguments
         mech=mech_service,
         settings_store=settings_store,
         grants=grant_store("workspace-token"),
+        switches=Switches(strict_parameters=True),
     )
+
+
+async def test_an_unknown_parameter_is_ignored_with_the_switch_off(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    guard: Guard,
+    mech_service: MechService,
+    settings_store: SettingsStore,
+    fake_w3: FakeW3,
+) -> None:
+    """STRICT_PARAMETERS is off in production: the call goes on without the key."""
+    lenient = build_mcp(
+        test_signer,
+        app_config,
+        activity,
+        guard=guard,
+        mech=mech_service,
+        settings_store=settings_store,
+        grants=grant_store("workspace-token"),
+    )
+    await lenient.call_tool(
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "targett": RECIPIENT},
+    )
+    assert len(fake_w3.eth.sent) == 1
 
 
 @pytest.fixture

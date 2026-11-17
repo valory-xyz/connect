@@ -46,6 +46,8 @@ logger = logging.getLogger("agent")
 
 
 router = APIRouter()
+# the EOA's own signing route, served only with the REST_SIGNING_ROUTES switch
+eoa_router = APIRouter()
 
 
 class _SendBody(StrictBody):
@@ -138,7 +140,7 @@ def _authorize(request: Request, action: str, body: _SendBody | None = None) -> 
     return authorize_route(request, request.app.state.activity, action, arguments)
 
 
-@router.post("/sign-and-send")
+@eoa_router.post("/sign-and-send")
 def sign_and_send(body: SignAndSendRequest, request: Request) -> dict:
     """Sign and send one transaction from the agent EOA."""
     replay_only = _authorize(request, "send_transaction", body)

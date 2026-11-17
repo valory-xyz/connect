@@ -51,7 +51,8 @@ other non-aea agent. It:
      body overrides the saved preference for that launch alone, without
      rewriting what the operator chose
    - a bearer-authed signing surface: `POST /safe-transaction` (the safe's call:
-     `target`, `value`, `data`), `POST /sign-and-send` (the EOA's: `to`,
+     `target`, `value`, `data`), `POST /sign-and-send` (the EOA's, routed only
+     with the `rest_signing_routes` switch, on in Pearl: `to`,
      `value`, `data`; both also take `request_id`, `intent`, and
      `wait_for_receipt`/`timeout`, answering `status` and the receipt as the
      MCP send tools do), `POST /sign-message`, `GET /wallet`. A send failure
@@ -77,10 +78,12 @@ other non-aea agent. It:
      mech-client's `redacted_cause`, its class and its text with every URL
      cut to scheme and host and every path or query cut. The `log.txt` line
      also says where each link was raised (file, line and function, never
-     its text), so a bug in Connect's own code is located. Every body and
-     every MCP tool refuses a parameter it does not take, with an error naming
-     the ones it does (`to` on the safe path is pointed at `target`); read-only
-     tools carry `readOnlyHint`
+     its text), so a bug in Connect's own code is located. Every body
+     refuses a parameter it does not take, with an error naming the ones it
+     does (`to` on the safe path is pointed at `target`); an MCP tool ignores
+     one, as OnchainBench's reference does, unless the `strict_parameters`
+     switch is on (off in Pearl too; see [Bench parity](#bench-parity));
+     read-only tools carry `readOnlyHint`
    - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
      `safe_transaction`, `send_transaction`, `preflight_transaction`,
      `simulate_transaction`, `transaction_status`, `chain_call`, `get_abi`,
@@ -886,6 +889,27 @@ exactly as it clears `mech_result`'s pending ids; and it keeps the last 1024
 ids, so an id replayed long after that many others pays again. An id is also
 bound to what it asked — reusing one for a different prompt, tool, chain, mech,
 flow or `request_context` is refused rather than answering the wrong question.
+
+## Bench parity
+
+OnchainBench tests agents against a reference implementation of Connect's
+agent-visible surface, and Connect matches it so the bench can import real
+Connect. Two public modules carry that contract:
+
+- `connect.texts` — every agent-visible text whose wording is part of it (the
+  13 tool descriptions, the guardrail and intent-gate refusals, the markers the
+  bench's broker classifies — `guardrail: rule `, `. Nothing was sent.`,
+  `transaction 0x` — and the mech and transport errors), verbatim from the
+  reference. The bench imports the module, so a rename fails its suite.
+- `connect.switches` — `Switches`, one position per feature only Connect has
+  and per protection Pearl keeps. `PRODUCTION` is what Pearl runs;
+  `TEST_INTERFACE` is the reference's behaviour. A switch is a constructor
+  argument of `create_app` / `build_mcp` and nothing else: no env var,
+  setting or route can set one, `__main__` passes none, and the release binary
+  excludes `connect.testing`. So far: `strict_parameters` (off in both: an MCP
+  tool ignores an argument it does not take), `rest_signing_routes`
+  (`POST /sign-and-send`; on in Pearl) and `agent_topup_at_boot` (the
+  [Agent top-up](#agent-top-up); on in Pearl).
 
 ## Development
 

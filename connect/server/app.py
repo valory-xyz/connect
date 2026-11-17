@@ -51,6 +51,7 @@ from connect.server.mcp_tools import build_mcp
 from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
 from connect.settings import MODE_RESTRICTED, SettingsStore
 from connect.signer import SERVER_BUILT, Signer
+from connect.switches import PRODUCTION, Switches
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
@@ -169,8 +170,9 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     settings_store: SettingsStore,
     mech: MechService,
     workspace: Workspace,
+    switches: Switches = PRODUCTION,
 ) -> FastAPI:
-    """Create app."""
+    """Create app; `switches` stays at `PRODUCTION` for every Pearl build."""
     # the run's token is the workspace's scoped token (read + mech + tx);
     # narrower ones are minted from it through POST /tokens
     grants = GrantStore(token, held=signer.holds_request)
@@ -182,16 +184,20 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
         mech=mech,
         settings_store=settings_store,
         grants=grants,
+        switches=switches,
     )
 
     @asynccontextmanager
     async def lifespan(running: FastAPI) -> t.AsyncIterator[None]:
-        tasks = (
-            asyncio.create_task(refresh_performance(activity)),
-            asyncio.create_task(
-                top_up_agent(config, signer, guard, activity, running.state.topped_up)
-            ),
-        )
+        tasks = [asyncio.create_task(refresh_performance(activity))]
+        if switches.agent_topup_at_boot:
+            tasks.append(
+                asyncio.create_task(
+                    top_up_agent(
+                        config, signer, guard, activity, running.state.topped_up
+                    )
+                )
+            )
         try:
             async with mcp.session_manager.run():
                 yield
@@ -217,6 +223,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     app.state.mech = mech
     app.state.auth_limiter = limiter
     app.state.workspace = workspace
+    app.state.switches = switches
     # stale from the start: the monotonic clock can begin near 0 after a boot
     app.state.funds_cache = {
         "at": float("-inf"),
@@ -236,10 +243,10 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     app.include_router(
         settings_routes.router, dependencies=[Depends(require_local_origin)]
     )
-    app.include_router(
-        signer_routes.router,
-        dependencies=[Depends(RequireAuth(grants, activity, limiter))],
-    )
+    signing_auth = [Depends(RequireAuth(grants, activity, limiter))]
+    app.include_router(signer_routes.router, dependencies=signing_auth)
+    if switches.rest_signing_routes:
+        app.include_router(signer_routes.eoa_router, dependencies=signing_auth)
     app.mount(
         "/mcp",
         AuthMiddleware(mcp.streamable_http_app(), grants, activity, limiter),

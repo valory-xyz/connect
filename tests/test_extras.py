@@ -65,6 +65,7 @@ from connect.server.auth import AuthFailureLimiter, AuthMiddleware
 from connect.server.mcp_tools import build_mcp
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError, _IdempotencyCache
+from connect.switches import PRODUCTION, Switches
 
 from tests.conftest import (
     FakeW3,
@@ -314,6 +315,23 @@ class TestMain:
         app = served[0].config.app
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/healthcheck").json() == {"is_healthy": True}
+
+    def test_main_builds_the_production_switch_positions(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+    ) -> None:
+        """Pearl's entrypoint passes no switches, so it serves PRODUCTION."""
+        monkeypatch.setattr("sys.stdin", io.StringIO(TEST_PASSWORD + "\n"))
+        assert main_module.main(["--password-stdin"]) == 0
+        assert served[0].config.app.state.switches == PRODUCTION
+        assert PRODUCTION == Switches()
+
+    def test_the_binary_excludes_the_test_interface(self) -> None:
+        """The PyInstaller build leaves connect.testing out of Pearl's binary."""
+        spec = Path(__file__).parent.parent / "packaging" / "pyinstaller.spec"
+        assert 'excludes=["connect.testing"]' in spec.read_text(encoding="utf-8")
 
     @pytest.mark.usefixtures("tty_stdin")
     def test_main_password_tty_happy_path(
