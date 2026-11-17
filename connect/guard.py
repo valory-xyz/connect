@@ -143,6 +143,35 @@ class _DepositAllowance:
 DepositGrant = _DepositAllowance
 
 
+def exec_floor(chain: str, to: str, data: str) -> SafeExec | None:
+    """Enforce the floor's execTransaction rules; return the call it decoded.
+
+    Every execTransaction is decoded and checked, whatever it targets and
+    whether or not a safe is configured on `chain`: the floor protects any safe
+    the agent reaches, and "protected only if configured" would be a hole an
+    unconfigured chain walks straight through. Calldata that cannot be decoded
+    cannot be judged, so it is refused. `to` is the contract the call is sent
+    to, the safe whose call this is: a safe calling itself is how it changes
+    its own owners, modules or guard. The signer runs this even with no
+    guardrail attached, so no build lifts it.
+
+    :raises GuardError: `undecodable-exec-transaction`, `no-delegatecall` or
+        `no-self-call`.
+    """
+    calldata = calldata_hex(data)
+    if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
+        return None
+    try:
+        exec_call = decode_exec(calldata, chain=chain, to=to)
+    except ValueError as e:
+        raise GuardError(GUARD_UNDECODABLE) from e
+    if exec_call.operation != OPERATION_CALL:
+        raise GuardError(GUARD_NO_DELEGATECALL)
+    if exec_call.to.lower() == to.lower():
+        raise GuardError(GUARD_NO_SELF_CALL)
+    return exec_call
+
+
 class Guard:
     """Mode/whitelist enforcement backed by the tamper-evident settings store."""
 
@@ -303,19 +332,7 @@ class Guard:
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
         calldata = calldata_hex(data)
-        exec_call = None
-        if calldata.startswith(EXEC_TRANSACTION_SELECTOR):
-            # decode and floor-check every execTransaction, whatever it targets
-            # and whether or not a safe is configured here: the floor protects
-            # any safe the agent reaches, and "protected only if configured"
-            # would be a hole an unconfigured chain walks straight through.
-            try:
-                exec_call = decode_exec(calldata, chain=chain, to=to)
-            except ValueError as e:
-                # calldata we cannot parse is calldata we cannot judge, so it
-                # is refused rather than waved through
-                raise GuardError(GUARD_UNDECODABLE) from e
-            self._check_floor(to, exec_call)
+        exec_call = exec_floor(chain, to, calldata)
         if not server_built:
             self._check_marketplace(chain, to, exec_call)
         if self._store.load().protected.mode == MODE_RESTRICTED:
@@ -328,18 +345,6 @@ class Guard:
                 exec_call=exec_call,
                 consume=consume,
             )
-
-    def _check_floor(self, target: str, exec_call: "SafeExec") -> None:
-        """Enforce the two rules no mode lifts; see the module docstring for why.
-
-        `target` is the contract the execTransaction is sent to — the safe
-        whose call this is. A safe calling itself is how it changes its own
-        owners, modules or guard.
-        """
-        if exec_call.operation != OPERATION_CALL:
-            raise GuardError(GUARD_NO_DELEGATECALL)
-        if exec_call.to.lower() == target.lower():
-            raise GuardError(GUARD_NO_SELF_CALL)
 
     @staticmethod
     def _check_marketplace(chain: str, to: str, exec_call: "SafeExec | None") -> None:

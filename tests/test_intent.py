@@ -147,22 +147,24 @@ def test_an_approval_by_the_celo_face_is_an_approval() -> None:
         }
     ]
     assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
-    assert rules(intent.check_intent(diff, intent.parse_intent({})[0])) == [
-        "undeclared-approval"
-    ]
+    assert rules(
+        intent.check_intent(diff, intent.parse_intent({}, strict_parameters=False)[0])
+    ) == ["undeclared-approval"]
 
 
 def test_a_spend_naming_the_celo_face_is_a_native_spend() -> None:
     """Face moves are booked under native, so an intent naming the face is too."""
     parsed, problems = intent.parse_intent(
-        {"spend": {CELO_FACE.upper().replace("0X", "0x"): 3}}
+        {"spend": {CELO_FACE.upper().replace("0X", "0x"): 3}}, strict_parameters=False
     )
     assert problems == []
     assert parsed is not None
     assert parsed["spend"] == {"native": 3}
     diff = simulate([transfer(CELO_FACE, SAFE, CONTRACT, 3)])
     assert rules(intent.check_intent(diff, parsed)) == []
-    _, twice = intent.parse_intent({"spend": {"native": 1, CELO_FACE: 2}})
+    _, twice = intent.parse_intent(
+        {"spend": {"native": 1, CELO_FACE: 2}}, strict_parameters=False
+    )
     assert rules(twice) == ["bad-intent"]
     assert "twice" in twice[0]["detail"]
 
@@ -535,7 +537,9 @@ def test_a_tool_amount_is_a_json_integer_only_while_a_double_holds_it_exactly() 
 @pytest.mark.parametrize("raw", [0.9, 1.0, True])
 def test_an_amount_is_never_truncated(raw: t.Any) -> None:
     """A float minimum of 0.9 must not become 0: floats and bools are refused."""
-    _, problems = intent.parse_intent({"receive_min": {TOKEN: raw}})
+    _, problems = intent.parse_intent(
+        {"receive_min": {TOKEN: raw}}, strict_parameters=False
+    )
     assert rules(problems) == ["bad-intent"]
     assert "whole number" in problems[0]["detail"]
 
@@ -695,7 +699,12 @@ def test_a_permit2_grant_is_an_approval_the_intent_must_declare(event: str) -> N
             {"token": TOKEN, "spender": SPENDER, "amount": intent.MAX_UINT160}
         ]
     }
-    assert intent.check_intent(diff, intent.parse_intent(declared)[0]) == []
+    assert (
+        intent.check_intent(
+            diff, intent.parse_intent(declared, strict_parameters=False)[0]
+        )
+        == []
+    )
     elsewhere = simulate([{**log, "address": TOKEN}])  # not Permit2: not its grant
     assert elsewhere["approvals"] == []
     for_another = simulate(
@@ -783,7 +792,8 @@ def test_parse_intent_normalises_and_refuses_bad_shapes() -> None:
             "spend": {"NATIVE": "0x10", TOKEN.upper().replace("0X", "0x"): 5},
             "recipients": [EOA.upper().replace("0X", "0x")],
             "approvals": [{"token": TOKEN, "spender": SPENDER, "amount": 1}],
-        }
+        },
+        strict_parameters=False,
     )
     assert problems == []
     assert parsed == {
@@ -792,7 +802,7 @@ def test_parse_intent_normalises_and_refuses_bad_shapes() -> None:
         "recipients": [EOA],
         "approvals": [{"token": TOKEN, "spender": SPENDER, "amount": 1}],
     }
-    assert intent.parse_intent(None) == (None, [])
+    assert intent.parse_intent(None, strict_parameters=False) == (None, [])
     for bad in (
         "spend 5",
         {"spend": {"native": -1}},
@@ -802,15 +812,15 @@ def test_parse_intent_normalises_and_refuses_bad_shapes() -> None:
         {"approvals": ["x"]},
         {"approvals": [{"token": TOKEN}]},
     ):
-        _, problems = intent.parse_intent(bad)
+        _, problems = intent.parse_intent(bad, strict_parameters=False)
         assert rules(problems) == ["bad-intent"], bad
 
 
 def test_an_unread_intent_key_is_ignored_unless_strict() -> None:
-    """B1: the intent is read on the keys it carries; S2 refuses the rest."""
+    """The intent is read on the keys it carries; strict_parameters refuses the rest."""
     approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": 2}
     raw = {"spend": {"native": 3}, "limit": 1, "approvals": [approval]}
-    parsed, problems = intent.parse_intent(raw)
+    parsed, problems = intent.parse_intent(raw, strict_parameters=False)
     assert problems == []
     assert parsed == {
         "spend": {"native": 3},
@@ -818,16 +828,33 @@ def test_an_unread_intent_key_is_ignored_unless_strict() -> None:
         "recipients": [],
         "approvals": [{"token": TOKEN, "spender": SPENDER, "amount": 1}],
     }
-    _, problems = intent.parse_intent({"limit": 1}, strict=True)
+    _, problems = intent.parse_intent({"limit": 1}, strict_parameters=True)
     assert problems == [
         intent.Problem(rule="bad-intent", detail="unknown intent keys ['limit']")
     ]
 
 
+def test_an_ignored_intent_key_is_logged_by_name_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The operator can see a key was dropped; its value is never written."""
+    approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": "SECRET-2"}
+    raw = {"recieve_min": {"native": "SECRET-1"}, "approvals": [approval]}
+    with caplog.at_level("WARNING", logger="agent"):
+        intent.parse_intent(raw, strict_parameters=False)
+    assert [r.message for r in caplog.records] == [
+        "ignored intent keys ['recieve_min']",
+        "ignored intent approval keys ['max']",
+    ]
+    assert "SECRET" not in caplog.text
+
+
 def test_an_unknown_approval_key_is_refused_by_name_under_strict() -> None:
-    """Under S2, an approval with a key it does not know is bad-intent, by name."""
+    """Under strict_parameters, an approval with a key it does not know is bad-intent, by name."""
     approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": 2}
-    parsed, problems = intent.parse_intent({"approvals": [approval]}, strict=True)
+    parsed, problems = intent.parse_intent(
+        {"approvals": [approval]}, strict_parameters=True
+    )
     assert parsed is None
     assert problems == [
         intent.Problem(rule="bad-intent", detail="unknown intent approval keys ['max']")

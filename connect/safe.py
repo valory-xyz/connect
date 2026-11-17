@@ -156,8 +156,9 @@ def exec_transaction(
     """Return execTransaction calldata carrying one call out of the safe.
 
     `target` is the address the safe calls. The refund fields the guard refuses
-    to see set are never set here; `operation` is the caller's, so a
-    DELEGATECALL reaches the guard's floor and is refused by its rule there.
+    to see set are never set here. `operation` is the caller's, as the
+    reference reads it: a DELEGATECALL is refused by the floor
+    (`guard.exec_floor`), which the signer runs with or without a guardrail.
     """
     args = abi_encode(
         EXEC_TRANSACTION_TYPES,

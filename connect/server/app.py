@@ -174,7 +174,11 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     switches = signer.switches
     # the run's token is the workspace's scoped token (read + mech + tx);
     # narrower ones are minted from it through POST /tokens
-    grants = GrantStore(token, held=signer.holds_request)
+    grants = GrantStore(
+        token,
+        held=signer.holds_request,
+        strict_parameters=signer.switches.strict_parameters,
+    )
     mcp = build_mcp(
         signer,
         config,

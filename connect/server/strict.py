@@ -30,6 +30,7 @@ import typing as t
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic.json_schema import SkipJsonSchema
 from pydantic_core import PydanticCustomError
 
 from connect.activity import ActivityLog
@@ -43,12 +44,20 @@ HINTS: dict[str, dict[str, str]] = {
 
 
 def unknown_parameters_message(
-    given: t.Iterable[str], expected: t.Collection[str]
+    given: t.Iterable[str],
+    expected: t.Collection[str],
+    published: t.Collection[str] | None = None,
 ) -> str | None:
-    """Say which parameters are unknown and what was expected, or None if none are."""
+    """Say which parameters are unknown and what was expected, or None if none are.
+
+    `published` is what the refusal names and hints at, when it differs from
+    what is accepted: a parameter kept out of the published schema is taken
+    but never advertised.
+    """
     unknown = sorted(set(given) - set(expected))
     if not unknown:
         return None
+    expected = set(expected if published is None else published)
     parts = []
     for name in unknown:
         hint = next(
@@ -79,8 +88,14 @@ def _check_known(
 ) -> t.Any:
     """Before-validator body: refuse a mapping that carries unknown keys."""
     if isinstance(data, dict):
-        expected = {field.alias or name for name, field in cls.model_fields.items()}
-        message = unknown_parameters_message(data, expected)
+        fields = cls.model_fields.items()
+        expected = {field.alias or name for name, field in fields}
+        published = {
+            field.alias or name
+            for name, field in fields
+            if not any(isinstance(m, SkipJsonSchema) for m in field.metadata)
+        }
+        message = unknown_parameters_message(data, expected, published)
         if message is not None:
             if on_refusal is not None:
                 on_refusal(message)

@@ -123,8 +123,8 @@ async def test_a_misspelled_target_is_refused_by_name(
     # a model-level refusal has no argument to name before it
     assert str(refused.value) == (
         "invalid request: ValidationError: unknown parameter 'targett' (did you "
-        "mean 'target'?); this call takes chain, data, intent, operation, "
-        "request_id, target, timeout, value, wait_for_receipt"
+        "mean 'target'?); this call takes chain, data, intent, request_id, "
+        "target, timeout, value, wait_for_receipt"
     )
     assert not fake_w3.eth.sent
     (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
@@ -491,7 +491,7 @@ async def test_a_decimal_string_intent_amount_reaches_the_gate_exactly(
             },
         )
     for intent in seen:
-        parsed, problems = parse_intent(intent)
+        parsed, problems = parse_intent(intent, strict_parameters=False)
         assert not problems
         assert parsed is not None
         if where == "approvals":
@@ -527,7 +527,7 @@ async def test_a_json_integer_intent_amount_reaches_the_gate_exactly(
         },
     )
     (intent,) = seen
-    parsed, problems = parse_intent(intent)
+    parsed, problems = parse_intent(intent, strict_parameters=False)
     assert not problems
     assert parsed is not None
     if where == "approvals":
@@ -578,7 +578,7 @@ async def test_a_misspelled_intent_key_on_a_tool_is_refused_not_dropped(
 async def test_an_unread_intent_key_is_ignored_with_the_switch_off(
     make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
 ) -> None:
-    """B1: with the switch off, the intent is checked on the keys it carries."""
+    """With the switch off, the intent is checked on the keys it carries."""
     lenient = make_mcp()
     intent = {
         "recipients": [RECIPIENT],

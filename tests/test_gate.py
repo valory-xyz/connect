@@ -47,12 +47,13 @@ from connect.signer_errors import (
     logged_cause,
 )
 from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
-from connect.texts import EXEC_UNDECODABLE
+from connect.texts import EXEC_UNDECODABLE, GUARD_NO_DELEGATECALL
 
 from tests.conftest import (
     FakeW3,
     approval_log,
     audit_entries,
+    on_fake_chain,
     pay,
     position_out_log,
     transfer_log,
@@ -535,6 +536,18 @@ class TestSignerGate:
         assert record.levelname == "WARNING"
         assert record.message.startswith(prefix)
         assert len(record.message) > len(prefix)  # eth_abi's cause, logged only
+        assert not fake_w3.eth.sent
+
+    def test_with_no_guardrail_attached_the_floor_still_refuses_a_delegatecall(
+        self, account: t.Any, app_config: t.Any, activity: t.Any, fake_w3: FakeW3
+    ) -> None:
+        """No build lifts the floor: a guardless signer refuses as the guard would."""
+        bare = on_fake_chain(
+            Signer(account=account, config=app_config, activity=activity), fake_w3
+        )
+        with pytest.raises(SignerError) as refused:
+            bare.send_via_safe("testchain", EOA, operation=1)
+        assert str(refused.value) == GUARD_NO_DELEGATECALL
         assert not fake_w3.eth.sent
 
     def test_a_fault_in_the_decoder_is_not_read_as_bad_input(

@@ -23,6 +23,7 @@ The rules, what the asset diff is read from and what it cannot see are in
 the README, "Intent gate"; `Rule` is the full list of rule names.
 """
 
+import logging
 import re
 import typing as t
 
@@ -37,6 +38,8 @@ from connect.texts import (
     gate_undeclared_approval,
     gate_undeclared_recipient,
 )
+
+logger = logging.getLogger("agent")
 
 TokenKey = str  # an ERC-20 address, lower-case, or "native"
 NATIVE = "native"
@@ -659,19 +662,20 @@ def implied_intent(value: int, target: str, *, positions_locked: bool) -> Intent
 
 
 def parse_intent(
-    raw: t.Any, *, strict: bool = False
+    raw: t.Any, *, strict_parameters: bool
 ) -> tuple[Intent | None, list[Problem]]:
     """Validate a caller's intent; return it normalised, or a bad-intent problem.
 
     A key the gate does not read, in the intent or an approval, is ignored, as
-    the reference ignores it (B1, D11); `strict` (the `strict_parameters`
-    switch) refuses it instead. An ignored key declares nothing: a misspelled
-    `spend` leaves nothing to spend, and a misspelled `receive_min` sets no
-    floor.
+    the reference ignores it, and logged by name (never its value);
+    `strict_parameters` (the switch) refuses it instead. Every reader passes
+    the switch, so the grant store's cap and the gate read one intent one way.
+    An ignored key declares nothing: a misspelled `spend` leaves nothing to
+    spend, and a misspelled `receive_min` sets no floor.
     """
     if not isinstance(raw, Capped):
-        return _parse(raw, strict)
-    parsed, problems = _parse(raw.raw, strict)
+        return _parse(raw, strict_parameters)
+    parsed, problems = _parse(raw.raw, strict_parameters)
     if parsed is not None:
         parsed["positions_locked"] = True
     return parsed, problems
@@ -685,6 +689,7 @@ def _parse(raw: t.Any, strict: bool) -> tuple[Intent | None, list[Problem]]:
     unknown = sorted(set(raw) - {"spend", "receive_min", "recipients", "approvals"})
     if strict and unknown:
         return None, [_bad(f"unknown intent keys {unknown}")]
+    _ignored("intent", unknown)
     try:
         intent = Intent(
             spend=_amounts(raw.get("spend") or {}, "spend"),
@@ -697,6 +702,12 @@ def _parse(raw: t.Any, strict: bool) -> tuple[Intent | None, list[Problem]]:
     except (TypeError, ValueError, AttributeError) as e:
         return None, [_bad(str(e))]
     return intent, []
+
+
+def _ignored(where: str, keys: list[t.Any]) -> None:
+    """Log the names of the keys an intent carried that the gate does not read."""
+    if keys:  # a name only: a value could be anything the agent sent
+        logger.warning("ignored %s keys %s", where, [str(k)[:40] for k in keys])
 
 
 def _bad(detail: str) -> Problem:
@@ -807,6 +818,7 @@ def _approval(raw: t.Any, strict: bool) -> IntentApproval:
     unknown = sorted(set(raw) - {"token", "spender", "amount"})
     if strict and unknown:
         raise ValueError(f"unknown intent approval keys {unknown}")
+    _ignored("intent approval", unknown)
     return IntentApproval(
         token=_token(raw["token"]),
         spender=_address(raw["spender"]),
@@ -900,15 +912,16 @@ def _leaving(diff: AssetDiff) -> list[dict]:
 
 
 def no_intent_hold(
-    value: int, target: str, *, strict: bool, capped: bool
+    value: int, target: str, *, hold_uncapped: bool, capped: bool
 ) -> Intent | None:
     """Return what a call with no intent is held to, or None for a revert check alone.
 
-    Under `strict`, and always under a capped token (which no cap could bound
-    otherwise), it is held to its own value and target (`implied_intent`), a
-    capped token's with no position leaving.
+    When `hold_uncapped` (any `no_intent_policy` but `simulate-only`), and
+    always under a capped token (which no cap could bound otherwise), it is
+    held to its own value and target (`implied_intent`), a capped token's with
+    no position leaving.
     """
-    if not (strict or capped):
+    if not (hold_uncapped or capped):
         return None
     return implied_intent(value, target, positions_locked=capped)
 

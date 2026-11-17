@@ -269,7 +269,7 @@ def _key(token: str) -> str:
 
 
 def _declared(
-    arguments: t.Mapping[str, t.Any],
+    arguments: t.Mapping[str, t.Any], *, strict_parameters: bool
 ) -> tuple[dict[str, int], list[intent_module.IntentApproval]]:
     """Return what a call may spend, and the approvals its intent allows.
 
@@ -283,7 +283,9 @@ def _declared(
     :raises GrantRefused: a malformed intent or a value that is not a whole
         number >= 0, before any budget is drawn on.
     """
-    parsed, problems = intent_module.parse_intent(_intent_argument(arguments))
+    parsed, problems = intent_module.parse_intent(
+        _intent_argument(arguments), strict_parameters=strict_parameters
+    )
     if problems:
         raise GrantRefused("bad-intent", problems[0]["detail"])
     declared = dict((parsed or {}).get("spend", {}))
@@ -312,15 +314,21 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
     """
 
     def __init__(
-        self, workspace_token: str, *, held: t.Callable[[str, bool], bool]
+        self,
+        workspace_token: str,
+        *,
+        held: t.Callable[[str, bool], bool],
+        strict_parameters: bool,
     ) -> None:
         """Hold the workspace token, the root every other token is minted from.
 
         `held(request_id, via_safe)` says whether the signer holds that request
         id, completed or still sending (`Signer.holds_request`): a call
-        repeating it then sends nothing new.
+        repeating it then sends nothing new. `strict_parameters` is the
+        signer's switch, so the cap reads an intent as the gate will.
         """
         self._held = held
+        self._strict_parameters = strict_parameters
         # what each (token, action, request_id) has drawn, so a retry of a
         # request this token already paid for is not drawn again; forgotten
         # past the bound, which only draws again
@@ -575,7 +583,9 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
         draw: bool,
     ) -> bool:
         """Hold a send to the caps; return whether a retry's draw was relieved."""
-        declared, approvals = _declared(arguments)  # refuses malformed first
+        declared, approvals = _declared(  # refuses malformed first
+            arguments, strict_parameters=self._strict_parameters
+        )
         self._check_approvals(grant, approvals)
         per_tx = grant.max_value_per_tx
         if per_tx is not None:

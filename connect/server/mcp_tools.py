@@ -48,6 +48,7 @@ from connect.input_errors import InputError, check_arguments, checked_hex
 from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
+from connect.safe import OPERATION_CALL
 from connect.server.auth import (
     GrantRefused,
     GrantStore,
@@ -138,6 +139,10 @@ class ToolIntent(TypedDict, total=False):
     recipients: list[str] | None
     approvals: list[ToolApproval] | None
 
+
+# a Safe call's operation, read as the reference reads it but not published:
+# CALL or DELEGATECALL, which only the guardrail's floor refuses
+Operation = t.Annotated[int, Field(ge=OPERATION_CALL, le=1)]
 
 RequestContext = t.Annotated[dict | None, Field(description=REQUEST_CONTEXT_NOTE)]
 
@@ -265,11 +270,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["wallet_info"], annotations=READ_ONLY)
     async def wallet_info(chain: str | None = None) -> dict:
-        """Report the EOA, the safes and their balances: every chain, whatever `chain`.
-
-        The reference takes `chain` and answers the same (B1), so it is accepted
-        and ignored.
-        """
+        """Report the EOA, the safes and their balances; `chain` is ignored."""
         del chain
 
         def _run() -> dict:
@@ -292,13 +293,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
-        operation: SkipJsonSchema[int] = 0,
+        operation: SkipJsonSchema[Operation] = OPERATION_CALL,
     ) -> dict:
-        """Have the service safe make one call.
-
-        `operation` is read as the reference reads it, but not published: the
-        guardrail's floor refuses a DELEGATECALL by its own rule (B1).
-        """
+        """Have the service safe make one call."""
         return await _dispatch(
             functools.partial(signer.send_via_safe, operation=operation),
             signer,
@@ -424,10 +421,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     async def decode_calldata(
         data: str, address: str | None = None, chain: str | None = None
     ) -> dict:
-        """Decode calldata against the signatures Connect ships.
+        """Decode calldata against the signatures Connect ships; `chain` is ignored.
 
-        `address` and `chain` are the reference's and are accepted and ignored
-        (B1): what Connect ships does not depend on them.
+        `address` is ignored too, once the boundary has checked its shape.
         """
         del address, chain
         return chain_read.decode_calldata(data)

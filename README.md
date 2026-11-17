@@ -100,8 +100,9 @@ other non-aea agent. It:
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
      of an empty or absent `target`. Every argument the reference takes is taken: `wallet_info`'s
      `chain` and `decode_calldata`'s `address` and `chain` are accepted and
-     ignored (`decode_calldata` needs only `data`), and `safe_transaction`
-     reads an unpublished `operation`, so a DELEGATECALL is refused by the
+     ignored (`decode_calldata` needs only `data`; its `address` is still
+     checked for shape), and `safe_transaction` (on MCP only) reads an
+     unpublished `operation`, 0 or 1, so a DELEGATECALL is refused by the
      guardrail's `no-delegatecall` rule rather than by a parameter check. Three texts stay Connect's own: `get_abi`'s description,
      until its answers match the reference's; `transaction_status`'s, which
      names `pending` too; and the warning on
@@ -318,8 +319,10 @@ cause, since every agent send on that chain is refused until it can. A key
 an intent does not know, at its top level or in an approval, is ignored on
 every surface, as OnchainBench's reference ignores it: the intent is checked on
 the keys it does carry, so a misspelled `spend` allows no spend and a
-misspelled `receive_min` sets no floor. With the `strict_parameters` switch on
-(off in Pearl too) it is `bad-intent`, naming the key. An amount in an intent is a whole number
+misspelled `receive_min` sets no floor. Each ignored key is logged to
+`log.txt` by name, never its value. With the `strict_parameters` switch on
+(off in Pearl too) it is `bad-intent`, naming the key, and the cap of a
+scoped token refuses it before drawing on any budget. An amount in an intent is a whole number
 of base units, never truncated. On the HTTP routes a float or a bool there is
 `bad-intent`. The MCP tools hold it to the `value` rule (a decimal or 0x-hex
 string, or a JSON integer up to 2^53 - 1) and refuse anything else as
@@ -456,6 +459,8 @@ Two rules hold in **every** mode, and no setting lifts them: the safe may not
 `addOwnerWithThreshold`, `setGuard` — the ways a Safe changes what it *is*).
 Both would outlive a switch back to restricted mode, so the guardrail refuses
 them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
+The signer holds both even with no guardrail attached (`guard.exec_floor`), so
+no build of Connect lifts them either.
 A third holds in every mode too: the mech marketplace takes only the calls the
 server's own mech flow composes (`mech_request`, bounded by `max_payment` and
 the token's mech budget). A call to the chain's marketplace (every

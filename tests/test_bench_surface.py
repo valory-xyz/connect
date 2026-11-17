@@ -425,9 +425,8 @@ async def test_a_failure_in_the_argument_check_itself_is_logged_not_forwarded(
     mcp: FastMCP, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A deeply nested intent (RecursionError) reads tool_failed, cause logged."""
-    tool = mcp._tool_manager.get_tool(
-        "safe_transaction"
-    )  # pylint: disable=protected-access
+    manager = mcp._tool_manager  # pylint: disable=protected-access
+    tool = manager.get_tool("safe_transaction")
 
     def deep(*_: t.Any) -> dict:
         raise RecursionError("maximum recursion depth exceeded while decoding")
@@ -462,7 +461,7 @@ async def test_a_stringified_intent_is_taken_like_the_object(
 def test_a_delegatecall_operation_is_refused_by_the_guardrail_s_rule(
     client: TestClient, fake_w3: FakeW3
 ) -> None:
-    """B1: `operation` is read, so the floor rule refuses it, not a parameter check."""
+    """`operation` is read, so the floor rule refuses it, not a parameter check."""
     text = _tool_error(
         client,
         "safe_transaction",
@@ -482,13 +481,58 @@ def test_a_delegatecall_operation_is_refused_by_the_guardrail_s_rule(
 
 
 @pytest.mark.parametrize("switches", [PRODUCTION, TEST_INTERFACE])
-def test_operation_is_accepted_but_not_published(
+async def test_operation_is_accepted_but_not_published(
     make_mcp: t.Callable[..., FastMCP], switches: Switches
 ) -> None:
     """The reference reads `operation` without publishing it."""
-    manager = make_mcp(switches)._tool_manager  # pylint: disable=protected-access
-    schema = manager.get_tool("safe_transaction").parameters
-    assert "operation" not in schema["properties"]
+    (tool,) = [
+        t for t in await make_mcp(switches).list_tools() if t.name == "safe_transaction"
+    ]
+    assert "operation" not in tool.inputSchema["properties"]
+
+
+@pytest.mark.parametrize("operation", [-1, 2, 256])
+async def test_an_operation_that_is_neither_call_nor_delegatecall_is_refused(
+    mcp: FastMCP, fake_w3: FakeW3, operation: int
+) -> None:
+    """A Safe has CALL (0) and DELEGATECALL (1); anything else is bad input."""
+    with pytest.raises(ToolError) as refused:
+        await mcp.call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "operation": operation},
+        )
+    assert str(refused.value).startswith(
+        "invalid request: ValidationError: operation: Input should be "
+    )
+    assert not fake_w3.eth.sent
+
+
+async def test_a_strict_refusal_never_advertises_an_unpublished_parameter(
+    make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
+) -> None:
+    """`operation` is taken under strict_parameters but never named or hinted."""
+    strict = make_mcp(Switches(strict_parameters=True))
+    with pytest.raises(ToolError) as refused:
+        await strict.call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "operatoin": 1},
+        )
+    assert "operation" not in str(refused.value)
+    await strict.call_tool(
+        "safe_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "operation": 0},
+    )
+    assert len(fake_w3.eth.sent) == 1
+
+
+async def test_wallet_info_takes_chain_even_under_strict_parameters(
+    make_mcp: t.Callable[..., FastMCP],
+) -> None:
+    """With unknown parameters refused, `chain` is still one wallet_info takes."""
+    strict = make_mcp(Switches(strict_parameters=True))
+    (bare,) = await strict.call_tool("wallet_info", {})
+    (carried,) = await strict.call_tool("wallet_info", {"chain": "gnosis"})
+    assert json.loads(carried.text) == json.loads(bare.text)  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize(
@@ -505,7 +549,7 @@ def test_operation_is_accepted_but_not_published(
 async def test_an_argument_the_handler_does_not_read_changes_nothing(
     mcp: FastMCP, tool: str, plain: dict, extra: dict
 ) -> None:
-    """B1: `chain` on wallet_info, `address`/`chain` on decode_calldata, ignored."""
+    """`chain` on wallet_info, `address`/`chain` on decode_calldata, ignored."""
     (bare,) = await mcp.call_tool(tool, plain)
     (carried,) = await mcp.call_tool(tool, {**plain, **extra})
     assert json.loads(carried.text) == json.loads(bare.text)  # type: ignore[union-attr]

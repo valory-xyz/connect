@@ -852,7 +852,9 @@ def _no_handed_token() -> t.Iterator[None]:
 
 def grant_store(token: str) -> GrantStore:
     """Return a GrantStore over a signer that holds no request id."""
-    return GrantStore(token, held=lambda request_id, via_safe: False)
+    return GrantStore(
+        token, held=lambda request_id, via_safe: False, strict_parameters=False
+    )
 
 
 # a minted token's expiry, far enough out never to pass during a test

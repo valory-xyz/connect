@@ -44,7 +44,8 @@ from connect import intent as intent_module
 from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.guard import Guard, GuardError
+from connect.guard import Guard, GuardError, exec_floor
+from connect.safe import OPERATION_CALL as CALL
 from connect.settings import prepaid_balance_trackers
 from connect.signer_errors import (
     SEND_UNKNOWN,
@@ -467,7 +468,7 @@ class Signer:
         raise SignerError(intent_module.refusal_message(problems))
 
     def _compose_safe_call(
-        self, chain: str, target: str, value: int, data: str, *, operation: int = 0
+        self, chain: str, target: str, value: int, data: str, *, operation: int = CALL
     ) -> tuple[str, str]:
         """Wrap one inner call for the safe; returns (safe address, calldata).
 
@@ -505,18 +506,15 @@ class Signer:
         audit: bool = True,
         intent: t.Any = None,
         replay_only: bool = False,
-        operation: int = 0,  # a DELEGATECALL is the guard floor's to refuse
+        operation: int = CALL,
     ) -> str:
         """Act as the service safe: wrap one inner call and send it.
 
-        `target`, `value` and `data` are the call the *safe* makes — most carry
-        no value at all (an approve, a stake, a claim); any they do carry leaves
-        the safe rather than the EOA. The distinct parameter name is deliberate:
-        this is not send()'s outer recipient, and the two must not be confused.
-
-        The composed transaction goes through _send_guarded(), the one path
-        send() takes too, so it meets the same guard and intent gate as
-        anything else — a caller of the gate, not a way around it.
+        `target`, `value` and `data` are the call the *safe* makes; any value
+        leaves the safe, not the EOA. The distinct name is deliberate: this is
+        not send()'s outer recipient. The composed transaction goes through
+        _send_guarded(), the one path send() takes too, so it meets the same
+        guard and intent gate as anything else.
         """
         problem = intent_module.calldata_problem(data)
         if problem is not None:  # composing it would fail on the same bytes
@@ -577,7 +575,7 @@ class Signer:
                 "an execTransaction to a safe may not also carry value from the "
                 "EOA; send the value as part of the safe's own call",
             )
-        if exec_call.operation != safe_module.OPERATION_CALL:
+        if exec_call.operation != CALL:
             raise _GateRefused(
                 "bad-exec-transaction",
                 "an execTransaction may only CALL (operation 0), never DELEGATECALL",
@@ -654,8 +652,9 @@ class Signer:
         problem = intent_module.calldata_problem(call.data)
         if problem is not None:
             return None, None, [problem]
-        strict = self._switches.strict_parameters  # S2: unread keys refused
-        parsed, problems = intent_module.parse_intent(raw_intent, strict=strict)
+        parsed, problems = intent_module.parse_intent(
+            raw_intent, strict_parameters=self._switches.strict_parameters
+        )
         if problems:
             return None, None, problems
         held_to = parsed
@@ -663,7 +662,7 @@ class Signer:
             held_to = intent_module.no_intent_hold(
                 call.value,
                 call.to,
-                strict=self._switches.no_intent_policy != "simulate-only",
+                hold_uncapped=self._switches.no_intent_policy != "simulate-only",
                 capped=isinstance(raw_intent, intent_module.Capped),
             )
         try:
@@ -958,12 +957,13 @@ class Signer:
         server_built: bool,
     ) -> None:
         """Consult the guardrail; a denial is audited and surfaced as SignerError."""
-        if self._guard is None:
-            return
         try:
-            self._guard.check_transaction(
-                chain, to, value, data, server_built=server_built
-            )
+            if self._guard is None:  # the floor holds with no guardrail attached
+                exec_floor(chain, to, data)
+            else:
+                self._guard.check_transaction(
+                    chain, to, value, data, server_built=server_built
+                )
         except GuardError as e:
             if audit:
                 self._activity.record(

@@ -47,6 +47,7 @@ from connect.server.auth import (
     narrower,
 )
 from connect.signer import Signer
+from connect.switches import Switches
 from connect.texts import AMOUNT_RULE, CAP_RULE
 
 from tests.conftest import (
@@ -1132,6 +1133,39 @@ def test_mcp_a_malformed_address_is_refused_before_the_budget_is_drawn(
     assert len(fake_w3.eth.sent) == 1
 
 
+def test_mcp_under_strict_parameters_an_unknown_intent_key_is_refused_before_any_draw(
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    make_app: t.Callable,
+    fake_w3: FakeW3,
+) -> None:
+    """The cap reads the intent as the gate will: refused at the mount, budget whole."""
+    app = make_app(
+        test_signer,
+        app_config,
+        activity,
+        token=WORKSPACE,
+        switches=Switches(strict_parameters=True),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        capped = _session_capped(client)  # 10 native for the session
+        intent = {**pay(RECIPIENT, 10), "limit": 1}
+        arguments = {"chain": "testchain", "target": RECIPIENT, "value": 10}
+        refused = _mcp_call(
+            client, capped, "safe_transaction", {**arguments, "intent": intent}
+        )
+        assert _refused_rule(refused) == "bad-intent"
+        sent = _mcp_call(
+            client,
+            capped,
+            "safe_transaction",
+            {**arguments, "intent": pay(RECIPIENT, 10)},
+        )
+        assert _refused_rule(sent) is None  # the session's 10 are all still there
+    assert len(fake_w3.eth.sent) == 1
+
+
 def test_mcp_a_mech_cap_from_2_53_on_reaches_the_flow_exactly(
     client: TestClient,
     mech_service: t.Any,
@@ -1402,7 +1436,11 @@ def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(  # pylint:
 def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
     """The exemption covers what this token drew for the id, and nothing more."""
     held: set = set()
-    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: (rid, via_safe) in held)
+    store = GrantStore(
+        WORKSPACE,
+        held=lambda rid, via_safe: (rid, via_safe) in held,
+        strict_parameters=False,
+    )
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     other = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     store.authorize(capped, "safe_transaction", {"value": 6, "request_id": "r1"})
@@ -1427,7 +1465,9 @@ def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
 
 def test_a_retry_s_record_keeps_the_most_drawn_per_asset() -> None:
     """A retry declaring less, or leaving an asset out, lowers nothing on record."""
-    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True)
+    store = GrantStore(
+        WORKSPACE, held=lambda rid, via_safe: True, strict_parameters=False
+    )
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 20, USDC: 5}))
 
     def send(request_id: str, value: int, usdc: int = 0) -> None:
@@ -1454,7 +1494,9 @@ def test_a_forgotten_request_id_is_drawn_in_full(
 ) -> None:
     """Past the bound a draw is forgotten, which only ever draws again."""
     monkeypatch.setattr(auth_module, "MAX_DRAWN_REQUEST_IDS", 1)
-    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True)
+    store = GrantStore(
+        WORKSPACE, held=lambda rid, via_safe: True, strict_parameters=False
+    )
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r1"})
     store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r2"})
