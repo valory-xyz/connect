@@ -376,12 +376,16 @@ installed for an operator who never selects `ocb_cli`.
 **Launch.** A terminal opens, the same way as for `codex_cli`, running
 
 ```sh
-<recorded path> --dir <STORE_PATH> --model 'mech:chat@<the chat mech>' --model-budget <OCB_MODEL_BUDGET_USD>
+<recorded path> --dir <STORE_PATH> --model 'mech:chat@<the chat mech>' --model-budget <OCB_MODEL_BUDGET_USD> --trusted-skill-hash <sha256> ...
 ```
 
 by absolute path, without a PATH probe: uv's tool directory is not always on
 the login shell's PATH. `--dir` names this instance's workspace; without it
-`ocb-agent` takes the first Connect service it finds under `~/.operate`.
+`ocb-agent` takes the first Connect service it finds under `~/.operate`. One
+`--trusted-skill-hash` names the SHA-256 of each skill file Connect installs
+into the workspace: OCB treats a skill file whose digest it was not given as
+data, not instructions, so without these it would be told to ignore Connect's
+own skills.
 OCB's REPL takes no opening prompt, so the session
 opens empty. Its model calls go through the `mech_request` MCP tool with that
 mech as `priority_mech`, so they are paid like any other mech request and pass
