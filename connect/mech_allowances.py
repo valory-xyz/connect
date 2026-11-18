@@ -475,7 +475,17 @@ class MechAllowances:
             self._deposit(short.deposits, kind, short.amount)
             rose = int(short.deposits.check_balance(safe, kind)) > short.balance
         except Exception as e:  # pylint: disable=broad-exception-caught
-            self._unconfirmed(chain, priced, short.sends, error=e, amount=short.amount)
+            # only the safe's payment to the tracker can leave a deposit
+            # uncertain, and `check_top_up` draws for that call alone:
+            # mech-client's approve ahead of a token deposit moves nothing
+            paid = self._top_ups[chain].drawn > drawn
+            self._unconfirmed(
+                chain,
+                priced,
+                short.sends.hashes if paid else [],
+                error=e,
+                amount=short.amount,
+            )
             self._return_drawn(chain, drawn)
             return 0
         if not rose:
@@ -515,28 +525,29 @@ class MechAllowances:
         self,
         chain: str,
         priced: PricedMech,
-        sends: _Sends,
+        paid: list[str],
         *,
         error: Exception,
         amount: int,
     ) -> None:
         """Say what a failed prepaid deposit was; raise if it may have landed.
 
-        A failure that reached no chain is simply no deposit. One after the
-        transaction left is spend-uncertain, whatever failed — the receipt
-        wait, a balance read, the token path's deposit after its approve
-        landed — so it is audited and raised, and the caller keeps its
-        request id rather than being told to send again.
+        `paid` is the hashes of this deposit's payments to the tracker, in
+        order. A failure with none of them is simply no deposit, whatever
+        else was sent: mech-client approves the tracker before it pays it,
+        and an approval whose receipt is lost moved nothing. A failure once a
+        payment has left is spend-uncertain, whatever failed next, so it is
+        audited and raised, and the caller keeps its request id rather than
+        being told to send again.
 
         :raises MechDepositUnknown: the deposit may have landed.
         """
         failure = top_up_failure(error)
         tx_hash = failure.tx_hash if isinstance(failure, MechDepositUnknown) else None
-        # a refused deposit moved nothing, whatever went before it: the token
-        # path's own approve may have been sent, and signs no payment
+        # a refused payment moved nothing either, whatever went before it
         refused = tx_hash is None and isinstance(failure, SignerError)
-        if tx_hash is None and sends.hashes and not refused:
-            tx_hash = sends.hashes[-1]
+        if tx_hash is None and paid and not refused:
+            tx_hash = paid[-1]
         if tx_hash is None:
             logger.info(
                 "did not prepay %s into the mech balance: %s", amount, cause_of(error)

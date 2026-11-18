@@ -2233,6 +2233,7 @@ class FakeDepositService:
         self.target = TRACKER  # where the deposit pays; the guard judges it
         self.credits = True  # whether the deposit lands in the prepaid balance
         self.after_send_error: Exception | None = None  # raised once it is sent
+        self.approve_error: Exception | None = None  # raised once the approve is sent
         # forced before anything is signed, as mech-client's own pre-checks do
         self.deposit_error: Exception | None = None
 
@@ -2267,6 +2268,10 @@ class FakeDepositService:
                 ),
             }
         )
+        if self.approve_error is not None:
+            raise self.approve_error
+        if self.approve_error is not None:
+            raise self.approve_error
         data = bytes.fromhex(DEPOSIT_SELECTOR) + abi_encode(["uint256"], [amount])
         return self._deposit(
             amount, token_type, exec_transaction_calldata(TRACKER, data=data)
@@ -4812,6 +4817,50 @@ class TestMech:
                 allowances.check_top_up("testchain", SAFE, over)
         other.join(5)
         assert prepaying.prefunded.amount == 4 * 10**16  # once the lock was free
+
+    def test_a_token_approve_whose_receipt_is_lost_did_not_prepay(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An approve that reached the chain is not a payment that may have landed.
+
+        mech-client approves the tracker before it pays it, so a receipt wait
+        that times out on the approve leaves the prepaid balance exactly as
+        it was: the request carries on to the 402 path instead of stopping
+        with a deposit it cannot account for.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, True),
+        )
+        monkeypatch.setattr(
+            allowances_module, "payment_token", lambda kind, chain: PAYMENT_TOKEN
+        )
+        fake_w3.eth.contract = (  # type: ignore[attr-defined]
+            lambda address, abi: erc20_holding(2 * 10**16, decimals=6)
+        )
+        patched_mech.info = (PaymentType.USDC_TOKEN, 42, 10**16)
+        patched_mech.prepaid.balance = 0
+        patched_mech.prepaid.approve_error = TimeoutError("receipt not in 300s")
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.deposits == []
+        assert len(fake_w3.eth.sent) == 1  # the approve, and no payment after it
+        assert len(patched_mech.calls) == 1
+        kinds = audit_kinds(store_path)
+        assert "mech_deposit_unconfirmed" not in kinds
+        assert "mech_prefund" not in kinds
 
     def test_a_token_deposit_refused_after_its_approve_did_not_prepay(  # pylint: disable=too-many-arguments
         self,
