@@ -32,6 +32,7 @@ that hand a URL to a URL handler or a command to a terminal, and the
 environment scrub that keeps our own packaging out of the session it starts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -49,12 +50,21 @@ from urllib.parse import quote
 import tomli_w
 
 from connect.config import AGENT_HTTP_PORT, BIND_HOST
+from connect.launch_errors import LaunchError, OcbLaunchError
+from connect.ocb import (
+    OCB_ASSETS_SUBDIR,
+    OCB_SESSION_WAIT_SECONDS,
+    OcbInstaller,
+    ocb_command,
+)
+from connect.private_files import write_private
 from connect.settings import (
     DEFAULT_HARNESS,
     HARNESS_CLAUDE_CODE_CLI,
     HARNESS_CLAUDE_CODE_DESKTOP,
     HARNESS_CODEX_CLI,
     HARNESS_CODEX_DESKTOP,
+    HARNESS_OCB_CLI,
 )
 
 logger = logging.getLogger("agent")
@@ -82,10 +92,15 @@ AGENT_DIRS = (Path(".claude"), Path(".agents"))
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harnesses read these themselves; the model never needs to, and reading
 # one would put the bearer token into the session transcript
-TOKEN_DENY_RULES = ("Read(./.mcp.json*)", "Read(./.codex/config.toml*)")
+# (OCB copies the token into its own shim under ocb-agent/)
+TOKEN_DENY_RULES = (
+    "Read(./.mcp.json*)",
+    "Read(./.codex/config.toml*)",
+    "Read(./ocb-agent/**)",
+)
 # a `git init` in the workspace must never be able to stage the token, nor
 # the virtualenv the connect-polymarket skill builds at the workspace root
-GITIGNORE_ENTRIES = (".mcp.json*", ".codex/config.toml*", ".venv/")
+GITIGNORE_ENTRIES = (".mcp.json*", ".codex/config.toml*", "ocb-agent/", ".venv/")
 # picked, not tuned: refusals seen exit in ms; still running by then means launching
 LAUNCH_SETTLE_SECONDS = 2.0
 LAUNCH_PROBE_SECONDS = 10.0
@@ -109,10 +124,6 @@ LOADER_ENV_VARS = (
     "DYLD_LIBRARY_PATH_ORIG",
 )
 LOADER_ENV_PREFIXES = ("_PYI_",)
-
-
-class LaunchError(Exception):
-    """An agent session could not be opened in the requested harness."""
 
 
 def assets_dir() -> Path:
@@ -228,6 +239,9 @@ DEEP_LINKS: dict[str, t.Callable[[Path], str]] = {
     HARNESS_CLAUDE_CODE_DESKTOP: desktop_deep_link,
 }
 TERMINAL_COMMANDS: dict[str, str] = {HARNESS_CODEX_CLI: "codex"}
+# Opened in a terminal by the absolute path its installer reported, so they sit
+# in neither table above and are never in another harness's fallback order.
+INSTALLED_HARNESSES = (HARNESS_OCB_CLI,)
 
 # shells that take `-lic`; tcsh, fish and friends do not
 POSIX_SHELLS = ("bash", "zsh", "ksh", "mksh", "dash", "sh")
@@ -287,10 +301,35 @@ class Workspace:
     our health.
     """
 
-    def __init__(self, store_path: Path, token: str) -> None:
-        """Start unprovisioned: the first ensure() is what makes it real."""
+    def __init__(
+        self,
+        store_path: Path,
+        token: str,
+        ocb_mech: str | None = None,
+        record_dir: Path | None = None,
+        *,
+        record_key: bytes,
+    ) -> None:
+        """Start unprovisioned: the first ensure() is what makes it real.
+
+        `ocb_mech` is OCB's model, the instance chain's chat mech; `record_dir`
+        keeps OCB's install record, by default STORE_PATH's parent (the
+        service's own folder): outside the workspace, and unlike Connect's
+        working directory (the deployment, which Pearl rebuilds on every
+        service start) it survives a restart. `record_key` signs that record
+        (Connect passes the settings MAC key), and is required so a caller
+        cannot leave the record unsigned by omission.
+        """
         self.path = store_path
         self._token = token
+        self._ocb_mech = ocb_mech
+        self.ocb = OcbInstaller(
+            store_path,
+            record_dir or store_path.parent,
+            bundle_dir=lambda: assets_dir() / OCB_ASSETS_SUBDIR,
+            env=harness_env,
+            record_key=record_key,
+        )
         self._lock = threading.Lock()
         self._reason: str | None = "the workspace has not been provisioned yet"
 
@@ -359,9 +398,16 @@ class Workspace:
         installed the guess was the whole reason no session ever opened
         (OPE-1867).
 
-        :raises ValueError: on an unknown harness;
-        :raises LaunchError: when none of the harnesses tried would open.
+        OCB never falls back: it was chosen for its own spending guardrails,
+        and opening another harness instead would drop them unnoticed.
+
+        :raises ValueError: on an unknown harness, or OCB on a chain without
+            a chat mech;
+        :raises LaunchError: when none of the harnesses tried would open —
+            InstallError or OcbLaunchError for OCB.
         """
+        if harness in INSTALLED_HARNESSES:
+            return self._open_ocb()
         order = [harness]
         if fallback:
             order += [
@@ -402,6 +448,32 @@ class Workspace:
             )
         raise LaunchError(f"{reason} The workspace is at {self.path}")
 
+    def prepare(self, harness: str) -> None:
+        """Start installing `harness` once it is chosen, if it needs installing."""
+        if harness in INSTALLED_HARNESSES:
+            self.ocb.start()
+
+    def _open_ocb(self) -> str:
+        """Install OCB if it is missing, then open a terminal running it.
+
+        :raises ValueError: with no chat mech — checked before any install,
+            so a launch that cannot happen never waits on one.
+        """
+        if self._ocb_mech is None:
+            raise ValueError("OCB has no confirmed chat mech on this instance's chain")
+        command = ocb_command(
+            self.ocb.ensure(OCB_SESSION_WAIT_SECONDS),
+            self._ocb_mech,
+            self.path,
+            skill_hashes(),
+        )
+        if not _open_terminal(self.path, command):
+            raise OcbLaunchError(
+                f"Could not open a terminal running OCB. The workspace is at {self.path}"
+            )
+        logger.info("launched %s via a terminal", HARNESS_OCB_CLI)
+        return HARNESS_OCB_CLI
+
     def _provision(self) -> None:
         """Write our files into the workspace, leaving every other one alone."""
         self.path.mkdir(parents=True, exist_ok=True)
@@ -434,7 +506,7 @@ class Workspace:
             "headers": {"Authorization": f"Bearer {self._token}"},
             "timeout": MCP_TOOL_TIMEOUT_MS,
         }
-        _write_private(path, json.dumps(config, indent=2))
+        write_private(path, json.dumps(config, indent=2))
 
     def _write_codex_config(self) -> None:
         """Merge our server entry into .codex/config.toml (0600), keeping the rest."""
@@ -451,7 +523,7 @@ class Workspace:
             "network_access", True
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write_private(path, tomli_w.dumps(config))
+        write_private(path, tomli_w.dumps(config))
 
     def _write_gitignore(self) -> None:
         """Keep the token file out of any repo the agent may init here."""
@@ -483,7 +555,7 @@ class Workspace:
             if rule not in deny:
                 deny.append(rule)
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write_private(path, json.dumps(config, indent=2))
+        write_private(path, json.dumps(config, indent=2))
 
     def _install_lib(self) -> None:
         """Overwrite the shared modules our skills import, beside each skills dir."""
@@ -505,6 +577,22 @@ class Workspace:
             target_root.mkdir(parents=True, exist_ok=True)
             for skill_dir in skills:
                 _replace_tree(skill_dir, target_root / skill_dir.name)
+
+
+def skill_hashes() -> list[str]:
+    """Return the SHA-256 of each bundled skill file, as installed in the workspace.
+
+    `_install_skills` copies each skill tree byte for byte, so the bundle's
+    `SKILL.md` and the workspace copy hash alike. Sorted, so the launch line
+    is stable; empty when the bundle has no skills.
+    """
+    skills = assets_dir() / "skills"
+    if not skills.is_dir():
+        return []
+    return sorted(
+        hashlib.sha256(skill.read_bytes()).hexdigest()
+        for skill in skills.glob("*/SKILL.md")
+    )
 
 
 def _remove(target: Path) -> None:
@@ -572,16 +660,6 @@ def _load_config(path: Path, loads: t.Callable[[str], t.Any], *tables: str) -> d
         backup,
     )
     return {}
-
-
-def _write_private(path: Path, text: str) -> None:
-    """Atomically replace a file, readable by its owner alone."""
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.unlink(missing_ok=True)  # a stale tmp may have looser permissions
-    tmp.touch(mode=0o600)
-    tmp.write_text(text, encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
 
 
 def _login_shell() -> str:

@@ -25,9 +25,11 @@ whitelist) are authenticated with the keystore password — NOT the bearer
 token: the agent session holds the token and must not be able to lift its own
 restrictions, while only the human operator knows the password. The password
 is verified by re-decrypting the keystore the server booted from. The
-`harness` preference is not protected and needs no password. The mech queue's
-hard cancel pays for one on-chain request, so it takes the password the same
-way, and its status is read by the operator's UI.
+`harness` preference needs no password: it is under the settings file's MAC
+(an edit to the file is caught), but this route, gated on a local origin like
+every other here, may change it. The mech queue's hard cancel pays for one
+on-chain request, so it takes the password the same way, and its status is
+read by the operator's UI.
 """
 
 import logging
@@ -40,7 +42,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from connect.keystore import KeystoreError, load_account
 from connect.mech_queue import HardCancelFailed, HardCancelRefused
 from connect.server.strict import StrictBody
-from connect.settings import SettingsPersistError
+from connect.settings import SettingsPersistError, SettingsStore
 from connect.signer import SignerError
 
 logger = logging.getLogger("agent")
@@ -92,10 +94,15 @@ class SettingsPatch(BaseModel):
     harness: str | None = None
 
 
+def _settings_view(store: SettingsStore) -> dict:
+    """Return the enforced settings, plus which harnesses this instance can use."""
+    return {**store.load().to_dict(), "harnesses": store.harnesses()}
+
+
 @router.get("/settings")
 def get_settings(request: Request) -> dict:
     """Return the enforced settings (post-verification)."""
-    return request.app.state.settings_store.load().to_dict()
+    return _settings_view(request.app.state.settings_store)
 
 
 def _reject_password(request: Request) -> HTTPException:
@@ -148,9 +155,11 @@ def patch_settings(body: SettingsPatch, request: Request) -> dict:
 
     Omitted fields keep their current value. Changing `protected`
     (mode/whitelist) proves knowledge of the keystore password first; the
-    `harness` preference needs no password — it is not integrity-protected
-    and the worst a change can do is open the workspace in another harness.
-    Origin locality applies to everything via the router dependency.
+    `harness` preference needs no password — the file's MAC guards it
+    against edits on disk, and this route stays open to a local origin: the
+    worst a change can do is open the workspace in another harness (ocb_cli
+    included, which installs OCB on first use). Origin locality applies to
+    everything via the router dependency.
     """
     state = request.app.state
     if body.protected is None and body.harness is None:
@@ -182,7 +191,10 @@ def patch_settings(body: SettingsPatch, request: Request) -> dict:
     if settings.harness != previous.harness:
         state.activity.record("harness_changed", harness=settings.harness)
         logger.info("harness updated: %s", settings.harness)
-    return settings.to_dict()
+    if body.harness is not None:
+        # installed on selection, so the next session need not wait for it
+        state.workspace.prepare(body.harness)
+    return _settings_view(state.settings_store)
 
 
 class HardCancelRequest(StrictBody):

@@ -77,6 +77,22 @@ def test_safes_json_format(tmp_path: Path) -> None:
     assert config.chains["base"].safe_address is None
 
 
+@pytest.mark.parametrize(
+    ("safes", "expected"),
+    [
+        ({"gnosis": "0x" + "11" * 20}, "gnosis"),
+        ({}, None),
+        ({"gnosis": "0x" + "11" * 20, "base": "0x" + "22" * 20}, None),
+    ],
+)
+def test_instance_chain_is_the_one_chain_with_a_safe(
+    tmp_path: Path, safes: dict, expected: str | None
+) -> None:
+    """Every chain has an RPC; only the instance's own chain has a safe."""
+    env = base_env(tmp_path) | {SAFES_ENV: json.dumps(safes)}
+    assert load_config(env).instance_chain == expected
+
+
 def test_safe_for_unconfigured_chain_warns(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -297,3 +313,36 @@ def test_indexer_sources_are_logged_without_urls(
     assert "https://" not in caplog.text
     assert "private-template-key" not in caplog.text
     assert "private-direct-key" not in caplog.text
+
+
+def test_ocb_chat_mech_overrides_are_read_per_chain(tmp_path: Path) -> None:
+    """OCB_CHAT_MECH_<CHAIN> fills that chain's mech; empty means unset."""
+    mech = "0x" + "ab" * 20
+    env = base_env(tmp_path) | {
+        "OCB_CHAT_MECH_GNOSIS": f" {mech} ",  # all lowercase: no checksum to fail
+        "OCB_CHAT_MECH_POLYGON": "",
+    }
+    assert load_config(env).ocb_chat_mech_overrides == {"gnosis": mech}
+    assert load_config(base_env(tmp_path)).ocb_chat_mech_overrides == {}
+    checksummed = "0xABaBaBaBABabABabAbAbABAbABabababaBaBABaB"
+    env = base_env(tmp_path) | {"OCB_CHAT_MECH_GNOSIS": checksummed}
+    assert load_config(env).ocb_chat_mech_overrides == {"gnosis": checksummed}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0x1234",
+        "gnosis",
+        "0x" + "zz" * 20,
+        "ab" * 20,  # hex without the 0x prefix
+        "0x" + "aB" * 20,  # mixed case with a bad checksum
+    ],
+)
+def test_an_ocb_chat_mech_override_must_be_an_address(
+    tmp_path: Path, value: str
+) -> None:
+    """A typo must not reach the launch line as OCB's model."""
+    env = base_env(tmp_path) | {"OCB_CHAT_MECH_GNOSIS": value}
+    with pytest.raises(ValueError, match="OCB_CHAT_MECH_GNOSIS"):
+        load_config(env)
