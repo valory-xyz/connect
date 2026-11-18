@@ -43,6 +43,11 @@ class Switches:
     # refuse a tool argument the tool does not take, naming the ones it
     # does. Off in both positions: unknown arguments are ignored.
     strict_parameters: bool = False
+    # S3: the tool arguments only Connect has (`tool_schema.EXTRA_PARAMETERS`);
+    # off, they are neither published nor read
+    extra_tool_parameters: bool = True
+    # S4: `intent` published as its typed definitions, not a bare object
+    rich_intent_schema: bool = True
     # POST /sign-and-send, a signing route the reference does not serve
     rest_signing_routes: bool = True
     # the native top-up from the safe to the agent EOA at startup
@@ -67,6 +72,8 @@ PRODUCTION = Switches()
 TEST_INTERFACE = Switches(
     no_intent_policy="simulate-only",
     strict_parameters=False,
+    extra_tool_parameters=False,
+    rich_intent_schema=False,
     rest_signing_routes=False,
     agent_topup_at_boot=False,
 )

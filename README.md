@@ -1067,9 +1067,23 @@ Connect. Two public modules carry that contract:
   `simulate-only` for the bench; see [Intent gate](#intent-gate)),
   `strict_parameters` (off in both: an MCP
   tool ignores an argument it does not take, and the gate an intent key it
-  does not read), `rest_signing_routes`
-  (`POST /sign-and-send`; on in Pearl) and `agent_topup_at_boot` (the
-  [Agent top-up](#agent-top-up); on in Pearl).
+  does not read), `extra_tool_parameters` (on in Pearl: the arguments only
+  Connect has, `wait_for_receipt` and `timeout` on the send tools, `intent` on
+  `send_transaction`, `via_safe` on `simulate_transaction`, `block` on
+  `chain_call`, `limit` and `offset` on `mech_tools`, `timeout` on
+  `mech_result`, `legacy_on_chain` and `request_context` on `mech_request`;
+  off, they are neither listed nor read), `rich_intent_schema` (on in Pearl:
+  `intent` listed as its typed definitions; off, a bare object),
+  `rest_signing_routes` (`POST /sign-and-send`; on in Pearl) and
+  `agent_topup_at_boot` (the [Agent top-up](#agent-top-up); on in Pearl).
+
+The tool listing presents every argument as the reference does, in both
+positions: a bare type, with no title, default or nullable union; `value` and
+`max_payment` as strings carrying the reference's base-units description;
+`mech_request`'s `timeout` as an integer; each tool's `required` set the
+reference's, and `readOnlyHint` on exactly the reference's nine read-only
+tools. With Pearl's extras off, the listing equals the reference's field for
+field.
 
 Mech amounts are JSON integers, as the reference answers them: `mech_tools`'
 `max_delivery_rate` and `default_max_payment`, and `mech_request`'s

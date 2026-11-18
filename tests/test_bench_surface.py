@@ -255,14 +255,18 @@ def test_target_wins_over_to_and_other_tools_are_left_alone() -> None:
 
 
 def test_the_test_interface_takes_the_reference_s_positions() -> None:
-    """The bench's positions: simulate-only, lenient, no EOA route, no boot top-up."""
+    """The bench's positions: the reference's behaviour, switch by switch."""
     assert TEST_INTERFACE == Switches(
         no_intent_policy="simulate-only",
         strict_parameters=False,
+        extra_tool_parameters=False,
+        rich_intent_schema=False,
         rest_signing_routes=False,
         agent_topup_at_boot=False,
     )
     assert PRODUCTION.no_intent_policy == "strict"
+    assert PRODUCTION.extra_tool_parameters
+    assert PRODUCTION.rich_intent_schema
     assert PRODUCTION.rest_signing_routes
     assert PRODUCTION.agent_topup_at_boot
 
@@ -772,3 +776,157 @@ async def test_get_abi_reads_the_chain_it_is_given_over_the_instance_s(
     monkeypatch.setattr(AppConfig, "instance_chain", property(lambda _s: "nochain"))
     await mcp.call_tool("get_abi", {"address": RECIPIENT, "chain": "testchain"})
     assert read == [(test_signer.w3("testchain"), RECIPIENT)]
+
+
+WEI = {"type": "string", "description": texts.WEI_DESCRIPTION}
+STRING = {"type": "string"}
+# the reference's TOOLS argument table (onchainbench fork_connect.TOOLS)
+REFERENCE_ARGUMENTS: dict[str, dict[str, dict]] = {
+    "wallet_info": {"chain": STRING},
+    "safe_transaction": {
+        "chain": STRING,
+        "target": STRING,
+        "value": WEI,
+        "data": STRING,
+        "request_id": STRING,
+        "intent": {"type": "object"},
+    },
+    "send_transaction": {
+        "to": STRING,
+        "value": WEI,
+        "data": STRING,
+        "chain": STRING,
+        "request_id": STRING,
+    },
+    "preflight_transaction": {
+        "chain": STRING,
+        "target": STRING,
+        "value": WEI,
+        "data": STRING,
+        "via_safe": {"type": "boolean"},
+    },
+    "simulate_transaction": {
+        "chain": STRING,
+        "target": STRING,
+        "value": WEI,
+        "data": STRING,
+        "intent": {"type": "object"},
+    },
+    "chain_call": {"chain": STRING, "to": STRING, "data": STRING},
+    "get_abi": {"chain": STRING, "address": STRING},
+    "decode_calldata": {"data": STRING, "address": STRING, "chain": STRING},
+    "transaction_status": {"chain": STRING, "tx_hash": STRING},
+    "sign_message": {"digest": STRING},
+    "mech_tools": {"priority_mech": STRING, "chain": STRING},
+    "mech_request": {
+        "prompt": STRING,
+        "tool": STRING,
+        "priority_mech": STRING,
+        "max_payment": WEI,
+        "auto_deposit": {"type": "boolean"},
+        "request_id": STRING,
+        "timeout": {"type": "integer"},
+        "chain": STRING,
+    },
+    "mech_result": {"request_id": STRING},
+}
+REFERENCE_READ_ONLY = {
+    "wallet_info",
+    "preflight_transaction",
+    "simulate_transaction",
+    "chain_call",
+    "get_abi",
+    "decode_calldata",
+    "transaction_status",
+    "mech_tools",
+    "mech_result",
+}
+
+
+def _reference_listing() -> dict[str, dict]:
+    """Return the reference's listing, tool by tool, as the test interface serves it."""
+    descriptions = dict(texts.TOOL_DESCRIPTIONS)
+    # decisions 4 and 11: Connect's own two descriptions
+    descriptions["get_abi"] = texts.GET_ABI_DESCRIPTION
+    descriptions["transaction_status"] = texts.TRANSACTION_STATUS_DESCRIPTION
+    return {
+        name: {
+            "name": name,
+            "description": descriptions[name],
+            "inputSchema": {
+                "type": "object",
+                "properties": arguments,
+                "required": REFERENCE_REQUIRED.get(name, []),
+            },
+            "readOnlyHint": name in REFERENCE_READ_ONLY,
+        }
+        for name, arguments in REFERENCE_ARGUMENTS.items()
+    }
+
+
+async def test_the_test_interface_lists_the_reference_s_tools(
+    make_mcp: t.Callable[..., FastMCP],
+) -> None:
+    """B3: the listing equals the reference's, field for field, for all 13 tools."""
+    listing = {
+        tool.name: {
+            "name": tool.name,
+            "description": tool.description,
+            "inputSchema": {
+                **tool.inputSchema,
+                "required": sorted(tool.inputSchema["required"]),
+            },
+            "readOnlyHint": bool(tool.annotations and tool.annotations.readOnlyHint),
+        }
+        for tool in await make_mcp(TEST_INTERFACE).list_tools()
+    }
+    expected = _reference_listing()
+    for spec in expected.values():
+        spec["inputSchema"]["required"] = sorted(spec["inputSchema"]["required"])
+    assert listing == expected
+
+
+async def test_pearl_publishes_connect_s_extra_arguments_and_the_typed_intent(
+    make_mcp: t.Callable[..., FastMCP],
+) -> None:
+    """S3 and S4 on: the extras are listed, as bare types, and intent is typed."""
+    tools = {tool.name: tool for tool in await make_mcp(PRODUCTION).list_tools()}
+    safe = tools["safe_transaction"].inputSchema
+    assert safe["properties"]["wait_for_receipt"] == {"type": "boolean"}
+    assert safe["properties"]["intent"] == {"$ref": "#/$defs/ToolIntent"}
+    assert safe["$defs"]["ToolIntent"]["additionalProperties"] is True
+    assert "intent" in tools["send_transaction"].inputSchema["properties"]  # S18
+    assert (
+        tools["mech_request"].inputSchema["properties"]["request_context"][
+            "description"
+        ]
+        == texts.REQUEST_CONTEXT_NOTE
+    )
+    for tool in tools.values():
+        for argument in tool.inputSchema["properties"].values():
+            assert "title" not in argument
+            assert "default" not in argument
+
+
+@pytest.mark.parametrize("extras", [True, False])
+async def test_an_extra_argument_is_read_only_when_published(
+    make_mcp: t.Callable[..., FastMCP],
+    monkeypatch: pytest.MonkeyPatch,
+    extras: bool,
+) -> None:
+    """S3 off: simulate_transaction's via_safe is neither listed nor read."""
+    seen: list[bool] = []
+
+    def simulate(_self: Signer, *_args: t.Any, **kwargs: t.Any) -> dict:
+        seen.append(kwargs["via_safe"])
+        return {}
+
+    monkeypatch.setattr(Signer, "simulate", simulate)
+    mcp = make_mcp(Switches(extra_tool_parameters=extras))
+    (tool,) = [t for t in await mcp.list_tools() if t.name == "simulate_transaction"]
+    assert ("via_safe" in tool.inputSchema["properties"]) is extras
+    await mcp.call_tool(
+        "simulate_transaction",
+        {"chain": "testchain", "target": RECIPIENT, "via_safe": False},
+    )
+    assert seen == [not extras]  # off, the default (the safe) stands

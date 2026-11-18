@@ -32,6 +32,7 @@ import typing as t
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import Tool as MCPTool
 from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator, ConfigDict, Field, ValidationError, with_config
 from pydantic.json_schema import SkipJsonSchema
@@ -49,6 +50,7 @@ from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
 from connect.safe import OPERATION_CALL, Operation
+from connect.server import tool_schema
 from connect.server.auth import (
     GrantRefused,
     GrantStore,
@@ -64,6 +66,7 @@ from connect.server.strict import (
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
 from connect.signer_errors import logged_cause
+from connect.switches import Switches
 from connect.texts import (
     AMOUNT_DESCRIPTION,
     AMOUNT_REFUSED,
@@ -206,11 +209,28 @@ class ConnectMCP(FastMCP):
     the markers the bench's broker reads.
     """
 
-    def __init__(self, **settings: t.Any) -> None:
-        """Build the server, reporting the reference's serverInfo version."""
+    def __init__(self, *, switches: Switches, **settings: t.Any) -> None:
+        """Build the server, reporting the reference's serverInfo version.
+
+        `switches` decide what the listing publishes (`tool_schema`).
+        """
         super().__init__(**settings)
+        self._switches = switches
         # FastMCP takes no version; unset, the MCP SDK reports its own
         self._mcp_server.version = SERVER_INFO["version"]
+
+    async def list_tools(self) -> list[MCPTool]:
+        """List the tools, each argument presented as the reference presents it."""
+        return [
+            tool.model_copy(
+                update={
+                    "inputSchema": tool_schema.published(
+                        tool.name, tool.inputSchema, self._switches
+                    )
+                }
+            )
+            for tool in await super().list_tools()
+        ]
 
     def tool_names(self) -> frozenset[str]:
         """Return the names of the registered tools."""
@@ -231,6 +251,8 @@ class ConnectMCP(FastMCP):
             raise ToolError(UNKNOWN_TOOL(name))
         try:  # the arguments' check is Connect's; one inside a tool body is not
             check_arguments(arguments)
+            unread = tool_schema.unread(name, self._switches)
+            arguments = {k: v for k, v in arguments.items() if k not in unread}
             arguments = with_aliases(name, arguments)
             metadata = tool.fn_metadata
             metadata.arg_model.model_validate(metadata.pre_parse_json(arguments))
@@ -288,7 +310,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     expose_mode = settings_config.EXPOSE_MODE_TO_AGENT
     # no instructions at initialize: the reference sends none
     mcp = ConnectMCP(
-        name=SERVER_INFO["name"], stateless_http=True, streamable_http_path="/"
+        switches=signer.switches,
+        name=SERVER_INFO["name"],
+        stateless_http=True,
+        streamable_http_path="/",
     )
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["wallet_info"], annotations=READ_ONLY)
