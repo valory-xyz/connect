@@ -75,7 +75,7 @@ from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
 from connect.chains import MECH_MARKETPLACES
-from connect.config import AppConfig, ChainConfig
+from connect.config import AppConfig, ChainConfig, NATIVE_ASSET
 from connect.guard import ALLOWANCE_TTL, Guard, GuardError
 from connect.idempotency import RequestLedger
 from connect.intent import Capped
@@ -2172,6 +2172,26 @@ def _executor_wrapped(failure: Exception) -> Exception:
         return wrapped
 
 
+class FakeCall(t.NamedTuple):
+    """One contract read's answer."""
+
+    value: int
+
+    def call(self) -> int:
+        """Return the answer."""
+        return self.value
+
+
+def erc20_holding(balance: int, decimals: int = 18) -> t.Any:
+    """An ERC-20 contract stand-in answering balanceOf and decimals."""
+    return SimpleNamespace(
+        functions=SimpleNamespace(
+            balanceOf=lambda _address: FakeCall(balance),
+            decimals=lambda: FakeCall(decimals),
+        )
+    )
+
+
 class FakeDepositService:
     """mech-client's deposit path, faked at its chain reads and writes only.
 
@@ -2188,6 +2208,10 @@ class FakeDepositService:
         self.deposits: list[tuple[int, str]] = []
         self.signer: t.Any = None
         self.safe_address: str | None = None
+        self.ledger_api: t.Any = None  # what the safe's own balance is read over
+        self.target = TRACKER  # where the deposit pays; the guard judges it
+        # forced before anything is signed, as mech-client's own pre-checks do
+        self.deposit_error: Exception | None = None
 
     def built(self, **kwargs: t.Any) -> "FakeDepositService":
         """Stand in for the DepositService constructor, capturing its signer."""
@@ -2203,7 +2227,7 @@ class FakeDepositService:
     def deposit_native(self, amount: int) -> str:
         """Send the safe's native transfer to the balance tracker."""
         return self._deposit(
-            amount, "native", exec_transaction_calldata(TRACKER, value=amount)
+            amount, "native", exec_transaction_calldata(self.target, value=amount)
         )
 
     def deposit_token(self, amount: int, token_type: str = "olas") -> str:  # nosec B107
@@ -2215,6 +2239,8 @@ class FakeDepositService:
 
     def _deposit(self, amount: int, asset: str, data: str) -> str:
         """Sign and send the deposit, wrapping a refusal as the executor does."""
+        if self.deposit_error is not None:
+            raise self.deposit_error
         try:
             self.signer.send_transaction({"to": self.safe_address, "data": data})
         except SignerError as e:
@@ -2400,7 +2426,7 @@ class TestMech:
 
     @pytest.fixture(name="patched_mech")
     def patched_mech_fixture(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, fake_w3: FakeW3
     ) -> FakeMarketplaceService:
         """Route MechService._service construction to the fake.
 
@@ -2408,6 +2434,7 @@ class TestMech:
         patching mech-client's own module would miss the import-time binding.
         """
         fake = FakeMarketplaceService()
+        fake.prepaid.ledger_api = SimpleNamespace(api=fake_w3)
 
         def _construct(**kwargs: object) -> FakeMarketplaceService:
             """Capture the MechSigner and safe the service would sign with."""
@@ -3459,6 +3486,7 @@ class TestMech:
         app_config: AppConfig,
         activity: ActivityLog,
         settings_store: SettingsStore,
+        fake_w3: FakeW3 | None = None,
     ) -> tuple[MechService, Guard]:
         """Build a mech service whose signer and flow share a restricted guard.
 
@@ -3475,6 +3503,12 @@ class TestMech:
         signer = Signer(
             account=account, config=app_config, activity=activity, guard=guard
         )
+        if fake_w3 is not None:  # a test that sends, not only one that probes
+            signer._chains._states["testchain"] = (  # pylint: disable=protected-access
+                _ChainState(
+                    w3=t.cast(Web3, fake_w3), lock=threading.Lock(), chain_id=31337
+                )
+            )
         return MechService(signer, app_config, activity, guard), guard
 
     def test_offchain_request_signs_in_restricted_mode(  # pylint: disable=too-many-arguments
@@ -4023,6 +4057,7 @@ class TestMech:
         """
         self._native_tracker(monkeypatch)
         patched_mech.prepaid.balance = 0
+        fake_w3.eth.balance = 10**18  # what the safe itself holds
         cap = 4 * 10**16  # max_payment, under 10x the mech's 10**16 rate
         mech_service.request(
             "q",
@@ -4059,6 +4094,7 @@ class TestMech:
         calls instead of each call paying for its own.
         """
         self._native_tracker(monkeypatch)
+        fake_w3.eth.balance = 10**18
         patched_mech.prepaid.balance = 10**16  # exactly the mech's rate
         mech_service.request(
             "q",
@@ -4072,6 +4108,374 @@ class TestMech:
         assert patched_mech.prepaid.deposits == []
         assert not fake_w3.eth.sent
         assert "mech_prefund" not in audit_kinds(store_path)
+
+    @pytest.mark.parametrize(
+        ("payment_type", "asset"),
+        [(PaymentType.OLAS_TOKEN, "olas"), (PaymentType.USDC_TOKEN, "usdc")],
+    )
+    def test_a_token_paid_mech_is_prepaid_through_the_token_deposit(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        payment_type: PaymentType,
+        asset: str,
+    ) -> None:
+        """A token-paid mech is prepaid the same way, through deposit(uint256).
+
+        mech-client's deposit path covers both assets, so nothing about the
+        asset is decided here: the deposit is the token's own call, and the
+        top-up bound reads its amount out of that call rather than a value.
+        """
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, True),
+        )
+        monkeypatch.setattr(
+            allowances_module, "payment_token", lambda kind, chain: PAYMENT_TOKEN
+        )
+        fake_w3.eth.contract = (  # type: ignore[attr-defined]
+            lambda address, abi: erc20_holding(10**18)
+        )
+        patched_mech.info = (payment_type, 42, 10**16)
+        patched_mech.prepaid.balance = 0
+        cap = 3 * 10**16
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=cap,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.reads == [(SAFE, payment_type)]
+        assert patched_mech.prepaid.deposits == [(cap, asset)]
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_a_prepaid_deposit_is_clamped_to_what_the_safe_can_pay(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A safe that cannot pay the whole cap prepays what it can.
+
+        mech-client refuses a deposit above the safe's own balance before
+        anything is signed, so asking for the cap regardless would cost the
+        request its deposit; and the operator's floor for the safe stays in
+        place, since prepaid mech calls must not drain what every other
+        action spends.
+        """
+        self._native_tracker(monkeypatch)
+        app_config.fund_requirements = {
+            "testchain": {"safe": {NATIVE_ASSET: {"threshold": 5 * 10**15, "topup": 0}}}
+        }
+        patched_mech.prepaid.balance = 0
+        fake_w3.eth.balance = 2 * 10**16  # the safe holds less than the cap
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=None,
+        )
+        # the balance less the operator's floor, not the 4 * 10**16 cap
+        assert patched_mech.prepaid.deposits == [(15 * 10**15, "native")]
+        assert len(patched_mech.calls) == 1
+
+    def test_a_safe_short_of_one_call_prepays_nothing(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A safe that cannot cover even the shortfall leaves the 402 path alone.
+
+        A deposit that still cannot pay for this call buys nothing, and
+        mech-client would refuse it; the request goes out for the mech to
+        answer or to price, as it did before.
+        """
+        self._native_tracker(monkeypatch)
+        patched_mech.prepaid.balance = 0
+        fake_w3.eth.balance = 10**15  # the mech's rate is 10**16
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.deposits == []
+        assert not fake_w3.eth.sent
+        assert len(patched_mech.calls) == 1
+
+    def test_a_prepaid_deposit_mech_client_refuses_leaves_the_402_path(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mech-client's own refusal, before anything is signed, is not a failure.
+
+        Its deposit path checks the safe's balance itself and raises a plain
+        refusal, which can still happen when the balance moves between the
+        read and the deposit. Nothing was sent, so the request carries on and
+        the mech names the shortfall if it must.
+        """
+        self._native_tracker(monkeypatch)
+        patched_mech.prepaid.balance = 0
+        fake_w3.eth.balance = 10**18
+        patched_mech.prepaid.deposit_error = ValueError(
+            "Insufficient native token balance for deposit. Amount: 40000000000000000"
+        )
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.deposits == []
+        assert not fake_w3.eth.sent
+        assert len(patched_mech.calls) == 1
+
+    def test_a_prepaid_deposit_the_guard_refuses_leaves_the_402_path(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deposit the guard denies is refused, audited, and not the request's end.
+
+        The deposit here pays the safe itself, which the guardrail's floor
+        refuses in every mode, so nothing is signed: the refusal is audited
+        as a blocked send and the request still goes out for the mech to
+        name a shortfall for.
+        """
+        self._native_tracker(monkeypatch)
+        service, _ = self._restricted_mech_service(
+            account, app_config, activity, settings_store, fake_w3
+        )
+        patched_mech.prepaid.balance = 0
+        patched_mech.prepaid.target = SAFE
+        fake_w3.eth.balance = 10**18
+        service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.deposits == []
+        assert not fake_w3.eth.sent
+        assert len(patched_mech.calls) == 1
+        assert "blocked" in audit_kinds(store_path)
+        assert "mech_prefund" not in audit_kinds(store_path)
+
+    def test_restricted_mode_rearms_the_grant_a_prepaid_deposit_spent(  # pylint: disable=too-many-arguments
+        self,
+        account: LocalAccount,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        settings_store: SettingsStore,
+        store_path: Path,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Restricted mode still admits the mech's shortfall after a prepaid deposit.
+
+        The guard spends a deposit allowance whole, so the prepaid deposit
+        consumes the one the request armed. What is left of the cap is armed
+        again, and only that: both deposits pass, and together they stay
+        inside the request's max_payment.
+        """
+        self._native_tracker(monkeypatch)
+        service, _ = self._restricted_mech_service(
+            account, app_config, activity, settings_store, fake_w3
+        )
+        prefund, shortfall = 10**16, 5 * 10**15
+        patched_mech.prepaid.balance = 0
+        patched_mech.top_up = shortfall  # the mech asks for one anyway
+        fake_w3.eth.balance = prefund  # the safe can prepay this much
+        service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.deposits == [(prefund, "native")]
+        assert len(fake_w3.eth.sent) == 2  # the prepaid deposit and the shortfall
+        caps = [
+            e["amount_cap"]
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_deposit_allowance"
+        ]
+        assert caps == [str(4 * 10**16), str(3 * 10**16)]  # the cap, then its rest
+        assert "blocked" not in audit_kinds(store_path)
+
+    def test_a_prepaid_deposit_draws_on_the_session_budget(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """What a prepaid deposit moves is drawn on the calling token's budget.
+
+        It leaves the safe for a mech exactly as a 402 top-up does, so a
+        token's mech session budget must see it before it is signed.
+        """
+        self._native_tracker(monkeypatch)
+        patched_mech.prepaid.balance = 0
+        fake_w3.eth.balance = 10**18
+        drawn: list[int] = []
+
+        def budget(amount: int) -> str | None:
+            """Record the draw and allow it."""
+            drawn.append(amount)
+            return None
+
+        cap = 4 * 10**16
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=cap,
+            top_up_budget=budget,
+        )
+        assert drawn == [cap]
+
+    def test_a_prefund_and_a_402_top_up_share_one_cap(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """What the prepaid deposit put in is what a 402 top-up may no longer.
+
+        The cap bounds the request, not each deposit: a request that prepaid
+        the whole cap and is still asked for a shortfall is refused, so no
+        request moves more than its max_payment however the mech asks for it.
+        """
+        self._native_tracker(monkeypatch)
+        patched_mech.prepaid.balance = 0
+        fake_w3.eth.balance = 10**18
+        cap = 4 * 10**16
+        patched_mech.top_up = cap  # the mech asks for a shortfall anyway
+        with pytest.raises(MechRefused, match="above the 0 this request may still"):
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=cap,
+                top_up_budget=None,
+            )
+        assert patched_mech.prepaid.deposits == [(cap, "native")]
+        assert len(fake_w3.eth.sent) == 1  # the prepaid deposit, and nothing more
+        (refused,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_deposit_refused"
+        ]
+        assert refused["amount"] == str(cap)
+
+    def test_a_prepaid_deposit_the_budget_refuses_leaves_the_402_path(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A refused prepaid deposit is not the request's failure.
+
+        A session budget that cannot carry the cap refuses the deposit before
+        it is signed, exactly as it refuses a 402 top-up: nothing leaves the
+        safe, the refusal is audited, and the request still goes out for the
+        mech to price and, if it must, to name a shortfall for.
+        """
+        self._native_tracker(monkeypatch)
+        patched_mech.prepaid.balance = 0
+        fake_w3.eth.balance = 10**18
+        refusal = "rule 'token-mech-session-cap': nothing left this session"
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=lambda amount: refusal,
+        )
+        assert patched_mech.prepaid.deposits == []
+        assert not fake_w3.eth.sent
+        assert len(patched_mech.calls) == 1  # the request went out regardless
+        (refused,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_deposit_refused"
+        ]
+        assert refused["reason"] == refusal
+        assert "mech_prefund" not in audit_kinds(store_path)
+
+    def test_a_prepaid_deposit_the_rpc_never_answered_is_reported(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A prepaid deposit that may have landed stops the request, named.
+
+        Nothing downstream can tell whether it moved funds, so it is reported
+        with its hash and audited instead of being read as a deposit that
+        never happened, which would send the request on to pay again.
+        """
+        self._native_tracker(monkeypatch)
+        patched_mech.prepaid.balance = 0
+        fake_w3.eth.balance = 10**18
+        deposit = "0x" + "d1" * 32
+
+        def unanswered(amount: int) -> str:
+            """Fail the deposit's broadcast the way an unanswered RPC does."""
+            raise _executor_wrapped(SendUnknown(deposit, held=False))
+
+        monkeypatch.setattr(patched_mech.prepaid, "deposit_native", unanswered)
+        with pytest.raises(MechDepositUnknown) as lost:
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=4 * 10**16,
+                top_up_budget=None,
+            )
+        assert deposit in str(lost.value)
+        assert not patched_mech.calls  # the request never reached the mech
+        (audited,) = [
+            e
+            for e in audit_entries(store_path)
+            if e["kind"] == "mech_deposit_unconfirmed"
+        ]
+        assert audited["tx_hash"] == deposit
 
     def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
         self,
