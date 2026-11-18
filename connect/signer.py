@@ -25,7 +25,6 @@ and send_via_safe() are its two callers; off-chain mech requests use
 Signer.sign_digest(). The key never leaves this module's LocalAccount.
 """
 
-import hashlib
 import logging
 import threading
 import typing as t
@@ -44,8 +43,13 @@ from connect import intent as intent_module
 from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.guard import Guard, GuardError, exec_floor
-from connect.safe import OPERATION_CALL as CALL
+from connect.guard import Guard, GuardError, exec_floor, floor
+from connect.safe import OPERATION_CALL, Operation
+from connect.send_cache import (
+    IdempotencyCache,
+    call_stamp,
+    safe_request_key,
+)
 from connect.settings import prepaid_balance_trackers
 from connect.signer_errors import (
     SEND_UNKNOWN,
@@ -146,132 +150,10 @@ class _ChainPool:
             return self._states.setdefault(chain, state)
 
 
-MAX_CACHED_RESULTS = 1024
-
-
-class _Sent(t.NamedTuple):
-    """What a request id's send left: its hash, and whether the RPC took it."""
-
-    tx_hash: str
-    stamp: str
-    # False for a broadcast the RPC never answered (SendUnknown)
-    confirmed: bool
-
-
-def _same_call(key: str, cached: _Sent, stamp: str) -> str:
-    """Return the cached tx hash.
-
-    :raises SignerError: on a different call.
-    :raises SendUnknown: again, for a broadcast that may not have landed.
-    """
-    if cached.stamp != stamp:
-        raise SignerError(
-            f"request id '{key}' was already used for a different call; "
-            "choose a new id rather than replaying this one, which would "
-            "report a transaction that was never sent for it"
-        )
-    if not cached.confirmed:
-        raise SendUnknown(cached.tx_hash, held=True)
-    return cached.tx_hash
-
-
-def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
-    """Fingerprint the call a request id stands for."""
-    raw = "\x1f".join((chain.lower(), to.lower(), str(value), (data or "0x").lower()))
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 COMPOSE_FAILED = (
     "cannot compose the safe call: the target must be an address, the value a "
     "whole amount and the data hex"
 )
-
-
-def _safe_request_key(request_id: str) -> str:
-    """Return send_via_safe's idempotency key: its own namespace, apart from send's.
-
-    The same id on the EOA path is a different logical action and must not
-    collide with it.
-    """
-    return f"safe:{request_id}"
-
-
-class _IdempotencyCache:
-    """At-most-once execution of actions keyed by caller-chosen request ids."""
-
-    def __init__(self, max_results: int = MAX_CACHED_RESULTS) -> None:
-        """Initialize."""
-        self._lock = threading.Lock()
-        self._max_results = max_results
-        self._results: dict[str, _Sent] = {}
-        self._in_flight: set[str] = set()  # request_ids currently executing
-
-    def run(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
-        """Run action at most once per key.
-
-        A completed key returns its cached result; a key whose action is still
-        executing raises (the caller retries after the original settles); a
-        failed attempt releases the key so a retry can run the action again,
-        except a broadcast that may have landed (`SendUnknown`), whose hash is
-        kept as the key's unconfirmed result so a retry raises it again.
-
-        :raises SignerError: when the key was used for a different call.
-        :raises SendUnknown: for a key whose broadcast may not have landed.
-        """
-        with self._lock:
-            cached = self._results.get(key)
-            if cached is not None:
-                return _same_call(key, cached, stamp)
-            if key in self._in_flight:
-                raise SignerError(
-                    f"request '{key}' is already in flight; retry shortly"
-                )
-            self._in_flight.add(key)
-        return self._execute(key, stamp, action)
-
-    def cached(self, key: str, stamp: str) -> str | None:
-        """Return the result of a completed run of this key, if any.
-
-        :raises SignerError: when the key was used for a different call.
-        :raises SendUnknown: for a key whose broadcast may not have landed.
-        """
-        with self._lock:
-            cached = self._results.get(key)
-        return None if cached is None else _same_call(key, cached, stamp)
-
-    def holds(self, key: str) -> bool:
-        """Whether a run of this key completed or is running: a new run sends nothing."""
-        with self._lock:
-            return key in self._results or key in self._in_flight
-
-    def _execute(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
-        try:
-            result = action()
-        except SendUnknown as e:
-            # it may have landed: re-running would sign a second transaction
-            # at the next nonce, so a retry raises this hash again instead,
-            # never as a confirmed send, and its receipt settles whether it
-            # was mined
-            self._store(key, _Sent(e.tx_hash, stamp, confirmed=False))
-            raise
-        except Exception:
-            with self._lock:
-                self._in_flight.discard(key)
-            raise
-        self._store(key, _Sent(result, stamp, confirmed=True))
-        return result
-
-    def _store(self, key: str, sent: _Sent) -> None:
-        # cache the result and release the reservation atomically, so no retry
-        # can observe "not cached and not in flight" after a success
-        with self._lock:
-            self._results[key] = sent
-            self._in_flight.discard(key)
-            # bound memory over a long run: a request_id evicted here and
-            # retried much later re-broadcasts, which is the right trade at
-            # that distance — retries cluster within seconds of the original
-            while len(self._results) > self._max_results:
-                del self._results[next(iter(self._results))]
 
 
 class Signer:
@@ -292,7 +174,7 @@ class Signer:
         self._activity = activity
         self._config = config
         self._chains = _ChainPool(config)
-        self._requests = _IdempotencyCache()
+        self._requests = IdempotencyCache()
         self._guard = guard
 
     @property
@@ -318,7 +200,7 @@ class Signer:
         send_via_safe's namespace.
         """
         return self._requests.holds(
-            _safe_request_key(request_id) if via_safe else request_id
+            safe_request_key(request_id) if via_safe else request_id
         )
 
     def w3(self, chain: str) -> Web3:
@@ -386,7 +268,7 @@ class Signer:
         """
         if replay_only and request_id is None:
             raise SignerError("a replay-only send needs the request id it replays")
-        stamp = _call_stamp(chain, to, value, data)
+        stamp = call_stamp(chain, to, value, data)
         if request_id is not None:
             # a completed send stays answerable even if the guardrail has
             # tightened since — the transaction already happened; nothing
@@ -468,7 +350,13 @@ class Signer:
         raise SignerError(intent_module.refusal_message(problems))
 
     def _compose_safe_call(
-        self, chain: str, target: str, value: int, data: str, *, operation: int = CALL
+        self,
+        chain: str,
+        target: str,
+        value: int,
+        data: str,
+        *,
+        operation: Operation = OPERATION_CALL,
     ) -> tuple[str, str]:
         """Wrap one inner call for the safe; returns (safe address, calldata).
 
@@ -506,7 +394,7 @@ class Signer:
         audit: bool = True,
         intent: t.Any = None,
         replay_only: bool = False,
-        operation: int = CALL,
+        operation: Operation = OPERATION_CALL,
     ) -> str:
         """Act as the service safe: wrap one inner call and send it.
 
@@ -527,7 +415,7 @@ class Signer:
             safe,
             value=0,  # the outer transaction carries none; the safe pays
             data=calldata,
-            request_id=None if request_id is None else _safe_request_key(request_id),
+            request_id=None if request_id is None else safe_request_key(request_id),
             gas=gas,
             audit=audit,
             # the gate simulates the call the safe makes, as the safe: that is
@@ -547,7 +435,7 @@ class Signer:
         :raises _GateRefused: what the gate cannot hold to an intent — the
             safe's approveHash (it pre-approves a transaction by hash, which
             anyone may then execute), and an execTransaction that also carries
-            EOA value, pays a gas refund or is not a CALL.
+            EOA value or pays a gas refund, and what the floor refuses.
         """
         calldata = safe_module.calldata_hex(data)
         if calldata.startswith(safe_module.APPROVE_HASH_SELECTOR):
@@ -565,20 +453,16 @@ class Signer:
             or not safe_module.is_exec_transaction(data)
         ):
             return own
-        try:
-            exec_call = safe_module.decode_exec(data, chain=chain, to=to)
-        except ValueError as e:
+        try:  # the floor's own rules, worded as the send's guardrail words them
+            # is_exec_transaction held above, so the floor decodes a call
+            exec_call = t.cast(safe_module.SafeExec, exec_floor(chain, to, data))
+        except GuardError as e:
             raise _GateRefused("bad-exec-transaction", str(e)) from e
         if value:
             raise _GateRefused(
                 "bad-exec-transaction",
                 "an execTransaction to a safe may not also carry value from the "
                 "EOA; send the value as part of the safe's own call",
-            )
-        if exec_call.operation != CALL:
-            raise _GateRefused(
-                "bad-exec-transaction",
-                "an execTransaction may only CALL (operation 0), never DELEGATECALL",
             )
         if exec_call.pays_refund:
             raise _GateRefused(
@@ -657,8 +541,13 @@ class Signer:
         )
         if problems:
             return None, None, problems
+        ignored = intent_module.ignored_keys(raw_intent)
+        if ignored:  # a misspelled key declares nothing, so the operator is told
+            logger.warning(
+                "ignored intent keys %s on a call to %s on %s", ignored, call.to, chain
+            )
         held_to = parsed
-        if parsed is None:  # fails closed: any position but simulate-only is strict
+        if parsed is None:  # fails closed: held unless the policy is simulate-only
             held_to = intent_module.no_intent_hold(
                 call.value,
                 call.to,
@@ -813,15 +702,19 @@ class Signer:
     def _refused_by_guard(
         self, chain: str, to: str, value: int, data: str
     ) -> str | None:
-        """Ask the guardrail about a composed transaction, consuming nothing."""
-        if self._guard is None:
-            logger.error(
-                "the signing choke point has no guardrail attached; every "
-                "request would be permitted"
-            )
-            return None
+        """Ask the guardrail about a composed transaction, consuming nothing.
+
+        With no guardrail attached the floor still answers, as on a send.
+        """
         try:
-            self._guard.check_transaction(chain, to, value, data, consume=False)
+            if self._guard is None:
+                logger.error(
+                    "the signing choke point has no guardrail attached; only "
+                    "the floor's rules apply"
+                )
+                floor(chain, to, data, server_built=False)
+            else:
+                self._guard.check_transaction(chain, to, value, data, consume=False)
         except GuardError as e:
             return str(e)
         return None
@@ -959,7 +852,7 @@ class Signer:
         """Consult the guardrail; a denial is audited and surfaced as SignerError."""
         try:
             if self._guard is None:  # the floor holds with no guardrail attached
-                exec_floor(chain, to, data)
+                floor(chain, to, data, server_built=server_built)
             else:
                 self._guard.check_transaction(
                     chain, to, value, data, server_built=server_built

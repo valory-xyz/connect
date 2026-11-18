@@ -33,6 +33,7 @@ to predict it; the Safe reads and increments its own.
 """
 
 import logging
+import typing as t
 from dataclasses import dataclass
 
 from eth_abi import decode as abi_decode
@@ -59,7 +60,10 @@ EXEC_TRANSACTION_TYPES = [
     "address",  # refundReceiver
     "bytes",  # signatures
 ]
-OPERATION_CALL = 0
+OPERATION_CALL: t.Final = 0
+OPERATION_DELEGATECALL: t.Final = 1
+# the operations a Safe has; the floor refuses every one but CALL
+Operation = t.Literal[0, 1]
 ZERO_ADDRESS = "0x" + "00" * 20
 
 logger = logging.getLogger("agent")
@@ -151,7 +155,11 @@ def _hex_to_bytes(value: str) -> bytes:
 
 
 def exec_transaction(
-    target: str, value: int, data: str, owner: str, operation: int = OPERATION_CALL
+    target: str,
+    value: int,
+    data: str,
+    owner: str,
+    operation: Operation = OPERATION_CALL,
 ) -> str:
     """Return execTransaction calldata carrying one call out of the safe.
 
@@ -209,6 +217,10 @@ def decode_deposit(data: str) -> int | None:
     return int(amount)
 
 
+class ExecUndecodable(InputError):
+    """execTransaction calldata whose arguments do not decode (`EXEC_UNDECODABLE`)."""
+
+
 @dataclass(frozen=True)
 class SafeExec:
     """An execTransaction, decoded: the call the safe makes and its refund fields.
@@ -243,7 +255,7 @@ class SafeExec:
                 abi_decode(EXEC_TRANSACTION_TYPES, bytes.fromhex(calldata[8:]))
             )
         except (DecodingError, ValueError, ArithmeticError) as e:
-            raise InputError(EXEC_UNDECODABLE) from e
+            raise ExecUndecodable(EXEC_UNDECODABLE) from e
         return cls(
             to=str(decoded[0]),
             value=int(decoded[1]),
@@ -268,16 +280,15 @@ def decode_exec(data: str, *, chain: str, to: str) -> SafeExec:
     """`SafeExec.decode`, logging undecodable calldata with where it was sent."""
     try:
         return SafeExec.decode(data)
-    except InputError as e:
-        if str(e) == EXEC_UNDECODABLE:
-            logger.warning(
-                "%s to %s on %s (%d bytes): %s",
-                EXEC_UNDECODABLE,
-                to,
-                chain,
-                len(calldata_hex(data)) // 2,
-                cause_of(e.__cause__ or e),
-            )
+    except ExecUndecodable as e:
+        logger.warning(
+            "%s to %s on %s (%d bytes): %s",
+            EXEC_UNDECODABLE,
+            to,
+            chain,
+            len(calldata_hex(data)) // 2,
+            cause_of(t.cast(BaseException, e.__cause__)),
+        )
         raise
 
 

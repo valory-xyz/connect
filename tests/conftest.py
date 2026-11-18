@@ -847,10 +847,33 @@ def _no_handed_token() -> t.Iterator[None]:
         yield
 
 
+class FakeBoundary:
+    """A stand-in MCP app boundary for the mount: named tools, an input check."""
+
+    def __init__(
+        self,
+        tools: t.Iterable[str],
+        check: t.Callable[[str, dict], None] | None = None,
+    ) -> None:
+        """Hold the tool names and the check (none passes every call)."""
+        self._tools = frozenset(tools)
+        self._check = check
+
+    def tool_names(self) -> frozenset[str]:
+        """Return the tool names."""
+        return self._tools
+
+    def check_call(self, name: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
+        """Run the check, which refuses by raising `ToolError`."""
+        if self._check is not None:
+            self._check(name, arguments)
+        return arguments
+
+
 def grant_store(token: str) -> GrantStore:
     """Return a GrantStore over a signer that holds no request id."""
     return GrantStore(
-        token, held=lambda request_id, via_safe: False, strict_parameters=False
+        token, held=lambda request_id, via_safe: False, switches=PRODUCTION
     )
 
 

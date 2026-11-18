@@ -41,18 +41,19 @@ from connect.server import signer_routes as signer_routes_module
 from connect.server.auth import (
     ACTION_SCOPES,
     AuthFailureLimiter,
-    AuthMiddleware,
     GrantRefused,
     GrantStore,
     TokenGrant,
     WORKSPACE_GRANT,
     narrower,
 )
+from connect.server.mcp_auth import AuthMiddleware
 from connect.signer import Signer
-from connect.switches import Switches
+from connect.switches import PRODUCTION, Switches
 from connect.texts import AMOUNT_REFUSED, CAP_REFUSED
 
 from tests.conftest import (
+    FakeBoundary,
     FakeW3,
     TOKEN_EXPIRES_AT,
     advance_token_clock,
@@ -774,8 +775,7 @@ class TestMcpMiddleware:
             store,
             activity,
             AuthFailureLimiter(),
-            tools=["wallet_info", "safe_transaction"],
-            check=lambda name, arguments: None,
+            boundary=FakeBoundary(["wallet_info", "safe_transaction"]),
         )
         return middleware, reader
 
@@ -850,20 +850,27 @@ class TestMcpMiddleware:
         assert entry["rule"] == "batch"
 
     async def test_an_input_refusal_is_the_tool_s_own_error(
-        self, activity: ActivityLog, store_path: t.Any
+        self,
+        activity: ActivityLog,
+        store_path: t.Any,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The mount runs the tool's input check first and answers it as isError."""
 
         def check(name: str, arguments: dict) -> None:
             raise ToolError(f"{name} refused {sorted(arguments)}")
 
+        grants = grant_store(WORKSPACE)
+        authorized: list[str] = []
+        monkeypatch.setattr(
+            grants, "authorize", lambda _t, name, _a, **_k: authorized.append(name)
+        )
         middleware = AuthMiddleware(
             lambda *a: None,
-            grant_store(WORKSPACE),
+            grants,
             activity,
             AuthFailureLimiter(),
-            tools=["safe_transaction"],
-            check=check,
+            boundary=FakeBoundary(["safe_transaction"], check),
         )
         body = json.dumps(
             {
@@ -885,6 +892,29 @@ class TestMcpMiddleware:
                 "isError": True,
             },
         }
+        assert authorized == []  # the check comes first, and refused
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry == {
+            **entry,
+            "rule": "invalid-request",
+            "tool": "safe_transaction",
+            "reason": "safe_transaction refused ['target']",
+        }
+
+    async def test_a_body_nested_past_the_parser_is_a_parse_error(
+        self, setup: tuple[AuthMiddleware, str], store_path: t.Any
+    ) -> None:
+        """A body json cannot read for depth is refused, never a 500."""
+        middleware, reader = setup
+        sent, seen = await self._call(middleware, reader, b"[" * 200_000)
+        assert seen == []
+        assert json.loads(sent[1]["body"]) == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": texts.BODY_TOO_DEEP},
+        }
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry["rule"] == "body-too-deep"
 
     @pytest.mark.parametrize(
         ("tools", "name", "passed"),
@@ -907,8 +937,7 @@ class TestMcpMiddleware:
             store,
             activity,
             AuthFailureLimiter(),
-            tools=tools,
-            check=lambda name, arguments: None,
+            boundary=FakeBoundary(tools),
         )
         call = json.dumps(
             {"method": "tools/call", "params": {"name": name, "arguments": {}}}
@@ -946,8 +975,7 @@ async def test_a_disconnect_before_any_body_is_passed_on(activity: ActivityLog) 
         grant_store(WORKSPACE),
         activity,
         AuthFailureLimiter(),
-        tools=ACTION_SCOPES,
-        check=lambda name, arguments: None,
+        boundary=FakeBoundary(ACTION_SCOPES),
     )
     messages = [{"type": "http.disconnect"}, {"type": "http.disconnect"}]
 
@@ -1106,9 +1134,7 @@ def test_mcp_value_that_is_not_finite_is_a_bad_value_refusal(
         },
     )
     assert answer.status_code == 200
-    assert _tool_error(answer) == (
-        f"invalid request: ValidationError: value: Value error, {AMOUNT_REFUSED}"
-    )
+    assert _tool_error(answer) == texts.AMOUNT_INEXACT(float("inf"))
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert rules == ["invalid-request"]
 
@@ -1136,9 +1162,7 @@ def test_mcp_an_amount_from_2_53_on_is_refused_at_the_mount_before_any_draw(
     key = "to" if tool == "send_transaction" else "target"
     arguments = {"chain": "testchain", key: RECIPIENT, "value": 2**53}
     refused = _mcp_call(client, WORKSPACE, tool, arguments)
-    assert _tool_error(refused) == (
-        f"invalid request: ValidationError: value: Value error, {AMOUNT_REFUSED}"
-    )
+    assert _tool_error(refused) == texts.AMOUNT_INEXACT(2**53)
     (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert entry["rule"] == "invalid-request"
     assert entry["tool"] == tool
@@ -1195,29 +1219,35 @@ def test_mcp_a_malformed_address_is_refused_before_the_budget_is_drawn(
     assert len(fake_w3.eth.sent) == 1
 
 
-def test_mcp_under_strict_parameters_an_unknown_intent_key_is_refused_before_any_draw(
+@pytest.mark.parametrize("strict", [True, False])
+def test_mcp_the_cap_reads_an_unknown_intent_key_as_the_gate_does(  # pylint: disable=too-many-arguments
     test_signer: Signer,
     app_config: AppConfig,
     activity: ActivityLog,
     make_app: t.Callable,
     fake_w3: FakeW3,
+    strict: bool,
 ) -> None:
-    """The cap reads the intent as the gate will: refused at the mount, budget whole."""
+    """Under strict_parameters it is refused before any draw; otherwise it is ignored."""
     app = make_app(
         test_signer,
         app_config,
         activity,
         token=WORKSPACE,
-        switches=Switches(strict_parameters=True),
+        switches=Switches(strict_parameters=strict),
     )
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         capped = _session_capped(client)  # 10 native for the session
         intent = {**pay(RECIPIENT, 10), "limit": 1}
         arguments = {"chain": "testchain", "target": RECIPIENT, "value": 10}
-        refused = _mcp_call(
+        first = _mcp_call(
             client, capped, "safe_transaction", {**arguments, "intent": intent}
         )
-        assert _refused_rule(refused) == "bad-intent"
+        if not strict:  # ignored by the cap and the gate alike: sent, 10 drawn
+            assert _refused_rule(first) is None
+            assert len(fake_w3.eth.sent) == 1
+            return
+        assert _refused_rule(first) == "bad-intent"
         sent = _mcp_call(
             client,
             capped,
@@ -1270,6 +1300,7 @@ def test_mcp_a_mech_cap_from_2_53_on_reaches_the_flow_exactly(
     ],
 )
 @pytest.mark.parametrize("tool", ["safe_transaction", "simulate_transaction"])
+@pytest.mark.parametrize("as_string", [False, True])
 def test_mcp_an_intent_amount_a_json_number_may_have_rounded_is_refused_at_the_mount(  # pylint: disable=too-many-arguments
     client: TestClient,
     fake_w3: FakeW3,
@@ -1277,13 +1308,21 @@ def test_mcp_an_intent_amount_a_json_number_may_have_rounded_is_refused_at_the_m
     tool: str,
     intent: dict,
     where: str,
+    as_string: bool,
 ) -> None:
-    """Every amount inside an intent follows the value rule, named by where it sits."""
+    """Every amount inside an intent follows the value rule, named by where it sits.
+
+    A JSON-string intent is decoded first, as the tool decodes it.
+    """
     refused = _mcp_call(
         client,
         WORKSPACE,
         tool,
-        {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+        {
+            "chain": "testchain",
+            "target": RECIPIENT,
+            "intent": json.dumps(intent) if as_string else intent,
+        },
     )
     assert _tool_error(refused) == (
         f"invalid request: ValidationError: {where}: Value error, {AMOUNT_REFUSED}"
@@ -1502,7 +1541,7 @@ def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
     store = GrantStore(
         WORKSPACE,
         held=lambda rid, via_safe: (rid, via_safe) in held,
-        strict_parameters=False,
+        switches=PRODUCTION,
     )
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     other = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
@@ -1528,9 +1567,7 @@ def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
 
 def test_a_retry_s_record_keeps_the_most_drawn_per_asset() -> None:
     """A retry declaring less, or leaving an asset out, lowers nothing on record."""
-    store = GrantStore(
-        WORKSPACE, held=lambda rid, via_safe: True, strict_parameters=False
-    )
+    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True, switches=PRODUCTION)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 20, USDC: 5}))
 
     def send(request_id: str, value: int, usdc: int = 0) -> None:
@@ -1557,9 +1594,7 @@ def test_a_forgotten_request_id_is_drawn_in_full(
 ) -> None:
     """Past the bound a draw is forgotten, which only ever draws again."""
     monkeypatch.setattr(auth_module, "MAX_DRAWN_REQUEST_IDS", 1)
-    store = GrantStore(
-        WORKSPACE, held=lambda rid, via_safe: True, strict_parameters=False
-    )
+    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True, switches=PRODUCTION)
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r1"})
     store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r2"})
@@ -1683,10 +1718,10 @@ def _mcp_call(client: TestClient, token: str, tool: str, arguments: dict) -> t.A
 
 
 def _refused_rule(response: t.Any) -> str | None:
-    """Return the rule of a mount refusal, or None if not refused.
+    """Return the rule of a refusal over `/mcp`, or None if not refused.
 
-    A grant refusal is a JSON-RPC -32001 naming its rule; an input refusal is
-    the tool's own `isError` answer, audited as `invalid-request`.
+    A grant refusal is a JSON-RPC -32001 naming its rule. Any `isError` answer
+    reads as `invalid-request`: in these tests it is the mount's input check.
     """
     if not response.headers["content-type"].startswith("application/json"):
         return None

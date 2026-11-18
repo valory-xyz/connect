@@ -834,19 +834,15 @@ def test_an_unread_intent_key_is_ignored_unless_strict() -> None:
     ]
 
 
-def test_an_ignored_intent_key_is_logged_by_name_only(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The operator can see a key was dropped; its value is never written."""
+def test_an_ignored_intent_key_is_named_never_its_value() -> None:
+    """The names the gate logs: top-level and per approval, each cut to 40."""
+    long_key = "k" * 100
     approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": "SECRET-2"}
-    raw = {"recieve_min": {"native": "SECRET-1"}, "approvals": [approval]}
-    with caplog.at_level("WARNING", logger="agent"):
-        intent.parse_intent(raw, strict_parameters=False)
-    assert [r.message for r in caplog.records] == [
-        "ignored intent keys ['recieve_min']",
-        "ignored intent approval keys ['max']",
-    ]
-    assert "SECRET" not in caplog.text
+    raw = {"recieve_min": {"native": "SECRET-1"}, long_key: 1, "approvals": [approval]}
+    names = intent.ignored_keys(intent.Capped(raw))
+    assert names == ["k" * 40, "recieve_min", "approvals[0].max"]
+    assert "SECRET" not in str(names)
+    assert intent.ignored_keys("not an intent") == []
 
 
 def test_an_unknown_approval_key_is_refused_by_name_under_strict() -> None:

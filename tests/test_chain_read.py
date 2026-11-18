@@ -372,3 +372,17 @@ def test_a_bad_signature_in_the_tables_is_not_blamed_on_the_calldata(
     monkeypatch.setitem(chain_read.SELECTORS, "0xdeadbeef", ["broken(uintx)"])
     with pytest.raises(Exception, match="uintx"):  # noqa: PT011
         chain_read.decode_calldata("0xdeadbeef" + "00" * 32)
+
+
+def test_a_length_past_the_index_range_does_not_decode() -> None:
+    """eth_abi's OverflowError on a huge `bytes` length is bad input, not a fault."""
+    from connect.safe import (  # pylint: disable=import-outside-toplevel
+        EXEC_TRANSACTION_SELECTOR,
+    )
+
+    head = "".join(
+        hex(0x140 if i in (2, 9) else 0)[2:].rjust(64, "0") for i in range(10)
+    )
+    data = "0x" + EXEC_TRANSACTION_SELECTOR + head + hex(2**255)[2:].rjust(64, "0")
+    decoded = chain_read.decode_calldata(data)
+    assert decoded["error"] == "the arguments do not decode as this signature"

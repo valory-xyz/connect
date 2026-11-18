@@ -29,7 +29,11 @@ a malformed argument is refused where, and in the words, the reference does.
 import re
 import typing as t
 
-from connect.texts import ADDRESS_INVALID, HEX_INVALID
+from connect.texts import ADDRESS_INVALID, AMOUNT_INEXACT, HEX_INVALID
+
+# the largest integer a JSON number carries exactly (an IEEE-754 double's):
+# 2^53 + 1 is the first a double cannot hold, and it rounds to 2^53
+MAX_EXACT_JSON_INT = 2**53 - 1
 
 _ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}", re.ASCII)
 # the reference's hex rule, for every tool argument; the intent gate's
@@ -39,9 +43,13 @@ _HEX = re.compile(r"(?:0x)?(?:[0-9a-fA-F]{2})*", re.ASCII)
 _TX_HASH = re.compile(r"(?:0x)?[0-9a-fA-F]{64}", re.ASCII)
 
 
-# every tool's address and hex arguments, as the reference's `check_args` names them
+# every tool's address, hex and amount arguments, as the reference's `check_args`
+# names them
 ADDRESS_ARGUMENTS = ("target", "to", "address", "priority_mech")
 HEX_ARGUMENTS = ("data", "digest")
+# the amounts a JSON number may already have rounded; a cap is never spent, so
+# `max_payment` takes an integer of any size and only a float is inexact
+AMOUNT_ARGUMENTS = ("value", "max_payment")
 
 
 class InputError(ValueError):
@@ -81,3 +89,18 @@ def check_arguments(arguments: t.Mapping[str, t.Any]) -> None:
     for name in HEX_ARGUMENTS:
         if arguments.get(name) not in (None, ""):
             checked_hex(name, arguments[name])
+    for name in AMOUNT_ARGUMENTS:
+        if _inexact(arguments.get(name), capped=name == "value"):
+            raise InputError(AMOUNT_INEXACT(arguments[name]))
+
+
+def _inexact(value: object, *, capped: bool) -> bool:
+    """Whether a JSON number cannot carry this amount exactly.
+
+    A float, or an integer past 2^53 - 1 where the amount is spent (`capped`).
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        return True
+    return capped and isinstance(value, int) and value > MAX_EXACT_JSON_INT

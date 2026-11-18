@@ -62,11 +62,14 @@ from connect.config import (
 from connect.input_errors import InputError
 from connect.keystore import KeystoreError, load_account
 from connect.run_goal import RunGoal
-from connect.server.auth import ACTION_SCOPES, AuthFailureLimiter, AuthMiddleware
-from connect.signer import Signer, SignerError, _IdempotencyCache
+from connect.send_cache import IdempotencyCache
+from connect.server.auth import ACTION_SCOPES, AuthFailureLimiter
+from connect.server.mcp_auth import AuthMiddleware
+from connect.signer import Signer, SignerError
 from connect.switches import PRODUCTION, Switches
 
 from tests.conftest import (
+    FakeBoundary,
     FakeW3,
     TEST_PASSWORD,
     audit_entries,
@@ -1085,8 +1088,7 @@ class TestAuthMiddlewareASGI:
             grant_store("tok"),
             activity,
             AuthFailureLimiter(),
-            tools=ACTION_SCOPES,
-            check=lambda name, arguments: None,
+            boundary=FakeBoundary(ACTION_SCOPES),
         )
 
     @staticmethod
@@ -1570,13 +1572,13 @@ class TestSignerExtras:
 
     def test_idempotency_cache_returns_cached_inside_run(self) -> None:
         """run() itself replays a completed key (guards the racing-caller path)."""
-        cache = _IdempotencyCache()
+        cache = IdempotencyCache()
         assert cache.run("k", "s", lambda: "0xaaa") == "0xaaa"
         assert cache.run("k", "s", lambda: "0xbbb") == "0xaaa"  # action not re-run
 
     def test_idempotency_cache_evicts_oldest(self) -> None:
         """The result cache is bounded; the oldest replays are dropped first."""
-        cache = _IdempotencyCache(max_results=2)
+        cache = IdempotencyCache(max_results=2)
         cache.run("a", "s", lambda: "0xa")
         cache.run("b", "s", lambda: "0xb")
         cache.run("c", "s", lambda: "0xc")

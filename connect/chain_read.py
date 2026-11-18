@@ -384,7 +384,9 @@ def _decode_args(signature: str, args_raw: bytes) -> tuple | None:
     types = _split_types(signature.partition("(")[2][:-1])
     try:
         return tuple(abi_decode(types, args_raw))
-    except DecodingError:  # the bytes do not fit; a bad signature still raises
+    # the bytes do not fit (a length past the index range raises an
+    # ArithmeticError, as in safe.SafeExec.decode); a bad signature still raises
+    except (DecodingError, ArithmeticError):
         return None
 
 

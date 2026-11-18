@@ -20,6 +20,7 @@
 """Unknown parameters are refused by name on both surfaces."""
 
 import json
+import re
 import typing as t
 
 import pytest
@@ -28,6 +29,7 @@ from fastapi.testclient import TestClient
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
+from connect import texts
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.input_errors import ADDRESS_ARGUMENTS, HEX_ARGUMENTS
@@ -292,10 +294,7 @@ def test_a_non_mapping_body_is_left_to_pydantic() -> None:
 async def test_the_tool_schema_declares_base_unit_amounts_as_strings(
     mcp: FastMCP,
 ) -> None:
-    """Every value and max_payment is a string in the published schema.
-
-    The mount's input check validates each against the tool's own model.
-    """
+    """Every value and max_payment is a string in the published schema."""
     declared: dict[str, list[str]] = {}
     for tool in await mcp.list_tools():
         for name, schema in tool.inputSchema.get("properties", {}).items():
@@ -315,19 +314,28 @@ async def test_the_tool_schema_declares_base_unit_amounts_as_strings(
 async def test_a_tool_refuses_an_amount_a_json_number_may_have_rounded(
     mcp: FastMCP, fake_w3: FakeW3, amount: t.Any
 ) -> None:
-    """A float, a number from 2^53 on or a non-amount is refused naming the rule.
+    """A number a double may have rounded reads the reference's inexact text.
 
-    The mech cap is a bound, not a spend, so only the amounts a double cannot
-    hold are exempt there (`test_a_mech_cap_takes_any_whole_json_integer`).
+    Anything else that is not an amount is refused naming the rule. The mech
+    cap is a bound, not a spend, so a whole integer of any size is exempt
+    there (`test_a_mech_cap_takes_any_whole_json_integer`).
     """
+    inexact = isinstance(amount, float) or (
+        isinstance(amount, int) and not isinstance(amount, bool) and amount >= 2**53
+    )
+    expected = (
+        f"^{re.escape(texts.AMOUNT_INEXACT(amount))}$"
+        if inexact
+        else "rule 'bad-value'"
+    )
     for tool, arguments in (
         ("safe_transaction", {"chain": "testchain", "target": RECIPIENT}),
         ("simulate_transaction", {"chain": "testchain", "target": RECIPIENT}),
     ):
-        with pytest.raises(ToolError, match="rule 'bad-value'"):
+        with pytest.raises(ToolError, match=expected):
             await mcp.call_tool(tool, {**arguments, "value": amount})
     if amount not in (2**53, 2**53 + 1):
-        with pytest.raises(ToolError, match="rule 'bad-value'"):
+        with pytest.raises(ToolError, match=expected):
             await mcp.call_tool(
                 "mech_request", {"prompt": "q", "tool": "t", "max_payment": amount}
             )
@@ -603,3 +611,47 @@ async def test_an_unread_intent_key_is_ignored_with_the_switch_off(
     answer = json.loads(content.text)  # type: ignore[union-attr]
     assert answer["fits_intent"] is True
     assert answer["problems"] == []
+
+
+async def test_an_ignored_intent_key_is_logged_once_with_the_call(
+    make_mcp: t.Callable[..., FastMCP],
+    fake_w3: FakeW3,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One line per call, from the gate's read, naming the chain and the target."""
+    lenient = make_mcp()
+    intent = {"recipients": [RECIPIENT], "recieve_min": {"native": "SECRET"}}
+    with caplog.at_level("WARNING", logger="agent"):
+        await lenient.call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+        )
+    (line,) = [r.message for r in caplog.records if "ignored intent keys" in r.message]
+    assert line == (
+        f"ignored intent keys ['recieve_min'] on a call to {RECIPIENT} on testchain"
+    )
+    assert "SECRET" not in caplog.text
+    assert len(fake_w3.eth.sent) == 1
+
+
+def test_over_the_mount_a_strict_refusal_is_audited_once(
+    client: TestClient, store_path: t.Any
+) -> None:
+    """The strict model records the unknown parameter; the mount adds no second entry."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "safe_transaction",
+            "arguments": {"chain": "testchain", "targett": RECIPIENT},
+        },
+    }
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Authorization": f"Bearer {TOKEN}",
+    }
+    answer = client.post("/mcp/", json=body, headers=headers)
+    assert answer.json()["result"]["isError"] is True
+    refusals = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert [e["rule"] for e in refusals] == ["unknown-parameter"]

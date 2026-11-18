@@ -48,7 +48,7 @@ from connect.input_errors import InputError, check_arguments, checked_hex
 from connect.intent import AgentIntent, parse_amount, parse_tool_amount
 from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
-from connect.safe import OPERATION_CALL
+from connect.safe import OPERATION_CALL, Operation
 from connect.server.auth import (
     GrantRefused,
     GrantStore,
@@ -56,7 +56,11 @@ from connect.server.auth import (
     request_token,
 )
 from connect.server.receipts import settled, settlement
-from connect.server.strict import make_tools_strict
+from connect.server.strict import (
+    AuditedRefusal,
+    UNKNOWN_PARAMETER_RULE,
+    make_tools_strict,
+)
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
 from connect.signer_errors import logged_cause
@@ -143,10 +147,6 @@ class ToolIntent(TypedDict, total=False):
     recipients: list[str] | None
     approvals: list[ToolApproval] | None
 
-
-# a Safe call's operation, read as the reference reads it but not published:
-# CALL or DELEGATECALL, which only the guardrail's floor refuses
-Operation = t.Annotated[int, Field(ge=OPERATION_CALL, le=1)]
 
 RequestContext = t.Annotated[dict | None, Field(description=REQUEST_CONTEXT_NOTE)]
 
@@ -236,7 +236,9 @@ class ConnectMCP(FastMCP):
         except InputError as e:
             raise ToolError(str(e)) from e
         except ValidationError as e:
-            raise ToolError(
+            audited = any(i["type"] == UNKNOWN_PARAMETER_RULE for i in e.errors())
+            refusal = AuditedRefusal if audited else ToolError
+            raise refusal(
                 INVALID_REQUEST(type(e).__name__, argument_problems(e))
             ) from e
         except Exception as e:  # e.g. a JSON intent nested past the stack
@@ -305,6 +307,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
+        # CALL or DELEGATECALL; guard.exec_floor refuses the latter
         operation: SkipJsonSchema[Operation] = OPERATION_CALL,
     ) -> dict:
         """Have the service safe make one call."""

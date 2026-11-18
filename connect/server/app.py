@@ -42,11 +42,11 @@ from connect.server import pearl_routes, settings_routes, signer_routes, strict
 from connect.server.auth import (
     ALLOWED_HOSTS,
     AuthFailureLimiter,
-    AuthMiddleware,
     GrantStore,
     RequireAuth,
     require_local_origin,
 )
+from connect.server.mcp_auth import AuthMiddleware
 from connect.server.mcp_tools import build_mcp
 from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
 from connect.settings import MODE_RESTRICTED, SettingsStore
@@ -177,7 +177,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     grants = GrantStore(
         token,
         held=signer.holds_request,
-        strict_parameters=signer.switches.strict_parameters,
+        switches=switches,
     )
     mcp = build_mcp(
         signer,
@@ -255,8 +255,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
             grants,
             activity,
             limiter,
-            tools=mcp.tool_names(),
-            check=mcp.check_call,
+            boundary=mcp,
         ),
     )
 

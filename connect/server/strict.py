@@ -29,6 +29,7 @@ import difflib
 import typing as t
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic.json_schema import SkipJsonSchema
 from pydantic_core import PydanticCustomError
@@ -57,24 +58,24 @@ def unknown_parameters_message(
     unknown = sorted(set(given) - set(expected))
     if not unknown:
         return None
-    expected = set(expected if published is None else published)
+    named = set(expected if published is None else published)
     parts = []
     for name in unknown:
         hint = next(
             (
                 aliases[name]
                 for wanted, aliases in HINTS.items()
-                if wanted in expected and name in aliases
+                if wanted in named and name in aliases
             ),
             None,
         )
         if hint is None:
-            close = difflib.get_close_matches(name, list(expected), n=1)
+            close = difflib.get_close_matches(name, list(named), n=1)
             hint = close[0] if close else None
         parts.append(f"'{name}' (did you mean '{hint}'?)" if hint else f"'{name}'")
     return (
         f"unknown parameter {', '.join(parts)}; this call takes "
-        f"{', '.join(sorted(expected))}"
+        f"{', '.join(sorted(named))}"
     )
 
 
@@ -102,6 +103,14 @@ def _check_known(
             # typed, so the HTTP audit finds its own refusals by type, not text
             raise PydanticCustomError(UNKNOWN_PARAMETER_RULE, message)
     return data
+
+
+class AuditedRefusal(ToolError):
+    """A tool call's refusal already recorded where it was refused.
+
+    An unknown parameter under `strict_parameters`: the strict model audits
+    it, so the mount does not audit it twice.
+    """
 
 
 class StrictBody(BaseModel):

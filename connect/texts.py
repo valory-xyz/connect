@@ -30,7 +30,7 @@ formatters included.
 
 Not every text is emitted by Connect yet. `WEI_DESCRIPTION`, `MINED_PREFIX`,
 `MINED_REVERT`, `INTENT_UNKNOWN_TOKEN`, `LOST_RESPONSE`, `SIGNER_REFUSED`,
-`UNAUTHORIZED_BODY`, `AMOUNT_INEXACT`, `ABI_UNVERIFIED`,
+`UNAUTHORIZED_BODY`, `ABI_UNVERIFIED`,
 `UNKNOWN_SELECTOR` and the `MECH_*` texts are the reference's wording for
 behaviour still to be matched; until each is wired, Connect answers those
 cases in its own words.
@@ -359,10 +359,15 @@ CAP_REFUSED = (
     "rule 'bad-value': pass a whole number of base units, as an integer or a "
     "decimal or 0x-hex string"
 )
+
+# Connect's own field descriptions of those amounts
 AMOUNT_DESCRIPTION = "base units, as a decimal or 0x-hex string"
 CAP_DESCRIPTION = "base units, as an integer or a decimal or 0x-hex string"
+
+# Connect's own refusals of a send's value and of a body the MCP mount cannot serve
 VALUE_REFUSED = "value must be a non-negative amount in wei"
 BATCH_REFUSED = "batch requests are not supported: send one message per request"
+BODY_TOO_DEEP = "parse error: the request nests too deeply"
 
 
 def tool_failed(tool: str) -> str:
@@ -381,10 +386,14 @@ def block_negative(number: int) -> str:
 
 
 def AMOUNT_INEXACT(value: object) -> str:
-    """Return the refusal of an amount that is not an exact integer."""
+    """Return the refusal of an amount a JSON number cannot carry exactly.
+
+    The value is truncated as `ADDRESS_INVALID` truncates it, so no refusal
+    echoes a long value whole.
+    """
     return (
-        f"amount {value!r} is not an exact integer: send large amounts as a "
-        "decimal string"
+        f"amount {str(value)[:60]!r} is not an exact integer: send large amounts "
+        "as a decimal string"
     )
 
 

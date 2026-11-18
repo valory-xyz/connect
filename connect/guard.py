@@ -76,7 +76,6 @@ anything to switch.
 import logging
 import threading
 import time
-import typing as t
 from dataclasses import dataclass
 
 from connect.chains import MECH_MARKETPLACES
@@ -89,17 +88,16 @@ from connect.safe import (
     decode_approve,
     decode_deposit,
     decode_exec,
+    is_exec_transaction,
 )
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
 from connect.texts import (
-    GUARDRAIL_PREFIX,
     GUARD_NO_DELEGATECALL,
     GUARD_NO_SELF_CALL,
     GUARD_OUTER_VALUE,
     GUARD_RAW_DIGEST,
     GUARD_REFUND,
     GUARD_UNDECODABLE,
-    GuardRule,
     GuardText,
     guard_exec_transaction_only,
     guard_marketplace,
@@ -113,16 +111,11 @@ logger = logging.getLogger("agent")
 
 
 class GuardError(Exception):
-    """A transaction or signing request denied by the guardrail.
-
-    It takes only a `texts.GuardText`, which `guard_refusal` alone builds, so
-    every refusal carries the `guardrail: rule '<id>': ` prefix and `rule`.
-    """
+    """A transaction or signing request denied by the guardrail (`texts.GuardText`)."""
 
     def __init__(self, text: GuardText) -> None:
-        """Hold the refusal and the rule id it names."""
+        """Hold the refusal."""
         super().__init__(text)
-        self.rule = t.cast(GuardRule, text.removeprefix(GUARDRAIL_PREFIX).split("'")[1])
 
 
 # How long a registered allowance stays consumable. Arming must happen before
@@ -165,23 +158,41 @@ def exec_floor(chain: str, to: str, data: str) -> SafeExec | None:
     unconfigured chain walks straight through. Calldata that cannot be decoded
     cannot be judged, so it is refused. `to` is the contract the call is sent
     to, the safe whose call this is: a safe calling itself is how it changes
-    its own owners, modules or guard. The signer runs this even with no
-    guardrail attached, so no build lifts it.
+    its own owners, modules or guard.
 
     :raises GuardError: `undecodable-exec-transaction`, `no-delegatecall` or
         `no-self-call`.
     """
-    calldata = calldata_hex(data)
-    if not calldata.startswith(EXEC_TRANSACTION_SELECTOR):
+    if not is_exec_transaction(data):
         return None
     try:
-        exec_call = decode_exec(calldata, chain=chain, to=to)
+        exec_call = decode_exec(data, chain=chain, to=to)
     except ValueError as e:
         raise GuardError(GUARD_UNDECODABLE) from e
     if exec_call.operation != OPERATION_CALL:
         raise GuardError(GUARD_NO_DELEGATECALL)
     if exec_call.to.lower() == to.lower():
         raise GuardError(GUARD_NO_SELF_CALL)
+    return exec_call
+
+
+def floor(chain: str, to: str, data: str, *, server_built: bool) -> SafeExec | None:
+    """Enforce every rule no mode and no build lifts; return the call decoded.
+
+    `exec_floor`, then the marketplace rule: a mech marketplace takes only the
+    requests the server's mech flow composes (`server_built`), from the EOA or
+    the safe. The guard runs this first, and the signer runs it alone when no
+    guardrail is attached, on a send and on a dry run alike.
+
+    :raises GuardError: one of `exec_floor`'s rules, or `marketplace`.
+    """
+    chain = chain.lower()
+    exec_call = exec_floor(chain, to, data)
+    if not server_built:
+        called = {to.lower()} | ({exec_call.to.lower()} if exec_call else set())
+        marketplaces = sorted(called & MECH_MARKETPLACES.get(chain, frozenset()))
+        if marketplaces:
+            raise GuardError(guard_marketplace(marketplaces[0], chain))
     return exec_call
 
 
@@ -345,9 +356,7 @@ class Guard:
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
         calldata = calldata_hex(data)
-        exec_call = exec_floor(chain, to, calldata)
-        if not server_built:
-            self._check_marketplace(chain, to, exec_call)
+        exec_call = floor(chain, to, calldata, server_built=server_built)
         if self._store.load().protected.mode == MODE_RESTRICTED:
             self._check_restricted(
                 chain,
@@ -358,18 +367,6 @@ class Guard:
                 exec_call=exec_call,
                 consume=consume,
             )
-
-    @staticmethod
-    def _check_marketplace(chain: str, to: str, exec_call: "SafeExec | None") -> None:
-        """Refuse a call to a mech marketplace, by the EOA or by the safe.
-
-        In every mode: a marketplace takes only the requests the server's
-        mech flow composes; see the module docstring.
-        """
-        called = {to.lower()} | ({exec_call.to.lower()} if exec_call else set())
-        marketplaces = sorted(called & MECH_MARKETPLACES.get(chain, frozenset()))
-        if marketplaces:
-            raise GuardError(guard_marketplace(marketplaces[0], chain))
 
     def _check_restricted(  # pylint: disable=too-many-arguments
         self,

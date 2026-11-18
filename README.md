@@ -94,15 +94,17 @@ other non-aea agent. It:
      `invalid request: ValidationError: <argument>: <problem>`, never the
      value sent, and every address argument — `target`, `to`, `address`,
      `priority_mech` — or hex argument — `data`, `digest` — the reference's
-     `must be a 0x address` / `must be hex` text, checked on the arguments
-     as sent, before any alias is read and before a token's budget is drawn
+     `must be a 0x address` / `must be hex` text, and a `value` or
+     `max_payment` a JSON number may have rounded the reference's
+     `amount … is not an exact integer` text, checked on the arguments as
+     sent, before any alias is read and before a token's budget is drawn
      on), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
      of an empty or absent `target`. Every argument the reference takes is taken: `wallet_info`'s
      `chain` and `decode_calldata`'s `address` and `chain` are accepted and
      ignored (`decode_calldata` needs only `data`; its `address` is still
      checked for shape), and `safe_transaction` (on MCP only) reads an
-     unpublished `operation`, 0 or 1, so a DELEGATECALL is refused by the
+     unpublished `operation`, 0 (CALL) or 1 (DELEGATECALL), so a DELEGATECALL is refused by the
      guardrail's `no-delegatecall` rule rather than by a parameter check. Three texts stay Connect's own: `get_abi`'s description,
      until its answers match the reference's; `transaction_status`'s, which
      names `pending` too; and the warning on
@@ -319,8 +321,9 @@ cause, since every agent send on that chain is refused until it can. A key
 an intent does not know, at its top level or in an approval, is ignored on
 every surface, as OnchainBench's reference ignores it: the intent is checked on
 the keys it does carry, so a misspelled `spend` allows no spend and a
-misspelled `receive_min` sets no floor. Each ignored key is logged to
-`log.txt` by name, never its value. With the `strict_parameters` switch on
+misspelled `receive_min` sets no floor. The gate logs the ignored keys to
+`log.txt` once per call, by name with the call's chain and target, never a
+value. With the `strict_parameters` switch on
 (off in Pearl too) it is `bad-intent`, naming the key, and the cap of a
 scoped token refuses it before drawing on any budget. An amount in an intent is a whole number
 of base units, never truncated. On the HTTP routes a float or a bool there is
@@ -459,8 +462,9 @@ Two rules hold in **every** mode, and no setting lifts them: the safe may not
 `addOwnerWithThreshold`, `setGuard` — the ways a Safe changes what it *is*).
 Both would outlive a switch back to restricted mode, so the guardrail refuses
 them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
-The signer holds both even with no guardrail attached (`guard.exec_floor`), so
-no build of Connect lifts them either.
+The signer holds both, and the marketplace rule below, even with no guardrail
+attached (`guard.floor`), on a send and a dry run alike, so no build of Connect
+lifts them either.
 A third holds in every mode too: the mech marketplace takes only the calls the
 server's own mech flow composes (`mech_request`, bounded by `max_payment` and
 the token's mech budget). A call to the chain's marketplace (every
@@ -704,16 +708,16 @@ gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
 `token-expired`, `token-expiry-required`, `token-mech-cap-required`,
 `token-limit`, `token-cap-per-tx`, `token-cap-per-session`, `token-cap-sign`
 (a raw digest refused to a value-capped token),
-`token-mech-payment-cap`, `token-mech-session-cap`, and `bad-value` for an
-amount that is not a whole number >= 0, which the HTTP routes name `bad-intent`
+`token-mech-payment-cap`, `token-mech-session-cap`, and, on the HTTP routes,
+`bad-value` for an amount that is not a whole number >= 0, named `bad-intent`
 when it sits in an intent), come back as the HTTP 403/401 detail or a JSON-RPC
 error, and are recorded as activity `refusal` entries. MCP calls are authorized
 in the mount's middleware, which reads each JSON-RPC `tools/call` before the
 MCP server does: it first runs the tool's own input check, so a malformed call
 (address, hex, amount, an unknown parameter under `strict_parameters`) is
-answered as the tool's error, in its words, and audited as `invalid-request`
-before any budget is drawn on; it refuses a batch body whole (the MCP server
-serves one message per request); and it stamps the token on the request; whether its intent is
+answered as the tool's error, in its words, and audited once, as
+`invalid-request`, before any budget is drawn on; it refuses a batch body, or
+one nested too deep to parse, whole; and it stamps the token on the request; whether its intent is
 held as capped is decided from the token in one place (`GrantStore.intent_for`)
 for both surfaces, and a call with no known token is treated as capped. A mech
 payment never draws on `max_value_per_session`: its asset is the mech's,
@@ -989,10 +993,15 @@ Connect. Two public modules carry that contract:
   tool description, the guardrail and intent-gate refusals, the markers the
   bench's broker classifies — `guardrail: rule `, `. Nothing was sent.`,
   `transaction 0x` — and the mech, amount and transport errors). Most are the
-  reference's word for word; the guardrail rules and gate details Connect adds,
-  its refusal of an amount it cannot read exactly and the descriptions it keeps
-  (`get_abi`'s, `transaction_status`'s and `request_context`'s field note) are
-  its own. The bench imports the module, so a rename fails its suite.
+  reference's word for word, the inexact-amount text included (its value cut to
+  60 characters, as an address's is). Connect's own are: the guardrail rules it
+  adds beyond the floor and the whitelist, its gate and decode details
+  (`gate_token_cap_positions`, `EXEC_UNDECODABLE`), `AMOUNT_REFUSED` /
+  `CAP_REFUSED` for an amount that is not one, `VALUE_REFUSED`, `tool_failed`,
+  `BATCH_REFUSED`, `BODY_TOO_DEEP`, the block texts, the amount field
+  descriptions and the descriptions it keeps (`get_abi`'s,
+  `transaction_status`'s and `request_context`'s field note). The bench imports
+  the module, so a rename fails its suite.
 - `connect.switches` — `Switches`, one position per feature only Connect has
   and per protection Pearl keeps. `PRODUCTION` is what Pearl runs;
   `TEST_INTERFACE` is the reference's behaviour. The set is given once, to

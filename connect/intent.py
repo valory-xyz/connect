@@ -23,11 +23,11 @@ The rules, what the asset diff is read from and what it cannot see are in
 the README, "Intent gate"; `Rule` is the full list of rule names.
 """
 
-import logging
 import re
 import typing as t
 
 from connect.chains import NATIVE_ERC20_FACES as _FACES
+from connect.input_errors import MAX_EXACT_JSON_INT
 from connect.safe import ZERO_ADDRESS, calldata_hex
 from connect.texts import (
     GATE_PROBLEM,
@@ -38,8 +38,6 @@ from connect.texts import (
     gate_undeclared_approval,
     gate_undeclared_recipient,
 )
-
-logger = logging.getLogger("agent")
 
 TokenKey = str  # an ERC-20 address, lower-case, or "native"
 NATIVE = "native"
@@ -667,7 +665,7 @@ def parse_intent(
     """Validate a caller's intent; return it normalised, or a bad-intent problem.
 
     A key the gate does not read, in the intent or an approval, is ignored, as
-    the reference ignores it, and logged by name (never its value);
+    the reference ignores it (`ignored_keys` names it for the log);
     `strict_parameters` (the switch) refuses it instead. Every reader passes
     the switch, so the grant store's cap and the gate read one intent one way.
     An ignored key declares nothing: a misspelled `spend` leaves nothing to
@@ -686,10 +684,9 @@ def _parse(raw: t.Any, strict: bool) -> tuple[Intent | None, list[Problem]]:
         return None, []
     if not isinstance(raw, dict):
         return None, [_bad("the intent must be an object")]
-    unknown = sorted(set(raw) - {"spend", "receive_min", "recipients", "approvals"})
+    unknown = sorted(set(raw) - _INTENT_KEYS)
     if strict and unknown:
         return None, [_bad(f"unknown intent keys {unknown}")]
-    _ignored("intent", unknown)
     try:
         intent = Intent(
             spend=_amounts(raw.get("spend") or {}, "spend"),
@@ -704,10 +701,27 @@ def _parse(raw: t.Any, strict: bool) -> tuple[Intent | None, list[Problem]]:
     return intent, []
 
 
-def _ignored(where: str, keys: list[t.Any]) -> None:
-    """Log the names of the keys an intent carried that the gate does not read."""
-    if keys:  # a name only: a value could be anything the agent sent
-        logger.warning("ignored %s keys %s", where, [str(k)[:40] for k in keys])
+_INTENT_KEYS = {"spend", "receive_min", "recipients", "approvals"}
+_APPROVAL_KEYS = {"token", "spender", "amount"}
+
+
+def ignored_keys(raw: t.Any) -> list[str]:
+    """Name each key of a raw intent the gate does not read, cut to 40 characters.
+
+    Names only, never a value: a value could be anything the agent sent.
+    """
+    raw = raw.raw if isinstance(raw, Capped) else raw
+    if not isinstance(raw, dict):
+        return []
+    names = sorted(str(k)[:40] for k in set(raw) - _INTENT_KEYS)
+    approvals = raw.get("approvals")
+    for index, approval in enumerate(approvals if isinstance(approvals, list) else []):
+        if isinstance(approval, dict):
+            names += [
+                f"approvals[{index}].{str(k)[:40]}"
+                for k in sorted(set(approval) - _APPROVAL_KEYS, key=str)
+            ]
+    return names
 
 
 def _bad(detail: str) -> Problem:
@@ -743,11 +757,6 @@ def parse_amount(value: t.Any) -> int:
     if parsed < 0:
         raise ValueError("an amount must be >= 0")
     return parsed
-
-
-# the largest integer a JSON number carries exactly (an IEEE-754 double's):
-# 2^53 + 1 is the first a double cannot hold, and it rounds to 2^53
-MAX_EXACT_JSON_INT = 2**53 - 1
 
 
 def parse_tool_amount(value: t.Any) -> int:
@@ -796,10 +805,9 @@ def _amounts(raw: t.Any, where: str) -> dict[TokenKey, int]:
 def _approval(raw: t.Any, strict: bool) -> IntentApproval:
     if not isinstance(raw, dict):
         raise TypeError("each intent approval must be {token, spender, amount}")
-    unknown = sorted(set(raw) - {"token", "spender", "amount"})
+    unknown = sorted(set(raw) - _APPROVAL_KEYS)
     if strict and unknown:
         raise ValueError(f"unknown intent approval keys {unknown}")
-    _ignored("intent approval", unknown)
     return IntentApproval(
         token=_token(raw["token"]),
         spender=_address(raw["spender"]),

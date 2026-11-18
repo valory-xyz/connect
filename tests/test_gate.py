@@ -47,13 +47,17 @@ from connect.signer_errors import (
     logged_cause,
 )
 from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
-from connect.texts import EXEC_UNDECODABLE, GUARD_NO_DELEGATECALL
+from connect.texts import (
+    EXEC_UNDECODABLE,
+    GUARD_NO_DELEGATECALL,
+    GUARD_NO_SELF_CALL,
+    guard_marketplace,
+)
 
 from tests.conftest import (
     FakeW3,
     approval_log,
     audit_entries,
-    on_fake_chain,
     pay,
     position_out_log,
     transfer_log,
@@ -539,15 +543,57 @@ class TestSignerGate:
         assert not fake_w3.eth.sent
 
     def test_with_no_guardrail_attached_the_floor_still_refuses_a_delegatecall(
-        self, account: t.Any, app_config: t.Any, activity: t.Any, fake_w3: FakeW3
+        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
     ) -> None:
         """No build lifts the floor: a guardless signer refuses as the guard would."""
-        bare = on_fake_chain(
-            Signer(account=account, config=app_config, activity=activity), fake_w3
-        )
         with pytest.raises(SignerError) as refused:
-            bare.send_via_safe("testchain", EOA, operation=1)
+            test_signer.send_via_safe("testchain", EOA, operation=1)
         assert str(refused.value) == GUARD_NO_DELEGATECALL
+        assert not fake_w3.eth.sent
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "blocked"]
+        assert entry["reason"] == GUARD_NO_DELEGATECALL
+
+    @pytest.mark.parametrize("case", ["delegatecall", "self-call", "marketplace"])
+    def test_with_no_guardrail_attached_the_dry_run_holds_the_floor(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        case: str,
+    ) -> None:
+        """Preflight answers a floor refusal as the send gives it, guard or none."""
+        from connect import (
+            guard as guard_module,  # pylint: disable=import-outside-toplevel
+        )
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        market = "0x" + "5b" * 20
+        monkeypatch.setattr(
+            guard_module, "MECH_MARKETPLACES", {"testchain": frozenset({market})}
+        )
+        owner = test_signer.address
+        target, data, expected = {
+            "delegatecall": (
+                SAFE,
+                safe_module.exec_transaction(EOA, 0, "0x", owner, operation=1),
+                GUARD_NO_DELEGATECALL,
+            ),
+            "self-call": (
+                SAFE,
+                safe_module.exec_transaction(SAFE, 0, "0x", owner),
+                GUARD_NO_SELF_CALL,
+            ),
+            "marketplace": (market, "0x", guard_marketplace(market, "testchain")),
+        }[case]
+        reason, _ = test_signer.check(
+            "testchain", target, data=data, via_safe=False, run_intent_gate=False
+        )
+        assert reason == expected
+        with pytest.raises(SignerError) as refused:
+            test_signer.send("testchain", target, data=data)
+        assert str(refused.value) == expected
         assert not fake_w3.eth.sent
 
     def test_a_fault_in_the_decoder_is_not_read_as_bad_input(
@@ -713,7 +759,7 @@ class TestSignerGate:
         result = test_signer.simulate("testchain", SAFE, data=delegate, via_safe=False)
         assert result["fits_intent"] is False
         assert _rules(result["problems"])[0] == "bad-exec-transaction"
-        assert "DELEGATECALL" in result["problems"][0]
+        assert GUARD_NO_DELEGATECALL in result["problems"][0]
         args[3], args[6] = 0, 1
         refund = "0x" + safe_module.EXEC_TRANSACTION_SELECTOR
         refund += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()

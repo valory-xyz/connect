@@ -103,7 +103,7 @@ FORMATTED = [
     ),
     (
         texts.AMOUNT_INEXACT(9e18),
-        "amount 9e+18 is not an exact integer: send large amounts as a decimal "
+        "amount '9e+18' is not an exact integer: send large amounts as a decimal "
         "string",
     ),
     (
@@ -275,6 +275,7 @@ CONNECT_OWN = [
     (texts.AMOUNT_DESCRIPTION, "base units, as a decimal or 0x-hex string"),
     (texts.CAP_DESCRIPTION, "base units, as an integer or a decimal or 0x-hex string"),
     (texts.VALUE_REFUSED, "value must be a non-negative amount in wei"),
+    (texts.BODY_TOO_DEEP, "parse error: the request nests too deeply"),
     (
         texts.BATCH_REFUSED,
         "batch requests are not supported: send one message per request",
@@ -314,10 +315,15 @@ def test_text_equals_the_reference(constant: t.Any, reference: t.Any) -> None:
 
 
 def test_a_malformed_value_is_quoted_truncated_to_sixty_characters() -> None:
-    """The reference cuts the echoed value at 60 characters before quoting it."""
+    """The reference cuts the echoed value at 60 characters before quoting it.
+
+    B16's inexact amount is cut the same way (the team's answer on the PR).
+    """
     long = "0x" + "z" * 100
     assert texts.ADDRESS_INVALID("to", long).endswith(repr(long[:60]))
     assert texts.HEX_INVALID("data", long).endswith(repr(long[:60]))
+    assert texts.AMOUNT_INEXACT(10**70).startswith(f"amount {str(10**70)[:60]!r} ")
+    assert texts.block_invalid(("latest",), "b" * 61).endswith(repr("b" * 60))
 
 
 def test_the_guardrail_texts_carry_the_prefix_the_broker_reads() -> None:
@@ -332,14 +338,16 @@ def test_the_guardrail_texts_carry_the_prefix_the_broker_reads() -> None:
 
 # modules that must not restate a contract text inline
 def _readers() -> list[str]:
-    """Return every module of `connect` that imports the texts module."""
+    """Return every server module of `connect` but the texts module itself.
+
+    Every one, not only those that import `texts`: an inline copy is most
+    likely in a module that never imported the constant.
+    """
     package = Path(texts.__file__).parent
     return sorted(
         path.relative_to(package).as_posix()
         for path in package.rglob("*.py")
-        if path.name != "texts.py"
-        and "assets" not in path.parts
-        and "from connect.texts import" in path.read_text(encoding="utf-8")
+        if path.name != "texts.py" and "assets" not in path.parts
     )
 
 
@@ -347,7 +355,7 @@ READERS = _readers()
 
 
 def test_the_readers_are_found() -> None:
-    """The scan sees every module that reads a text, so none escapes the check."""
+    """The scan sees every module, those that read a text among them."""
     assert {
         "guard.py",
         "intent.py",
@@ -357,6 +365,8 @@ def test_the_readers_are_found() -> None:
         "input_errors.py",
         "server/auth.py",
         "server/mcp_tools.py",
+        "mech.py",
+        "server/signer_routes.py",
     } <= set(READERS)
 
 
