@@ -107,8 +107,7 @@ other non-aea agent. It:
      by name: `invalid request: ValidationError: <field>: Field required`.
      Every argument the reference takes is taken: `wallet_info`'s
      `chain` and `decode_calldata`'s `address` and `chain` are accepted and
-     ignored (`decode_calldata` needs only `data`; its `address` is still
-     checked for shape), and `safe_transaction` (on MCP only) reads an
+     ignored (its `address` is still checked for shape), and `safe_transaction` (on MCP only) reads an
      unpublished `operation`, 0 (CALL) or 1 (DELEGATECALL), so a DELEGATECALL is refused by the
      guardrail's `no-delegatecall` rule rather than by a parameter check. Three texts stay Connect's own: `get_abi`'s description,
      until its answers match the reference's; `transaction_status`'s, which

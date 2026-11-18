@@ -287,7 +287,7 @@ def decode_exec(data: str, *, chain: str, to: str) -> SafeExec:
             to,
             chain,
             len(calldata_hex(data)) // 2,
-            cause_of(t.cast(BaseException, e.__cause__)),
+            cause_of(e.__cause__ or e),
         )
         raise
 

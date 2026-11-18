@@ -638,7 +638,7 @@ async def test_each_tool_requires_what_the_reference_requires(
 
 
 async def test_get_abi_takes_an_address_alone_on_the_instance_chain(
-    mcp: FastMCP, monkeypatch: pytest.MonkeyPatch
+    mcp: FastMCP, test_signer: Signer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With no chain, get_abi reads the chain this instance's safe is on."""
     read: list[t.Any] = []
@@ -650,7 +650,7 @@ async def test_get_abi_takes_an_address_alone_on_the_instance_chain(
     monkeypatch.setattr(chain_read, "get_abi", get_abi)
     (answer,) = await mcp.call_tool("get_abi", {"address": RECIPIENT})
     assert json.loads(answer.text) == {"address": RECIPIENT}  # type: ignore[union-attr]
-    assert len(read) == 1
+    assert read == [(test_signer.w3("testchain"), RECIPIENT)]
 
 
 async def test_get_abi_with_no_chain_and_no_instance_chain_is_refused(
@@ -681,3 +681,94 @@ async def test_a_missing_or_empty_target_is_refused_by_name(
         str(refused.value) == "invalid request: ValidationError: target: Field required"
     )
     assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize("switches", [PRODUCTION, TEST_INTERFACE])
+async def test_a_misspelled_target_is_refused_naming_target(
+    make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3, switches: Switches
+) -> None:
+    """B2 holds in both S2 positions: `targett` leaves target missing, by name."""
+    with pytest.raises(ToolError) as refused:
+        await make_mcp(switches).call_tool(
+            "safe_transaction", {"chain": "testchain", "targett": RECIPIENT}
+        )
+    assert str(refused.value) == (
+        "invalid request: ValidationError: target: Field required"
+    )
+    assert not fake_w3.eth.sent
+
+
+async def test_a_misspelled_target_under_strict_parameters_names_target(
+    make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
+) -> None:
+    """Under strict_parameters the unknown name is refused, pointing at target."""
+    with pytest.raises(ToolError) as refused:
+        await make_mcp(Switches(strict_parameters=True)).call_tool(
+            "safe_transaction", {"chain": "testchain", "targett": RECIPIENT}
+        )
+    assert "'targett' (did you mean 'target'?)" in str(refused.value)
+    assert not fake_w3.eth.sent
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "named"),
+    [
+        ("safe_transaction", {"chain": "", "target": ""}, ["chain", "target"]),
+        ("chain_call", {"chain": "testchain", "to": RECIPIENT, "data": ""}, ["data"]),
+    ],
+)
+async def test_every_empty_required_field_is_named(
+    mcp: FastMCP, tool: str, arguments: dict, named: list[str]
+) -> None:
+    """Each empty required field is named, joined as pydantic joins them."""
+    with pytest.raises(ToolError) as refused:
+        await mcp.call_tool(tool, arguments)
+    problems = "; ".join(f"{name}: Field required" for name in named)
+    assert str(refused.value) == f"invalid request: ValidationError: {problems}"
+
+
+async def test_an_inexact_amount_is_refused_before_bad_hex(mcp: FastMCP) -> None:
+    """The reference checks addresses, then amounts, then hex: the amount wins."""
+    with pytest.raises(ToolError) as refused:
+        await mcp.call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "value": 1.5, "data": "zz"},
+        )
+    assert str(refused.value) == texts.AMOUNT_INEXACT(1.5)
+
+
+@pytest.mark.parametrize("tool", ["safe_transaction", "simulate_transaction"])
+async def test_the_largest_exact_json_integer_is_taken(
+    mcp: FastMCP, test_signer: Signer, monkeypatch: pytest.MonkeyPatch, tool: str
+) -> None:
+    """2^53 - 1 is the last value a JSON number carries exactly: it reaches the signer."""
+    seen: list[int] = []
+    method = "send_via_safe" if tool == "safe_transaction" else "simulate"
+
+    def record(*_args: t.Any, **kwargs: t.Any) -> t.Any:
+        seen.append(kwargs["value"])
+        return {} if tool == "simulate_transaction" else "0x" + "11" * 32
+
+    monkeypatch.setattr(test_signer, method, record)
+    await mcp.call_tool(
+        tool, {"chain": "testchain", "target": RECIPIENT, "value": 2**53 - 1}
+    )
+    assert seen == [2**53 - 1]
+
+
+async def test_get_abi_reads_the_chain_it_is_given_over_the_instance_s(
+    mcp: FastMCP,
+    test_signer: Signer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit chain wins; with none, the instance chain is the one read."""
+    read: list[t.Any] = []
+
+    def get_abi(w3: t.Any, address: str) -> dict:
+        read.append((w3, address))
+        return {}
+
+    monkeypatch.setattr(chain_read, "get_abi", get_abi)
+    monkeypatch.setattr(AppConfig, "instance_chain", property(lambda _s: "nochain"))
+    await mcp.call_tool("get_abi", {"address": RECIPIENT, "chain": "testchain"})
+    assert read == [(test_signer.w3("testchain"), RECIPIENT)]

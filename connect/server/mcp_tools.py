@@ -58,8 +58,8 @@ from connect.server.auth import (
 from connect.server.receipts import settled, settlement
 from connect.server.strict import (
     AuditedRefusal,
-    UNKNOWN_PARAMETER_RULE,
     make_tools_strict,
+    unknown_parameter_errors,
 )
 from connect.settings import SettingsStore
 from connect.signer import Signer, SignerError
@@ -245,7 +245,7 @@ class ConnectMCP(FastMCP):
         except InputError as e:
             raise ToolError(str(e)) from e
         except ValidationError as e:
-            audited = any(i["type"] == UNKNOWN_PARAMETER_RULE for i in e.errors())
+            audited = bool(unknown_parameter_errors(e.errors()))
             refusal = AuditedRefusal if audited else ToolError
             raise refusal(
                 INVALID_REQUEST(type(e).__name__, argument_problems(e))
@@ -316,7 +316,6 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
-        # CALL or DELEGATECALL; guard.exec_floor refuses the latter
         operation: SkipJsonSchema[Operation] = OPERATION_CALL,
     ) -> dict:
         """Have the service safe make one call."""

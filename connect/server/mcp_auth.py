@@ -23,8 +23,7 @@
 body the MCP server cannot serve (a batch, or JSON nested past the parser's
 depth), runs the tool's own input check (`ToolBoundary.check_call`) and then
 `GrantStore.authorize`, so a malformed call never draws on a budget. The rules
-are the README's ("Scoped tokens"). Split out of `auth.py` for pylint's line
-limit.
+are the README's ("Scoped tokens").
 """
 
 import json
@@ -51,6 +50,8 @@ _TOO_DEEP = object()  # a body nested past the JSON parser's recursion limit
 
 
 # the audit rules of a body the mount refused before authorizing anything
+# the JSON-RPC error code of a grant refusal, which the shipped client reads
+GRANT_REFUSED_CODE = -32001
 INPUT_REFUSED_RULE = "invalid-request"  # a call's own input check refused it
 BATCH_REFUSED_RULE = "batch"  # a batch body: one message per request
 BODY_TOO_DEEP_RULE = "body-too-deep"  # JSON nested past the parser's depth
@@ -131,11 +132,10 @@ class AuthMiddleware:
     ) -> dict | None:
         """Return the answer to a tool call this token may not make, if any.
 
-        A batch is refused whole before anything is authorized: the MCP server
-        serves one message per body. A call's input refusal (the tool's own
-        `check_call`) is answered as the tool's error would be, and a grant
-        refusal as a JSON-RPC error. A call relieved as a retry is added to
-        `replays` as (tool, request id).
+        A body `_refused_body` refuses answers first. A call's input refusal
+        (the tool's own `check_call`) is answered as the tool's error would
+        be, and a grant refusal as a JSON-RPC error. A call relieved as a retry
+        is added to `replays` as (tool, request id).
         """
         call = _parsed(body)
         refused = self._refused_body(call)
@@ -170,11 +170,11 @@ class AuthMiddleware:
             }
         except GrantRefused as e:
             self._activity.record("refusal", rule=e.rule, tool=name, reason=str(e))
-            return _rpc_error(call.get("id"), -32001, e.message)
+            return _rpc_error(call.get("id"), GRANT_REFUSED_CODE, e.message)
         return None
 
     def _refused_body(self, call: t.Any) -> dict | None:
-        """Refuse a body the MCP server cannot serve, before anything is read."""
+        """Refuse a body the MCP server cannot serve, before anything is checked."""
         if call is _TOO_DEEP:
             self._activity.record(
                 "refusal", rule=BODY_TOO_DEEP_RULE, reason=BODY_TOO_DEEP

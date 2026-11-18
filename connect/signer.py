@@ -435,7 +435,7 @@ class Signer:
         :raises _GateRefused: what the gate cannot hold to an intent — the
             safe's approveHash (it pre-approves a transaction by hash, which
             anyone may then execute), and an execTransaction that also carries
-            EOA value or pays a gas refund, and what the floor refuses.
+            EOA value or pays a gas refund, and what `exec_floor` refuses.
         """
         calldata = safe_module.calldata_hex(data)
         if calldata.startswith(safe_module.APPROVE_HASH_SELECTOR):
@@ -453,8 +453,8 @@ class Signer:
             or not safe_module.is_exec_transaction(data)
         ):
             return own
-        try:  # the floor's own rules, worded as the send's guardrail words them
-            # is_exec_transaction held above, so the floor decodes a call
+        try:  # exec_floor's rules, worded as the send's guardrail words them
+            # is_exec_transaction held above, so exec_floor decodes a call
             exec_call = t.cast(safe_module.SafeExec, exec_floor(chain, to, data))
         except GuardError as e:
             raise _GateRefused("bad-exec-transaction", str(e)) from e
@@ -547,11 +547,11 @@ class Signer:
                 "ignored intent keys %s on a call to %s on %s", ignored, call.to, chain
             )
         held_to = parsed
-        if parsed is None:  # fails closed: held unless the policy is simulate-only
+        if parsed is None:
             held_to = intent_module.no_intent_hold(
                 call.value,
                 call.to,
-                hold_uncapped=self._switches.no_intent_policy != "simulate-only",
+                hold_uncapped=self._switches.holds_no_intent_calls,
                 capped=isinstance(raw_intent, intent_module.Capped),
             )
         try:
@@ -707,17 +707,35 @@ class Signer:
         With no guardrail attached the floor still answers, as on a send.
         """
         try:
-            if self._guard is None:
-                logger.error(
-                    "the signing choke point has no guardrail attached; only "
-                    "the floor's rules apply"
-                )
-                floor(chain, to, data, server_built=False)
-            else:
-                self._guard.check_transaction(chain, to, value, data, consume=False)
+            self._guard_or_floor(chain, to, value, data, consume=False)
         except GuardError as e:
             return str(e)
         return None
+
+    def _guard_or_floor(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        to: str,
+        value: int,
+        data: str,
+        *,
+        consume: bool = True,
+        server_built: bool = False,
+    ) -> None:
+        """Ask the guardrail, or, with none attached, the floor no build lifts.
+
+        :raises GuardError: the refusal.
+        """
+        if self._guard is not None:
+            self._guard.check_transaction(
+                chain, to, value, data, consume=consume, server_built=server_built
+            )
+            return
+        logger.error(
+            "the signing choke point has no guardrail attached; only the floor's "
+            "rules apply"
+        )
+        floor(chain, to, data, server_built=server_built)
 
     def _send(  # pylint: disable=too-many-arguments
         self,
@@ -851,12 +869,7 @@ class Signer:
     ) -> None:
         """Consult the guardrail; a denial is audited and surfaced as SignerError."""
         try:
-            if self._guard is None:  # the floor holds with no guardrail attached
-                floor(chain, to, data, server_built=server_built)
-            else:
-                self._guard.check_transaction(
-                    chain, to, value, data, server_built=server_built
-                )
+            self._guard_or_floor(chain, to, value, data, server_built=server_built)
         except GuardError as e:
             if audit:
                 self._activity.record(

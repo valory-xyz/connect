@@ -334,6 +334,10 @@ def UNKNOWN_TOOL(tool: str) -> str:
 UNAUTHORIZED_BODY: t.Mapping[str, str] = MappingProxyType({"detail": "unauthorized"})
 
 
+# the most of a caller's value a refusal echoes, as the reference cuts it
+ECHO_LIMIT = 60
+
+
 def INVALID_REQUEST(type_name: str, message: str) -> str:
     """Return the error for malformed input on a tool call."""
     return f"invalid request: {type_name}: {message}"
@@ -341,12 +345,14 @@ def INVALID_REQUEST(type_name: str, message: str) -> str:
 
 def ADDRESS_INVALID(field: str, value: object) -> str:
     """Return the refusal of an address argument that is not 0x + 40 hex digits."""
-    return f"{field} must be a 0x address (40 hex digits), got {str(value)[:60]!r}"
+    return (
+        f"{field} must be a 0x address (40 hex digits), got {str(value)[:ECHO_LIMIT]!r}"
+    )
 
 
 def HEX_INVALID(field: str, value: object) -> str:
     """Return the refusal of a hex argument that is not whole-byte hex."""
-    return f"{field} must be hex (0x and whole bytes), got {str(value)[:60]!r}"
+    return f"{field} must be hex (0x and whole bytes), got {str(value)[:ECHO_LIMIT]!r}"
 
 
 # Connect's own refusal of a base-unit amount it cannot read exactly: it names
@@ -380,7 +386,7 @@ def tool_failed(tool: str) -> str:
 
 def block_invalid(tags: t.Iterable[str], block: str) -> str:
     """Return the refusal of a `chain_call` block that is no tag and no number."""
-    return f"block must be one of {', '.join(tags)} or a number, got {block[:60]!r}"
+    return f"block must be one of {', '.join(tags)} or a number, got {block[:ECHO_LIMIT]!r}"
 
 
 def block_negative(number: int) -> str:
@@ -395,7 +401,7 @@ def AMOUNT_INEXACT(value: object) -> str:
     echoes a long value whole.
     """
     return (
-        f"amount {str(value)[:60]!r} is not an exact integer: send large amounts "
+        f"amount {str(value)[:ECHO_LIMIT]!r} is not an exact integer: send large amounts "
         "as a decimal string"
     )
 

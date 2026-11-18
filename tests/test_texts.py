@@ -318,7 +318,7 @@ def test_text_equals_the_reference(constant: t.Any, reference: t.Any) -> None:
 def test_a_malformed_value_is_quoted_truncated_to_sixty_characters() -> None:
     """The reference cuts the echoed value at 60 characters before quoting it.
 
-    B16's inexact amount is cut the same way (the team's answer on the PR).
+    The inexact amount and a block are cut the same way.
     """
     long = "0x" + "z" * 100
     assert texts.ADDRESS_INVALID("to", long).endswith(repr(long[:60]))
@@ -339,7 +339,7 @@ def test_the_guardrail_texts_carry_the_prefix_the_broker_reads() -> None:
 
 # modules that must not restate a contract text inline
 def _readers() -> list[str]:
-    """Return every server module of `connect` but the texts module itself.
+    """Return every module of `connect` outside its assets, but `texts` itself.
 
     Every one, not only those that import `texts`: an inline copy is most
     likely in a module that never imported the constant.

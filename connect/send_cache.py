@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""At-most-once sends keyed by a caller's request id, split out of `signer.py`.
+"""At-most-once sends keyed by a caller's request id.
 
 `IdempotencyCache` keeps each request id's hash with a stamp of the call it
 stood for, so a retry answers the same hash and a reused id cannot answer a

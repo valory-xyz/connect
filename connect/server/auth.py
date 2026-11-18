@@ -259,6 +259,17 @@ def _is_universal_router(spender: str, chain: t.Any) -> bool:
     return known is not None and known.name == UNIVERSAL_ROUTER_NAME
 
 
+class GateView(t.Protocol):
+    """What the grant store reads of the signer whose gate it fronts."""
+
+    @property
+    def switches(self) -> Switches:
+        """The signer's switch positions."""
+
+    def holds_request(self, request_id: str, via_safe: bool) -> bool:
+        """Whether the signer holds this request id, completed or still sending."""
+
+
 class GrantStore:  # pylint: disable=too-many-instance-attributes
     """The bearer tokens this process honours, and what each may do.
 
@@ -269,19 +280,17 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
         self,
         workspace_token: str,
         *,
-        held: t.Callable[[str, bool], bool],
-        switches: Switches,
+        signer: GateView,
     ) -> None:
         """Hold the workspace token, the root every other token is minted from.
 
-        `held(request_id, via_safe)` says whether the signer holds that request
-        id, completed or still sending (`Signer.holds_request`): a call
-        repeating it then sends nothing new. `switches` are the signer's
-        (`Signer.switches`, the one source), so the cap reads an intent as the
-        gate will.
+        `signer` is the one whose gate this store's caps front: its
+        `holds_request(request_id, via_safe)` says whether a call repeats one
+        it already holds (sending nothing new), and its `switches` are the one
+        source of `strict_parameters`, so the cap reads an intent as the gate.
         """
-        self._held = held
-        self._strict_parameters = switches.strict_parameters
+        self._held = signer.holds_request
+        self._strict_parameters = signer.switches.strict_parameters
         # what each (token, action, request_id) has drawn, so a retry of a
         # request this token already paid for is not drawn again; forgotten
         # past the bound, which only draws again

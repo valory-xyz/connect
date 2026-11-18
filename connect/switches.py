@@ -48,6 +48,14 @@ class Switches:
     # the native top-up from the safe to the agent EOA at startup
     agent_topup_at_boot: bool = True
 
+    @property
+    def holds_no_intent_calls(self) -> bool:
+        """Whether a call with no intent is held to its implied one (S1).
+
+        Fails closed: every policy but `simulate-only` holds it.
+        """
+        return self.no_intent_policy != "simulate-only"
+
     def __post_init__(self) -> None:
         """Refuse a position no switch has, rather than read it as another."""
         if self.no_intent_policy not in t.get_args(NoIntentPolicy):

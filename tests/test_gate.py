@@ -51,6 +51,7 @@ from connect.texts import (
     EXEC_UNDECODABLE,
     GUARD_NO_DELEGATECALL,
     GUARD_NO_SELF_CALL,
+    GUARD_UNDECODABLE,
     guard_marketplace,
 )
 
@@ -596,6 +597,24 @@ class TestSignerGate:
         assert str(refused.value) == expected
         assert not fake_w3.eth.sent
 
+    def test_with_no_guardrail_attached_the_mech_flow_still_reaches_its_marketplace(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The floor refuses the agent a marketplace, never the server's own request."""
+        from connect import (
+            guard as guard_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        market = "0x" + "5b" * 20
+        monkeypatch.setattr(
+            guard_module, "MECH_MARKETPLACES", {"testchain": frozenset({market})}
+        )
+        test_signer.send("testchain", market, data="0x", intent=SERVER_BUILT)
+        assert len(fake_w3.eth.sent) == 1
+
     def test_a_fault_in_the_decoder_is_not_read_as_bad_input(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -770,7 +789,14 @@ class TestSignerGate:
         bad = test_signer.simulate(
             "testchain", SAFE, data="0x6a761202zz", via_safe=False
         )
-        assert _rules(bad["problems"])[0] == "bad-exec-transaction"
+        assert bad["problems"] == [
+            f"intent gate: rule 'bad-exec-transaction' ({GUARD_UNDECODABLE})"
+        ]
+        self_call = safe_module.exec_transaction(SAFE, 0, "0x", test_signer.address)
+        own = test_signer.simulate("testchain", SAFE, data=self_call, via_safe=False)
+        assert own["problems"] == [
+            f"intent gate: rule 'bad-exec-transaction' ({GUARD_NO_SELF_CALL})"
+        ]
 
     def test_a_replay_answers_before_the_gate(
         self, test_signer: Signer, fake_w3: FakeW3

@@ -124,9 +124,7 @@ class StrictBody(BaseModel):
         return _check_known(cls, data)
 
 
-def strict_arg_model(
-    model: type[BaseModel], on_refusal: OnRefusal | None = None
-) -> type[BaseModel]:
+def strict_arg_model(model: type[BaseModel], on_refusal: OnRefusal) -> type[BaseModel]:
     """Return a subclass of an MCP tool's argument model that refuses unknown keys."""
 
     class Strict(model):  # type: ignore[valid-type, misc]
@@ -155,15 +153,25 @@ def make_tools_strict(mcp: FastMCP, activity: ActivityLog) -> None:
         tool.fn_metadata.arg_model = strict_arg_model(tool.fn_metadata.arg_model, audit)
 
 
+def unknown_parameter_errors(
+    errors: t.Iterable[t.Mapping[str, t.Any]],
+) -> list[t.Mapping[str, t.Any]]:
+    """Return the validation errors that are unknown-parameter refusals.
+
+    Each was recorded where it was raised: an MCP tool's strict model audits
+    through its `on_refusal`, and an HTTP body through `audit_unknown_parameters`.
+    """
+    return [e for e in errors if e.get("type") == UNKNOWN_PARAMETER_RULE]
+
+
 def audit_unknown_parameters(
     activity: ActivityLog, path: str, errors: t.Iterable[t.Mapping[str, t.Any]]
 ) -> None:
     """Record an HTTP body's unknown-parameter refusal in the activity log."""
-    for error in errors:
-        if error.get("type") == UNKNOWN_PARAMETER_RULE:
-            activity.record(
-                "refusal",
-                rule=UNKNOWN_PARAMETER_RULE,
-                path=path,
-                reason=str(error.get("msg", "")),
-            )
+    for error in unknown_parameter_errors(errors):
+        activity.record(
+            "refusal",
+            rule=UNKNOWN_PARAMETER_RULE,
+            path=path,
+            reason=str(error.get("msg", "")),
+        )

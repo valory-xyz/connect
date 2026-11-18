@@ -847,6 +847,23 @@ def _no_handed_token() -> t.Iterator[None]:
         yield
 
 
+class FakeGate:
+    """A stand-in for the signer a grant store fronts: held ids and switches."""
+
+    def __init__(
+        self,
+        held: t.Callable[[str, bool], bool] = lambda request_id, via_safe: False,
+        switches: Switches = PRODUCTION,
+    ) -> None:
+        """Hold the request-id check and the switch positions."""
+        self._held = held
+        self.switches = switches
+
+    def holds_request(self, request_id: str, via_safe: bool) -> bool:
+        """Whether the stand-in holds this request id."""
+        return self._held(request_id, via_safe)
+
+
 class FakeBoundary:
     """A stand-in MCP app boundary for the mount: named tools, an input check."""
 
@@ -872,9 +889,7 @@ class FakeBoundary:
 
 def grant_store(token: str) -> GrantStore:
     """Return a GrantStore over a signer that holds no request id."""
-    return GrantStore(
-        token, held=lambda request_id, via_safe: False, switches=PRODUCTION
-    )
+    return GrantStore(token, signer=FakeGate())
 
 
 # a minted token's expiry, far enough out never to pass during a test

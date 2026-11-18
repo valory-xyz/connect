@@ -18,11 +18,11 @@
 # ------------------------------------------------------------------------------
 
 
-"""`InputError`, and the reference's checks of an address or hex argument.
+"""`InputError`, and the reference's checks of an address, amount or hex argument.
 
 `InputError` is a `ValueError`, so existing callers that catch one keep
 working, and its own class, so the MCP call boundary can tell Connect's words
-from a library's. The two checks are OnchainBench's `check_args` patterns, so
+from a library's. The checks are OnchainBench's `check_args`, in its order, so
 a malformed argument is refused where, and in the words, the reference does.
 """
 
@@ -76,31 +76,31 @@ def checked_hex(field: str, value: object) -> str:
 
 
 def check_arguments(arguments: t.Mapping[str, t.Any]) -> None:
-    """Refuse a malformed address or hex argument, naming it, as the reference does.
+    """Refuse a malformed address, amount or hex argument, naming it, as the reference does.
 
-    Run on a call's arguments as sent: the MCP mount runs it before any budget
-    is drawn on, and `ConnectMCP` again for an in-process caller.
+    Run on a call's arguments as sent, in the reference's order (addresses,
+    then amounts, then hex), by `ConnectMCP.check_call`.
 
     :raises InputError: the first malformed argument, in the reference's words.
     """
     for name in ADDRESS_ARGUMENTS:
         if arguments.get(name) not in (None, ""):
             checked_address(name, arguments[name])
+    for name in AMOUNT_ARGUMENTS:
+        if _inexact(arguments.get(name), spent=name == "value"):
+            raise InputError(AMOUNT_INEXACT(arguments[name]))
     for name in HEX_ARGUMENTS:
         if arguments.get(name) not in (None, ""):
             checked_hex(name, arguments[name])
-    for name in AMOUNT_ARGUMENTS:
-        if _inexact(arguments.get(name), capped=name == "value"):
-            raise InputError(AMOUNT_INEXACT(arguments[name]))
 
 
-def _inexact(value: object, *, capped: bool) -> bool:
+def _inexact(value: object, *, spent: bool) -> bool:
     """Whether a JSON number cannot carry this amount exactly.
 
-    A float, or an integer past 2^53 - 1 where the amount is spent (`capped`).
+    A float, or an integer past 2^53 - 1 where the amount is spent (`spent`).
     """
     if isinstance(value, bool):
         return False
     if isinstance(value, float):
         return True
-    return capped and isinstance(value, int) and value > MAX_EXACT_JSON_INT
+    return spent and isinstance(value, int) and value > MAX_EXACT_JSON_INT

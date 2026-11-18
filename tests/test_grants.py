@@ -49,11 +49,12 @@ from connect.server.auth import (
 )
 from connect.server.mcp_auth import AuthMiddleware
 from connect.signer import Signer
-from connect.switches import PRODUCTION, Switches
+from connect.switches import Switches
 from connect.texts import AMOUNT_REFUSED, CAP_REFUSED
 
 from tests.conftest import (
     FakeBoundary,
+    FakeGate,
     FakeW3,
     TOKEN_EXPIRES_AT,
     advance_token_clock,
@@ -1539,9 +1540,7 @@ def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
     """The exemption covers what this token drew for the id, and nothing more."""
     held: set = set()
     store = GrantStore(
-        WORKSPACE,
-        held=lambda rid, via_safe: (rid, via_safe) in held,
-        switches=PRODUCTION,
+        WORKSPACE, signer=FakeGate(lambda rid, via_safe: (rid, via_safe) in held)
     )
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     other = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
@@ -1567,7 +1566,7 @@ def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
 
 def test_a_retry_s_record_keeps_the_most_drawn_per_asset() -> None:
     """A retry declaring less, or leaving an asset out, lowers nothing on record."""
-    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True, switches=PRODUCTION)
+    store = GrantStore(WORKSPACE, signer=FakeGate(lambda rid, via_safe: True))
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 20, USDC: 5}))
 
     def send(request_id: str, value: int, usdc: int = 0) -> None:
@@ -1594,7 +1593,7 @@ def test_a_forgotten_request_id_is_drawn_in_full(
 ) -> None:
     """Past the bound a draw is forgotten, which only ever draws again."""
     monkeypatch.setattr(auth_module, "MAX_DRAWN_REQUEST_IDS", 1)
-    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True, switches=PRODUCTION)
+    store = GrantStore(WORKSPACE, signer=FakeGate(lambda rid, via_safe: True))
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r1"})
     store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r2"})
