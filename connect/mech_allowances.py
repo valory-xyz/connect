@@ -36,7 +36,14 @@ from web3 import Web3
 from connect.activity import ActivityLog
 from connect.config import AppConfig, NATIVE_ASSET
 from connect.guard import Guard
-from connect.mech_types import MechDepositUnknown, PricedMech, top_up_failure
+from connect.mech_types import (
+    Armed,
+    MechDepositUnknown,
+    PricedMech,
+    RequestPlan,
+    TopUpBudget,
+    top_up_failure,
+)
 from connect.safe import (
     SafeExec,
     decode_deposit,
@@ -49,11 +56,55 @@ from connect.wallet import asset_balance
 
 logger = logging.getLogger("agent")
 
-# what one request armed, each entry withdrawing one grant (MechAllowances.revoke)
-Armed = list[t.Callable[[], None]]
-# draws a top-up's amount on the calling token's mech session budget: the
-# refusal, naming its rule, or None once drawn
-TopUpBudget = t.Callable[[int], str | None]
+# What `DepositService` is asked for each token payment type it deposits; a
+# native one takes no asset. A payment type in neither (an NVM subscription,
+# or one a pin bump adds upstream) has no prepaid deposit here, and its
+# shortfall is left to the mech to name.
+DEPOSIT_TOKEN_ASSETS = {
+    PaymentType.OLAS_TOKEN: "olas",
+    PaymentType.USDC_TOKEN: "usdc",
+}
+
+
+class _Sends:
+    """mech-client's signer, keeping the hash of each transaction it sends.
+
+    What reached the chain is what tells a prepaid deposit that never
+    happened from one that may have landed, and no error mech-client's
+    deposit path raises carries it.
+    """
+
+    def __init__(self, signer: t.Any) -> None:
+        """Wrap `signer`, forwarding everything but the send."""
+        self._signer = signer
+        self.hashes: list[str] = []
+        self.address = signer.address
+        self.sign_message = signer.sign_message
+        self.sign_safe_message = signer.sign_safe_message
+
+    def send_transaction(self, unsigned_tx: dict) -> str:
+        """Send through the wrapped signer, keeping the hash it answered."""
+        tx_hash = self._signer.send_transaction(unsigned_tx)
+        self.hashes.append(tx_hash)
+        return tx_hash
+
+
+def deposit_cap(priced: PricedMech, max_payment: int) -> int:
+    """Return the most one request may deposit, prepaid and on a 402 together.
+
+    The request's `max_payment`, within the ratio of the mech's per-request
+    rate mech-client itself enforces on a shortfall.
+    """
+    return min(_MAX_AUTO_DEPOSIT_RATIO * priced.rate, max_payment)
+
+
+class _Short(t.NamedTuple):
+    """What a prepaid deposit will be: the path, the balance read and the amount."""
+
+    deposits: DepositService
+    sends: _Sends
+    balance: int
+    amount: int
 
 
 class _TopUp(t.NamedTuple):
@@ -101,10 +152,12 @@ class MechAllowances:
         self._config = config
         self._guard = guard
         self._activity = activity
-        # chain -> the top-up the send under its queue's lock may make
+        # chain -> the deposits the send under its queue's lock may make
         self._top_ups: dict[str, _TopUp] = {}
-        # chain -> mech-client's deposit path, built once per chain
-        self._deposits: dict[str, DepositService] = {}
+        # chain -> mech-client's deposit path and what it has sent
+        self._deposits: dict[str, tuple[DepositService, _Sends]] = {}
+        # chain -> what the request in flight prepaid, off its cap
+        self._prefunded: dict[str, int] = {}
 
     def arm(  # pylint: disable=too-many-arguments
         self,
@@ -168,7 +221,6 @@ class MechAllowances:
         auto_deposit: bool,
         max_payment: int,
         budget: TopUpBudget | None,
-        service: MarketplaceService,
     ) -> t.Iterator[None]:
         """Pre-authorize the deposits of the send this wraps, then withdraw them.
 
@@ -196,7 +248,6 @@ class MechAllowances:
                 self._arm_deposit(
                     chain, priced, armed, max_payment=max_payment, budget=budget
                 )
-                self._prefund(chain, priced, service, armed)
             yield
         except Exception as e:
             failure = top_up_failure(e)
@@ -229,133 +280,180 @@ class MechAllowances:
         tracker, is_token = deposit_tracker(chain, priced.payment_type)
         if tracker is None:  # restricted already disarmed it; unrestricted needs none
             return
-        amount_cap = min(_MAX_AUTO_DEPOSIT_RATIO * priced.rate, max_payment)
-        self._top_ups[chain] = _TopUp(tracker, amount_cap, budget)
+        amount_cap = deposit_cap(priced, max_payment)
+        deposited = self._prefunded.get(chain, 0)
+        self._top_ups[chain] = _TopUp(tracker, amount_cap, budget, deposited)
         armed.append(functools.partial(self._disarm_top_up, chain))
+        remaining = max(amount_cap - deposited, 0)
         if self._guard.mode() == MODE_RESTRICTED:
             grant = self._guard.allow_safe_deposit_once(
-                chain=chain, tracker=tracker, amount_cap=amount_cap, is_token=is_token
+                chain=chain, tracker=tracker, amount_cap=remaining, is_token=is_token
             )
             armed.append(functools.partial(self._guard.revoke_safe_deposit, grant))
         self._activity.record(
             "mech_deposit_allowance",
             chain=chain,
             tracker=tracker,
-            amount_cap=str(amount_cap),
+            amount_cap=str(remaining),
             is_token=is_token,
         )
 
-    def _prefund(  # pylint: disable=too-many-arguments
-        self,
-        chain: str,
-        priced: PricedMech,
-        service: MarketplaceService,
-        armed: Armed,
-    ) -> None:
-        """Deposit the armed cap when the safe cannot prepay one more request.
+    def prefund(self, plan: RequestPlan, safe: str) -> None:
+        """Prepay the mech balance for `plan`, before any nonce is reserved.
 
         A mech admits an off-chain request only while the safe's prepaid
         balance covers it, and a balance holding exactly one call is spent by
-        the first of the calls behind it. Depositing the whole armed cap,
-        rather than waiting for the mech to name a one-call shortfall over
-        HTTP 402, keeps the balance ahead of the requests in flight: one
+        the first of the calls behind it. Depositing the whole capped amount
+        here, rather than waiting for the mech to name a one-call shortfall
+        over HTTP 402, keeps the balance ahead of the requests in flight: one
         deposit carries several calls, and a call whose balance is already
         there costs no transaction at all.
 
-        Everything that bounds a 402 top-up bounds this: the tracker and cap
-        the allowance was just armed for, `check_top_up`'s draw on the
-        session budget, the guard's shape check, and mech-client's own
-        deposit path.
+        It runs before the request takes a marketplace nonce, so a deposit
+        whose outcome is unknown strands no slot and holds no queue. What it
+        deposits is remembered for the send, whose own cap is that much
+        smaller (`_arm_deposit`), so one request's deposits together stay
+        within its max_payment; and it is armed, bounded and audited while it
+        is made exactly as the 402 top-up is, so nothing is armed at all for
+        a request that turns out to need no deposit.
 
-        What it deposits is counted on the send, so this deposit and any 402
-        top-up after it stay within the one cap together.
-
-        Every way it cannot happen leaves the 402 path to deposit the
-        shortfall as before: a balance that cannot be read, a safe that
-        cannot pay even what one call is short, and a deposit refused before
-        anything is signed — by the guard, by the budget, or by mech-client
-        itself. Only a deposit that may have landed stops the request, named.
+        :raises MechDepositUnknown: a deposit that may have landed; audited.
         """
-        top_up = self._top_ups.get(chain)
-        if top_up is None:  # no tracker for this payment type: nothing to prepay
+        if not plan.auto_deposit or not plan.offchain:
             return
-        kind = PaymentType(priced.payment_type)
-        safe = str(self._config.chain(chain).safe_address)
+        short = self._shortfall(plan, safe)
+        if short is None:
+            return
+        armed: Armed = []
         try:
-            deposits = self._deposit_service(chain, service)
+            self._arm_deposit(
+                plan.chain,
+                plan.priced,
+                armed,
+                max_payment=plan.max_payment,
+                budget=plan.top_up_budget,
+            )
+            deposited = self._deposit_shortfall(plan, safe, short)
+        finally:
+            self.revoke(armed)
+        if deposited:
+            self._prefunded[plan.chain] = deposited
+            plan.armed.append(functools.partial(self._forget_prefunded, plan.chain))
+
+    def _shortfall(self, plan: RequestPlan, safe: str) -> "_Short | None":
+        """Decide what to prepay, from chain reads alone; None to prepay nothing.
+
+        None where there is nothing to do, or nothing that can be done: no
+        tracker for the payment type, a payment type with no deposit of its
+        own, a prepaid balance that already covers the call or cannot be
+        read, and a safe that cannot cover what the call is short.
+        """
+        chain, priced = plan.chain, plan.priced
+        if deposit_tracker(chain, priced.payment_type)[0] is None:
+            return None
+        kind = PaymentType(priced.payment_type)
+        if kind is not PaymentType.NATIVE and kind not in DEPOSIT_TOKEN_ASSETS:
+            logger.info(
+                "payment type %s has no prepaid deposit; leaving its shortfall "
+                "to the mech",
+                kind.name,
+            )
+            return None
+        try:
+            deposits, sends = self._deposit_service(chain, plan.service)
             balance = int(deposits.check_balance(safe, kind))
             if balance >= priced.rate:
-                return
+                return None
             spendable = self._spendable(deposits, chain, kind, safe)
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.warning(
                 "could not read what the safe can prepay on %s: %s", chain, cause_of(e)
             )
-            return
-        amount = min(top_up.cap, spendable)
-        short = priced.rate - balance  # the least that lets this call through
-        if amount < short:
+            return None
+        amount = min(deposit_cap(priced, plan.max_payment), spendable)
+        missing = priced.rate - balance  # the least that lets this call through
+        if amount < missing:
             logger.info(
                 "not prepaying the mech balance on %s: the safe can spend %s of "
                 "the %s one call is short",
                 chain,
                 spendable,
-                short,
+                missing,
             )
-            return
+            return None
+        return _Short(deposits, sends, balance, amount)
+
+    def _deposit_shortfall(self, plan: RequestPlan, safe: str, short: "_Short") -> int:
+        """Send the deposit `_shortfall` decided on; return what it put in.
+
+        0 when the deposit was refused before it reached the chain (by the
+        guard, by the session budget, or by mech-client's own balance check),
+        and when its receipt left the prepaid balance where it was, since
+        mech-client answers a hash without reading that receipt's status. The
+        mech's shortfall is then left to the 402 path, as it was before.
+
+        :raises MechDepositUnknown: the deposit reached the chain and what
+            became of it is unknown; audited as `mech_deposit_unconfirmed`.
+        """
+        chain, priced = plan.chain, plan.priced
+        kind = PaymentType(priced.payment_type)
+        short.sends.hashes.clear()
         try:
-            if kind.is_token():
-                deposits.deposit_token(amount, "usdc" if kind.is_usdc() else "olas")
-            else:
-                deposits.deposit_native(amount)
+            self._deposit(short.deposits, kind, short.amount)
+            rose = int(short.deposits.check_balance(safe, kind)) > short.balance
         except Exception as e:  # pylint: disable=broad-exception-caught
-            refused = top_up_failure(e)
-            if not isinstance(refused, (SignerError, ValueError)):
-                raise  # it may have landed: auto_deposit_armed audits that
-            logger.info(
-                "did not prepay %s into the mech balance: %s",
-                amount,
-                cause_of(refused),
+            self._unconfirmed(chain, priced, short.sends, error=e, amount=short.amount)
+            return 0
+        if not rose:
+            logger.warning(
+                "the safe's prepaid mech balance on %s did not rise on a deposit "
+                "of %s; leaving the shortfall to the mech",
+                chain,
+                short.amount,
             )
-            return
-        self._top_ups[chain] = top_up._replace(deposited=top_up.deposited + amount)
-        self._rearm(chain, kind, armed)
+            return 0
         self._activity.record(
             "mech_prefund",
             chain=chain,
-            tracker=top_up.tracker,
-            amount=str(amount),
-            balance=str(balance),
+            tracker=self._top_ups[chain].tracker,
+            amount=str(short.amount),
+            balance=str(short.balance),
             rate=str(priced.rate),
         )
+        return short.amount
 
-    def _rearm(self, chain: str, kind: PaymentType, armed: Armed) -> None:
-        """Re-arm the deposit grant a prepaid deposit consumed, for the rest of the cap.
+    def _unconfirmed(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        priced: PricedMech,
+        sends: _Sends,
+        *,
+        error: Exception,
+        amount: int,
+    ) -> None:
+        """Say what a failed prepaid deposit was; raise if it may have landed.
 
-        The guard spends a deposit allowance whole, so after a prepaid
-        deposit restricted mode would refuse the mech's 402 shortfall and
-        lose the request. What is left of the cap is armed again, and only
-        that: the two deposits of a send stay within its one cap.
+        A failure that reached no chain is simply no deposit. One after the
+        transaction left is spend-uncertain, whatever failed — the receipt
+        wait, a balance read, the token path's deposit after its approve
+        landed — so it is audited and raised, and the caller keeps its
+        request id rather than being told to send again.
+
+        :raises MechDepositUnknown: the deposit may have landed.
         """
-        top_up = self._top_ups[chain]
-        remaining = top_up.cap - top_up.deposited
-        if self._guard.mode() != MODE_RESTRICTED or remaining <= 0:
+        failure = top_up_failure(error)
+        tx_hash = failure.tx_hash if isinstance(failure, MechDepositUnknown) else None
+        if tx_hash is None and sends.hashes:
+            tx_hash = sends.hashes[-1]
+        if tx_hash is None:
+            logger.info(
+                "did not prepay %s into the mech balance: %s", amount, cause_of(error)
+            )
             return
-        is_token = kind.is_token()
-        grant = self._guard.allow_safe_deposit_once(
-            chain=chain,
-            tracker=top_up.tracker,
-            amount_cap=remaining,
-            is_token=is_token,
-        )
-        armed.append(functools.partial(self._guard.revoke_safe_deposit, grant))
         self._activity.record(
-            "mech_deposit_allowance",
-            chain=chain,
-            tracker=top_up.tracker,
-            amount_cap=str(remaining),
-            is_token=is_token,
+            "mech_deposit_unconfirmed", chain=chain, mech=priced.mech, tx_hash=tx_hash
         )
+        raise MechDepositUnknown(tx_hash) from error
 
     def _spendable(
         self, deposits: DepositService, chain: str, kind: PaymentType, safe: str
@@ -374,30 +472,44 @@ class MechAllowances:
         balance, _ = asset_balance(deposits.ledger_api.api, asset, safe, chain)
         if token is not None:
             return balance
-        floor = (
-            self._config.fund_requirements.get(chain, {})
-            .get("safe", {})
-            .get(NATIVE_ASSET, {})
-            .get("threshold", 0)
-        )
+        rules = self._config.fund_requirements.get(chain, {}).get("safe", {})
+        rule = rules.get(NATIVE_ASSET)
+        floor = 0 if rule is None else rule["threshold"]
         return max(balance - floor, 0)
 
     def _deposit_service(
         self, chain: str, service: MarketplaceService
-    ) -> DepositService:
+    ) -> tuple[DepositService, _Sends]:
         """Build, once per chain, the deposit path mech-client's own top-up takes."""
-        deposits = self._deposits.get(chain)
-        if deposits is None:
-            deposits = DepositService(
-                chain_config=service.chain_config,
-                agent_mode=service.agent_mode,
-                safe_address=service.safe_address,
-                ethereum_client=service.ethereum_client,
-                signer=service.signer,
-                rpc_url=service.rpc_url,
+        built = self._deposits.get(chain)
+        if built is None:
+            sends = _Sends(service.signer)
+            built = (
+                DepositService(
+                    chain_config=service.chain_config,
+                    agent_mode=service.agent_mode,
+                    safe_address=service.safe_address,
+                    ethereum_client=service.ethereum_client,
+                    signer=sends,
+                    rpc_url=service.rpc_url,
+                ),
+                sends,
             )
-            self._deposits[chain] = deposits
-        return deposits
+            self._deposits[chain] = built
+        return built
+
+    @staticmethod
+    def _deposit(deposits: DepositService, kind: PaymentType, amount: int) -> None:
+        """Send the deposit mech-client's own 402 top-up would send."""
+        asset = DEPOSIT_TOKEN_ASSETS.get(kind)
+        if asset is None:
+            deposits.deposit_native(amount)
+        else:
+            deposits.deposit_token(amount, asset)
+
+    def _forget_prefunded(self, chain: str) -> None:
+        """Forget what the request prepaid on `chain`: the request has ended."""
+        self._prefunded.pop(chain, None)
 
     def _disarm_top_up(self, chain: str) -> None:
         """Forget the top-up armed on `chain`: its send has ended."""
