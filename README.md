@@ -678,8 +678,10 @@ is not loaded automatically. For Pearl, add the four values to the Connect
 service template's `valory/configs` fields (`mechx_marketplace_base_squid_url`,
 etc.). Middleware injects them as `CONNECTION_CONFIGS_CONFIG_MECHX_...`;
 Connect forwards them to mech-client at startup. Non-empty template values
-take precedence over direct variables; blank or `null` defaults leave direct
-variables unchanged. Startup logs record variable names and their source,
+take precedence over direct variables. Blank, `null` and `None` values
+(case-insensitive, whitespace trimmed) are unset in both sources. An unset
+template preserves a valid direct URL; if both are unset, Connect removes the
+direct variable so mech-client reports its missing-endpoint configuration error. Startup logs record variable names and their source,
 including template overrides, without logging URLs. Endpoint values stay in
 deployment configuration. Other chains keep their existing indexers.
 

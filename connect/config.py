@@ -279,17 +279,25 @@ def _parse_count(env: dict[str, str], name: str, default: int) -> int:
     return value
 
 
+def _indexer_url(value: str | None) -> str | None:
+    """Normalize unset endpoint values from Pearl and standalone environments."""
+    value = (value or "").strip()
+    return None if value.lower() in ("", "null", "none") else value
+
+
 def configure_mech_indexers() -> None:
     """Forward Pearl squid settings and log their sources; see README."""
     for name in MECH_INDEXER_ENV_VARS:
-        value = os.environ.get(CUSTOM_ENV_VARS_PREFIX + name, "").strip()
-        direct = bool(os.environ.get(name, "").strip())
-        if value and value.lower() != "null":
+        value = _indexer_url(os.environ.get(CUSTOM_ENV_VARS_PREFIX + name))
+        direct = _indexer_url(os.environ.get(name))
+        if value:
             os.environ[name] = value
             source = "template (overrides direct)" if direct else "template"
         elif direct:
+            os.environ[name] = direct
             source = "direct"
         else:
+            os.environ.pop(name, None)
             continue
         logger.info("mech indexer %s source=%s", name, source)
 

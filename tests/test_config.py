@@ -42,6 +42,15 @@ from connect.config import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clean_indexer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore indexer variables even when production code creates them."""
+    for name in MECH_INDEXER_ENV_VARS:
+        for key in (name, CUSTOM_ENV_VARS_PREFIX + name):
+            monkeypatch.setenv(key, "")
+            monkeypatch.delenv(key)
+
+
 def base_env(tmp_path: Path) -> dict:
     """Return a base environment with two RPC vars and a store path."""
     return {
@@ -257,7 +266,7 @@ def test_pearl_indexers_override_direct_values(
         assert os.environ[key] == "https://old.example/graphql"
 
 
-@pytest.mark.parametrize("raw", [None, "", "  ", "null", " NULL "])
+@pytest.mark.parametrize("raw", [None, "", "  ", "null", " NULL ", "None", " nOnE "])
 def test_unset_pearl_indexers_preserve_standalone(
     monkeypatch: pytest.MonkeyPatch, raw: str | None
 ) -> None:
@@ -313,6 +322,46 @@ def test_indexer_sources_are_logged_without_urls(
     assert "https://" not in caplog.text
     assert "private-template-key" not in caplog.text
     assert "private-direct-key" not in caplog.text
+    if source in ("template", "override"):
+        assert os.environ[name] == "https://squid.example/private-template-key"
+    elif source == "direct":
+        assert os.environ[name] == "https://squid.example/private-direct-key"
+    else:
+        assert name not in os.environ
+
+
+@pytest.mark.parametrize("template", ["", "null", " NULL ", "None", " nOnE "])
+@pytest.mark.parametrize("direct", ["", "null", " NULL ", "None", " nOnE "])
+def test_unset_indexer_strings_are_removed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    template: str,
+    direct: str,
+) -> None:
+    """Pearl's prefixed None plus bare null must reach mech-client as unset."""
+    for name in MECH_INDEXER_ENV_VARS:
+        monkeypatch.setenv(CUSTOM_ENV_VARS_PREFIX + name, template)
+        monkeypatch.setenv(name, direct)
+    with caplog.at_level(logging.INFO, logger="agent"):
+        configure_mech_indexers()
+    assert all(name not in os.environ for name in MECH_INDEXER_ENV_VARS)
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("direct", ["null", "None", " nOnE "])
+def test_template_urls_replace_unset_direct_strings(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    direct: str,
+) -> None:
+    """A direct placeholder is not a configured URL or a logged override."""
+    name = MECH_INDEXER_ENV_VARS[0]
+    monkeypatch.setenv(name, direct)
+    monkeypatch.setenv(CUSTOM_ENV_VARS_PREFIX + name, " https://squid.example/graphql ")
+    with caplog.at_level(logging.INFO, logger="agent"):
+        configure_mech_indexers()
+    assert os.environ[name] == "https://squid.example/graphql"
+    assert caplog.messages == [f"mech indexer {name} source=template"]
 
 
 def test_ocb_chat_mech_overrides_are_read_per_chain(tmp_path: Path) -> None:

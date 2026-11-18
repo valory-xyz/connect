@@ -476,8 +476,6 @@ class TestMain:
         self,
         boot_env: Path,
         served: list[StubServer],
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A clean boot provisions the workspace and reports itself healthy.
 
@@ -485,6 +483,21 @@ class TestMain:
         once is_healthy turns true, so a regression that left a good boot
         unhealthy would quietly mean no session ever opens.
         """
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert (boot_env / ".mcp.json").exists()
+        app = served[0].config.app
+        assert app.state.workspace.reason is None
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            assert client.get("/healthcheck").json() == {"is_healthy": True}
+
+    def test_main_configures_indexers_after_logging_and_before_mech_service(
+        self,
+        boot_env: Path,
+        served: list[StubServer],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Forward endpoint settings and log their sources before mech startup."""
         name = "MECHX_MARKETPLACE_BASE_SQUID_URL"
         monkeypatch.setenv(name, "https://old.example/graphql")
         monkeypatch.setenv(
@@ -504,11 +517,7 @@ class TestMain:
             logging.INFO,
             f"mech indexer {name} source=template (overrides direct)",
         ) in caplog.record_tuples
-        assert (boot_env / ".mcp.json").exists()
-        app = served[0].config.app
-        assert app.state.workspace.reason is None
-        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
-            assert client.get("/healthcheck").json() == {"is_healthy": True}
+        assert served
 
     @pytest.mark.skipif(sys.platform == "win32", reason="OCB is off on Windows")
     @pytest.mark.parametrize("source", ["shipped", "override"])
