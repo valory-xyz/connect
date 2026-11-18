@@ -21,21 +21,34 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
 from connect.config import (
+    CUSTOM_ENV_VARS_PREFIX,
     FUND_REQUIREMENTS_ENV,
     LOG_LEVEL_ENV,
     MECH_GAP_RETRIES_ENV,
     MECH_HARD_CANCEL_AFTER_ENV,
+    MECH_INDEXER_ENV_VARS,
     MECH_SETTLE_TIMEOUT_ENV,
     MINUTES_PER_RUN_ENV,
     SAFES_ENV,
     STORE_PATH_ENV,
+    configure_mech_indexers,
     load_config,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clean_indexer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore indexer variables even when production code creates them."""
+    for name in MECH_INDEXER_ENV_VARS:
+        for key in (name, CUSTOM_ENV_VARS_PREFIX + name):
+            monkeypatch.setenv(key, "")
+            monkeypatch.delenv(key)
 
 
 def base_env(tmp_path: Path) -> dict:
@@ -238,6 +251,38 @@ def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:
         config.chain("solana")
 
 
+@pytest.mark.parametrize("name", MECH_INDEXER_ENV_VARS)
+def test_pearl_indexers_override_direct_values(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Pearl values reach mech-client without mixing chains or reader types."""
+    for key in MECH_INDEXER_ENV_VARS:
+        monkeypatch.delenv(CUSTOM_ENV_VARS_PREFIX + key, raising=False)
+        monkeypatch.setenv(key, "https://old.example/graphql")
+    monkeypatch.setenv(CUSTOM_ENV_VARS_PREFIX + name, " https://squid.example/graphql ")
+    configure_mech_indexers()
+    assert os.environ[name] == "https://squid.example/graphql"
+    for key in set(MECH_INDEXER_ENV_VARS) - {name}:
+        assert os.environ[key] == "https://old.example/graphql"
+
+
+@pytest.mark.parametrize("raw", [None, "", "  ", "null", " NULL ", "None", " nOnE "])
+def test_unset_pearl_indexers_preserve_standalone(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None
+) -> None:
+    """Template defaults neither erase direct URLs nor invent endpoints."""
+    for index, name in enumerate(MECH_INDEXER_ENV_VARS):
+        monkeypatch.delenv(CUSTOM_ENV_VARS_PREFIX + name, raising=False)
+        if raw is not None:
+            monkeypatch.setenv(CUSTOM_ENV_VARS_PREFIX + name, raw)
+        monkeypatch.delenv(name, raising=False)
+        if index == 0:
+            monkeypatch.setenv(name, "https://direct.example/graphql")
+    configure_mech_indexers()
+    assert os.environ[MECH_INDEXER_ENV_VARS[0]] == "https://direct.example/graphql"
+    assert all(name not in os.environ for name in MECH_INDEXER_ENV_VARS[1:])
+
+
 def test_the_hard_cancel_window_outlasts_the_settle_timeout(tmp_path: Path) -> None:
     """Six hours by default; configurable, but never within the settle timeout."""
     env = base_env(tmp_path)
@@ -249,6 +294,74 @@ def test_the_hard_cancel_window_outlasts_the_settle_timeout(tmp_path: Path) -> N
             load_config(env | {MECH_HARD_CANCEL_AFTER_ENV: raw})
     with pytest.raises(ValueError, match=MECH_HARD_CANCEL_AFTER_ENV):
         load_config(env | {MECH_HARD_CANCEL_AFTER_ENV: "soon"})
+
+
+@pytest.mark.parametrize("source", ["template", "direct", "override", "unset"])
+def test_indexer_sources_are_logged_without_urls(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, source: str
+) -> None:
+    """Log each configured source once, without leaking endpoint credentials."""
+    for name in MECH_INDEXER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(CUSTOM_ENV_VARS_PREFIX + name, raising=False)
+    name = MECH_INDEXER_ENV_VARS[0]
+    if source in ("template", "override"):
+        monkeypatch.setenv(
+            CUSTOM_ENV_VARS_PREFIX + name, "https://squid.example/private-template-key"
+        )
+    if source in ("direct", "override"):
+        monkeypatch.setenv(name, "https://squid.example/private-direct-key")
+    with caplog.at_level(logging.INFO, logger="agent"):
+        configure_mech_indexers()
+    messages = [record.getMessage() for record in caplog.records]
+    if source == "unset":
+        assert not messages
+    else:
+        expected = "template (overrides direct)" if source == "override" else source
+        assert messages == [f"mech indexer {name} source={expected}"]
+    assert "https://" not in caplog.text
+    assert "private-template-key" not in caplog.text
+    assert "private-direct-key" not in caplog.text
+    if source in ("template", "override"):
+        assert os.environ[name] == "https://squid.example/private-template-key"
+    elif source == "direct":
+        assert os.environ[name] == "https://squid.example/private-direct-key"
+    else:
+        assert name not in os.environ
+
+
+@pytest.mark.parametrize("template", ["", "null", " NULL ", "None", " nOnE "])
+@pytest.mark.parametrize("direct", ["", "null", " NULL ", "None", " nOnE "])
+def test_unset_indexer_strings_are_removed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    template: str,
+    direct: str,
+) -> None:
+    """Pearl's prefixed None plus bare null must reach mech-client as unset."""
+    for name in MECH_INDEXER_ENV_VARS:
+        monkeypatch.setenv(CUSTOM_ENV_VARS_PREFIX + name, template)
+        monkeypatch.setenv(name, direct)
+    with caplog.at_level(logging.INFO, logger="agent"):
+        configure_mech_indexers()
+    assert all(name not in os.environ for name in MECH_INDEXER_ENV_VARS)
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("direct", ["null", "None", " nOnE "])
+def test_template_urls_replace_unset_direct_strings(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    direct: str,
+) -> None:
+    """A direct placeholder is not a configured URL or a logged override."""
+    name = MECH_INDEXER_ENV_VARS[0]
+    monkeypatch.setenv(name, direct)
+    monkeypatch.setenv(CUSTOM_ENV_VARS_PREFIX + name, " https://squid.example/graphql ")
+    with caplog.at_level(logging.INFO, logger="agent"):
+        configure_mech_indexers()
+    assert os.environ[name] == "https://squid.example/graphql"
+    assert caplog.messages == [f"mech indexer {name} source=template"]
 
 
 def test_ocb_chat_mech_overrides_are_read_per_chain(tmp_path: Path) -> None:
