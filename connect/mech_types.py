@@ -19,6 +19,7 @@
 
 """Errors and shapes shared by connect/mech.py and mech_allowances.py."""
 
+import dataclasses
 import logging
 import typing as t
 
@@ -42,6 +43,9 @@ Armed = list[t.Callable[[], None]]
 # draws a top-up's amount on the calling token's mech session budget: the
 # refusal, naming its rule, or None once drawn
 TopUpBudget = t.Callable[[int], str | None]
+# counts the safe's requests in flight, which the prepaid balance still owes
+# (MechQueue.in_flight); read only when a prepaid deposit is being decided
+InFlight = t.Callable[[], int]
 
 
 class MechError(Exception):
@@ -151,6 +155,29 @@ class PricedMech(t.NamedTuple):
     payment_type: str
 
 
+@dataclasses.dataclass
+class Prefunded:
+    """What one request prepaid into the mech balance, counted against its cap.
+
+    Per request, not per chain: two requests on one chain prepay and send
+    from different threads, and each must spend only its own `max_payment`.
+    """
+
+    amount: int = 0
+    _on_hook: bool = False
+
+    def on_hook(self, hook: t.Any) -> None:
+        """Hand the prepaid amount to the send's hook, once.
+
+        mech-client's hook carries what a request has deposited across its
+        503 resends and bounds them by `max_price`, so the prepaid deposit
+        belongs on it too: both bounds then count the same spend.
+        """
+        if self.amount and not self._on_hook:
+            hook.record_deposit(self.amount)
+            self._on_hook = True
+
+
 class RequestPlan(t.NamedTuple):
     """Everything a request needs, settled before any payment can happen.
 
@@ -169,6 +196,7 @@ class RequestPlan(t.NamedTuple):
     terms: dict  # mech-client's mech report, merged into the request's report
     armed: Armed  # the guard grants this request armed, revoked if nothing is sent
     top_up_budget: TopUpBudget | None  # the session budget a top-up draws on
+    prefunded: Prefunded  # what its prepaid deposit put in, off its cap
 
     @property
     def legacy_on_chain(self) -> bool:

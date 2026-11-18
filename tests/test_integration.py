@@ -52,7 +52,7 @@ from connect.activity import ActivityLog
 from connect.config import AGENT_HTTP_PORT, AppConfig, ChainConfig
 from connect.guard import Guard
 from connect.mech import MechError, MechService
-from connect.mech_allowances import deposit_tracker
+from connect.mech_allowances import _MAX_AUTO_DEPOSIT_RATIO, deposit_tracker
 from connect.server.app import create_app
 from connect.settings import (
     MODE_UNRESTRICTED,
@@ -65,7 +65,7 @@ from connect.settings import (
 from connect.signer import Signer
 from connect.workspace import Workspace
 
-from tests.conftest import TEST_PASSWORD, audit_kinds
+from tests.conftest import TEST_PASSWORD, audit_entries, audit_kinds
 from tests.forks import AnvilFork, json_rpc
 
 RPC_ENV = "GNOSIS_RPC"
@@ -952,11 +952,17 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
 
     One guard instance shared by signer and mech service (the __main__
     wiring): the digest the flow signs is derived against the real forked
-    marketplace and validated mech-side by the local endpoint, the HTTP 402
-    triggers a real safe -> tracker deposit that must pass the guard through
-    its one-shot allowance, and the retried request is served and delivered.
-    A second request rides the now-funded balance straight through — the
-    no-402 path — proving the deposit allowance is not needed twice.
+    marketplace and validated mech-side by the local endpoint, and every
+    safe -> tracker deposit is a real transaction that must pass the guard
+    through its one-shot allowance.
+
+    Three requests, covering both ways the balance gets funded. The first
+    cannot prepay — its budget will not carry the capped deposit — so the
+    mech answers HTTP 402 and mech-client deposits the shortfall it names,
+    as it did before any of this. The second prepays instead: the balance
+    the first left is owed to a request in flight, so the whole cap goes in
+    before the request is sent and the mech never has to ask. The third
+    rides that balance straight through, depositing nothing at all.
 
     The mech endpoint is local (no live mech serves a fork); everything else
     — marketplace reads, nonces, digests, signing, the deposit transaction —
@@ -1011,45 +1017,65 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
             lambda sid: MetadataRead.ok({"tools": [tool], "url": url}),
         )
         monkeypatch.setattr(service.tool_manager, "get_offchain_url", lambda sid: url)
-        first = mech_service.request(
-            f"integration offchain {secrets.token_hex(4)}",
-            tool,
-            chain="gnosis",
-            priority_mech=mech_address,
-            timeout=60,
-            max_payment=10**18,
-            top_up_budget=None,
-        )
-        second = mech_service.request(
-            f"integration offchain {secrets.token_hex(4)}",
-            tool,
-            chain="gnosis",
-            priority_mech=mech_address,
-            timeout=60,
-            max_payment=10**18,
-            top_up_budget=None,
-        )
+        prepaid_cap = _MAX_AUTO_DEPOSIT_RATIO * int(rate)
+
+        def no_room_for_the_cap(amount: int) -> str | None:
+            """Carry a one-call shortfall, but not the capped prepaid deposit."""
+            if amount <= 2 * int(rate):
+                return None
+            return "rule 'token-mech-session-cap': this test's budget is lower"
+
+        def ask(budget: t.Any) -> dict:
+            """Send one request to the local endpoint."""
+            return mech_service.request(
+                f"integration offchain {secrets.token_hex(4)}",
+                tool,
+                chain="gnosis",
+                priority_mech=mech_address,
+                timeout=60,
+                max_payment=10**18,
+                top_up_budget=budget,
+            )
+
+        first = ask(no_room_for_the_cap)
+        # the prepaid deposit was refused before it was signed, so the mech
+        # asked for the shortfall and mech-client deposited exactly that
+        assert endpoint.saw_402 is True
+        assert endpoint.paid == endpoint.required
+        endpoint.saw_402 = False
+        second = ask(None)  # prepays the cap, so the mech has nothing to ask
+        third = ask(None)  # rides the balance the second one left
+        assert endpoint.saw_402 is False
 
     # the mech-side validation a real mech performs all passed
     assert endpoint.validation_errors == []
-    # the 402 fired, and the deposit it demanded landed on the tracker; the
-    # safe paid exactly the shortfall
-    assert endpoint.saw_402 is True
-    assert endpoint.paid == endpoint.required
+    # the tracker holds the shortfall the mech asked for and the prepaid cap
+    assert endpoint.paid == endpoint.required + prepaid_cap
     assert (
         int(w3.eth.get_balance(Web3.to_checksum_address(safe_address)))
-        == safe_balance_before - endpoint.required
+        == safe_balance_before - endpoint.required - prepaid_cap
     )
-    # both requests were served and delivered
-    for result in (first, second):
+    # every request was served and delivered
+    for result in (first, second, third):
         assert result["request_ids"], result
         assert result["delivery_results"], result
         assert not result.get("pending_request_ids"), result
     # the audit trail shows the allowances, the signatures, and no refusal
+    entries = audit_entries(store_path)
     kinds = audit_kinds(store_path)
-    assert kinds.count("mech_offchain_digest") == 2
-    assert kinds.count("mech_deposit_allowance") == 2  # armed per request
-    assert kinds.count("sign_message") == 2
-    assert kinds.count("mech_request") == 2
+    assert kinds.count("mech_offchain_digest") == 3
+    # one per deposit the flow armed: the first request's refused prepaid
+    # deposit and its 402 top-up, the second's prepaid deposit and its send,
+    # and the third's send
+    assert kinds.count("mech_deposit_allowance") == 5
+    assert kinds.count("sign_message") == 3
+    assert kinds.count("mech_request") == 3
+    # the prepaid deposit the second request made, and the one it was refused
+    (prefund,) = [e for e in entries if e["kind"] == "mech_prefund"]
+    assert prefund["amount"] == str(prepaid_cap)
+    assert prefund["tracker"] == tracker
+    assert kinds.count("mech_deposit_refused") == 1
+    # a guard denial would mean a deposit the allowance did not cover
     assert "blocked" not in kinds
     assert "mech_request_blocked" not in kinds
+    assert not guard._deposit_allowances  # pylint: disable=protected-access

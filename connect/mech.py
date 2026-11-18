@@ -76,6 +76,7 @@ from connect.mech_types import (
     MechRefused,
     MechUnknownRequest,
     PendingDelivery,
+    Prefunded,
     PricedMech,
     RequestPlan,
     SPEND_UNCERTAIN,
@@ -564,6 +565,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             terms=terms,
             armed=armed,
             top_up_budget=top_up_budget,
+            prefunded=Prefunded(),
         )
 
     def _dispatch(  # pylint: disable=too-many-locals,too-many-statements
@@ -720,7 +722,6 @@ class MechService:  # pylint: disable=too-many-instance-attributes
     ) -> dict:
         """Send the planned request, off-chain through mech-client's allocator."""
         safe = t.cast(str, self._config.chain(plan.chain).safe_address)
-        self._allowances.prefund(plan, safe)
 
         def send(**extra: t.Any) -> dict:
             return asyncio.run(
@@ -754,6 +755,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     f"could not read the marketplace nonce: {said(e, what)}"
                 ) from e
 
+        def in_flight() -> int:
+            return self.queue.in_flight(plan.chain, safe, read_map())
+
+        self._allowances.prefund(plan, safe, in_flight)
+
         if not plan.offchain:  # on-chain takes mapNonces itself: none held
             with self._nonces.exclusive(plan.chain, safe, read_map, timeout=timeout):
                 return send()
@@ -776,13 +782,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         def send_one(nonce: int, hook: PreSignHook) -> dict:
             sent.append((nonce, hook))
             # under the queue's lock: no other request's top-up can spend it
-            with self._allowances.auto_deposit_armed(
-                plan.chain,
-                plan.priced,
-                auto_deposit=plan.auto_deposit,
-                max_payment=plan.max_payment,
-                budget=plan.top_up_budget,
-            ):
+            with self._allowances.auto_deposit_armed(plan, hook):
                 return send(nonces=[nonce], on_request_id=hook)
 
         try:
