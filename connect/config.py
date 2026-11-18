@@ -54,6 +54,12 @@ LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 MECH_SETTLE_TIMEOUT_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_SETTLE_TIMEOUT"
 MECH_GAP_RETRIES_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_GAP_RETRIES"
+MECH_INDEXER_ENV_VARS = (
+    "MECHX_MARKETPLACE_BASE_SQUID_URL",
+    "MECHX_MARKETPLACE_POLYGON_SQUID_URL",
+    "MECHX_REGISTRY_BASE_SQUID_URL",
+    "MECHX_REGISTRY_POLYGON_SQUID_URL",
+)
 MECH_HARD_CANCEL_AFTER_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_HARD_CANCEL_AFTER"
 
 # A QA override, never set by Pearl: OCB_CHAT_MECH_GNOSIS=0x... gives OCB that
@@ -272,6 +278,29 @@ def _parse_count(env: dict[str, str], name: str, default: int) -> int:
     if value < 0:
         raise ValueError(f"{name} is not a whole number >= 0: {raw!r}")
     return value
+
+
+def _indexer_url(value: str | None) -> str | None:
+    """Normalize unset endpoint values from Pearl and standalone environments."""
+    value = (value or "").strip()
+    return None if value.lower() in ("", "null", "none") else value
+
+
+def configure_mech_indexers() -> None:
+    """Forward Pearl squid settings and log their sources; see README."""
+    for name in MECH_INDEXER_ENV_VARS:
+        value = _indexer_url(os.environ.get(CUSTOM_ENV_VARS_PREFIX + name))
+        direct = _indexer_url(os.environ.get(name))
+        if value:
+            os.environ[name] = value
+            source = "template (overrides direct)" if direct else "template"
+        elif direct:
+            os.environ[name] = direct
+            source = "direct"
+        else:
+            os.environ.pop(name, None)
+            continue
+        logger.info("mech indexer %s source=%s", name, source)
 
 
 def _is_mech_address(value: str) -> bool:

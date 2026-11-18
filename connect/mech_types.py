@@ -19,6 +19,7 @@
 
 """Errors and shapes shared by connect/mech.py and mech_allowances.py."""
 
+import dataclasses
 import logging
 import typing as t
 
@@ -30,10 +31,21 @@ from mech_client import (
     RequestIdMismatch,
     RequestIdRpcError,
 )
+from mech_client.services.marketplace_service import MarketplaceService
 
 from connect.signer_errors import SendUnknown, SignerError, logged_cause
 
 logger = logging.getLogger("agent")
+
+
+# what one request armed, each entry withdrawing one grant (MechAllowances.revoke)
+Armed = list[t.Callable[[], None]]
+# draws a top-up's amount on the calling token's mech session budget: the
+# refusal, naming its rule, or None once drawn
+TopUpBudget = t.Callable[[int], str | None]
+# counts the safe's requests in flight, which the prepaid balance still owes
+# (MechQueue.in_flight); read only when a prepaid deposit is being decided
+InFlight = t.Callable[[], int]
 
 
 class MechError(Exception):
@@ -141,6 +153,67 @@ class PricedMech(t.NamedTuple):
     # native mechs, token base units for OLAS/USDC ones)
     rate: int
     payment_type: str
+
+
+@dataclasses.dataclass
+class Prefunded:
+    """What one request prepaid into the mech balance, counted against its cap.
+
+    Per request, not per chain: two requests on one chain prepay and send
+    from different threads, and each must spend only its own `max_payment`.
+    """
+
+    amount: int = 0
+    _on_hook: bool = False
+    # whether its chain still counts this request as one the allocator has
+    # not been given a slot for yet (`MechAllowances._hold_slot`)
+    counted: bool = False
+
+    def on_hook(self, hook: t.Any) -> None:
+        """Hand the prepaid amount to the send's hook, once.
+
+        mech-client's hook carries what a request has deposited across its
+        503 resends and bounds them by `max_price`, so the prepaid deposit
+        belongs on it too: both bounds then count the same spend.
+        """
+        if self.amount and not self._on_hook:
+            hook.record_deposit(self.amount)
+            self._on_hook = True
+
+
+class RequestPlan(t.NamedTuple):
+    """Everything a request needs, settled before any payment can happen.
+
+    Its existence is the payment boundary: a failure with no plan spent
+    nothing, a failure with one may have spent funds.
+    """
+
+    chain: str
+    service: MarketplaceService
+    priced: PricedMech
+    extra_attributes: dict | None
+    offchain: bool  # the flow; False is the on-chain one
+    auto_deposit: bool
+    tool: str
+    max_payment: int
+    terms: dict  # mech-client's mech report, merged into the request's report
+    armed: Armed  # the guard grants this request armed, revoked if nothing is sent
+    top_up_budget: TopUpBudget | None  # the session budget a top-up draws on
+    prefunded: Prefunded  # what its prepaid deposit put in, off its cap
+
+    @property
+    def legacy_on_chain(self) -> bool:
+        """Whether the request goes on-chain: read off `offchain`, never apart."""
+        return not self.offchain
+
+
+def over_max_payment(mech: str, price: int, max_payment: int) -> str:
+    """Word the refusal of a mech whose price is above the request's budget."""
+    return (
+        f"mech {mech} charges {price} per request (in its payment asset base "
+        f"units), above max_payment={max_payment}; pass a higher max_payment "
+        "to accept that price"
+    )
 
 
 class PendingDelivery(t.NamedTuple):

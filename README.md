@@ -749,11 +749,62 @@ works in both modes: it signs the request-id digest, which restricted mode
 allows through the server-derived single-use allowance described above, and
 its `auto_deposit` top-up (paying the balance tracker from the safe on HTTP
 402) is pre-authorized the same way — capped, single-use, armed only for the
-request being sent. The flow also needs a mech whose operator published an
+request being sent.
+
+Before each off-chain request, and before it takes a marketplace nonce, the
+flow reads the safe's prepaid balance on that tracker. A mech admits a
+request while that balance covers it and settles what it has delivered
+afterwards, so the bar is not one call but one for every request this safe
+has in flight, plus this one. Below that it deposits the capped amount
+(`max_payment`, within mech-client's ratio of the price) instead of waiting
+for the mech to name a one-call shortfall over HTTP 402, so one deposit
+carries several calls and a call the balance already covers costs no
+transaction at all. The deposit is clamped to what the safe can pay — its
+balance of the payment asset, less the floor the operator configured for the
+safe in that asset — and is made only when it covers what the call is short. It passes the same guard check, cap, token session budget
+and audit trail as a 402 top-up, and is recorded as `mech_prefund`. The cap
+bounds the request, not each deposit: what the prepaid deposit put in is
+counted against the one the send may still make, across mech-client's own
+resends of the request, so a request never moves more than its
+`max_payment`, and restricted mode arms its one-shot grant for the rest. A mech priced above `max_payment` is refused while the request is
+planned, before any of this.
+
+Everything that can stop the deposit leaves the mech's shortfall to the 402
+path: a balance that cannot be read, a safe that cannot cover what the call
+is short, a refusal by the guard, the budget or mech-client's own balance
+check, and a deposit whose receipt left the prepaid balance where it was —
+which gives back what it drew on the session budget, since it moved nothing.
+Only a deposit that reached the chain and whose outcome is unknown stops the
+request, reported with its hash and audited as `mech_deposit_unconfirmed`;
+no nonce was taken for it, so the caller keeps its own request id.
+
+The flow also needs a mech whose operator published an
 endpoint in its on-chain metadata — few have, so `mech_tools` reports
 `offchain_capable` per mech and a request to one that cannot serve it is
 refused before any payment. The on-chain path sends through the
 MechMarketplace via the service safe and works for any listed mech.
+
+### Base and Polygon indexers
+
+Mech discovery and registry reads on Base and Polygon require mech-client
+0.26.0 or later and four operator-supplied squid GraphQL endpoints:
+
+- `MECHX_MARKETPLACE_BASE_SQUID_URL`
+- `MECHX_MARKETPLACE_POLYGON_SQUID_URL`
+- `MECHX_REGISTRY_BASE_SQUID_URL`
+- `MECHX_REGISTRY_POLYGON_SQUID_URL`
+
+For standalone runs, export these variables before starting Connect; `.env`
+is not loaded automatically. For Pearl, add the four values to the Connect
+service template's `valory/configs` fields (`mechx_marketplace_base_squid_url`,
+etc.). Middleware injects them as `CONNECTION_CONFIGS_CONFIG_MECHX_...`;
+Connect forwards them to mech-client at startup. Non-empty template values
+take precedence over direct variables. Blank, `null` and `None` values
+(case-insensitive, whitespace trimmed) are unset in both sources. An unset
+template preserves a valid direct URL; if both are unset, Connect removes the
+direct variable so mech-client reports its missing-endpoint configuration error. Startup logs record variable names and their source,
+including template overrides, without logging URLs. Endpoint values stay in
+deployment configuration. Other chains keep their existing indexers.
 
 ### One payer per safe: nonces
 
@@ -1069,7 +1120,9 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`)
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`, plus
+  `CONNECTION_CONFIGS_CONFIG_MECHX_{MARKETPLACE,REGISTRY}_{BASE,POLYGON}_SQUID_URL`;
+  see [Base and Polygon indexers](#base-and-polygon-indexers))
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
   vendorable dependencies, synced on demand)
 

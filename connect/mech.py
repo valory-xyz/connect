@@ -77,10 +77,13 @@ from connect.mech_types import (
     MechRefused,
     MechUnknownRequest,
     PendingDelivery,
+    Prefunded,
     PricedMech,
+    RequestPlan,
     SPEND_UNCERTAIN,
     answer_lost,
     not_bought,
+    over_max_payment,
     published_tools,
     refusal,
     request_key,
@@ -109,31 +112,6 @@ DEFAULT_RESULT_TIMEOUT = 30.0
 ACK_WAIT_SECONDS = 1.0
 DEFAULT_MECH_PAGE_SIZE = 20
 MAX_MECH_PAGE_SIZE = 100
-
-
-class _RequestPlan(t.NamedTuple):
-    """Everything a request needs, settled before any payment can happen.
-
-    Its existence is the payment boundary: a failure with no plan spent
-    nothing, a failure with one may have spent funds.
-    """
-
-    chain: str
-    service: MarketplaceService
-    priced: PricedMech
-    extra_attributes: dict | None
-    offchain: bool  # the flow; False is the on-chain one
-    auto_deposit: bool
-    tool: str
-    max_payment: int
-    terms: dict  # mech-client's mech report, merged into the request's report
-    armed: Armed  # the guard grants this request armed, revoked if nothing is sent
-    top_up_budget: TopUpBudget | None  # the session budget a top-up draws on
-
-    @property
-    def legacy_on_chain(self) -> bool:
-        """Whether the request goes on-chain: read off `offchain`, never apart."""
-        return not self.offchain
 
 
 def _clamp_timeout(timeout: float) -> float:
@@ -358,7 +336,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         not.
         """
         timeout = _clamp_timeout(timeout)
-        planned: _RequestPlan | None = None
+        planned: RequestPlan | None = None
 
         def attempt() -> dict:
             nonlocal planned
@@ -423,7 +401,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         self._requests.complete(request_id, payload, stamp)
         return payload
 
-    def _uncertain(self, plan: _RequestPlan, error: Exception, request_id: str) -> dict:
+    def _uncertain(self, plan: RequestPlan, error: Exception, request_id: str) -> dict:
         """Record that a request was sent and its outcome is unknown.
 
         Releasing the id here would be the friendly-looking mistake: the
@@ -517,7 +495,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         max_payment: int | None,
         request_context: dict | None,
         top_up_budget: TopUpBudget | None,
-    ) -> _RequestPlan:
+    ) -> RequestPlan:
         """Settle everything a request needs before any payment can happen.
 
         Each refusal below is audited before it raises: the activity log is
@@ -539,6 +517,10 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     f"mech {priority_mech} is paid in an asset this server has no "
                     "default budget for; pass max_payment to set one"
                 )
+        if priced.rate > max_payment:
+            detail = f"{priced.rate} > {max_payment}"
+            self._blocked(chain, tool, "over-max-payment", detail)
+            raise MechNotSent(over_max_payment(priority_mech, priced.rate, max_payment))
         extra_attributes: dict | None
         armed: Armed = []
         if not legacy_on_chain:
@@ -573,7 +555,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 if request_context is None
                 else {"request_context": request_context}
             )
-        return _RequestPlan(
+        return RequestPlan(
             chain=chain,
             service=service,
             priced=priced,
@@ -585,11 +567,12 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             terms=terms,
             armed=armed,
             top_up_budget=top_up_budget,
+            prefunded=Prefunded(),
         )
 
     def _dispatch(  # pylint: disable=too-many-locals,too-many-statements
         self,
-        plan: _RequestPlan,
+        plan: RequestPlan,
         prompt: str,
         *,
         timeout: float,
@@ -624,9 +607,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         except MechPriceExceeded as e:  # mech-client's cap: nothing was paid
             self._blocked(plan.chain, plan.tool, "over-max-payment", str(e))
             raise MechNotSent(
-                f"mech {plan.priced.mech} charges {e.price} per request (in its "
-                f"payment asset base units), above max_payment={e.max_price}; "
-                "pass a higher max_payment to accept that price"
+                over_max_payment(plan.priced.mech, e.price, e.max_price)
             ) from e
         except NonceRefused as e:
             note = self.queue.note(plan.chain)
@@ -739,7 +720,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             payload.pop("pending_request_ids", None)
 
     def _send(  # pylint: disable=too-many-locals
-        self, plan: _RequestPlan, prompt: str, timeout: float
+        self, plan: RequestPlan, prompt: str, timeout: float
     ) -> dict:
         """Send the planned request, off-chain through mech-client's allocator."""
         safe = t.cast(str, self._config.chain(plan.chain).safe_address)
@@ -776,6 +757,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     f"could not read the marketplace nonce: {said(e, what)}"
                 ) from e
 
+        def in_flight() -> int:
+            return self.queue.in_flight(plan.chain, safe, read_map())
+
+        self._allowances.prefund(plan, safe, in_flight)
+
         if not plan.offchain:  # on-chain takes mapNonces itself: none held
             with self._nonces.exclusive(plan.chain, safe, read_map, timeout=timeout):
                 return send()
@@ -798,13 +784,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         def send_one(nonce: int, hook: PreSignHook) -> dict:
             sent.append((nonce, hook))
             # under the queue's lock: no other request's top-up can spend it
-            with self._allowances.auto_deposit_armed(
-                plan.chain,
-                plan.priced,
-                auto_deposit=plan.auto_deposit,
-                max_payment=plan.max_payment,
-                budget=plan.top_up_budget,
-            ):
+            with self._allowances.auto_deposit_armed(plan, hook):
                 return send(nonces=[nonce], on_request_id=hook)
 
         try:
@@ -841,7 +821,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
 
     def _lost(
         self,
-        plan: _RequestPlan,
+        plan: RequestPlan,
         sent: list[tuple[int, PreSignHook]],
         armed: dict[int, bytes],
         error: Exception,

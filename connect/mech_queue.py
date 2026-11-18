@@ -244,6 +244,24 @@ class MechQueue:
         )
         raise HardCancelFailed(chain) from failure
 
+    def in_flight(self, chain: str, safe: str, settled: int) -> int:
+        """Count the safe's slots the allocator holds at or above `settled`.
+
+        Those are the requests this safe has in flight: delivered but not yet
+        settled on chain, and accepted and not yet delivered. Each will take
+        its price out of the prepaid balance, which still shows it, so a
+        balance that covers one call may owe several. Slots below `settled`
+        are paid for, as the allocator's own sync will find.
+
+        mech-client exposes no reader of a held slot, so this reads the
+        allocator's persisted queue as `_stuck_mech` does, and so counts what
+        a restart left behind too.
+        """
+        queue = self.allocator._queue(  # pylint: disable=protected-access
+            self.allocator.key(chain, safe)
+        )
+        return sum(1 for nonce in dict(queue.slots) if nonce >= settled)
+
     def _stuck_mech(self, chain: str, safe: str, nonce: int) -> str:
         """Return the mech of the safe's slot at `nonce`, else its lowest held one.
 

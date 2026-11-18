@@ -61,6 +61,7 @@ from connect.config import (
 )
 from connect.input_errors import InputError
 from connect.keystore import KeystoreError, load_account
+from connect.mech import MechService
 from connect.run_goal import RunGoal
 from connect.send_cache import IdempotencyCache
 from connect.server.auth import ACTION_SCOPES, AuthFailureLimiter
@@ -508,6 +509,35 @@ class TestMain:
         assert app.state.workspace.reason is None
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/healthcheck").json() == {"is_healthy": True}
+
+    def test_main_configures_indexers_after_logging_and_before_mech_service(
+        self,
+        boot_env: Path,
+        served: list[StubServer],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Forward endpoint settings and log their sources before mech startup."""
+        name = "MECHX_MARKETPLACE_BASE_SQUID_URL"
+        monkeypatch.setenv(name, "https://old.example/graphql")
+        monkeypatch.setenv(
+            "CONNECTION_CONFIGS_CONFIG_" + name, "https://squid.example/graphql"
+        )
+        original = main_module.MechService
+
+        def make_mech(*args: t.Any, **kwargs: t.Any) -> MechService:
+            """Check the endpoint before constructing the first service."""
+            assert os.environ[name] == "https://squid.example/graphql"
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(main_module, "MechService", make_mech)
+        assert main_module.main(["--password", TEST_PASSWORD]) == 0
+        assert (
+            "agent",
+            logging.INFO,
+            f"mech indexer {name} source=template (overrides direct)",
+        ) in caplog.record_tuples
+        assert served
 
     @pytest.mark.skipif(sys.platform == "win32", reason="OCB is off on Windows")
     @pytest.mark.parametrize("source", ["shipped", "override"])

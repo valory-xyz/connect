@@ -42,7 +42,13 @@ from mech_client import NonceRefused
 
 from connect import workspace
 from connect.activity import ActivityLog
-from connect.config import AGENT_HTTP_PORT, AppConfig, BIND_HOST, load_config
+from connect.config import (
+    AGENT_HTTP_PORT,
+    AppConfig,
+    BIND_HOST,
+    configure_mech_indexers,
+    load_config,
+)
 from connect.guard import Guard
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
@@ -221,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-loca
         return 1
 
     logger = setup_logging(config.log_level)
+    configure_mech_indexers()
     logger.info("connect starting")
 
     try:

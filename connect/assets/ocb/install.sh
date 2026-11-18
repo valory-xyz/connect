@@ -23,9 +23,9 @@
 #   UV_TOOL_DIR, UV_TOOL_BIN_DIR, UV_PYTHON_INSTALL_DIR, UV_CACHE_DIR   uv's own locations
 set -eu
 
-DEFAULT_VERSION="0.4.1"  # keep in step with pyproject.toml (tests/test_install_scripts.py checks)
+DEFAULT_VERSION="0.1.0"  # keep in step with pyproject.toml (tests/test_install_scripts.py checks)
 # Its dependencies resolve as PyPI stood at its release: bump with DEFAULT_VERSION.
-EXCLUDE_NEWER="2026-11-16T10:00:00Z"
+EXCLUDE_NEWER="2026-11-17T18:00:00Z"
 UV_VERSION="0.13.8"
 UV_INSTALLER_SHA256="4d8fa56e00f16b66feecacbd943773c61d61ab768b13856de350d86fd8740e2f"  # astral.sh/uv/0.13.8/install.sh
 
@@ -119,7 +119,7 @@ export UV_PYTHON_PREFERENCE=only-managed
 export UV_PYTHON_DOWNLOADS=automatic
 
 # ---- install, unless already exactly this -------------------------------------------------------
-# uv lists a tool as `olas-ocb-agent v0.4.1 [required: ==0.4.1] [extras: facilitator]`: the version, the
+# uv lists a tool as `olas-ocb-agent v0.1.0 [required: ==0.1.0] [extras: facilitator]`: the version, the
 # source it came from (a branch or archive build shows its URL) and the extras, all of which must match.
 # The tool directory is shared with any other uv, so its interpreter must be a uv-managed Python 3.12 too.
 managed_312() {
@@ -140,11 +140,15 @@ if [ -z "${OCB_AGENT_SPEC:-}" ] && "$agent" --version >/dev/null 2>>"$log" && ma
 fi
 
 say "installing $spec"
-# No --force: an ocb-agent, pearl or pmini that the user or another tool put in the bin directory is never
+# No --force: an ocb-agent or pearl that the user or another tool put in the bin directory is never
 # replaced (uv refuses, and that is the error). olas-ocb-agent itself is pinned by version, not by date.
 if ! "$uv" tool install --python 3.12 --reinstall-package olas-ocb-agent \
     --exclude-newer "$EXCLUDE_NEWER" --exclude-newer-package olas-ocb-agent=false "$spec" >>"$log" 2>&1; then
     reason="$(grep -m1 '^error: ' "$log" | cut -c8-)" || true
+    taken="$(printf '%s\n' "$reason" | sed -n 's/^Executable already exists: \([^ ]*\).*/\1/p')"
+    if [ -n "$taken" ]; then
+        fail "$bin_dir/$taken already exists and isn't olas-ocb-agent's (another tool's, e.g. the unrelated '$taken' package from PyPI): uninstall that tool (uv tool uninstall <its package>) or remove the file, then rerun"
+    fi
     fail "$uv couldn't install $spec${reason:+: $reason}"
 fi
 
