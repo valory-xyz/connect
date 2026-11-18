@@ -659,16 +659,30 @@ its `auto_deposit` top-up (paying the balance tracker from the safe on HTTP
 402) is pre-authorized the same way — capped, single-use, armed only for the
 request being sent.
 
-Before each off-chain request the flow reads the safe's prepaid balance on
-that tracker. Below the mech's per-request price it deposits the whole capped
-amount (`max_payment`, within 10× the price) instead of waiting for the mech
-to name a one-call shortfall over HTTP 402: a mech admits a request only
-while the balance covers it, so one deposit carries several calls and a call
-the balance already pays for costs no transaction at all. The deposit passes
-the same guard shape check, cap, token session budget and audit trail as a
-402 top-up, and is recorded as `mech_prefund`. A balance that cannot be read,
-or a deposit the guard or the budget refuses, leaves the 402 path to deposit
-the shortfall as before.
+Before each off-chain request, and before it takes a marketplace nonce, the
+flow reads the safe's prepaid balance on that tracker. Below the mech's
+per-request price it deposits the capped amount (`max_payment`, within
+mech-client's ratio of the price) instead of waiting for the mech to name a
+one-call shortfall over HTTP 402: a mech admits a request only while the
+balance covers it, so one deposit carries several calls and a call the
+balance already pays for costs no transaction at all. The deposit is clamped
+to what the safe can pay — its balance of the payment asset, less the floor
+the operator configured for the safe — and is made only when it covers what
+the call is short. It passes the same guard check, cap, token session budget
+and audit trail as a 402 top-up, and is recorded as `mech_prefund`. The cap
+bounds the request, not each deposit: what the prepaid deposit put in is
+counted against the one the send may still make, so a request never moves
+more than its `max_payment`, and restricted mode arms its one-shot grant for
+the rest. A mech priced above `max_payment` is refused while the request is
+planned, before any of this.
+
+Everything that can stop the deposit leaves the mech's shortfall to the 402
+path: a balance that cannot be read, a safe that cannot cover what the call
+is short, a refusal by the guard, the budget or mech-client's own balance
+check, and a deposit whose receipt left the prepaid balance where it was.
+Only a deposit that reached the chain and whose outcome is unknown stops the
+request, reported with its hash and audited as `mech_deposit_unconfirmed`;
+no nonce was taken for it, so the caller keeps its own request id.
 
 The flow also needs a mech whose operator published an
 endpoint in its on-chain metadata — few have, so `mech_tools` reports

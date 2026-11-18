@@ -4063,7 +4063,7 @@ class TestMech:
         self._native_tracker(monkeypatch)
         patched_mech.prepaid.balance = 0
         fake_w3.eth.balance = 10**18  # what the safe itself holds
-        cap = 4 * 10**16  # max_payment, under 10x the mech's 10**16 rate
+        cap = 4 * 10**16
         mech_service.request(
             "q",
             "tool",
@@ -4075,8 +4075,8 @@ class TestMech:
         # read once to decide, once to see the deposit land
         assert patched_mech.prepaid.reads == [(SAFE, PaymentType.NATIVE)] * 2
         assert patched_mech.prepaid.deposits == [(cap, "native")]
-        assert len(fake_w3.eth.sent) == 1  # the deposit, and nothing after it
-        assert len(patched_mech.calls) == 1  # the request did go out
+        assert len(fake_w3.eth.sent) == 1
+        assert len(patched_mech.calls) == 1
         assert patched_mech.calls[0]["auto_deposit"] is True
         (prefund,) = [
             e for e in audit_entries(store_path) if e["kind"] == "mech_prefund"
@@ -4434,7 +4434,7 @@ class TestMech:
         )
         assert patched_mech.prepaid.deposits == []
         assert not fake_w3.eth.sent
-        assert len(patched_mech.calls) == 1  # the request went out regardless
+        assert len(patched_mech.calls) == 1
         (refused,) = [
             e for e in audit_entries(store_path) if e["kind"] == "mech_deposit_refused"
         ]
