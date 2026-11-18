@@ -1237,7 +1237,7 @@ class TestTools:
         assert await tools["chain_call"]("testchain", EOA, "0x", "pending") == {
             "result": "pending"
         }
-        assert await tools["get_abi"]("testchain", EOA) == {"a": EOA}
+        assert await tools["get_abi"](EOA, chain="testchain") == {"a": EOA}
         decoded = await tools["decode_calldata"]("0x095ea7b3", chain="testchain")
         assert decoded["signature"] == "approve(address,uint256)"
 

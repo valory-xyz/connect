@@ -30,6 +30,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
+from connect import chain_read
 from connect import settings as settings_module
 from connect import texts
 from connect.activity import ActivityLog
@@ -605,3 +606,78 @@ async def test_a_checksummed_priority_mech_is_accepted_at_the_boundary(
     monkeypatch.setattr(mech_service, "tools", tools)
     await mcp.call_tool("mech_tools", {"priority_mech": checksummed})
     assert asked == [checksummed]
+
+
+# the reference's required set per tool (onchainbench fork_connect.REQUIRED)
+REFERENCE_REQUIRED = {
+    "safe_transaction": ["chain", "target"],
+    "send_transaction": ["chain", "to"],
+    "preflight_transaction": ["chain", "target"],
+    "simulate_transaction": ["chain", "target"],
+    "chain_call": ["chain", "to", "data"],
+    "get_abi": ["address"],
+    "decode_calldata": ["data"],
+    "transaction_status": ["chain", "tx_hash"],
+    "sign_message": ["digest"],
+    "mech_request": ["prompt", "tool"],
+    "mech_result": ["request_id"],
+}
+
+
+@pytest.mark.parametrize("switches", [PRODUCTION, TEST_INTERFACE])
+async def test_each_tool_requires_what_the_reference_requires(
+    make_mcp: t.Callable[..., FastMCP], switches: Switches
+) -> None:
+    """B2: the published required set is the reference's, tool by tool."""
+    required = {
+        tool.name: sorted(tool.inputSchema.get("required", []))
+        for tool in await make_mcp(switches).list_tools()
+    }
+    expected = {tool: sorted(names) for tool, names in REFERENCE_REQUIRED.items()}
+    assert {tool: names for tool, names in required.items() if names} == expected
+
+
+async def test_get_abi_takes_an_address_alone_on_the_instance_chain(
+    mcp: FastMCP, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no chain, get_abi reads the chain this instance's safe is on."""
+    read: list[t.Any] = []
+
+    def get_abi(w3: t.Any, address: str) -> dict:
+        read.append((w3, address))
+        return {"address": address}
+
+    monkeypatch.setattr(chain_read, "get_abi", get_abi)
+    (answer,) = await mcp.call_tool("get_abi", {"address": RECIPIENT})
+    assert json.loads(answer.text) == {"address": RECIPIENT}  # type: ignore[union-attr]
+    assert len(read) == 1
+
+
+async def test_get_abi_with_no_chain_and_no_instance_chain_is_refused(
+    mcp: FastMCP, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An instance with no one chain cannot guess: the agent is told to name it."""
+    monkeypatch.setattr(AppConfig, "instance_chain", property(lambda _self: None))
+    with pytest.raises(ToolError) as refused:
+        await mcp.call_tool("get_abi", {"address": RECIPIENT})
+    assert str(refused.value) == texts.CHAIN_REQUIRED
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"chain": "testchain"},
+        {"chain": "testchain", "target": ""},
+        {"chain": "testchain", "to": ""},
+    ],
+)
+async def test_a_missing_or_empty_target_is_refused_by_name(
+    mcp: FastMCP, fake_w3: FakeW3, arguments: dict
+) -> None:
+    """B2: neither target nor to, or an empty one, names target; nothing is sent."""
+    with pytest.raises(ToolError) as refused:
+        await mcp.call_tool("safe_transaction", arguments)
+    assert (
+        str(refused.value) == "invalid request: ValidationError: target: Field required"
+    )
+    assert not fake_w3.eth.sent

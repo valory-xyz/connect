@@ -100,7 +100,12 @@ other non-aea agent. It:
      sent, before any alias is read and before a token's budget is drawn
      on), an unknown tool
      reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
-     of an empty or absent `target`. Every argument the reference takes is taken: `wallet_info`'s
+     of an empty or absent `target`. Each tool requires what the reference
+     requires (`get_abi` needs only `address`, reading the instance's chain,
+     the one its safe is on, when `chain` is omitted, and `decode_calldata`
+     only `data`), and a required field that is missing or empty is refused
+     by name: `invalid request: ValidationError: <field>: Field required`.
+     Every argument the reference takes is taken: `wallet_info`'s
      `chain` and `decode_calldata`'s `address` and `chain` are accepted and
      ignored (`decode_calldata` needs only `data`; its `address` is still
      checked for shape), and `safe_transaction` (on MCP only) reads an
@@ -998,7 +1003,7 @@ Connect. Two public modules carry that contract:
   adds beyond the floor and the whitelist, its gate and decode details
   (`gate_token_cap_positions`, `EXEC_UNDECODABLE`), `AMOUNT_REFUSED` /
   `CAP_REFUSED` for an amount that is not one, `VALUE_REFUSED`, `tool_failed`,
-  `BATCH_REFUSED`, `BODY_TOO_DEEP`, the block texts, the amount field
+  `BATCH_REFUSED`, `BODY_TOO_DEEP`, `CHAIN_REQUIRED`, the block texts, the amount field
   descriptions and the descriptions it keeps (`get_abi`'s,
   `transaction_status`'s and `request_context`'s field note). The bench imports
   the module, so a rename fails its suite.

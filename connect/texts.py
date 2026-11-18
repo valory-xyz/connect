@@ -364,6 +364,9 @@ CAP_REFUSED = (
 AMOUNT_DESCRIPTION = "base units, as a decimal or 0x-hex string"
 CAP_DESCRIPTION = "base units, as an integer or a decimal or 0x-hex string"
 
+# `get_abi` with no chain, on an instance whose config names no one chain
+CHAIN_REQUIRED = "chain is required: this instance runs on no single chain"
+
 # Connect's own refusals of a send's value and of a body the MCP mount cannot serve
 VALUE_REFUSED = "value must be a non-negative amount in wei"
 BATCH_REFUSED = "batch requests are not supported: send one message per request"

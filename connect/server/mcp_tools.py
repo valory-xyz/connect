@@ -69,6 +69,7 @@ from connect.texts import (
     AMOUNT_REFUSED,
     CAP_DESCRIPTION,
     CAP_REFUSED,
+    CHAIN_REQUIRED,
     GET_ABI_DESCRIPTION,
     INVALID_REQUEST,
     REQUEST_CONTEXT_NOTE,
@@ -233,6 +234,14 @@ class ConnectMCP(FastMCP):
             arguments = with_aliases(name, arguments)
             metadata = tool.fn_metadata
             metadata.arg_model.model_validate(metadata.pre_parse_json(arguments))
+            # the model refuses a missing required field; an empty one is none too
+            empty = [
+                f"{field}: Field required"
+                for field in tool.parameters.get("required", [])
+                if arguments.get(field) == ""
+            ]
+            if empty:
+                raise InputError(INVALID_REQUEST("ValidationError", "; ".join(empty)))
         except InputError as e:
             raise ToolError(str(e)) from e
         except ValidationError as e:
@@ -428,9 +437,12 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         )
 
     @mcp.tool(description=GET_ABI_DESCRIPTION, annotations=READ_ONLY)
-    async def get_abi(chain: str, address: str) -> dict:
-        """Report the ABI Connect ships for a contract."""
-        return await asyncio.to_thread(chain_read.get_abi, signer.w3(chain), address)
+    async def get_abi(address: str, chain: str | None = None) -> dict:
+        """Report the ABI Connect ships for a contract, on `chain` or the instance's."""
+        on = chain or config.instance_chain
+        if on is None:
+            raise InputError(CHAIN_REQUIRED)
+        return await asyncio.to_thread(chain_read.get_abi, signer.w3(on), address)
 
     @mcp.tool(description=TOOL_DESCRIPTIONS["decode_calldata"], annotations=READ_ONLY)
     async def decode_calldata(
