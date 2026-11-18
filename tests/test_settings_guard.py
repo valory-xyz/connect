@@ -2206,7 +2206,7 @@ class FakeDepositService:
             amount, "native", exec_transaction_calldata(TRACKER, value=amount)
         )
 
-    def deposit_token(self, amount: int, token_type: str = "olas") -> str:
+    def deposit_token(self, amount: int, token_type: str = "olas") -> str:  # nosec B107
         """Send the safe's deposit(uint256) to the balance tracker."""
         data = bytes.fromhex(DEPOSIT_SELECTOR) + abi_encode(["uint256"], [amount])
         return self._deposit(
