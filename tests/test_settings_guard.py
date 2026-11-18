@@ -5015,6 +5015,92 @@ class TestMech:
         # the token balance less the token's floor, not the 4 * 10**16 cap
         assert patched_mech.prepaid.deposits == [(15 * 10**15, "usdc")]
 
+    def test_a_request_without_a_slot_yet_still_counts_as_in_flight(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A request between its deposit and its nonce is still a request in flight.
+
+        The allocator shows a request only once it has reserved its slot, and
+        the deposit lock is released before that, so the next request to
+        prepay would read a bar one call too low and leave a delivery unpaid.
+        """
+        self._native_tracker(monkeypatch)
+        allowances = mech_service._allowances  # pylint: disable=protected-access
+        priced = PricedMech(OTHER, 42, 10**16, NATIVE_PAYMENT_TYPE)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
+        ) as slot:  # one request the mech has already accepted
+            slot.answered("accepted", mech=OTHER, salt="s", posted=True)
+        patched_mech.prepaid.balance = 2 * 10**16  # two calls at the 10**16 rate
+        fake_w3.eth.balance = 10**18
+        patched_mech.signer = MechSigner(
+            test_signer, "testchain", allowances.check_top_up
+        )
+        patched_mech.safe_address = SAFE
+
+        def in_flight() -> int:
+            """Count the slots of record, as the send does."""
+            return mech_service.queue.in_flight(
+                "testchain", SAFE, patched_mech.contract.nonce
+            )
+
+        cap = 4 * 10**16
+        first = request_plan(priced, max_payment=cap, service=patched_mech)
+        second = request_plan(priced, max_payment=cap, service=patched_mech)
+        allowances.prefund(first, SAFE, in_flight)
+        assert patched_mech.prepaid.deposits == []  # two calls owed, two covered
+        # the first holds no slot of record yet: three are owed now
+        allowances.prefund(second, SAFE, in_flight)
+        assert patched_mech.prepaid.deposits == [(cap, "native")]
+        count = allowances._unreserved_count  # pylint: disable=protected-access
+        assert count("testchain") == 2
+        allowances.prefund(second, SAFE, in_flight)  # counted once, not per call
+        assert count("testchain") == 2
+        assert patched_mech.prepaid.deposits == [(cap, "native")]
+        # and only until the request is done with, whatever became of it
+        allowances.revoke(second.armed)
+        assert count("testchain") == 1
+        allowances.revoke(first.armed)
+        assert count("testchain") == 0
+
+    def test_a_safe_with_nothing_to_spend_sends_no_empty_deposit(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deposit of nothing is not sent.
+
+        The balance covers this call but not the requests in flight, and the
+        safe has nothing left to put in: there is no deposit to make, and a
+        transaction moving zero would cost gas for it.
+        """
+        self._native_tracker(monkeypatch)
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve(
+            "testchain", SAFE, OTHER, lambda: patched_mech.contract.nonce, timeout=1
+        ) as slot:
+            slot.answered("accepted", mech=OTHER, salt="s", posted=True)
+        patched_mech.prepaid.balance = 10**16  # this call is covered, the other is not
+        fake_w3.eth.balance = 0  # and the safe has nothing to add
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.deposits == []
+        assert not fake_w3.eth.sent
+
     def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
         self,
         mech_service: MechService,

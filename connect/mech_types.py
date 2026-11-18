@@ -165,6 +165,9 @@ class Prefunded:
 
     amount: int = 0
     _on_hook: bool = False
+    # whether its chain still counts this request as one the allocator has
+    # not been given a slot for yet (`MechAllowances._hold_slot`)
+    counted: bool = False
 
     def on_hook(self, hook: t.Any) -> None:
         """Hand the prepaid amount to the send's hook, once.

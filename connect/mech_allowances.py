@@ -158,8 +158,10 @@ class MechAllowances:
         self._activity = activity
         # chain -> the deposits the send under its queue's lock may make
         self._top_ups: dict[str, _TopUp] = {}
-        self._lock = threading.Lock()  # guards the table of chain locks below
+        self._lock = threading.Lock()  # guards the two tables below
         self._locks: dict[str, threading.Lock] = {}
+        # chain -> requests about to be sent that have no allocator slot yet
+        self._unreserved: dict[str, int] = {}
 
     def arm(  # pylint: disable=too-many-arguments
         self,
@@ -250,6 +252,7 @@ class MechAllowances:
         with self._deposit_lock(plan.chain):
             try:
                 if plan.auto_deposit:
+                    self._took_slot(plan)  # the allocator shows its slot now
                     plan.prefunded.on_hook(hook)
                     self._arm_deposit(plan, armed, hook.deposited)
                 yield
@@ -270,6 +273,40 @@ class MechAllowances:
                 raise failure from failure.__cause__
             finally:
                 self.revoke(armed)
+
+    def _hold_slot(self, plan: RequestPlan) -> None:
+        """Count this request until the allocator shows the slot it will take.
+
+        A request is in flight from the moment it is going to be sent, but
+        the allocator shows it only once `reserve` has written its slot, and
+        the deposit lock is released before that. Until then it is counted
+        here, so the next request to prepay does not read a bar one call too
+        low and leave a delivery unpaid.
+        """
+        if plan.prefunded.counted:
+            return
+        plan.prefunded.counted = True
+        with self._lock:
+            self._unreserved[plan.chain] = self._unreserved.get(plan.chain, 0) + 1
+        # whatever becomes of the request, it stops being counted with it
+        plan.armed.append(functools.partial(self._took_slot, plan))
+
+    def _took_slot(self, plan: RequestPlan) -> None:
+        """Stop counting this request: it holds a slot now, or it gave up."""
+        if not plan.prefunded.counted:
+            return
+        plan.prefunded.counted = False
+        with self._lock:
+            left = self._unreserved.get(plan.chain, 0) - 1
+            if left > 0:
+                self._unreserved[plan.chain] = left
+            else:
+                self._unreserved.pop(plan.chain, None)
+
+    def _unreserved_count(self, chain: str) -> int:
+        """Return how many of this chain's requests have no slot of record yet."""
+        with self._lock:
+            return self._unreserved.get(chain, 0)
 
     def _deposit_lock(self, chain: str) -> threading.Lock:
         """Return the lock one chain's deposits are armed, made and withdrawn under.
@@ -342,6 +379,7 @@ class MechAllowances:
             # the read is inside the lock too: two requests that both read
             # before either deposit is mined would both deposit the cap
             short = self._shortfall(plan, safe, in_flight)
+            self._hold_slot(plan)
             if short is None:
                 return
             try:
@@ -361,15 +399,19 @@ class MechAllowances:
         in flight or cannot be read, and a safe that cannot cover what this
         call is short of the mech's own bar.
         """
-        chain, priced = plan.chain, plan.priced
+        chain, priced, kind = (
+            plan.chain,
+            plan.priced,
+            PaymentType(plan.priced.payment_type),
+        )
         if not self._prepays(plan):
             return None
-        kind = PaymentType(priced.payment_type)
         try:
             deposits, sends = self._deposit_path(plan.service)
             balance = int(deposits.check_balance(safe, kind))
             # what the balance owes: every request in flight, and this one
-            if balance >= (in_flight() + 1) * priced.rate:
+            needed = (in_flight() + self._unreserved_count(chain) + 1) * priced.rate
+            if balance >= needed:
                 return None
             spendable = self._spendable(deposits, chain, kind, safe)
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -378,16 +420,16 @@ class MechAllowances:
             )
             return None
         amount = min(deposit_cap(priced, plan.max_payment), spendable)
-        # the least that lets this call through: the mech admits it on the
-        # balance it reads, whatever the requests behind it will take
-        missing = priced.rate - balance
-        if amount < missing:
+        # worth its gas: one call's price, or the whole shortfall if that is
+        # less — a deposit the mech's own bar still refuses buys nothing
+        least = min(priced.rate, needed - balance)
+        if amount < least:
             logger.info(
                 "not prepaying the mech balance on %s: the safe can spend %s of "
-                "the %s one call is short",
+                "the %s it would take",
                 chain,
                 spendable,
-                missing,
+                least,
             )
             return None
         return _Short(deposits, sends, balance, amount)
