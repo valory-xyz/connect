@@ -657,7 +657,20 @@ works in both modes: it signs the request-id digest, which restricted mode
 allows through the server-derived single-use allowance described above, and
 its `auto_deposit` top-up (paying the balance tracker from the safe on HTTP
 402) is pre-authorized the same way — capped, single-use, armed only for the
-request being sent. The flow also needs a mech whose operator published an
+request being sent.
+
+Before each off-chain request the flow reads the safe's prepaid balance on
+that tracker. Below the mech's per-request price it deposits the whole capped
+amount (`max_payment`, within 10× the price) instead of waiting for the mech
+to name a one-call shortfall over HTTP 402: a mech admits a request only
+while the balance covers it, so one deposit carries several calls and a call
+the balance already pays for costs no transaction at all. The deposit passes
+the same guard shape check, cap, token session budget and audit trail as a
+402 top-up, and is recorded as `mech_prefund`. A balance that cannot be read,
+or a deposit the guard or the budget refuses, leaves the 402 path to deposit
+the shortfall as before.
+
+The flow also needs a mech whose operator published an
 endpoint in its on-chain metadata — few have, so `mech_tools` reports
 `offchain_capable` per mech and a request to one that cannot serve it is
 refused before any payment. The on-chain path sends through the

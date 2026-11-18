@@ -2044,6 +2044,12 @@ class FakeMarketplaceService:
         self.signer: t.Any = None  # the MechSigner mech-client would sign with
         self.safe_address: str | None = None  # agent-mode requester of record
         self.rpc_url: str | None = None  # the rpc_url it was built with
+        # what the deposit path is built from, as BaseTransactionService holds it
+        self.chain_config: str | None = None
+        self.agent_mode = True
+        self.ethereum_client: t.Any = None
+        # the prepaid balance the flow reads and deposits into
+        self.prepaid = FakeDepositService()
         # mirrors BaseTransactionService.mech_config, whose chain id the flow
         # threads into sign_safe_message
         self.mech_config = SimpleNamespace(
@@ -2164,6 +2170,58 @@ def _executor_wrapped(failure: Exception) -> Exception:
         wrapped = Exception(f"Failed to execute Safe transfer transaction: {e}")
         wrapped.__cause__ = e
         return wrapped
+
+
+class FakeDepositService:
+    """mech-client's deposit path, faked at its chain reads and writes only.
+
+    A deposit still goes through the service's own signer, as the agent-mode
+    executor sends it: the safe's call to the balance tracker. Connect's
+    guard, the top-up bound and the audit trail therefore see exactly what a
+    402 top-up gives them.
+    """
+
+    def __init__(self, balance: int = 10**18) -> None:
+        """Initialize with a prepaid balance that covers any request."""
+        self.balance = balance
+        self.reads: list[tuple[str, PaymentType]] = []
+        self.deposits: list[tuple[int, str]] = []
+        self.signer: t.Any = None
+        self.safe_address: str | None = None
+
+    def built(self, **kwargs: t.Any) -> "FakeDepositService":
+        """Stand in for the DepositService constructor, capturing its signer."""
+        self.signer = kwargs["signer"]
+        self.safe_address = kwargs["safe_address"]
+        return self
+
+    def check_balance(self, requester_address: str, payment_type: PaymentType) -> int:
+        """Read the safe's prepaid balance for a payment type."""
+        self.reads.append((requester_address, payment_type))
+        return self.balance
+
+    def deposit_native(self, amount: int) -> str:
+        """Send the safe's native transfer to the balance tracker."""
+        return self._deposit(
+            amount, "native", exec_transaction_calldata(TRACKER, value=amount)
+        )
+
+    def deposit_token(self, amount: int, token_type: str = "olas") -> str:
+        """Send the safe's deposit(uint256) to the balance tracker."""
+        data = bytes.fromhex(DEPOSIT_SELECTOR) + abi_encode(["uint256"], [amount])
+        return self._deposit(
+            amount, token_type, exec_transaction_calldata(TRACKER, data=data)
+        )
+
+    def _deposit(self, amount: int, asset: str, data: str) -> str:
+        """Sign and send the deposit, wrapping a refusal as the executor does."""
+        try:
+            self.signer.send_transaction({"to": self.safe_address, "data": data})
+        except SignerError as e:
+            raise _executor_wrapped(e) from e
+        self.deposits.append((amount, asset))
+        self.balance += amount
+        return "0x" + "dd" * 32
 
 
 REAL_MANIFEST: dict = {
@@ -2356,10 +2414,13 @@ class TestMech:
             fake.signer = kwargs.get("signer")
             fake.safe_address = t.cast(str, kwargs.get("safe_address"))
             fake.rpc_url = t.cast(str, kwargs.get("rpc_url"))
+            fake.chain_config = t.cast(str, kwargs.get("chain_config"))
+            fake.ethereum_client = kwargs.get("ethereum_client")
             return fake
 
         monkeypatch.setattr(mech_module, "MarketplaceService", _construct)
         monkeypatch.setattr(se, "EthereumClient", lambda uri: object())
+        monkeypatch.setattr(allowances_module, "DepositService", fake.prepaid.built)
         return fake
 
     def test_request_reports_whose_terms_apply(
@@ -3936,6 +3997,82 @@ class TestMech:
         # a chain mech-client does not know fails closed
         assert deposit_tracker("testchain", PaymentType.NATIVE.value) == (None, False)
 
+    @staticmethod
+    def _native_tracker(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Give the test chain a native balance tracker mech-client has none for."""
+        monkeypatch.setattr(
+            allowances_module,
+            "deposit_tracker",
+            lambda chain, payment_type: (TRACKER, False),
+        )
+
+    def test_a_balance_below_one_call_is_prepaid_with_the_armed_cap(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A safe that cannot prepay one call deposits the cap before the request.
+
+        The mech admits a request only while the prepaid balance covers it, so
+        the whole cap the allowance was armed for goes in, not the one-call
+        shortfall a 402 would name: the balance stays ahead of the requests
+        behind this one, and the request itself goes out afterwards.
+        """
+        self._native_tracker(monkeypatch)
+        patched_mech.prepaid.balance = 0
+        cap = 4 * 10**16  # max_payment, under 10x the mech's 10**16 rate
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=cap,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.reads == [(SAFE, PaymentType.NATIVE)]
+        assert patched_mech.prepaid.deposits == [(cap, "native")]
+        assert len(fake_w3.eth.sent) == 1  # the deposit, and nothing after it
+        assert len(patched_mech.calls) == 1  # the request did go out
+        assert patched_mech.calls[0]["auto_deposit"] is True
+        (prefund,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_prefund"
+        ]
+        assert prefund["amount"] == str(cap)
+        assert prefund["balance"] == "0"
+        assert prefund["tracker"] == TRACKER
+
+    def test_a_balance_that_covers_a_call_is_left_alone(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A balance that already pays for the request deposits nothing.
+
+        The mech's own rate is the bar, so a balance exactly at it needs no
+        transaction at all — which is what makes one deposit carry several
+        calls instead of each call paying for its own.
+        """
+        self._native_tracker(monkeypatch)
+        patched_mech.prepaid.balance = 10**16  # exactly the mech's rate
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=4 * 10**16,
+            top_up_budget=None,
+        )
+        assert patched_mech.prepaid.reads == [(SAFE, PaymentType.NATIVE)]
+        assert patched_mech.prepaid.deposits == []
+        assert not fake_w3.eth.sent
+        assert "mech_prefund" not in audit_kinds(store_path)
+
     def test_unrestricted_offchain_keeps_auto_deposit(  # pylint: disable=too-many-arguments
         self,
         mech_service: MechService,
@@ -5322,11 +5459,18 @@ class TestMech:
             "deposit_tracker",
             lambda chain, payment_type: (TRACKER, True),
         )
+        prepaid = FakeDepositService()
+        monkeypatch.setattr(allowances_module, "DepositService", prepaid.built)
         allowances = mech_service._allowances  # pylint: disable=protected-access
         priced = PricedMech(OTHER, 42, 10**16, NATIVE_PAYMENT_TYPE)
         deposit = bytes.fromhex(DEPOSIT_SELECTOR) + abi_encode(["uint256"], [7])
         with allowances.auto_deposit_armed(
-            "testchain", priced, auto_deposit=True, max_payment=6, budget=None
+            "testchain",
+            priced,
+            auto_deposit=True,
+            max_payment=6,
+            budget=None,
+            service=SimpleNamespace(chain_config="testchain", agent_mode=True),
         ):
             for to, data in (
                 (OTHER, exec_transaction_calldata(TRACKER, data=deposit)),

@@ -802,6 +802,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 auto_deposit=plan.auto_deposit,
                 max_payment=plan.max_payment,
                 budget=plan.top_up_budget,
+                service=plan.service,
             ):
                 return send(nonces=[nonce], on_request_id=hook)
 

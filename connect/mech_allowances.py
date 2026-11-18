@@ -26,7 +26,11 @@ import typing as t
 
 from mech_client import balance_tracker
 from mech_client.infrastructure.config import PaymentType
-from mech_client.services.marketplace_service import _MAX_AUTO_DEPOSIT_RATIO
+from mech_client.services.deposit_service import DepositService
+from mech_client.services.marketplace_service import (
+    MarketplaceService,
+    _MAX_AUTO_DEPOSIT_RATIO,
+)
 from web3 import Web3
 
 from connect.activity import ActivityLog
@@ -40,7 +44,7 @@ from connect.safe import (
     safe_message_hash,
 )
 from connect.settings import MODE_RESTRICTED
-from connect.signer_errors import SignerError
+from connect.signer_errors import SignerError, cause_of
 
 logger = logging.getLogger("agent")
 
@@ -52,7 +56,7 @@ TopUpBudget = t.Callable[[int], str | None]
 
 
 class _TopUp(t.NamedTuple):
-    """The one 402 top-up a send may make: its tracker, bound and budget."""
+    """The deposits a send may make: its tracker, bound and budget."""
 
     tracker: str
     cap: int  # max_payment, within mech-client's ratio of the mech's rate
@@ -97,6 +101,8 @@ class MechAllowances:
         self._activity = activity
         # chain -> the top-up the send under its queue's lock may make
         self._top_ups: dict[str, _TopUp] = {}
+        # chain -> mech-client's deposit path, built once per chain
+        self._deposits: dict[str, DepositService] = {}
 
     def arm(  # pylint: disable=too-many-arguments
         self,
@@ -160,15 +166,18 @@ class MechAllowances:
         auto_deposit: bool,
         max_payment: int,
         budget: TopUpBudget | None,
+        service: MarketplaceService,
     ) -> t.Iterator[None]:
-        """Pre-authorize the one 402 top-up of the send this wraps, then withdraw it.
+        """Pre-authorize the deposits of the send this wraps, then withdraw them.
 
-        The deposit pays the balance tracker from the safe. It is bounded by
-        the same cap mech-client itself enforces on the shortfall: the
-        request's `max_payment`, within ratio x the mech's per-request rate;
-        `check_top_up` holds it to that cap and draws it on `budget` before
-        it is signed, in every mode, and restricted mode allows it only
-        through a one-shot allowance of that cap. The guard consumes a grant
+        A deposit pays the balance tracker from the safe, whether this flow
+        prepays it (`_prefund`) or the mech asks for a shortfall over HTTP
+        402. Together they are bounded by the same cap mech-client itself
+        enforces on the shortfall: the request's `max_payment`, within ratio
+        x the mech's per-request rate; `check_top_up` holds the send's
+        deposits to that cap and draws each on `budget` before it is signed,
+        in every mode, and restricted mode allows them only through a
+        one-shot allowance of that cap. The guard consumes a grant
         by its shape, not by who
         armed it, so it is armed only inside the send, under the queue's
         lock, and withdrawn before that lock is released: one request at a
@@ -180,11 +189,12 @@ class MechAllowances:
         that may have landed is audited as `mech_deposit_unconfirmed`.
         """
         armed: Armed = []
-        if auto_deposit:
-            self._arm_deposit(
-                chain, priced, armed, max_payment=max_payment, budget=budget
-            )
         try:
+            if auto_deposit:
+                self._arm_deposit(
+                    chain, priced, armed, max_payment=max_payment, budget=budget
+                )
+                self._prefund(chain, priced, service)
             yield
         except Exception as e:
             failure = top_up_failure(e)
@@ -232,6 +242,83 @@ class MechAllowances:
             amount_cap=str(amount_cap),
             is_token=is_token,
         )
+
+    def _prefund(
+        self, chain: str, priced: PricedMech, service: MarketplaceService
+    ) -> None:
+        """Deposit the armed cap when the safe cannot prepay one more request.
+
+        A mech admits an off-chain request only while the safe's prepaid
+        balance covers it, and a balance holding exactly one call is spent by
+        the first of the calls behind it. Depositing the whole armed cap,
+        rather than waiting for the mech to name a one-call shortfall over
+        HTTP 402, keeps the balance ahead of the requests in flight: one
+        deposit carries several calls, and a call whose balance is already
+        there costs no transaction at all.
+
+        Everything that bounds a 402 top-up bounds this: the tracker and cap
+        the allowance was just armed for, `check_top_up`'s draw on the
+        session budget, the guard's shape check, and mech-client's own
+        deposit path.
+
+        A prepaid balance that cannot be read, and a deposit the budget or
+        the guard refuses, both leave the 402 path to deposit the shortfall
+        as before; a deposit that may have landed is not swallowed.
+        """
+        top_up = self._top_ups.get(chain)
+        if top_up is None:  # no tracker for this payment type: nothing to prepay
+            return
+        kind = PaymentType(priced.payment_type)
+        safe = str(self._config.chain(chain).safe_address)
+        try:
+            deposits = self._deposit_service(chain, service)
+            balance = int(deposits.check_balance(safe, kind))
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "could not read the safe's prepaid mech balance on %s: %s",
+                chain,
+                cause_of(e),
+            )
+            return
+        if balance >= priced.rate:
+            return
+        amount = top_up.cap
+        try:
+            if kind.is_token():
+                deposits.deposit_token(amount, "usdc" if kind.is_usdc() else "olas")
+            else:
+                deposits.deposit_native(amount)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            refused = top_up_failure(e)
+            if not isinstance(refused, SignerError):
+                raise  # it may have landed: auto_deposit_armed audits that
+            logger.info("did not prepay %s into the mech balance: %s", amount, refused)
+            return
+        self._activity.record(
+            "mech_prefund",
+            chain=chain,
+            tracker=top_up.tracker,
+            amount=str(amount),
+            balance=str(balance),
+            rate=str(priced.rate),
+        )
+
+    def _deposit_service(
+        self, chain: str, service: MarketplaceService
+    ) -> DepositService:
+        """Build, once per chain, the deposit path mech-client's own top-up takes."""
+        deposits = self._deposits.get(chain)
+        if deposits is None:
+            deposits = DepositService(
+                chain_config=service.chain_config,
+                agent_mode=service.agent_mode,
+                safe_address=service.safe_address,
+                ethereum_client=service.ethereum_client,
+                signer=service.signer,
+                rpc_url=service.rpc_url,
+            )
+            self._deposits[chain] = deposits
+        return deposits
 
     def _disarm_top_up(self, chain: str) -> None:
         """Forget the top-up armed on `chain`: its send has ended."""
