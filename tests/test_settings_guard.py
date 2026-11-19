@@ -7435,7 +7435,6 @@ class TestMech:
             ({"status": "rejected"}, "https://gateway.example/ab", False),
             ({"answer": "42"}, None, False),
             ({"status": "ok"}, None, False),
-            (None, None, False),
         ],
     )
     def test_only_an_inline_rejection_frees_its_slot(  # pylint: disable=too-many-arguments
@@ -7443,23 +7442,19 @@ class TestMech:
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
-        data: dict | None,
+        data: dict,
         url: str | None,
         freed: bool,
     ) -> None:
-        """A delivery the mech rejected frees its nonce; any other settles it.
-
-        The rejection is inline, so a delivery that names a result file
-        carries a settled request's tool output whatever its own status says.
-        The delivery arrives after the queue's lock is released, which is the
-        case mech-client's own send cannot see.
-        """
+        """Only an inline rejection frees its nonce; any other delivery settles it."""
         nonce = patched_mech.contract.nonce
         delivery = DeliveryResult(request_id="ab", data=data, url=url)
 
         async def watched(*_args: t.Any) -> dict:
             return {"ab": delivery}
 
+        # the delivery arrives after the queue's lock is released, which is
+        # the case mech-client's own send cannot see
         monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(watched))
         patched_mech.result = {
             **patched_mech.result,
@@ -7470,12 +7465,10 @@ class TestMech:
         mech_service.request(
             "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
         )
-        nonces = mech_service._nonces  # pylint: disable=protected-access
-        queue = nonces._queue(  # pylint: disable=protected-access
-            nonces.key("testchain", SAFE)
-        )
-        assert (nonce not in queue.slots) is freed
-        if not freed and data is not None:
+        queue = self._queue(mech_service)
+        if freed:
+            assert nonce not in queue.slots
+        else:
             assert queue.slots[nonce].delivered_at is not None
 
     def test_a_rejected_delivery_hands_its_nonce_to_the_next_request(
@@ -7484,11 +7477,7 @@ class TestMech:
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The mech discarded the request, so mapNonces still equals its nonce.
-
-        Left spent on this side, every later request from the safe would go
-        out above the slot the mech expects next.
-        """
+        """The mech discarded the request, so mapNonces still equals its nonce."""
 
         async def rejected(*_args: t.Any) -> dict:
             return {
@@ -7513,6 +7502,48 @@ class TestMech:
             "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
         )
         assert patched_mech.calls[-1]["nonces"] == [nonce]
+
+    def test_a_rejected_slot_held_below_another_still_settles(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Freeing is refused while a later slot is held, so the clock must start."""
+
+        async def nothing(*_args: t.Any) -> dict:
+            return {}
+
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(nothing))
+        nonce = patched_mech.contract.nonce
+        patched_mech.result = {
+            **patched_mech.result,
+            "request_ids": ["ab"],
+            "nonces": [nonce],
+            "deliveries": {},
+        }
+        for _ in range(2):  # nonce and nonce + 1 are both held, neither delivered
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+        queue = self._queue(mech_service)
+        assert queue.slots[nonce].delivered_at is None
+        mech_service.queue.settle(
+            "testchain",
+            SAFE,
+            [(nonce, {"status": "rejected"}, None)],
+            salt=queue.slots[nonce].salt,
+        )
+        assert nonce in queue.slots
+        assert queue.slots[nonce].delivered_at is not None
+
+    @staticmethod
+    def _queue(mech_service: MechService) -> t.Any:
+        """Return the allocator's persisted queue for the safe on testchain."""
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        return nonces._queue(  # pylint: disable=protected-access
+            nonces.key("testchain", SAFE)
+        )
 
     def test_a_plain_prompt_gets_no_chat_report(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService

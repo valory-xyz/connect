@@ -672,7 +672,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             payload["expires"] = None
             payload.update(self.queue.report(plan.chain))
         self._resume_watch(payload, deadline)
-        if plan.offchain:  # a delivery starts the settle clock, or frees the slot
+        if plan.offchain:  # a delivery settles its slot, or frees it
             by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
             got = payload.get("delivery_results") or {}
             urls = payload.get("delivery_urls") or {}
