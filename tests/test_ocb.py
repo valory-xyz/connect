@@ -26,6 +26,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -1091,6 +1092,25 @@ def test_this_build_bundles_ocb() -> None:
     )
     assert default is not None
     assert version == default.group(1)
+
+
+@POSIX_ONLY
+def test_the_bundled_script_takes_the_version_connect_passes(tmp_path: Path) -> None:
+    """Connect runs `sh install.sh <VERSION>`; the real script must read it there.
+
+    A bad version is refused before any download, so this needs no network.
+    """
+    script = workspace.assets_dir() / ocb.OCB_ASSETS_SUBDIR / ocb.OCB_INSTALL_SCRIPT
+    done = subprocess.run(  # nosec B603 B607
+        ["sh", str(script), "bad;ver"],
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode != 0
+    assert "not a version: 'bad;ver'" in done.stderr
 
 
 def test_the_bundle_directory_says_what_goes_in_it() -> None:
