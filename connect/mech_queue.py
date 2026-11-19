@@ -262,19 +262,15 @@ class MechQueue:
         )
 
     def settle(
-        self, chain: str, slots: t.Sequence[DeliveredSlot], *, salt: str | None
+        self, chain: str, slots: t.Sequence[DeliveredSlot], *, salt: str
     ) -> None:
         """Stamp delivered slots, then free the rejected ones the allocator allows.
 
         A kept slot keeps its stamp and a freed one takes it along, so the
         stamp goes first: a nonce freed here is the next request's, and
-        `delivered` would name its slot. A request whose answer was lost has
-        no salt, and the allocator holds its slot as unknown and will not free
-        it, so there is nothing to do for one.
+        `delivered` would name its slot.
         """
-        safe = self._config.chain(chain).safe_address
-        if not slots or salt is None or safe is None:
-            return
+        safe = t.cast(str, self._config.chain(chain).safe_address)
         self.allocator.delivered(chain, safe, [nonce for nonce, _, _ in slots])
         self.allocator.rejected(
             chain, safe, [(nonce, salt) for nonce in _rejected_nonces(slots)]

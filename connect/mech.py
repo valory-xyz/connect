@@ -933,7 +933,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             return report
         with self._lock:  # whoever takes the entry settles the delivery, once
             took = self._pending.pop(key, None) is not None
-        if took and pending.nonce is not None:
+        if took and pending.nonce is not None and pending.salt is not None:
             self.queue.settle(
                 pending.chain,
                 [(pending.nonce, data[key], split[key].url)],
