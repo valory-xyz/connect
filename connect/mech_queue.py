@@ -248,28 +248,37 @@ class MechQueue:
         )
         raise HardCancelFailed(chain) from failure
 
+    def stamp(self, chain: str, slots: t.Sequence[DeliveredSlot]) -> None:
+        """Start the settle clock of the deliveries mech-client has not answered.
+
+        `delivered` names a slot by its nonce alone, and a rejection that
+        arrived inside the send was answered under the queue's lock, which
+        this call is outside of: that nonce may be the next request's by now.
+        """
+        safe = t.cast(str, self._config.chain(chain).safe_address)
+        rejected = _rejected_nonces(slots)
+        self.allocator.delivered(
+            chain, safe, [nonce for nonce, _, _ in slots if nonce not in rejected]
+        )
+
     def settle(
         self, chain: str, slots: t.Sequence[DeliveredSlot], *, salt: str | None
     ) -> None:
-        """Start the settle clock of delivered slots; free the ones the mech rejected.
+        """Stamp delivered slots, then free the rejected ones the allocator allows.
 
-        A rejected slot stays held while a later slot is held above it, so it
-        is stamped before it is offered, and a freed one takes its stamp with
-        it. A None `salt` names no slot of ours: nothing to settle.
+        A kept slot keeps its stamp and a freed one takes it along, so the
+        stamp goes first: a nonce freed here is the next request's, and
+        `delivered` would name its slot. A request whose answer was lost has
+        no salt, and the allocator holds its slot as unknown and will not free
+        it, so there is nothing to do for one.
         """
         safe = self._config.chain(chain).safe_address
         if not slots or salt is None or safe is None:
             return
-        # copies mech_client.nonces._is_rejected (private)
-        rejected = [
-            (nonce, salt)
-            for nonce, data, url in slots
-            if url is None
-            and isinstance(data, dict)
-            and data.get("status") == DELIVERY_REJECTED
-        ]
         self.allocator.delivered(chain, safe, [nonce for nonce, _, _ in slots])
-        self.allocator.rejected(chain, safe, rejected)
+        self.allocator.rejected(
+            chain, safe, [(nonce, salt) for nonce in _rejected_nonces(slots)]
+        )
 
     def in_flight(self, chain: str, safe: str, settled: int) -> int:
         """Count the safe's slots the allocator holds at or above `settled`.
@@ -308,6 +317,18 @@ class MechQueue:
                 "stuck request's mech to send the hard cancel to",
             )
         return Web3.to_checksum_address(slot.mech)
+
+
+def _rejected_nonces(slots: t.Sequence[DeliveredSlot]) -> list[int]:
+    """Return the nonces whose delivery carried the mech's own rejection."""
+    # copies mech_client.nonces._is_rejected (private)
+    return [
+        nonce
+        for nonce, data, url in slots
+        if url is None
+        and isinstance(data, dict)
+        and data.get("status") == DELIVERY_REJECTED
+    ]
 
 
 def _guard_refusal(error: BaseException) -> SignerError | None:

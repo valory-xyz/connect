@@ -223,11 +223,6 @@ class PendingDelivery(t.NamedTuple):
     otherwise scans from the head minus a hundred blocks, which finds nothing
     for a request that has been waiting a while — exactly the case this exists
     to serve.
-
-    `nonce` and `salt` name the queue slot the request holds, so a delivery
-    read this late still settles or frees it. Both are None where there is no
-    slot of ours: an on-chain request, or one whose answer was lost (the
-    allocator holds that slot as unknown and declines to free it).
     """
 
     chain: str

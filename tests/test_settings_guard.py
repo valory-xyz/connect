@@ -7582,6 +7582,160 @@ class TestMech:
         else:
             assert queue.slots[nonce].delivered_at is not None
 
+    def test_a_rejection_inside_the_send_is_not_stamped(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mech-client answered that slot under the lock, and its nonce is free."""
+        stamped: list[int] = []
+        allocator = mech_service.queue.allocator
+        delivered = allocator.delivered
+
+        def record(chain: str, sender: str, nonces: t.Iterable[int]) -> None:
+            """Keep the nonces the stamp was asked for, then stamp them."""
+            asked = list(nonces)
+            stamped.extend(asked)
+            delivered(chain, sender, asked)
+
+        monkeypatch.setattr(allocator, "delivered", record)
+        nonce = patched_mech.contract.nonce
+        patched_mech.result = {
+            **patched_mech.result,
+            "request_ids": ["ab"],
+            "nonces": [nonce],
+            "deliveries": {
+                "ab": DeliveryResult(
+                    request_id="ab", data={"status": "rejected"}, url=None
+                )
+            },
+        }
+        mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        assert nonce not in self._queue(mech_service).slots
+        assert nonce not in stamped
+
+    def test_a_rejected_slot_is_stamped_before_it_is_freed(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A freed nonce is the next request's, so the stamp has to land first."""
+        allocator = mech_service.queue.allocator
+        free = allocator.rejected
+
+        def freed_then_taken(
+            chain: str, sender: str, slots: t.Iterable[tuple[int, str]]
+        ) -> None:
+            """Free the slot, then let the next request take the freed nonce."""
+            free(chain, sender, slots)
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                timeout=1,  # its own delivery is read later
+                top_up_budget=None,
+            )
+
+        async def nothing(*_args: t.Any) -> dict:
+            """Answer the first request's wait with no delivery."""
+            return {}
+
+        async def late(*_args: t.Any) -> dict:
+            """Answer the later read with the mech's rejection."""
+            return {
+                "ab": DeliveryResult(
+                    request_id="ab", data={"status": "rejected"}, url=None
+                )
+            }
+
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(nothing))
+        nonce = patched_mech.contract.nonce
+        patched_mech.result = {
+            **patched_mech.result,
+            "request_ids": ["ab"],
+            "nonces": [nonce],
+            "deliveries": {},
+        }
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=1,
+            top_up_budget=None,
+        )
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(late))
+        monkeypatch.setattr(allocator, "rejected", freed_then_taken)
+        assert mech_service.result("ab")["result"] == {"status": "rejected"}
+        queue = self._queue(mech_service)
+        assert queue.slots[nonce].delivered_at is None
+
+    def test_only_the_read_that_took_the_pending_entry_settles_it(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two reads of one id overlap; the one that took the entry settles it."""
+        nonce = patched_mech.contract.nonce
+        report = mech_service.queue.report
+
+        async def nothing(*_args: t.Any) -> dict:
+            """Answer the request's own wait with no delivery."""
+            return {}
+
+        async def late(*_args: t.Any) -> dict:
+            """Answer both reads with the mech's rejection."""
+            return {
+                "ab": DeliveryResult(
+                    request_id="ab", data={"status": "rejected"}, url=None
+                )
+            }
+
+        def read_elsewhere(chain: str) -> dict:
+            """Stand in for the other read, which runs before this one's pop."""
+            monkeypatch.setattr(mech_service.queue, "report", report)
+            mech_service.result("ab")  # it takes the entry and frees the slot
+            patched_mech.result = {
+                **patched_mech.result,
+                "request_ids": ["cd"],  # the next request takes the freed nonce
+            }
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                timeout=1,
+                top_up_budget=None,
+            )
+            return report(chain)
+
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(nothing))
+        patched_mech.result = {
+            **patched_mech.result,
+            "request_ids": ["ab"],
+            "nonces": [nonce],
+            "deliveries": {},
+        }
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=1,
+            top_up_budget=None,
+        )
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(late))
+        monkeypatch.setattr(mech_service.queue, "report", read_elsewhere)
+        assert mech_service.result("ab")["result"] == {"status": "rejected"}
+        queue = self._queue(mech_service)
+        assert queue.slots[nonce].delivered_at is None
+
     @staticmethod
     def _queue(mech_service: MechService) -> t.Any:
         """Return the allocator's persisted queue for the safe on testchain."""
