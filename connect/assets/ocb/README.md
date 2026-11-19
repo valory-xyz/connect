@@ -20,7 +20,3 @@ with another `VERSION` makes Connect run the installer again.
   for byte from it
 - `VERSION`: `v0.1.0`, published to PyPI on 2026-11-19 (wheel sha256
   `18116ccab4df544d04e17e0ef33cbc0338aea3af3ab3f5aaf0c914ca7667a18a`)
-- Connect v0.1.16 and v0.1.17 bundled a wheel built locally from pre-release
-  sources (sha256 `98a68cd9…`), and earlier releases a 0.4.1 wheel. Their
-  install records name that wheel, not the PyPI requirement, so those
-  installs are replaced from PyPI once

@@ -47,7 +47,7 @@ logger = logging.getLogger("agent")
 # the bundle's place in the assets, and what it holds (from olas-ocb-agent)
 OCB_ASSETS_SUBDIR = "ocb"
 OCB_INSTALL_SCRIPT = "install.sh"
-# the olas-ocb-agent release to install, e.g. `v0.1.0`
+# the olas-ocb-agent release to install
 OCB_VERSION_FILE = "VERSION"
 # the installed ocb-agent path and the requirement it came from, kept beside
 # STORE_PATH (its parent, the service folder): outside the session's
@@ -67,6 +67,24 @@ OCB_PACKAGE = "olas-ocb-agent"
 OCB_EXTRA = "facilitator"
 # how much of the installer's output a failure log keeps
 OCB_INSTALL_LOG_CHARS = 2000
+# unset for the installer: each would replace the PyPI requirement the record
+# names, or the index or files it comes from
+OCB_INSTALLER_UNSET_ENV = frozenset(
+    {
+        "OCB_AGENT_SPEC",
+        "UV_INDEX",
+        "UV_INDEX_URL",
+        "UV_DEFAULT_INDEX",
+        "UV_EXTRA_INDEX_URL",
+        "UV_FIND_LINKS",
+        "UV_NO_INDEX",
+        "UV_INDEX_STRATEGY",
+        "UV_OVERRIDE",
+        "UV_CONSTRAINT",
+        "UV_BUILD_CONSTRAINT",
+        "UV_CONFIG_FILE",
+    }
+)
 
 
 def ocb_command(
@@ -95,12 +113,7 @@ def ocb_command(
 
 
 def install_identity(version: str) -> str:
-    """Return what an install of `version` is recorded as: install.sh's requirement.
-
-    The script installs `olas-ocb-agent[facilitator]==<version>` from PyPI, so
-    a record naming anything else (another release, another extra, or a wheel
-    an earlier Connect release bundled) installs again.
-    """
+    """Return the requirement install.sh installs for `version`."""
     return f"{OCB_PACKAGE}[{OCB_EXTRA}]=={version}"
 
 
@@ -131,40 +144,28 @@ class _Attempt:
 def _bundled_ocb(bundle_dir: t.Callable[[], Path]) -> tuple[Path, str]:
     """Return the bundled install script and the release it installs (no `v`).
 
-    :raises InstallError: when the build does not bundle both.
+    :raises InstallError: when either is missing, or VERSION is unreadable or bad.
     """
     try:
         bundle = bundle_dir()
     except FileNotFoundError as e:
         raise InstallError(str(e)) from e
     script = bundle / OCB_INSTALL_SCRIPT
-    try:
-        version = (bundle / OCB_VERSION_FILE).read_text(encoding="utf-8").strip()
-    except (OSError, ValueError):
-        version = ""
-    version = version.removeprefix("v")
-    if not script.is_file() or not re.fullmatch(r"[0-9A-Za-z.+-]+", version):
+    if not script.is_file():
         raise InstallError(f"this Connect build does not bundle OCB under {bundle}")
+    version_file = bundle / OCB_VERSION_FILE
+    try:
+        raw = version_file.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError) as e:
+        raise InstallError(f"cannot read OCB's {version_file}: {e}") from e
+    version = raw.removeprefix("v")
+    if not re.fullmatch(r"[0-9A-Za-z.+-]+", version):
+        raise InstallError(f"OCB's {version_file} names no release: {raw!r}")
     return script, version
 
 
 class OcbInstaller:
-    """Installs OCB with its bundled script, in the background, one at a time.
-
-    The script brings uv and a Python of its own, installs the release named
-    in the bundle's VERSION from PyPI and prints the absolute path of
-    `ocb-agent`, which is launched by path: uv's tool directory is not always
-    on the login PATH. The path is recorded with the requirement it came from
-    (install_identity), so a Connect release asking for another release or
-    extra, or one replacing a wheel an earlier release bundled, installs
-    again; a matching record does not. The record lives in `record_dir`,
-    outside the workspace, and carries a MAC keyed off the agent key, so
-    neither the session nor anything else that can write the file can point
-    Connect's next launch at another program: an unsigned or tampered record
-    reads as no record, and OCB installs again.
-    A recorded path must also be `ocb-agent` inside uv's tool directory for
-    olas-ocb-agent, or it is not launched.
-    """
+    """Installs OCB from PyPI with its bundled script, one install at a time."""
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
@@ -333,8 +334,9 @@ class OcbInstaller:
         returncode, stdout, stderr = _run_installer(
             ["sh", str(script), version],
             cwd=self._store_path,
-            # unset: it would replace the PyPI requirement the record names
-            env={k: v for k, v in self._env().items() if k != "OCB_AGENT_SPEC"},
+            env={
+                k: v for k, v in self._env().items() if k not in OCB_INSTALLER_UNSET_ENV
+            },
             timeout=timeout,
         )
         installed = None if returncode else self._ocb_agent(_last_line(stdout))

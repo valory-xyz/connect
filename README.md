@@ -344,14 +344,15 @@ default, logged once.
 **Install.** Connect installs OCB from PyPI with OCB's `install.sh`, the
 release named in `VERSION`, both under `connect/assets/ocb/` (its README says
 what goes there); the OCB team supplies the script, committed as given.
-Without both, every install fails with `install_failed`. Selecting
-`ocb_cli` in `PATCH /settings` starts the install in the background and
-returns. `POST /session` with `ocb_cli` joins an install already running, or
-starts one, and waits for it at most `OCB_SESSION_WAIT_SECONDS` (240 s,
-inside Pearl's ~300 s request): past that it answers `install_failed` ("still
-being installed") while the install goes on, so a Retry finds it done. The
-script runs as `sh install.sh <VERSION>` in STORE_PATH, in its own session,
-with stdin closed, `harness_env()` without `OCB_AGENT_SPEC` (so it installs
+Without both, every install fails with `install_failed`. Selecting `ocb_cli`
+in `PATCH /settings` starts the install in the background and returns.
+`POST /session` with `ocb_cli` joins an install already running, or starts
+one, and waits for it at most `OCB_SESSION_WAIT_SECONDS` (240 s, inside
+Pearl's ~300 s request): past that it answers `install_failed` ("still being
+installed") while the install goes on, so a Retry finds it done. The script
+runs as `sh install.sh <VERSION>` in STORE_PATH, in its own session, with
+stdin closed, `harness_env()` without `OCB_AGENT_SPEC` or uv's index and
+source variables (`OCB_INSTALLER_UNSET_ENV`, so it installs
 `olas-ocb-agent[facilitator]==<VERSION>` from PyPI; the CLI imports the
 facilitator at startup, so the extra is required), and the
 `OCB_INSTALL_TIMEOUT_SECONDS` timeout (`connect/ocb.py`), after which its
@@ -359,18 +360,17 @@ whole process group is killed, uv and curl included. It brings uv and a
 Python of its own, prints the absolute path of `ocb-agent` on success, and a
 one-line reason on stderr otherwise; that line becomes `/session`'s `error`.
 Connect records the path, with the requirement it installed
-(`olas-ocb-agent[facilitator]==<VERSION>`), in `.ocb-agent.json` in STORE_PATH's parent (the service's own
-folder), outside the workspace and readable by its owner alone, so the
-session cannot point the next launch at another program, and outside
-Connect's working directory, which Pearl rebuilds on every service start, so
-a restart does not install again. The path is the last non-empty line the
-script prints. A record naming another requirement installs again, so a
-release with a newer `VERSION` or a different extra reaches existing
-installs, and an install from a wheel an earlier release bundled (recorded
-by wheel name and sha256) is replaced from PyPI once; a matching record is
-launched as is. One install runs
-at a time. Nothing is
-installed for an operator who never selects `ocb_cli`.
+(`olas-ocb-agent[facilitator]==<VERSION>`), in `.ocb-agent.json` in
+STORE_PATH's parent (the service's own folder), outside the workspace and
+readable by its owner alone, so the session cannot point the next launch at
+another program, and outside Connect's working directory, which Pearl
+rebuilds on every service start, so a restart does not install again. The
+path is the last non-empty line the script prints. A record naming another
+requirement installs again, so a release with a newer `VERSION` or a
+different extra reaches existing installs, and an install from a wheel an
+earlier release bundled (recorded by wheel name and sha256) is replaced from
+PyPI once; a matching record is launched as is. One install runs at a time.
+Nothing is installed for an operator who never selects `ocb_cli`.
 
 **Launch.** A terminal opens, the same way as for `codex_cli`, running
 

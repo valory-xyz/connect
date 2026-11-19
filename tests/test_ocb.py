@@ -66,7 +66,7 @@ from tests.conftest import audit_entries
 MECH = "0x" + "ab" * 20
 VERSION = "0.4.1"
 VERSION_FILE = b"v0.4.1"  # as the OCB team writes it
-# what Connect v0.1.16-v0.1.17 recorded for the 0.1.0 wheel it bundled
+# what earlier releases recorded for their bundled wheel
 BUNDLED_WHEEL_RECORD = (
     "olas-ocb-agent[facilitator] @ olas_ocb_agent-0.1.0-py3-none-any.whl "
     "sha256:98a68cd9e7ee62eb04412342f7d3c84da6004a91cc793e9c6eceaa8d7998846f"
@@ -329,7 +329,6 @@ def test_ocb_is_never_launched_or_installed_without_a_mech(store_path: Path) -> 
 # --- install ---------------------------------------------------------------
 
 
-@POSIX_ONLY
 def test_an_install_is_recorded_as_install_sh_s_pypi_requirement() -> None:
     """ocb-agent's CLI imports the facilitator at startup; a plain install crashes."""
     assert ocb.install_identity("0.4.1") == "olas-ocb-agent[facilitator]==0.4.1"
@@ -351,6 +350,45 @@ def test_install_runs_the_bundled_script_once(
     assert installer.ensure(30) == installed
     log = (store_path / "installs.log").read_text().splitlines()
     assert log == [VERSION]
+
+
+@POSIX_ONLY
+def test_uv_s_index_and_source_settings_do_not_reach_the_installer(
+    bundle: Path,
+    installer: OcbInstaller,
+    store_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OCB comes from PyPI whatever index Connect's environment names."""
+    redirects = [
+        "UV_INDEX",
+        "UV_INDEX_URL",
+        "UV_DEFAULT_INDEX",
+        "UV_EXTRA_INDEX_URL",
+        "UV_FIND_LINKS",
+        "UV_NO_INDEX",
+        "UV_INDEX_STRATEGY",
+        "UV_OVERRIDE",
+        "UV_CONSTRAINT",
+        "UV_BUILD_CONSTRAINT",
+        "UV_CONFIG_FILE",
+    ]
+    for name in redirects:
+        monkeypatch.setenv(name, "https://example.com/simple")
+    script = (bundle / ocb.OCB_INSTALL_SCRIPT).read_text(encoding="utf-8")
+    (bundle / ocb.OCB_INSTALL_SCRIPT).write_text(
+        script.replace("#!/bin/sh\n", "#!/bin/sh\nenv > installer.env\n", 1),
+        encoding="utf-8",
+    )
+    installer.ensure(30)
+    seen = dict(
+        line.split("=", 1)
+        for line in (store_path / "installer.env").read_text().splitlines()
+        if "=" in line
+    )
+    assert not set(redirects) & set(seen)
+    assert seen["UV_TOOL_DIR"] == str(tmp_path / "tools")  # uv's locations stay
 
 
 @POSIX_ONLY
@@ -461,19 +499,18 @@ def test_a_moved_bundle_does_not_reinstall(
         BUNDLED_WHEEL_RECORD.split(" sha256:", maxsplit=1)[0],  # before the sha256
     ],
 )
+@pytest.mark.usefixtures("bundle")
 def test_an_install_from_a_bundled_wheel_is_replaced_from_pypi_once(
     installer: OcbInstaller,
     record_dir: Path,
     store_path: Path,
     tmp_path: Path,
-    bundle: Path,
     requirement: str,
 ) -> None:
     """Earlier releases installed a bundled wheel; the next start installs from PyPI.
 
     After that one install the record matches, and nothing installs again.
     """
-    assert bundle.is_dir()
     installed = make_agent(tool_agent(tmp_path))
     (record_dir / ocb.OCB_RECORD_FILE).write_text(
         installer._signed_record(installed, requirement)  # pylint: disable=W0212
@@ -696,13 +733,14 @@ def test_a_failed_install_says_why(
 
 
 @pytest.mark.parametrize(
-    "version",
+    ("version", "error"),
     [
-        None,
-        b"",
-        b"v",
-        b"0.1.0; rm -rf ~",  # install.sh would refuse it too
-        b"\xff\xfe",  # not UTF-8
+        (None, "cannot read OCB's .*VERSION: "),
+        (b"\xff\xfe", "cannot read OCB's .*VERSION: .*codec"),  # not UTF-8
+        (b"", "VERSION names no release: ''"),
+        (b"v", "VERSION names no release: 'v'"),
+        # install.sh would refuse it too
+        (b"0.1.0; rm -rf ~", "VERSION names no release: '0.1.0; rm -rf ~'"),
     ],
 )
 def test_a_build_without_a_usable_version_cannot_install(
@@ -710,9 +748,21 @@ def test_a_build_without_a_usable_version_cannot_install(
     installer: OcbInstaller,
     monkeypatch: pytest.MonkeyPatch,
     version: bytes | None,
+    error: str,
 ) -> None:
-    """Which release to install must never be a guess."""
+    """Which release to install must never be a guess, and the error says why."""
     bundle = write_bundle(tmp_path, "exit 0\n", version=version)
+    monkeypatch.setattr(workspace, "assets_dir", lambda: bundle.parent)
+    with pytest.raises(InstallError, match=error):
+        installer.ensure(30)
+
+
+def test_a_build_without_the_install_script_cannot_install(
+    tmp_path: Path, installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VERSION alone installs nothing."""
+    bundle = write_bundle(tmp_path, "exit 0\n")
+    (bundle / ocb.OCB_INSTALL_SCRIPT).unlink()
     monkeypatch.setattr(workspace, "assets_dir", lambda: bundle.parent)
     with pytest.raises(InstallError, match="does not bundle OCB"):
         installer.ensure(30)
