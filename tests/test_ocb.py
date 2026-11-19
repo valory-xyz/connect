@@ -23,6 +23,7 @@
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -63,17 +64,24 @@ from connect.workspace import Workspace
 from tests.conftest import audit_entries
 
 MECH = "0x" + "ab" * 20
-WHEEL = "olas_ocb_agent-0.4.1-py3-none-any.whl"  # the name olas-ocb-agent builds
+VERSION = "0.4.1"
+# what Connect v0.1.16-v0.1.17 recorded for the 0.1.0 wheel it bundled
+BUNDLED_WHEEL_RECORD = (
+    "olas-ocb-agent[facilitator] @ olas_ocb_agent-0.1.0-py3-none-any.whl "
+    "sha256:98a68cd9e7ee62eb04412342f7d3c84da6004a91cc793e9c6eceaa8d7998846f"
+)
 POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="sh install script")
 
 
-def write_bundle(root: Path, script: str, wheels: tuple[str, ...] = (WHEEL,)) -> Path:
-    """Lay out assets/ocb with an install script and these wheels."""
+def write_bundle(
+    root: Path, script: str, version: bytes | None = b"v" + VERSION.encode()
+) -> Path:
+    """Lay out assets/ocb with an install script and, unless None, this VERSION."""
     bundle = root / "assets" / ocb.OCB_ASSETS_SUBDIR
     bundle.mkdir(parents=True)
     (bundle / ocb.OCB_INSTALL_SCRIPT).write_text(script, encoding="utf-8")
-    for wheel in wheels:
-        (bundle / wheel).write_bytes(b"")
+    if version is not None:
+        (bundle / ocb.OCB_VERSION_FILE).write_bytes(version + b"\n")
     return bundle
 
 
@@ -86,10 +94,13 @@ def make_agent(path: Path) -> Path:
 
 
 def installer_script(executable: Path) -> str:
-    """Return an install.sh honouring the contract: record the spec, print the path."""
+    """Return an install.sh honouring the contract: record the version, print the path.
+
+    A set OCB_AGENT_SPEC, which would replace the PyPI requirement, is logged too.
+    """
     return (
         "#!/bin/sh\n"
-        'echo "$OCB_AGENT_SPEC" >> installs.log\n'
+        'echo "$1${OCB_AGENT_SPEC:+ spec=$OCB_AGENT_SPEC}" >> installs.log\n'
         f"printf '#!/bin/sh\\n' > {shlex.quote(str(executable))}\n"
         f"chmod +x {shlex.quote(str(executable))}\n"
         f"echo {shlex.quote(str(executable))}\n"
@@ -320,26 +331,27 @@ def test_ocb_is_never_launched_or_installed_without_a_mech(store_path: Path) -> 
 
 
 @POSIX_ONLY
-def test_the_wheel_installs_with_the_facilitator_extra() -> None:
-    """ocb-agent's CLI imports the facilitator at startup; a plain wheel crashes."""
-    wheel = Path("/opt/connect/assets/ocb dir") / WHEEL
-    assert ocb.ocb_agent_spec(wheel) == (
-        "olas-ocb-agent[facilitator] @ "
-        "file:///opt/connect/assets/ocb%20dir/olas_ocb_agent-0.4.1-py3-none-any.whl"
-    )
+def test_an_install_is_recorded_as_install_sh_s_pypi_requirement() -> None:
+    """ocb-agent's CLI imports the facilitator at startup; a plain install crashes."""
+    assert ocb.install_identity("0.4.1") == "olas-ocb-agent[facilitator]==0.4.1"
 
 
 @POSIX_ONLY
 def test_install_runs_the_bundled_script_once(
-    bundle: Path, installer: OcbInstaller, store_path: Path, tmp_path: Path
+    bundle: Path,
+    installer: OcbInstaller,
+    store_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The real wheel name is found and installed plain; a rerun installs nothing."""
+    """VERSION is passed without its v, never a spec; a rerun installs nothing."""
+    monkeypatch.setenv("OCB_AGENT_SPEC", "olas-ocb-agent @ https://example.com/x")
     assert installer.path() is None
     installed = installer.ensure(30)
     assert installed == tool_agent(tmp_path)
     assert installer.ensure(30) == installed
     log = (store_path / "installs.log").read_text().splitlines()
-    assert log == [f"olas-ocb-agent[facilitator] @ {(bundle / WHEEL).as_uri()}"]
+    assert log == [VERSION]
 
 
 @POSIX_ONLY
@@ -390,34 +402,33 @@ def test_a_restart_that_rebuilds_the_deployment_does_not_reinstall(
 
 
 @POSIX_ONLY
-def test_a_newer_bundled_wheel_installs_again(
+def test_a_newer_version_installs_again(
     tmp_path: Path,
     installer: OcbInstaller,
     store_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Connect release with another wheel reaches users who installed before."""
+    """A Connect release with another VERSION reaches users who installed before."""
     tool_agent(tmp_path).parent.mkdir(parents=True)
     script = installer_script(tool_agent(tmp_path))
     old = write_bundle(tmp_path / "old", script)
     monkeypatch.setattr(workspace, "assets_dir", lambda: old.parent)
     installer.ensure(30)
-    new_wheel = "olas_ocb_agent-0.4.2-py3-none-any.whl"
-    new = write_bundle(tmp_path / "new", script, wheels=(new_wheel,))
+    new = write_bundle(tmp_path / "new", script, version=b"0.4.2")
     monkeypatch.setattr(workspace, "assets_dir", lambda: new.parent)
     assert installer.path() is None
     installer.ensure(30)
     log = (store_path / "installs.log").read_text().splitlines()
-    assert log == [ocb.ocb_agent_spec(old / WHEEL), ocb.ocb_agent_spec(new / new_wheel)]
+    assert log == [VERSION, "0.4.2"]
 
 
 @POSIX_ONLY
 def test_a_change_of_extra_installs_again(
     bundle: Path, installer: OcbInstaller, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same wheel, another extra: the install on disk is not what is asked for.
+    """Same release, another extra: the install on disk is not what is asked for.
 
-    How a machine that installed the plain wheel picks up [facilitator].
+    How a machine that installed the plain package picks up [facilitator].
     """
     installer.ensure(30)
     monkeypatch.setattr(ocb, "OCB_EXTRA", "something-else")
@@ -444,46 +455,48 @@ def test_a_moved_bundle_does_not_reinstall(
 
 
 @POSIX_ONLY
-def test_a_rebuilt_wheel_under_the_same_name_installs_again(
-    bundle: Path, installer: OcbInstaller, store_path: Path
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        BUNDLED_WHEEL_RECORD,  # Connect v0.1.16-v0.1.17
+        BUNDLED_WHEEL_RECORD.split(" sha256:", maxsplit=1)[0],  # before the sha256
+    ],
+)
+def test_an_install_from_a_bundled_wheel_is_replaced_from_pypi_once(
+    installer: OcbInstaller,
+    record_dir: Path,
+    store_path: Path,
+    tmp_path: Path,
+    bundle: Path,
+    requirement: str,
 ) -> None:
-    """Same file name and version, other bytes: the install on disk is stale."""
-    installed = installer.ensure(30)
-    (bundle / WHEEL).write_bytes(b"the same bytes")
-    assert installer.path() is None
-    installer.ensure(30)
-    (bundle / WHEEL).write_bytes(b"the same bytes")  # rewritten, unchanged
-    assert installer.path() == installed
-    assert len((store_path / "installs.log").read_text().splitlines()) == 2
+    """Earlier releases installed a bundled wheel; the next start installs from PyPI.
 
-
-@POSIX_ONLY
-def test_a_record_by_wheel_name_alone_installs_once_more(
-    bundle: Path, installer: OcbInstaller, record_dir: Path, store_path: Path
-) -> None:
-    """A record from before the sha256 was part of the identity is stale once."""
-    installed = installer.ensure(30)
-    by_name = ocb.install_identity(bundle / WHEEL).split(" sha256:", maxsplit=1)[0]
+    After that one install the record matches, and nothing installs again.
+    """
+    assert bundle.is_dir()
+    installed = make_agent(tool_agent(tmp_path))
     (record_dir / ocb.OCB_RECORD_FILE).write_text(
-        installer._signed_record(installed, by_name)  # pylint: disable=W0212
+        installer._signed_record(installed, requirement)  # pylint: disable=W0212
     )
     assert installer.path() is None
     assert installer.ensure(30) == installed
+    record = json.loads((record_dir / ocb.OCB_RECORD_FILE).read_text())
+    assert record["requirement"] == f"olas-ocb-agent[facilitator]=={VERSION}"
     assert installer.path() == installed
-    assert len((store_path / "installs.log").read_text().splitlines()) == 2
+    assert installer.ensure(30) == installed
+    assert (store_path / "installs.log").read_text().splitlines() == [VERSION]
 
 
 @POSIX_ONLY
-def test_an_unreadable_bundled_wheel_keeps_the_recorded_install(
+def test_an_unreadable_version_keeps_the_recorded_install(
     bundle: Path, installer: OcbInstaller
 ) -> None:
     """Nothing readable to install is no reason to drop the one installed."""
     installed = installer.ensure(30)
-    (bundle / WHEEL).unlink()
-    (bundle / WHEEL).mkdir()  # read -> OSError
+    (bundle / ocb.OCB_VERSION_FILE).unlink()
+    (bundle / ocb.OCB_VERSION_FILE).mkdir()  # read -> OSError
     assert installer.path() == installed
-    with pytest.raises(InstallError, match="could not read the bundled"):
-        ocb.install_identity(bundle / WHEEL)
 
 
 @POSIX_ONLY
@@ -684,24 +697,23 @@ def test_a_failed_install_says_why(
 
 
 @pytest.mark.parametrize(
-    "wheels",
+    "version",
     [
-        (),
-        (
-            "olas_ocb_agent-0.4.1-py3-none-any.whl",
-            "olas_ocb_agent-0.4.2-py3-none-any.whl",
-        ),
-        ("ocb_agent-0.4.1-py3-none-any.whl",),  # not the package's name
+        None,
+        b"",
+        b"v",
+        b"0.1.0; rm -rf ~",  # install.sh would refuse it too
+        b"\xff\xfe",  # not UTF-8
     ],
 )
-def test_a_build_without_exactly_one_wheel_cannot_install(
+def test_a_build_without_a_usable_version_cannot_install(
     tmp_path: Path,
     installer: OcbInstaller,
     monkeypatch: pytest.MonkeyPatch,
-    wheels: tuple[str, ...],
+    version: bytes | None,
 ) -> None:
-    """Which wheel to install must never be a guess."""
-    bundle = write_bundle(tmp_path, "exit 0\n", wheels=wheels)
+    """Which release to install must never be a guess."""
+    bundle = write_bundle(tmp_path, "exit 0\n", version=version)
     monkeypatch.setattr(workspace, "assets_dir", lambda: bundle.parent)
     with pytest.raises(InstallError, match="does not bundle OCB"):
         installer.ensure(30)
@@ -1016,22 +1028,27 @@ def test_only_the_last_line_the_installer_prints_is_the_path(
 
 
 def test_this_build_bundles_ocb() -> None:
-    """The shipped bundle resolves: deleting the script or the wheel fails here."""
+    """The shipped bundle resolves, holds no wheel, and asks for install.sh's default.
+
+    Deleting the script or VERSION fails here, as does a VERSION the script's
+    DEFAULT_VERSION disagrees with.
+    """
     bundle = workspace.assets_dir() / ocb.OCB_ASSETS_SUBDIR
-    script, wheel = ocb._bundled_ocb(lambda: bundle)
+    script, version = ocb._bundled_ocb(lambda: bundle)  # pylint: disable=W0212
     assert script == bundle / ocb.OCB_INSTALL_SCRIPT
-    assert wheel.name.startswith("olas_ocb_agent-")
-    assert wheel.stat().st_size > 0
-    version = (bundle / "VERSION").read_text(encoding="utf-8").strip()
-    assert version
-    assert wheel.name == f"olas_ocb_agent-{version.lstrip('v')}-py3-none-any.whl"
+    assert not list(bundle.glob("*.whl"))
+    default = re.search(
+        r'^DEFAULT_VERSION="([^"]+)"', script.read_text(encoding="utf-8"), re.M
+    )
+    assert default is not None
+    assert version == default.group(1)
 
 
 def test_the_bundle_directory_says_what_goes_in_it() -> None:
-    """The OCB team drops install.sh and the wheel here."""
+    """The OCB team drops install.sh here; VERSION names the PyPI release."""
     readme = Path(workspace.__file__).parent / "assets" / "ocb" / "README.md"
     text = readme.read_text(encoding="utf-8")
-    for name in ("install.sh", "olas_ocb_agent-", "VERSION"):
+    for name in ("install.sh", "VERSION", "PyPI"):
         assert name in text
 
 

@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-"""OCB: the launch line, and installing it from the bundled script and wheel.
+"""OCB: the launch line, and installing it from PyPI with the bundled script.
 
 Split out of workspace.py, over pylint's line limit. The workspace hands in
 where the bundle is and the scrubbed environment, so this module needs
@@ -30,6 +30,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import subprocess  # nosec B404
@@ -46,8 +47,9 @@ logger = logging.getLogger("agent")
 # the bundle's place in the assets, and what it holds (from olas-ocb-agent)
 OCB_ASSETS_SUBDIR = "ocb"
 OCB_INSTALL_SCRIPT = "install.sh"
-OCB_WHEEL_GLOB = "olas_ocb_agent-*.whl"
-# the installed ocb-agent path and the wheel it came from, kept beside
+# the olas-ocb-agent release to install, e.g. `v0.1.0`
+OCB_VERSION_FILE = "VERSION"
+# the installed ocb-agent path and the requirement it came from, kept beside
 # STORE_PATH (its parent, the service folder): outside the session's
 # workspace, and not in Connect's cwd, the deployment directory Pearl rebuilds
 # on every service start; HMAC'd with a key derived from the agent key
@@ -55,11 +57,11 @@ OCB_RECORD_FILE = ".ocb-agent.json"
 _RECORD_KEY_INFO = b"pearl-connect ocb install record v1"
 # what uv names the tool and the executable a recorded path must resolve to
 OCB_EXECUTABLE = "ocb-agent"
-# the script fetches uv, a Python and the wheel's dependencies
+# the script fetches uv, a Python, olas-ocb-agent and its dependencies
 OCB_INSTALL_TIMEOUT_SECONDS = 600.0
 # how long POST /session waits for an install: Pearl gives up at ~300s
 OCB_SESSION_WAIT_SECONDS = 240.0
-# ocb-agent's CLI imports the facilitator at startup, so the wheel installs
+# ocb-agent's CLI imports the facilitator at startup, so the package installs
 # with that extra; without it every launch dies on a missing eth_abi
 OCB_PACKAGE = "olas-ocb-agent"
 OCB_EXTRA = "facilitator"
@@ -92,31 +94,14 @@ def ocb_command(
     return shlex.join(line)
 
 
-def _requirement(target: str) -> str:
-    """Return the package, with its extra, at `target`; one shape for both uses."""
-    return f"{OCB_PACKAGE}[{OCB_EXTRA}] @ {target}"
+def install_identity(version: str) -> str:
+    """Return what an install of `version` is recorded as: install.sh's requirement.
 
-
-def ocb_agent_spec(wheel: Path) -> str:
-    """Return the requirement install.sh installs: the bundled wheel, with its extra."""
-    return _requirement(wheel.as_uri())
-
-
-def install_identity(wheel: Path) -> str:
-    """Return what an install is recorded as: the requirement and the wheel's sha256.
-
-    The requirement names the wheel by file name; the sha256 makes a rebuilt
-    wheel under the same name install again. Not ocb_agent_spec: its URI holds
-    the bundle's location, which in the packaged binary is a fresh extraction
-    directory on every start.
-
-    :raises InstallError: when the bundled wheel cannot be read.
+    The script installs `olas-ocb-agent[facilitator]==<version>` from PyPI, so
+    a record naming anything else (another release, another extra, or a wheel
+    an earlier Connect release bundled) installs again.
     """
-    try:
-        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
-    except OSError as e:
-        raise InstallError(f"could not read the bundled {wheel.name}: {e}") from e
-    return f"{_requirement(wheel.name)} sha256:{digest}"
+    return f"{OCB_PACKAGE}[{OCB_EXTRA}]=={version}"
 
 
 class _Attempt:
@@ -143,32 +128,36 @@ class _Attempt:
         return self._thread.is_alive()
 
 
-def _bundled_ocb(bundle_dir: t.Callable[[], Path]) -> tuple[Path, Path]:
-    """Return the bundled install script and the one wheel it installs.
+def _bundled_ocb(bundle_dir: t.Callable[[], Path]) -> tuple[Path, str]:
+    """Return the bundled install script and the release it installs (no `v`).
 
-    :raises InstallError: when the build does not bundle exactly that.
+    :raises InstallError: when the build does not bundle both.
     """
     try:
         bundle = bundle_dir()
     except FileNotFoundError as e:
         raise InstallError(str(e)) from e
     script = bundle / OCB_INSTALL_SCRIPT
-    wheels = sorted(bundle.glob(OCB_WHEEL_GLOB))
-    if not script.is_file() or len(wheels) != 1:
+    try:
+        version = (bundle / OCB_VERSION_FILE).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        version = ""
+    version = version.removeprefix("v")
+    if not script.is_file() or not re.fullmatch(r"[0-9A-Za-z.+-]+", version):
         raise InstallError(f"this Connect build does not bundle OCB under {bundle}")
-    return script, wheels[0]
+    return script, version
 
 
 class OcbInstaller:
     """Installs OCB with its bundled script, in the background, one at a time.
 
-    The script brings uv and a Python of its own, installs the bundled wheel
-    and prints the absolute path of `ocb-agent`, which is launched by path:
-    uv's tool directory is not always on the login PATH. The path is recorded
-    with the requirement it came from and the wheel's sha256 (install_identity),
-    so a Connect release bundling another wheel, a rebuilt one under the same
-    name, or asking for another extra, installs again. The
-    record lives in `record_dir`, outside the workspace, and carries a MAC
+    The script brings uv and a Python of its own, installs the release named
+    in the bundle's VERSION from PyPI and prints the absolute path of
+    `ocb-agent`, which is launched by path: uv's tool directory is not always
+    on the login PATH. The path is recorded with the requirement it came from
+    (install_identity), so a Connect release asking for another release or
+    extra, or one replacing a wheel an earlier release bundled, installs
+    again; a matching record does not. The record lives in `record_dir`, outside the workspace, and carries a MAC
     keyed off the agent key, so neither the session nor anything else that
     can write the file can point Connect's next launch at another program: an
     unsigned or tampered record reads as no record, and OCB installs again.
@@ -285,13 +274,13 @@ class OcbInstaller:
         if installed is None:
             return None
         try:
-            bundled = install_identity(_bundled_ocb(self._bundle_dir)[1])
+            wanted = install_identity(_bundled_ocb(self._bundle_dir)[1])
         except InstallError:
             return installed  # nothing newer to install
-        if record.get("requirement") != bundled:
+        if record.get("requirement") != wanted:
             logger.info(
-                "bundled OCB is now %s (installed: %s); reinstalling",
-                bundled,
+                "Connect now installs %s (installed: %s); reinstalling",
+                wanted,
                 record.get("requirement"),
             )
             return None
@@ -338,12 +327,13 @@ class OcbInstaller:
 
     def _install(self, timeout: float) -> Path:
         """Run the bundled script and record the path it reports."""
-        script, wheel = _bundled_ocb(self._bundle_dir)
-        logger.info("installing OCB from %s", wheel.name)
+        script, version = _bundled_ocb(self._bundle_dir)
+        logger.info("installing OCB %s from PyPI", version)
         returncode, stdout, stderr = _run_installer(
-            ["sh", str(script)],
+            ["sh", str(script), version],
             cwd=self._store_path,
-            env={**self._env(), "OCB_AGENT_SPEC": ocb_agent_spec(wheel)},
+            # unset: it would replace the PyPI requirement the record names
+            env={k: v for k, v in self._env().items() if k != "OCB_AGENT_SPEC"},
             timeout=timeout,
         )
         installed = None if returncode else self._ocb_agent(_last_line(stdout))
@@ -364,7 +354,7 @@ class OcbInstaller:
         try:
             write_private(
                 self._record,
-                self._signed_record(installed, install_identity(wheel)),
+                self._signed_record(installed, install_identity(version)),
             )
         except OSError as e:
             raise InstallError(f"could not record where OCB is installed: {e}") from e
