@@ -74,9 +74,7 @@ BUNDLED_WHEEL_RECORD = (
 POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="sh install script")
 
 
-def write_bundle(
-    root: Path, script: str, version: bytes | None = VERSION_FILE
-) -> Path:
+def write_bundle(root: Path, script: str, version: bytes | None = VERSION_FILE) -> Path:
     """Lay out assets/ocb with an install script and, unless None, this VERSION."""
     bundle = root / "assets" / ocb.OCB_ASSETS_SUBDIR
     bundle.mkdir(parents=True)
