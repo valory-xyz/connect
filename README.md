@@ -750,7 +750,11 @@ never answered may have landed: its nonce stays held, and the request fails
 with an error naming the deposit's
 hash and promising no replay, the deposit is audited as
 `mech_deposit_unconfirmed`, and a caller's `request_id` is held as possibly
-paid for rather than freed for a resend that could top up again. A
+paid for rather than freed for a resend that could top up again. A delivery
+carrying the mech's rejection (inline, with no result file: the mech
+discarded the request without settling it, so `mapNonces` still equals its
+nonce) frees that slot, so the next request from the safe reuses the nonce
+instead of going out above the slot the mech expects. A
 queue whose held slot `mapNonces` has not passed within the settle timeout
 (`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s) after its
 delivery, or after the request's own 300 s response timeout, stalls: only a

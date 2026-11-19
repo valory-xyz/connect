@@ -29,6 +29,7 @@ import time
 import typing as t
 
 from mech_client import MechPriceExceeded, NonceAllocator
+from mech_client.nonces import DELIVERY_REJECTED
 from mech_client.services.marketplace_service import MarketplaceService
 from web3 import Web3
 
@@ -55,6 +56,10 @@ HARD_CANCEL_AVAILABLE = (
 HARD_CANCEL_PROMPT = "Connect hard cancel: consumes this safe's stuck marketplace nonce"
 # the hard cancel only needs its transaction mined, not the mech's answer
 HARD_CANCEL_WAIT_SECONDS = 1.0
+
+# one delivered slot: its nonce, the delivery's inline data, and the url of
+# its result file where it named one
+DeliveredSlot = tuple[int, t.Any, str | None]
 
 
 class HardCancelRefused(MechError):
@@ -243,6 +248,38 @@ class MechQueue:
             error=type(failure).__name__,
         )
         raise HardCancelFailed(chain) from failure
+
+    def settle(
+        self, chain: str, safe: str, slots: t.Sequence[DeliveredSlot], *, salt: str
+    ) -> None:
+        """Start the settle clock of each delivered slot, freeing the rejected ones.
+
+        A delivery carrying the mech's rejection is a request it discarded
+        without settling, so it holds nothing at that nonce and `mapNonces`
+        still equals it. Freeing the slot (mech-client's
+        `NonceAllocator.rejected`, which names the slot by the metadata salt
+        its request was sent with, so a repeat cannot free the next request's
+        slot) is what hands that nonce to the next request, instead of every
+        later request going out above the mech's expected slot. A freed nonce
+        may already be another request's by now, so only the slots still held
+        start a settle clock.
+
+        The rejection is inline: a delivery naming a result file carries a
+        settled request's tool output, whose own status is not the mech's.
+        That rule is mech-client's (`mech_client.nonces`).
+        """
+        rejected = [
+            (nonce, salt)
+            for nonce, data, url in slots
+            if url is None
+            and isinstance(data, dict)
+            and data.get("status") == DELIVERY_REJECTED
+        ]
+        self.allocator.rejected(chain, safe, rejected)
+        freed = {nonce for nonce, _ in rejected}
+        self.allocator.delivered(
+            chain, safe, [nonce for nonce, _, _ in slots if nonce not in freed]
+        )
 
     def in_flight(self, chain: str, safe: str, settled: int) -> int:
         """Count the safe's slots the allocator holds at or above `settled`.

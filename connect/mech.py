@@ -672,13 +672,19 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             payload["expires"] = None
             payload.update(self.queue.report(plan.chain))
         self._resume_watch(payload, deadline)
-        if plan.offchain:  # a delivery starts the settle clock
+        if plan.offchain:  # a delivery starts the settle clock, or frees the slot
             by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
             got = payload.get("delivery_results") or {}
-            self._nonces.delivered(
+            urls = payload.get("delivery_urls") or {}
+            self.queue.settle(
                 plan.chain,
                 t.cast(str, self._config.chain(plan.chain).safe_address),
-                [nonce for key, nonce in by_key if key in got],
+                [
+                    (nonce, got[key], urls.get(key))
+                    for key, nonce in by_key
+                    if key in got
+                ],
+                salt=str((plan.extra_attributes or {})["nonce"]),
             )
         try:  # paid and delivered by now: a delivery it cannot read loses nothing
             if is_chat_prompt(prompt):
