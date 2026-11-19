@@ -3492,7 +3492,7 @@ class TestMech:
             ledger_api=object(),
             marketplace_contract=lambda: "contract",
         )
-        pending = PendingDelivery("testchain", OTHER, 42, offchain, 99)
+        pending = PendingDelivery("testchain", OTHER, 42, offchain, 99, None, None)
         out = asyncio.run(MechService._watch(service, pending, "ab", 5.0))
         assert out == {"ab": "delivered"}
         assert seen["request_ids"] == ["ab"]
@@ -7530,12 +7530,57 @@ class TestMech:
         assert queue.slots[nonce].delivered_at is None
         mech_service.queue.settle(
             "testchain",
-            SAFE,
             [(nonce, {"status": "rejected"}, None)],
             salt=queue.slots[nonce].salt,
         )
         assert nonce in queue.slots
         assert queue.slots[nonce].delivered_at is not None
+
+    @pytest.mark.parametrize(
+        ("data", "freed"),
+        [({"status": "rejected"}, True), ({"answer": "42"}, False)],
+    )
+    def test_a_delivery_read_through_mech_result_settles_its_slot(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+        data: dict,
+        freed: bool,
+    ) -> None:
+        """A delivery that arrives after the caller's wait still settles its slot."""
+
+        async def nothing(*_args: t.Any) -> dict:
+            return {}
+
+        async def late(*_args: t.Any) -> dict:
+            return {"ab": DeliveryResult(request_id="ab", data=data, url=None)}
+
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(nothing))
+        nonce = patched_mech.contract.nonce
+        patched_mech.result = {
+            **patched_mech.result,
+            "request_ids": ["ab"],
+            "nonces": [nonce],
+            "deliveries": {},
+        }
+        out = mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=1,  # the wait runs out before the delivery arrives
+            top_up_budget=None,
+        )
+        assert out["pending_request_ids"] == ["ab"]
+        assert self._queue(mech_service).slots[nonce].delivered_at is None
+        monkeypatch.setattr(mech_module.MechService, "_watch", staticmethod(late))
+        assert mech_service.result("ab")["result"] == data
+        queue = self._queue(mech_service)
+        if freed:
+            assert nonce not in queue.slots
+        else:
+            assert queue.slots[nonce].delivered_at is not None
 
     @staticmethod
     def _queue(mech_service: MechService) -> t.Any:

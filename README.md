@@ -756,7 +756,9 @@ discarded the request without settling it, so `mapNonces` still equals its
 nonce) frees that slot, so the next request from the safe reuses the nonce
 instead of going out above the slot the mech expects; it is freed only while
 no later slot is held above it, since freeing one below the top would hand
-the next request a nonce a live slot already holds. A
+the next request a nonce a live slot already holds. A rejection that arrives
+after the request's own wait frees it just the same, when `mech_result` reads
+the delivery. A
 queue whose held slot `mapNonces` has not passed within the settle timeout
 (`CONNECTION_CONFIGS_CONFIG_MECH_SETTLE_TIMEOUT`, default 1800 s) after its
 delivery, or after the request's own 300 s response timeout, stalls: only a

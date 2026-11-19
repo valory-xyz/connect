@@ -591,6 +591,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 mech=plan.priced.mech,
                 service_id=plan.priced.service_id,
                 offchain=not plan.legacy_on_chain,
+                salt=None,  # the allocator holds that slot as unknown
             )
             self._allowances.record_deposit(plan.chain, request_id, e.deposited)
             self._activity.record(
@@ -657,12 +658,14 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             ),
             request_ids=list(result.get("request_ids") or []),
         )
+        salt = (plan.extra_attributes or {}).get("nonce")
         payload = self._with_pending(
             dict(result),
             chain=plan.chain,
             mech=plan.priced.mech,
             service_id=plan.priced.service_id,
             offchain=not plan.legacy_on_chain,
+            salt=salt,
         )
         payload.update(charged(plan.terms, plan.priced.rate, result))
         if plan.offchain:
@@ -674,17 +677,16 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         self._resume_watch(payload, deadline)
         if plan.offchain:  # a delivery settles its slot, or frees it
             by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
-            got = payload.get("delivery_results") or {}
-            urls = payload.get("delivery_urls") or {}
+            # what came back inside the send; `result` settles the later ones
+            got = result.get("deliveries") or {}
             self.queue.settle(
                 plan.chain,
-                t.cast(str, self._config.chain(plan.chain).safe_address),
                 [
-                    (nonce, got[key], urls.get(key))
+                    (nonce, got[key].data, got[key].url)
                     for key, nonce in by_key
-                    if key in got
+                    if key in got and got[key].data is not None
                 ],
-                salt=str((plan.extra_attributes or {})["nonce"]),
+                salt=salt,
             )
         try:  # paid and delivered by now: a delivery it cannot read loses nothing
             if is_chat_prompt(prompt):
@@ -835,7 +837,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         what = request_label(plan.chain, plan.priced.mech, plan.tool, held)
         return answer_lost(error, held, what, self.queue.note(plan.chain))
 
-    def _with_pending(  # pylint: disable=too-many-locals
+    # too-many-arguments: keyword-only; what identifies a pending request
+    def _with_pending(  # pylint: disable=too-many-locals,too-many-arguments
         self,
         result: dict,
         *,
@@ -843,6 +846,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         mech: str,
         service_id: int,
         offchain: bool,
+        salt: str | None,
     ) -> dict:
         """Record every request id the mech has not answered, and report them.
 
@@ -856,17 +860,19 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         ids = list(result.get("request_ids") or [])
         receipt = result.get("receipt")
         block = receipt.get("blockNumber") if isinstance(receipt, Mapping) else None
-        pending = PendingDelivery(
-            chain=chain,
-            mech=mech,
-            service_id=service_id,
-            offchain=offchain,
-            from_block=block,
-        )
+        held = dict(zip(ids, result.get("nonces") or []))
         waiting = [key for key in ids if key not in delivered]
         with self._lock:
             for key in waiting:
-                self._pending[key] = pending
+                self._pending[key] = PendingDelivery(
+                    chain=chain,
+                    mech=mech,
+                    service_id=service_id,
+                    offchain=offchain,
+                    from_block=block,
+                    nonce=held.get(key),
+                    salt=salt,
+                )
         payload = {"chain": chain, **result}
         payload.pop("deliveries", None)
         if "deliveries" in result:
@@ -929,6 +935,12 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             return report
         with self._lock:
             self._pending.pop(key, None)
+        if pending.nonce is not None:
+            self.queue.settle(
+                pending.chain,
+                [(pending.nonce, data[key], split[key].url)],
+                salt=pending.salt,
+            )
         self._activity.record("mech_result", chain=pending.chain, request_id=key)
         url = split[key].url
         return {**report, "result": data[key], **({"url": url} if url else {})}

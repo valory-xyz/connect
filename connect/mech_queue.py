@@ -249,14 +249,17 @@ class MechQueue:
         raise HardCancelFailed(chain) from failure
 
     def settle(
-        self, chain: str, safe: str, slots: t.Sequence[DeliveredSlot], *, salt: str
+        self, chain: str, slots: t.Sequence[DeliveredSlot], *, salt: str | None
     ) -> None:
         """Start the settle clock of delivered slots; free the ones the mech rejected.
 
         A rejected slot stays held while a later slot is held above it, so it
         is stamped before it is offered, and a freed one takes its stamp with
-        it.
+        it. A None `salt` names no slot of ours: nothing to settle.
         """
+        safe = self._config.chain(chain).safe_address
+        if not slots or salt is None or safe is None:
+            return
         # copies mech_client.nonces._is_rejected (private)
         rejected = [
             (nonce, salt)
