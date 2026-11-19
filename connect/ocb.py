@@ -157,10 +157,11 @@ class OcbInstaller:
     on the login PATH. The path is recorded with the requirement it came from
     (install_identity), so a Connect release asking for another release or
     extra, or one replacing a wheel an earlier release bundled, installs
-    again; a matching record does not. The record lives in `record_dir`, outside the workspace, and carries a MAC
-    keyed off the agent key, so neither the session nor anything else that
-    can write the file can point Connect's next launch at another program: an
-    unsigned or tampered record reads as no record, and OCB installs again.
+    again; a matching record does not. The record lives in `record_dir`,
+    outside the workspace, and carries a MAC keyed off the agent key, so
+    neither the session nor anything else that can write the file can point
+    Connect's next launch at another program: an unsigned or tampered record
+    reads as no record, and OCB installs again.
     A recorded path must also be `ocb-agent` inside uv's tool directory for
     olas-ocb-agent, or it is not launched.
     """

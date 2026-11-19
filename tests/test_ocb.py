@@ -65,6 +65,7 @@ from tests.conftest import audit_entries
 
 MECH = "0x" + "ab" * 20
 VERSION = "0.4.1"
+VERSION_FILE = b"v0.4.1"  # as the OCB team writes it
 # what Connect v0.1.16-v0.1.17 recorded for the 0.1.0 wheel it bundled
 BUNDLED_WHEEL_RECORD = (
     "olas-ocb-agent[facilitator] @ olas_ocb_agent-0.1.0-py3-none-any.whl "
@@ -74,7 +75,7 @@ POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="sh install scri
 
 
 def write_bundle(
-    root: Path, script: str, version: bytes | None = b"v" + VERSION.encode()
+    root: Path, script: str, version: bytes | None = VERSION_FILE
 ) -> Path:
     """Lay out assets/ocb with an install script and, unless None, this VERSION."""
     bundle = root / "assets" / ocb.OCB_ASSETS_SUBDIR
