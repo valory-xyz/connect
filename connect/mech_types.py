@@ -230,6 +230,8 @@ class PendingDelivery(t.NamedTuple):
     service_id: int
     offchain: bool
     from_block: int | None
+    nonce: int | None
+    salt: str | None
 
 
 def published_tools(document: t.Any) -> list[str]:

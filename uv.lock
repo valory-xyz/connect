@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -653,7 +653,7 @@ requires-dist = [
     { name = "eth-account", specifier = "==0.13.7" },
     { name = "fastapi", specifier = "==0.139.2" },
     { name = "mcp", specifier = "==1.28.1" },
-    { name = "mech-client", specifier = "==0.26.0" },
+    { name = "mech-client", specifier = "==0.26.1" },
     { name = "open-aea-ledger-ethereum", specifier = "==2.2.9" },
     { name = "tomli-w", specifier = "==1.2.0" },
     { name = "uvicorn", specifier = "==0.54.0" },
@@ -1616,7 +1616,7 @@ name = "macholib"
 version = "1.16.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "altgraph" },
+    { name = "altgraph", marker = "sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/10/2f/97589876ea967487978071c9042518d28b958d87b17dceb7cdc1d881f963/macholib-1.16.4.tar.gz", hash = "sha256:f408c93ab2e995cd2c46e34fe328b130404be143469e41bc366c807448979362", size = 59427, upload-time = "2025-11-22T08:28:38.373Z" }
 wheels = [
@@ -1724,7 +1724,7 @@ wheels = [
 
 [[package]]
 name = "mech-client"
-version = "0.26.0"
+version = "0.26.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -1739,9 +1739,9 @@ dependencies = [
     { name = "setuptools" },
     { name = "tabulate" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c3/ef/aebed31b64fad9a90938988fe53dc351eda9733fe8eed1de06bc25554b33/mech_client-0.26.0.tar.gz", hash = "sha256:efd59e08c4c2a4b120d9fb53a0c849651d840e8930ced01349f84abad754a0c9", size = 283994, upload-time = "2026-11-16T20:25:17.876Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/69/32/35ee2a45664d7de11958c84a325fcd00802e10e0fc9b58138e1414a44b5b/mech_client-0.26.1.tar.gz", hash = "sha256:8d7b3bfd5f5a3955f993566ba7d674dd0d991b53a63cc613469a533bc78d41a9", size = 287183, upload-time = "2026-11-19T14:04:46.298Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/65/e7ab43cb4d655155ecb6b1cfba48fad4f47c98fa95af11a9657711e7c046/mech_client-0.26.0-py3-none-any.whl", hash = "sha256:9040870110ab469a07721be8a31900b7b42d9886ec083b63ff8f3366a4eda63e", size = 363844, upload-time = "2026-11-16T20:25:16.527Z" },
+    { url = "https://files.pythonhosted.org/packages/95/8d/871c8a6e8e6a66c8e38a37d2c6f7a5014c6c4fe6e38949ec749320f642b3/mech_client-0.26.1-py3-none-any.whl", hash = "sha256:3daa9e92983207337c999c9503be0218e100ae51dd9a3f3ff8485be35523eb4f", size = 366337, upload-time = "2026-11-19T14:04:45.06Z" },
 ]
 
 [[package]]
