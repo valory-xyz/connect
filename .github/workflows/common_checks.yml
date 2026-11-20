@@ -199,11 +199,10 @@ jobs:
         with:
           version: "0.13.4"
           python-version: "3.12"
-      - name: Build and run the binary
-        run: |
-          uv sync
-          uv run pyinstaller packaging/pyinstaller.spec
-          ./dist/connect --help
+      - name: Build the binary
+        run: uv run --locked pyinstaller packaging/pyinstaller.spec
+      - name: Boot the binary
+        run: packaging/boot_check.sh dist/connect
 
   all-checks-passed:
     # Single aggregate gate referenced by branch protection on `main`.

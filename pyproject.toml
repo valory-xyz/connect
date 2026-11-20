@@ -12,8 +12,8 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "fastapi>=0.139.2",
-    "uvicorn>=0.54.0",
+    "fastapi>=0.139.2,<0.140",
+    "uvicorn>=0.54.0,<0.55",
     "web3>=7.16.0,<8",
     "eth-account>=0.13.7,<0.14",
     "mcp==1.28.1",
@@ -30,6 +30,7 @@ dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "httpx==0.28.1",
+    "packaging==26.2",
     "pyinstaller==6.22.3",
     "open-autonomy>=0.21.28",
     "open-aea-cli-ipfs>=2.2.9",

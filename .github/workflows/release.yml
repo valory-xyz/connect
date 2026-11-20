@@ -2,7 +2,8 @@ name: Release Flow
 
 on:
   release:
-    types: [published]
+    # `released` also fires when a pre-release is promoted; only PyPI follows it
+    types: [published, released]
   workflow_dispatch:
 
 permissions:
@@ -11,6 +12,7 @@ permissions:
 jobs:
   publish-packages:
     name: Push packages to IPFS
+    if: github.event.action != 'released'
     runs-on: ubuntu-latest
     container:
       image: valory/open-autonomy-user:0.21.26
@@ -25,6 +27,7 @@ jobs:
           autonomy push-all
 
   build:
+    if: github.event.action != 'released'
     strategy:
       fail-fast: false
       matrix:
@@ -48,9 +51,7 @@ jobs:
           python-version: "3.12"
 
       - name: Build binary
-        run: |
-          uv sync
-          uv run pyinstaller packaging/pyinstaller.spec
+        run: uv run --locked pyinstaller packaging/pyinstaller.spec
 
       - name: Rename to release asset (unix)
         if: runner.os != 'Windows'
@@ -86,7 +87,7 @@ jobs:
 
   pypi-gate:
     name: Decide whether to publish to PyPI
-    if: github.event_name == 'release'
+    if: github.event.action == 'released'
     runs-on: ubuntu-latest
     outputs:
       publish: ${{ steps.gate.outputs.publish }}
@@ -98,7 +99,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.event.release.tag_name }}
-        # GitHub never marks a pre-release as latest, so "latest" covers it
         run: |
           latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name)
           on_main=0
@@ -138,15 +138,17 @@ jobs:
         with:
           name: dist
           path: dist/
-      - name: Check the wheel is the tag's version
+      - name: Check the build is the tag's version
         env:
           TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
-          version=$(basename dist/*.whl | cut -d- -f2)
-          if [ "$version" != "${TAG_NAME#v}" ]; then
-            echo "::error::built $version, but the release is $TAG_NAME"
-            exit 1
-          fi
+          expected="olas_connect-${TAG_NAME#v}"
+          for file in dist/*; do
+            case "$(basename "$file")" in
+              "$expected-py3-none-any.whl" | "$expected.tar.gz") ;;
+              *) echo "::error::$(basename "$file") is not the $TAG_NAME build"; exit 1 ;;
+            esac
+          done
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.13.4"
