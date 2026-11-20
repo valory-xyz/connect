@@ -12,7 +12,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "fastapi>=0.139.2,<0.140",
+    "fastapi>=0.139.2,<0.164",
     "uvicorn>=0.54.0,<0.55",
     "web3>=7.16.0,<8",
     "eth-account>=0.13.7,<0.14",
