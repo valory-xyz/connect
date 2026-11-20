@@ -1011,9 +1011,26 @@ minting the agent blueprint/service on the Olas Registry follow the
 Publishing a GitHub release triggers `.github/workflows/release.yml`, which:
 
 - verifies the package hashes (`autonomy packages lock --check`) and pushes
-  `packages/` to the Olas IPFS registry (`autonomy push-all`), and
+  `packages/` to the Olas IPFS registry (`autonomy push-all`),
 - builds PyInstaller binaries named `agent_runner_{linux,macos,windows}_{x64,arm64}`
-  — the asset names Pearl's middleware downloads and sha256-verifies.
+  — the asset names Pearl's middleware downloads and sha256-verifies, and
+- publishes the Python library to PyPI (below).
+
+### Python library
+
+The `connect` package is also published to PyPI as `olas-connect`, for
+callers that import it (OnchainBench). It ships no console script; Pearl
+runs the binary. Its dependencies are ranges whose floors are the versions
+`uv.lock` pins for the binary, so it installs beside a caller's own pins;
+`mcp`, `mech-client` and `open-aea-ledger-ethereum` stay exact, because
+Connect relies on their internals. Its version is the release tag
+(`hatch-vcs`; nothing in the repo holds one). `release.yml` publishes it
+through PyPI trusted publishing, from the `pypi` environment, only for the
+repository's latest release (never a pre-release) when it is tagged on
+`main`, and only if the wheel's version is the tag's; a skipped publish says
+why in the run summary. Every PR runs the same build, a clean install of the
+wheel and a check that it ships every file under `connect/assets/`
+(`library_package.yml`), and builds the Linux binary.
 
 ## Further reading
 

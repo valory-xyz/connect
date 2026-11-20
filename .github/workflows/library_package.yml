@@ -1,0 +1,38 @@
+name: Library package
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and install the library
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # hatch-vcs reads the version from the tags
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.4"
+          python-version: "3.12"
+      - name: Build
+        run: uv build
+      - name: Check metadata
+        run: uvx twine check --strict dist/*
+      - name: Install as a consumer would
+        run: |
+          uv venv --no-config "$RUNNER_TEMP/consumer"
+          VIRTUAL_ENV="$RUNNER_TEMP/consumer" uv pip install --no-config dist/*.whl
+          cd "$RUNNER_TEMP"
+          assets=$(consumer/bin/python -c "import connect.server.app; from connect.workspace import assets_dir, ui_build_dir; assert ui_build_dir(); print(assets_dir())" | tail -1)
+          diff <(git -C "$GITHUB_WORKSPACE" ls-files connect/assets | sed 's#^connect/assets/##' | sort) \
+               <(cd "$assets" && find . -type f -not -path '*/__pycache__/*' | sed 's#^\./##' | sort)
+          test -x "$assets/ocb/install.sh"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
