@@ -97,7 +97,7 @@ def check_arguments(arguments: t.Mapping[str, t.Any]) -> None:
 def _inexact(value: object, *, spent: bool) -> bool:
     """Whether a JSON number cannot carry this amount exactly.
 
-    A float, or an integer past 2^53 - 1 where the amount is spent (`spent`).
+    A float, or an integer past 2^53 - 1 where the amount is spent.
     """
     if isinstance(value, bool):
         return False

@@ -49,7 +49,7 @@ from connect.server.auth import (
 )
 from connect.server.mcp_auth import AuthMiddleware
 from connect.signer import Signer
-from connect.switches import Switches
+from connect.switches import Switches, TEST_INTERFACE
 from connect.texts import AMOUNT_REFUSED, CAP_REFUSED
 
 from tests.conftest import (
@@ -1259,6 +1259,34 @@ def test_mcp_the_cap_reads_an_unknown_intent_key_as_the_gate_does(  # pylint: di
     assert len(fake_w3.eth.sent) == 1
 
 
+def test_mcp_the_cap_reads_only_what_the_tool_reads(
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    make_app: t.Callable,
+    fake_w3: FakeW3,
+) -> None:
+    """With S3 off, send_transaction's intent is unread, so no cap counts it."""
+    app = make_app(
+        test_signer, app_config, activity, token=WORKSPACE, switches=TEST_INTERFACE
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        capped = _mint_capped(client)  # 5 native per transaction
+        answer = _mcp_call(
+            client,
+            capped,
+            "send_transaction",
+            {
+                "chain": "testchain",
+                "to": RECIPIENT,
+                "value": 1,
+                "intent": {"spend": {"native": "100"}, "recipients": [RECIPIENT]},
+            },
+        )
+        assert _refused_rule(answer) is None  # the 100 the tool never reads
+    assert len(fake_w3.eth.sent) == 1
+
+
 def test_mcp_a_mech_cap_from_2_53_on_reaches_the_flow_exactly(
     client: TestClient,
     mech_service: t.Any,
@@ -1648,12 +1676,9 @@ def test_mcp_preflight_answers_with_the_token_s_cap_and_draws_nothing(
     headers = {"Accept": "application/json, text/event-stream", **_bearer(capped)}
 
     def call(tool: str, value: int) -> str:
-        arguments = {
-            "chain": "testchain",
-            "target": RECIPIENT,
-            "value": value,
-            "intent": pay(RECIPIENT, value),
-        }
+        arguments = {"chain": "testchain", "target": RECIPIENT, "value": value}
+        if tool != "preflight_transaction":  # preflight takes no intent
+            arguments["intent"] = pay(RECIPIENT, value)
         body = {
             "jsonrpc": "2.0",
             "id": 1,

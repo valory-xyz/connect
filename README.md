@@ -81,8 +81,9 @@ other non-aea agent. It:
      its text), so a bug in Connect's own code is located. Every body
      refuses a parameter it does not take, with an error naming the ones it
      does (`to` on the safe path is pointed at `target`); an MCP tool ignores
-     one, as OnchainBench's reference does, unless the `strict_parameters`
-     switch is on (off in Pearl too; see [Bench parity](#bench-parity));
+     one, as OnchainBench's reference does, only when the `strict_parameters`
+     switch is off (on in Pearl, off for the bench; see
+     [Bench parity](#bench-parity));
      read-only tools carry `readOnlyHint`
    - MCP (streamable HTTP) at `/mcp`, its published descriptions, initialize
      answer (`serverInfo` is `connect.texts.SERVER_INFO`, the reference's name
@@ -321,15 +322,15 @@ bytes (a space or a newline included) is refused before anything reaches the
 RPC (`bad-calldata`), on a send, `preflight_transaction`
 and `simulate_transaction` alike, rather than reading as an RPC that cannot
 simulate. An RPC that cannot simulate is also logged to `log.txt` with the
-cause, since every agent send on that chain is refused until it can. A key
-an intent does not know, at its top level or in an approval, is ignored on
-every surface, as OnchainBench's reference ignores it: the intent is checked on
-the keys it does carry, so a misspelled `spend` allows no spend and a
-misspelled `receive_min` sets no floor. The gate logs the ignored keys to
-`log.txt` once per call, by name with the call's chain and target, never a
-value. With the `strict_parameters` switch on
-(off in Pearl too) it is `bad-intent`, naming the key, and the cap of a
-scoped token refuses it before drawing on any budget. An amount in an intent is a whole number
+cause, since every agent send on that chain is refused until it can. In Pearl
+(the `strict_parameters` switch on) a key an intent does not know, at its top
+level or in an approval, is `bad-intent`, naming the key, and the cap of a
+scoped token refuses it before drawing on any budget. For the bench (off) it
+is ignored on every surface, as OnchainBench's reference ignores it: the intent
+is checked on the keys it does carry, so a misspelled `spend` allows no spend
+and a misspelled `receive_min` sets no floor, and the gate logs the ignored
+keys to `log.txt` once per call, by name with the call's chain and target,
+never a value. An amount in an intent is a whole number
 of base units, never truncated. On the HTTP routes a float or a bool there is
 `bad-intent`. The MCP tools hold it to the `value` rule (a decimal or 0x-hex
 string, or a JSON integer up to 2^53 - 1) and refuse anything else as
@@ -1053,8 +1054,8 @@ Connect. Two public modules carry that contract:
   adds beyond the floor and the whitelist, its gate and decode details
   (`gate_token_cap_positions`, `EXEC_UNDECODABLE`), `AMOUNT_REFUSED` /
   `CAP_REFUSED` for an amount that is not one, `VALUE_REFUSED`, `tool_failed`,
-  `BATCH_REFUSED`, `BODY_TOO_DEEP`, `CHAIN_REQUIRED`, the block texts, the amount field
-  descriptions and the descriptions it keeps (`get_abi`'s,
+  `BATCH_REFUSED`, `BODY_TOO_DEEP`, `CHAIN_REQUIRED`, the block texts and the
+  descriptions it keeps (`get_abi`'s,
   `transaction_status`'s and `request_context`'s field note). The bench imports
   the module, so a rename fails its suite.
 - `connect.switches` — `Switches`, one position per feature only Connect has
@@ -1065,14 +1066,15 @@ Connect. Two public modules carry that contract:
   setting or route can set one, `__main__` passes none, and the release binary
   excludes `connect.testing`. So far: `no_intent_policy` (`strict` in Pearl,
   `simulate-only` for the bench; see [Intent gate](#intent-gate)),
-  `strict_parameters` (off in both: an MCP
-  tool ignores an argument it does not take, and the gate an intent key it
-  does not read), `extra_tool_parameters` (on in Pearl: the arguments only
+  `strict_parameters` (on in Pearl: an MCP tool refuses an argument it does
+  not take, a Connect extra unlisted while `extra_tool_parameters` is off
+  included, and the gate an intent key it does not read, each by name; off for
+  the bench, both are ignored), `extra_tool_parameters` (on in Pearl: the arguments only
   Connect has, `wait_for_receipt` and `timeout` on the send tools, `intent` on
   `send_transaction`, `via_safe` on `simulate_transaction`, `block` on
   `chain_call`, `limit` and `offset` on `mech_tools`, `timeout` on
   `mech_result`, `legacy_on_chain` and `request_context` on `mech_request`;
-  off, they are neither listed nor read), `rich_intent_schema` (on in Pearl:
+  off, they are neither listed nor read, and one sent anyway is logged), `rich_intent_schema` (on in Pearl:
   `intent` listed as its typed definitions; off, a bare object),
   `rest_signing_routes` (`POST /sign-and-send`; on in Pearl) and
   `agent_topup_at_boot` (the [Agent top-up](#agent-top-up); on in Pearl).

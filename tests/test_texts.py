@@ -272,8 +272,6 @@ CONNECT_OWN = [
         "rule 'bad-value': pass a whole number of base units, as an integer or a "
         "decimal or 0x-hex string",
     ),
-    (texts.AMOUNT_DESCRIPTION, "base units, as a decimal or 0x-hex string"),
-    (texts.CAP_DESCRIPTION, "base units, as an integer or a decimal or 0x-hex string"),
     (texts.VALUE_REFUSED, "value must be a non-negative amount in wei"),
     (texts.BODY_TOO_DEEP, "parse error: the request nests too deeply"),
     (texts.CHAIN_REQUIRED, "chain is required: this instance runs on no single chain"),

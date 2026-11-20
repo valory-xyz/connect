@@ -49,9 +49,10 @@ from connect.texts import BATCH_REFUSED, BODY_TOO_DEEP
 _TOO_DEEP = object()  # a body nested past the JSON parser's recursion limit
 
 
-# the audit rules of a body the mount refused before authorizing anything
 # the JSON-RPC error code of a grant refusal, which the shipped client reads
 GRANT_REFUSED_CODE = -32001
+
+# the audit rules of a body the mount refused before authorizing anything
 INPUT_REFUSED_RULE = "invalid-request"  # a call's own input check refused it
 BATCH_REFUSED_RULE = "batch"  # a batch body: one message per request
 BODY_TOO_DEEP_RULE = "body-too-deep"  # JSON nested past the parser's depth
@@ -151,7 +152,9 @@ class AuthMiddleware:
         if name not in self._tools:
             return None
         try:
-            self._check(name, arguments)
+            # authorized as the tool will read them: an unread extra (S3) is
+            # not something the cap may count
+            arguments = self._check(name, arguments)
             if self._grants.authorize(token, name, arguments):
                 replays.add((name, str(arguments["request_id"])))
         except ToolError as e:

@@ -39,6 +39,7 @@ from connect.guard import GuardError
 from connect.idempotency import InFlightError
 from connect.input_errors import InputError
 from connect.mech import MechError
+from connect.server import tool_schema
 from connect.server.auth import ACTION_SCOPES, GrantRefused
 from connect.server.mcp_tools import with_aliases
 from connect.signer import Signer, SignerError
@@ -687,7 +688,9 @@ async def test_a_missing_or_empty_target_is_refused_by_name(
     assert not fake_w3.eth.sent
 
 
-@pytest.mark.parametrize("switches", [PRODUCTION, TEST_INTERFACE])
+@pytest.mark.parametrize(
+    "switches", [Switches(strict_parameters=False), TEST_INTERFACE]
+)
 async def test_a_misspelled_target_is_refused_naming_target(
     make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3, switches: Switches
 ) -> None:
@@ -908,25 +911,92 @@ async def test_pearl_publishes_connect_s_extra_arguments_and_the_typed_intent(
             assert "default" not in argument
 
 
+# the arguments each tool needs, and a value for each extra unlike its default
+EXTRA_CALLS: dict[str, dict[str, t.Any]] = {
+    "safe_transaction": {"chain": "testchain", "target": RECIPIENT},
+    "send_transaction": {"chain": "testchain", "to": RECIPIENT},
+    "simulate_transaction": {"chain": "testchain", "target": RECIPIENT},
+    "chain_call": {"chain": "testchain", "to": RECIPIENT, "data": "0x"},
+    "mech_tools": {},
+    "mech_result": {"request_id": "r1"},
+    "mech_request": {"prompt": "q", "tool": "t"},
+}
+EXTRA_VALUES: dict[str, t.Any] = {
+    "wait_for_receipt": True,
+    "timeout": 7,
+    "intent": {"recipients": [RECIPIENT]},
+    "via_safe": False,
+    "block": "0x1",
+    "limit": 3,
+    "offset": 2,
+    "legacy_on_chain": True,
+    "request_context": {"market": "m"},
+}
+
+
 @pytest.mark.parametrize("extras", [True, False])
-async def test_an_extra_argument_is_read_only_when_published(
+@pytest.mark.parametrize(
+    ("tool", "extra"),
+    sorted(
+        (tool, extra)
+        for tool, names in tool_schema.EXTRA_PARAMETERS.items()
+        for extra in names
+    ),
+)
+async def test_an_extra_argument_is_read_only_when_published(  # pylint: disable=too-many-arguments
     make_mcp: t.Callable[..., FastMCP],
-    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tool: str,
+    extra: str,
     extras: bool,
 ) -> None:
-    """S3 off: simulate_transaction's via_safe is neither listed nor read."""
-    seen: list[bool] = []
+    """S3: every extra is listed and read when on; off, neither, and logged."""
+    mcp = make_mcp(Switches(strict_parameters=False, extra_tool_parameters=extras))
+    (listed,) = [t for t in await mcp.list_tools() if t.name == tool]
+    assert (extra in listed.inputSchema["properties"]) is extras
+    reached: list[dict] = []
 
-    def simulate(_self: Signer, *_args: t.Any, **kwargs: t.Any) -> dict:
-        seen.append(kwargs["via_safe"])
+    async def record(**kwargs: t.Any) -> dict:
+        reached.append(kwargs)
         return {}
 
-    monkeypatch.setattr(Signer, "simulate", simulate)
-    mcp = make_mcp(Switches(extra_tool_parameters=extras))
-    (tool,) = [t for t in await mcp.list_tools() if t.name == "simulate_transaction"]
-    assert ("via_safe" in tool.inputSchema["properties"]) is extras
-    await mcp.call_tool(
-        "simulate_transaction",
-        {"chain": "testchain", "target": RECIPIENT, "via_safe": False},
+    registered = mcp._tool_manager.get_tool(tool)  # pylint: disable=protected-access
+    registered.fn = record
+    with caplog.at_level("WARNING", logger="agent"):
+        await mcp.call_tool(tool, {**EXTRA_CALLS[tool], extra: EXTRA_VALUES[extra]})
+    (kwargs,) = reached
+    assert (kwargs[extra] == EXTRA_VALUES[extra]) is extras
+    ignored = f"ignored ['{extra}'] on {tool}: extra_tool_parameters is off"
+    assert (ignored in caplog.text) is not extras
+
+
+async def test_under_strict_parameters_an_unlisted_extra_is_refused_by_name(
+    make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
+) -> None:
+    """Strict on, extras off: the extra is an unknown parameter, never dropped."""
+    mcp = make_mcp(Switches(strict_parameters=True, extra_tool_parameters=False))
+    with pytest.raises(ToolError) as refused:
+        await mcp.call_tool(
+            "simulate_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "via_safe": False},
+        )
+    assert str(refused.value) == (
+        "invalid request: ValidationError: unknown parameter 'via_safe'; this "
+        "call takes chain, data, intent, target, value"
     )
-    assert seen == [not extras]  # off, the default (the safe) stands
+    assert not fake_w3.eth.sent
+
+
+async def test_pearl_refuses_a_misspelled_request_id_by_name(
+    make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
+) -> None:
+    """strict_parameters is on in Pearl: requestId is refused, never a second send."""
+    with pytest.raises(ToolError) as refused:
+        await make_mcp(PRODUCTION).call_tool(
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "requestId": "r1"},
+        )
+    assert "unknown parameter 'requestId' (did you mean 'request_id'?)" in str(
+        refused.value
+    )
+    assert not fake_w3.eth.sent

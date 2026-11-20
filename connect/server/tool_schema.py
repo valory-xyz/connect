@@ -31,7 +31,6 @@ import copy
 import typing as t
 
 from connect.switches import Switches
-from connect.texts import WEI_DESCRIPTION
 
 # S3: the arguments a tool takes that the reference's does not (S18 adds
 # `intent` on send_transaction); with the switch off they are not published
@@ -45,8 +44,6 @@ EXTRA_PARAMETERS: t.Mapping[str, frozenset[str]] = {
     "mech_result": frozenset({"timeout"}),
     "mech_request": frozenset({"legacy_on_chain", "request_context"}),
 }
-# the base-unit amounts, published as the reference describes them
-AMOUNT_PARAMETERS = frozenset({"value", "max_payment"})
 # published as integers, as the reference types them
 INTEGER_PARAMETERS: t.Mapping[str, frozenset[str]] = {
     "mech_request": frozenset({"timeout"}),
@@ -86,8 +83,6 @@ def _argument(
     tool: str, name: str, schema: t.Mapping[str, t.Any], switches: Switches
 ) -> dict:
     """Return one argument as published: its bare type, with no title or default."""
-    if name in AMOUNT_PARAMETERS:
-        return {"type": "string", "description": WEI_DESCRIPTION}
     if name in INTEGER_PARAMETERS.get(tool, frozenset()):
         return {"type": "integer"}
     if name == "intent" and not switches.rich_intent_schema:

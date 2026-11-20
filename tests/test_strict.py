@@ -40,7 +40,7 @@ from connect.server.strict import (
     unknown_parameters_message,
 )
 from connect.signer import Signer
-from connect.switches import Switches
+from connect.switches import Switches, TEST_INTERFACE
 
 from tests.conftest import FakeW3, audit_entries, on_fake_chain
 
@@ -77,8 +77,8 @@ def mcp(make_mcp: t.Callable[..., FastMCP]) -> FastMCP:
 async def test_an_unknown_parameter_is_ignored_with_the_switch_off(
     make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
 ) -> None:
-    """The strict_parameters switch is off in production: the key is dropped."""
-    lenient = make_mcp()
+    """The strict_parameters switch is off in the test interface: the key is dropped."""
+    lenient = make_mcp(TEST_INTERFACE)
     await lenient.call_tool(
         "safe_transaction",
         {"chain": "testchain", "target": RECIPIENT, "targett": RECIPIENT},
@@ -591,7 +591,7 @@ async def test_an_unread_intent_key_is_ignored_with_the_switch_off(
     make_mcp: t.Callable[..., FastMCP], fake_w3: FakeW3
 ) -> None:
     """With the switch off, the intent is checked on the keys it carries."""
-    lenient = make_mcp()
+    lenient = make_mcp(TEST_INTERFACE)
     intent = {
         "recipients": [RECIPIENT],
         "receive_minimum": {"native": "1000"},
@@ -619,7 +619,7 @@ async def test_an_ignored_intent_key_is_logged_once_with_the_call(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """One line per call, from the gate's read, naming the chain and the target."""
-    lenient = make_mcp()
+    lenient = make_mcp(TEST_INTERFACE)
     intent = {"recipients": [RECIPIENT], "recieve_min": {"native": "SECRET"}}
     with caplog.at_level("WARNING", logger="agent"):
         await lenient.call_tool(

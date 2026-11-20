@@ -40,9 +40,9 @@ class Switches:
     """One position per switch; the defaults are the production positions."""
 
     no_intent_policy: NoIntentPolicy = "strict"
-    # refuse a tool argument the tool does not take, naming the ones it
-    # does. Off in both positions: unknown arguments are ignored.
-    strict_parameters: bool = False
+    # S2: refuse a tool argument the tool does not take, and an intent key the
+    # gate does not read, naming the ones it does; off, both are ignored
+    strict_parameters: bool = True
     # S3: the tool arguments only Connect has (`tool_schema.EXTRA_PARAMETERS`);
     # off, they are neither published nor read
     extra_tool_parameters: bool = True

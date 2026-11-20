@@ -366,10 +366,6 @@ CAP_REFUSED = (
     "decimal or 0x-hex string"
 )
 
-# Connect's own field descriptions of those amounts
-AMOUNT_DESCRIPTION = "base units, as a decimal or 0x-hex string"
-CAP_DESCRIPTION = "base units, as an integer or a decimal or 0x-hex string"
-
 # `get_abi` with no chain, on an instance whose config names no one chain
 CHAIN_REQUIRED = "chain is required: this instance runs on no single chain"
 

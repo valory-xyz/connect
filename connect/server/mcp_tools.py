@@ -68,9 +68,7 @@ from connect.signer import Signer, SignerError
 from connect.signer_errors import logged_cause
 from connect.switches import Switches
 from connect.texts import (
-    AMOUNT_DESCRIPTION,
     AMOUNT_REFUSED,
-    CAP_DESCRIPTION,
     CAP_REFUSED,
     CHAIN_REQUIRED,
     GET_ABI_DESCRIPTION,
@@ -81,6 +79,7 @@ from connect.texts import (
     TRANSACTION_STATUS_DESCRIPTION,
     UNKNOWN_TOOL,
     VALUE_REFUSED,
+    WEI_DESCRIPTION,
     tool_failed,
 )
 
@@ -105,7 +104,7 @@ def _amount_text(value: t.Any) -> str:
 Amount = t.Annotated[
     str,
     BeforeValidator(_amount_text),
-    Field(description=AMOUNT_DESCRIPTION),
+    Field(description=WEI_DESCRIPTION),
 ]
 
 
@@ -127,7 +126,7 @@ def _cap_text(value: t.Any) -> str:
 Cap = t.Annotated[
     str,
     BeforeValidator(_cap_text),
-    Field(description=CAP_DESCRIPTION),
+    Field(description=WEI_DESCRIPTION),
 ]
 
 
@@ -251,15 +250,20 @@ class ConnectMCP(FastMCP):
             raise ToolError(UNKNOWN_TOOL(name))
         try:  # the arguments' check is Connect's; one inside a tool body is not
             check_arguments(arguments)
-            unread = tool_schema.unread(name, self._switches)
-            arguments = {k: v for k, v in arguments.items() if k not in unread}
+            unread = sorted(tool_schema.unread(name, self._switches) & arguments.keys())
+            if unread and not self._switches.strict_parameters:  # strict names them
+                logger.warning(
+                    "ignored %s on %s: extra_tool_parameters is off", unread, name
+                )
+                arguments = {k: v for k, v in arguments.items() if k not in unread}
             arguments = with_aliases(name, arguments)
             metadata = tool.fn_metadata
             metadata.arg_model.model_validate(metadata.pre_parse_json(arguments))
             # the model refuses a missing required field; an empty one is none too
+            listed = tool_schema.published(name, tool.parameters, self._switches)
             empty = [
                 f"{field}: Field required"
-                for field in tool.parameters.get("required", [])
+                for field in listed["required"]
                 if arguments.get(field) == ""
             ]
             if empty:
@@ -561,7 +565,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
     if signer.switches.strict_parameters:
         # a parameter a tool does not take is refused by name, never dropped
-        make_tools_strict(mcp, activity)
+        make_tools_strict(
+            mcp, activity, lambda tool: tool_schema.unread(tool, signer.switches)
+        )
     return mcp
 
 

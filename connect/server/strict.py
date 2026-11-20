@@ -85,11 +85,22 @@ OnRefusal = t.Callable[[str], None]
 
 
 def _check_known(
-    cls: type[BaseModel], data: t.Any, on_refusal: OnRefusal | None = None
+    cls: type[BaseModel],
+    data: t.Any,
+    on_refusal: OnRefusal | None = None,
+    unread: t.Collection[str] = frozenset(),
 ) -> t.Any:
-    """Before-validator body: refuse a mapping that carries unknown keys."""
+    """Before-validator body: refuse a mapping that carries unknown keys.
+
+    `unread` are fields this position neither lists nor reads (S3): a strict
+    model refuses them by name like any other unknown key.
+    """
     if isinstance(data, dict):
-        fields = cls.model_fields.items()
+        fields = [
+            (name, field)
+            for name, field in cls.model_fields.items()
+            if (field.alias or name) not in unread
+        ]
         expected = {field.alias or name for name, field in fields}
         published = {
             field.alias or name
@@ -124,8 +135,15 @@ class StrictBody(BaseModel):
         return _check_known(cls, data)
 
 
-def strict_arg_model(model: type[BaseModel], on_refusal: OnRefusal) -> type[BaseModel]:
-    """Return a subclass of an MCP tool's argument model that refuses unknown keys."""
+def strict_arg_model(
+    model: type[BaseModel],
+    on_refusal: OnRefusal,
+    unread: t.Collection[str] = frozenset(),
+) -> type[BaseModel]:
+    """Return a subclass of an MCP tool's argument model that refuses unknown keys.
+
+    `unread` fields count as unknown: the position does not take them.
+    """
 
     class Strict(model):  # type: ignore[valid-type, misc]
         """The tool's arguments, with unknown ones refused by name."""
@@ -135,14 +153,22 @@ def strict_arg_model(model: type[BaseModel], on_refusal: OnRefusal) -> type[Base
         @model_validator(mode="before")
         @classmethod
         def _refuse_unknown(cls, data: t.Any) -> t.Any:
-            return _check_known(cls, data, on_refusal)
+            return _check_known(cls, data, on_refusal, unread)
 
     Strict.__name__ = Strict.__qualname__ = model.__name__
     return Strict
 
 
-def make_tools_strict(mcp: FastMCP, activity: ActivityLog) -> None:
-    """Make every registered tool refuse arguments it does not take, audited."""
+def make_tools_strict(
+    mcp: FastMCP,
+    activity: ActivityLog,
+    unread: t.Callable[[str], t.Collection[str]],
+) -> None:
+    """Make every registered tool refuse arguments it does not take, audited.
+
+    `unread(tool)` names what this position does not take of a tool's own
+    arguments (`tool_schema.unread`), so those are refused by name too.
+    """
     for tool in mcp._tool_manager.list_tools():  # pylint: disable=protected-access
 
         def audit(message: str, name: str = tool.name) -> None:
@@ -150,17 +176,15 @@ def make_tools_strict(mcp: FastMCP, activity: ActivityLog) -> None:
                 "refusal", rule=UNKNOWN_PARAMETER_RULE, tool=name, reason=message
             )
 
-        tool.fn_metadata.arg_model = strict_arg_model(tool.fn_metadata.arg_model, audit)
+        tool.fn_metadata.arg_model = strict_arg_model(
+            tool.fn_metadata.arg_model, audit, unread(tool.name)
+        )
 
 
 def unknown_parameter_errors(
     errors: t.Iterable[t.Mapping[str, t.Any]],
 ) -> list[t.Mapping[str, t.Any]]:
-    """Return the validation errors that are unknown-parameter refusals.
-
-    Each was recorded where it was raised: an MCP tool's strict model audits
-    through its `on_refusal`, and an HTTP body through `audit_unknown_parameters`.
-    """
+    """Return the validation errors that are unknown-parameter refusals."""
     return [e for e in errors if e.get("type") == UNKNOWN_PARAMETER_RULE]
 
 
