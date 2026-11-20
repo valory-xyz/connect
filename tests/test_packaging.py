@@ -26,6 +26,7 @@ from pathlib import Path
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,6 +40,12 @@ def _locked_versions() -> dict[str, list[str]]:
     return versions
 
 
+def _next_breaking(floor: Version) -> Version:
+    """Return the first release allowed to break `floor`: next major, or next 0.x minor."""
+    major, minor = (*floor.release, 0)[:2]
+    return Version(f"{major + 1}") if major else Version(f"0.{minor + 1}")
+
+
 def test_every_dependency_is_a_pin_or_a_capped_range_holding_the_lock() -> None:
     """The unit suite runs on uv.lock, so a consumer must not resolve outside it."""
     locked = _locked_versions()
@@ -49,6 +56,11 @@ def test_every_dependency_is_a_pin_or_a_capped_range_holding_the_lock() -> None:
         requirement = Requirement(dependency)
         operators = sorted(spec.operator for spec in requirement.specifier)
         assert operators in (["=="], ["<", ">="]), dependency
+        if operators != ["=="]:
+            bounds = {
+                spec.operator: Version(spec.version) for spec in requirement.specifier
+            }
+            assert bounds["<"] == _next_breaking(bounds[">="]), dependency
         versions = locked[canonicalize_name(requirement.name)]
         assert versions, dependency
         assert all(requirement.specifier.contains(v) for v in versions), dependency

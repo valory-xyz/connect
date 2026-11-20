@@ -30,8 +30,7 @@ jobs:
           uv venv --no-config "$RUNNER_TEMP/consumer"
           uv pip install --no-config --python "$RUNNER_TEMP/consumer" dist/*.whl
           cd "$RUNNER_TEMP"
-          consumer/bin/python -c "import connect.server.app; from connect.workspace import assets_dir, ui_build_dir; assert ui_build_dir(); open('assets_dir', 'w').write(str(assets_dir()))"
-          assets=$(cat assets_dir)
+          assets=$(consumer/bin/python -c "import connect.server.app; from connect.workspace import assets_dir, ui_build_dir; assert ui_build_dir(); print(assets_dir())")
           diff <(git -C "$GITHUB_WORKSPACE" ls-files connect/assets | sed 's#^connect/assets/##' | sort) \
                <(cd "$assets" && find . -type f -not -path '*/__pycache__/*' | sed 's#^\./##' | sort)
           test -x "$assets/ocb/install.sh"

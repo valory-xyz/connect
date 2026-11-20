@@ -25,7 +25,7 @@ pid=$!
 trap 'kill "$pid" 2>/dev/null || true' EXIT
 
 for _ in $(seq 60); do
-  if [ "$(curl -sf http://127.0.0.1:8716/healthcheck || true)" = '{"is_healthy":true}' ]; then
+  if curl -sf -m 2 http://127.0.0.1:8716/healthcheck | grep '"is_healthy": *true' >/dev/null; then
     echo "healthy"
     exit 0
   fi
