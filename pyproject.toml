@@ -1,23 +1,26 @@
 [project]
-name = "connect"
-version = "0.1.0"
+name = "olas-connect"
+dynamic = ["version"]
 description = "Pearl BYOA agent server: hosts an MCP + HTTP signing service so any agent harness session can act as an Olas Pearl agent without key access"
 readme = "README.md"
 license = { file = "LICENSE" }
+authors = [{ name = "Valory AG", email = "info@valory.xyz" }]
 requires-python = ">=3.11"
-dependencies = [
-    "fastapi==0.139.2",
-    "uvicorn==0.54.0",
-    "web3==7.16.0",
-    "eth-account==0.13.7",
-    "mcp==1.28.1",
-    "mech-client==0.26.1",
-    "open-aea-ledger-ethereum==2.2.9",
-    "tomli-w==1.2.0",
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
 ]
-
-[project.scripts]
-connect = "connect.__main__:main"
+dependencies = [
+    "fastapi>=0.139.2,<0.140",
+    "uvicorn>=0.54.0,<0.55",
+    "web3>=7.16.0,<8",
+    "eth-account>=0.13.7,<0.14",
+    "mcp==1.28.1",
+    "mech-client==0.26.2",
+    "open-aea-ledger-ethereum==2.2.10",
+    "tomli-w>=1.2.0,<2",
+]
 
 [project.urls]
 Repository = "https://github.com/valory-xyz/connect"
@@ -27,17 +30,24 @@ dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "httpx==0.28.1",
+    "packaging==26.2",
     "pyinstaller==6.22.3",
     "open-autonomy>=0.21.28",
     "open-aea-cli-ipfs>=2.2.9",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["connect"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["connect"]
 
 [tool.black]
 force-exclude = '''packages/(valory/(connections|protocols)|open_aea)/'''
@@ -112,10 +122,3 @@ markers = [
     "integration: marks tests as integration tests (slow, requires network/RPC)",
     "launch: opens a real terminal window (tox -e launch-tests)",
 ]
-
-[tool.uv]
-# mech-client -> olas-operate-middleware declares fastapi<0.118, but operate is
-# import-only baggage for us (mech-client's operate paths never run: every
-# service gets rpc_url= and we never call its CLI/setup services). Override keeps
-# our own server on the pinned fastapi.
-override-dependencies = ["fastapi==0.139.2"]

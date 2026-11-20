@@ -2,7 +2,8 @@ name: Release Flow
 
 on:
   release:
-    types: [published]
+    # `released` also fires when a pre-release is promoted; only PyPI follows it
+    types: [published, released]
   workflow_dispatch:
 
 permissions:
@@ -11,6 +12,7 @@ permissions:
 jobs:
   publish-packages:
     name: Push packages to IPFS
+    if: github.event.action != 'released'
     runs-on: ubuntu-latest
     container:
       image: valory/open-autonomy-user:0.21.26
@@ -25,6 +27,7 @@ jobs:
           autonomy push-all
 
   build:
+    if: github.event.action != 'released'
     strategy:
       fail-fast: false
       matrix:
@@ -48,9 +51,7 @@ jobs:
           python-version: "3.12"
 
       - name: Build binary
-        run: |
-          uv sync
-          uv run pyinstaller packaging/pyinstaller.spec
+        run: uv run --locked pyinstaller packaging/pyinstaller.spec
 
       - name: Rename to release asset (unix)
         if: runner.os != 'Windows'
@@ -83,3 +84,72 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
+
+  pypi-gate:
+    name: Decide whether to publish to PyPI
+    if: github.event.action == 'released'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.gate.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name)
+          on_main=0
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || on_main=$?
+          if [ "$on_main" -gt 1 ]; then
+            echo "::error::could not tell whether $TAG_NAME is on main"
+            exit 1
+          fi
+          reason=""
+          if [ "$latest" != "$TAG_NAME" ]; then
+            reason="$TAG_NAME is not the latest release ($latest is)"
+          elif [ "$on_main" -ne 0 ]; then
+            reason="$TAG_NAME is not on main"
+          fi
+          if [ -n "$reason" ]; then
+            echo "::notice::Not publishing to PyPI: $reason"
+            echo "Not publishing to PyPI: $reason" >> "$GITHUB_STEP_SUMMARY"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  pypi-build:
+    needs: pypi-gate
+    if: needs.pypi-gate.outputs.publish == 'true'
+    uses: ./.github/workflows/library_package.yml
+
+  pypi-publish:
+    name: Publish to PyPI
+    needs: pypi-build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Check the build is the tag's version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          expected="olas_connect-${TAG_NAME#v}"
+          for file in dist/*; do
+            case "$(basename "$file")" in
+              "$expected-py3-none-any.whl" | "$expected.tar.gz") ;;
+              *) echo "::error::$(basename "$file") is not the $TAG_NAME build"; exit 1 ;;
+            esac
+          done
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.4"
+      - run: uv publish --trusted-publishing always

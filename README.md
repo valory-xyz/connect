@@ -1008,12 +1008,35 @@ minting the agent blueprint/service on the Olas Registry follow the
 
 ## Release
 
-Publishing a GitHub release triggers `.github/workflows/release.yml`, which:
+Publishing a GitHub release, or a pre-release, triggers
+`.github/workflows/release.yml`, which:
 
 - verifies the package hashes (`autonomy packages lock --check`) and pushes
   `packages/` to the Olas IPFS registry (`autonomy push-all`), and
 - builds PyInstaller binaries named `agent_runner_{linux,macos,windows}_{x64,arm64}`
   — the asset names Pearl's middleware downloads and sha256-verifies.
+
+A full release, published as one or promoted from a pre-release, also
+publishes the Python library to PyPI (below).
+
+### Python library
+
+The `connect` package is also published to PyPI as `olas-connect`, for
+callers that import it (OnchainBench). It ships no console script; Pearl
+runs the binary. Each dependency is either an exact pin (`mcp`, `mech-client`
+and `open-aea-ledger-ethereum`, whose internals Connect relies on) or a range
+capped below the next breaking release, and `uv.lock`, which the unit suite
+runs on, must sit inside every range (`tests/test_packaging.py`). Moving a
+dependency past its cap is a deliberate change to both. Its version is the
+release tag (`hatch-vcs`; nothing in the repo holds one). `release.yml`
+publishes it through PyPI trusted publishing, from the `pypi` environment,
+only for the repository's latest release, when that is tagged on `main` and
+both built files carry the tag's version; a skipped publish says why in the
+run summary. Every PR checks `uv.lock` against `pyproject.toml`, runs the
+same build, installs the wheel in a clean environment and checks it ships
+every file under `connect/assets/` (`library_package.yml`), and builds the
+Linux binary and boots it until it reports itself healthy
+(`packaging/boot_check.sh`).
 
 ## Further reading
 

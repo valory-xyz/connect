@@ -185,6 +185,25 @@ jobs:
         if: runner.os != 'Linux'
         run: tox -e launch-tests
 
+  library-package:
+    uses: ./.github/workflows/library_package.yml
+
+  binary:
+    needs:
+      - linter_checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.4"
+          python-version: "3.12"
+      - name: Build the binary
+        run: uv run --locked pyinstaller packaging/pyinstaller.spec
+      - name: Boot the binary
+        run: packaging/boot_check.sh dist/connect
+
   all-checks-passed:
     # Single aggregate gate referenced by branch protection on `main`.
     # When adding/removing mandatory jobs, update `needs` here instead of editing branch protection.
@@ -196,6 +215,8 @@ jobs:
       - coverage
       - integration-tests
       - launch-tests
+      - library-package
+      - binary
     if: always()
     runs-on: ubuntu-latest
     steps:
