@@ -67,18 +67,19 @@ from web3 import Web3
 from web3.datastructures import AttributeDict
 
 from connect import chains as chains_module
+from connect import guard as guard_module
 from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
 from connect import mech_queue as mech_queue_module
 from connect import settings as settings_module
+from connect import texts
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
 from connect.chains import MECH_MARKETPLACES
 from connect.config import AppConfig, ChainConfig, NATIVE_ASSET
 from connect.guard import ALLOWANCE_TTL, Guard, GuardError
 from connect.idempotency import RequestLedger
-from connect.intent import Capped
 from connect.mech import (
     DEFAULT_DELIVERY_TIMEOUT,
     DEFAULT_MECH_CHAIN,
@@ -150,6 +151,7 @@ from tests.conftest import (
 SAFE = "0x" + "22" * 20
 WHITELISTED = "0x" + "aa" * 20
 OTHER = "0x" + "bb" * 20
+FLOOR_MARKETPLACE = "0x" + "5b" * 20
 AGENT = "0x" + "Ab" * 20  # the agent EOA; mixed case, as a checksum address is
 # A mech's on-chain record as the marketplace indexer counts it. A fixed
 # creation time keeps everything but the age independent of the clock.
@@ -202,6 +204,76 @@ def exec_transaction_calldata(  # pylint: disable=too-many-arguments
         [to, value, data, operation, 0, 0, gas_price, gas_token, refund_receiver, b""],
     )
     return "0x" + EXEC_TRANSACTION_SELECTOR + encoded.hex()
+
+
+# one call per guardrail rule check_transaction answers, and its whole refusal:
+# a swapped argument at a call site reads as a different text
+GUARD_RULE_CASES = [
+    (
+        "no-delegatecall",
+        "testchain",
+        SAFE,
+        0,
+        exec_transaction_calldata(OTHER, operation=1),
+    ),
+    ("no-self-call", "testchain", SAFE, 0, exec_transaction_calldata(SAFE)),
+    ("whitelist", "testchain", SAFE, 0, exec_transaction_calldata(WHITELISTED)),
+    ("no-safe", "nosafe", WHITELISTED, 0, "0x"),
+    ("safe-only", "testchain", WHITELISTED, 0, "0x"),
+    ("exec-transaction-only", "testchain", SAFE, 0, "0x12345678"),
+    ("outer-value", "testchain", SAFE, 1, exec_transaction_calldata(OTHER)),
+    ("refund", "testchain", SAFE, 0, exec_transaction_calldata(OTHER, gas_price=1)),
+    (
+        "payment-token-approve",
+        "testchain",
+        SAFE,
+        0,
+        exec_transaction_calldata(PAYMENT_TOKEN),
+    ),
+    ("marketplace", "testchain", FLOOR_MARKETPLACE, 0, "0x"),
+    (
+        "undecodable-exec-transaction",
+        "testchain",
+        SAFE,
+        0,
+        "0x" + EXEC_TRANSACTION_SELECTOR,
+    ),
+    # a bytes length word past the index range: eth_abi raises OverflowError
+    (
+        "undecodable-exec-transaction",
+        "testchain",
+        SAFE,
+        0,
+        "0x"
+        + EXEC_TRANSACTION_SELECTOR
+        + "".join(
+            hex(0x140 if i in (2, 9) else 0)[2:].rjust(64, "0") for i in range(10)
+        )
+        + hex(2**255)[2:].rjust(64, "0"),
+    ),
+]
+GUARD_REFUSALS = {
+    "no-delegatecall": texts.GUARD_NO_DELEGATECALL,
+    "no-self-call": texts.GUARD_NO_SELF_CALL,
+    "whitelist": texts.guard_not_allowed(WHITELISTED, "testchain"),
+    "no-safe": texts.guard_no_safe("nosafe"),
+    "safe-only": texts.guard_safe_only(SAFE, WHITELISTED),
+    "exec-transaction-only": texts.guard_exec_transaction_only(
+        EXEC_TRANSACTION_SELECTOR, "12345678"
+    ),
+    "outer-value": texts.GUARD_OUTER_VALUE,
+    "refund": texts.GUARD_REFUND,
+    "payment-token-approve": texts.guard_payment_token_approve(TRACKER, PAYMENT_TOKEN),
+    "marketplace": texts.guard_marketplace(FLOOR_MARKETPLACE, "testchain"),
+    "undecodable-exec-transaction": texts.GUARD_UNDECODABLE,
+}
+
+
+def test_every_guardrail_rule_is_exercised() -> None:
+    """A rule added to `GuardRule` cannot go untested: raw-digest has its own test."""
+    exercised = {case[0] for case in GUARD_RULE_CASES} | {"raw-digest"}
+    assert exercised == set(texts.GUARD_RULES)
+    assert set(GUARD_REFUSALS) == {case[0] for case in GUARD_RULE_CASES}
 
 
 @pytest.fixture(name="store")
@@ -1280,12 +1352,52 @@ class TestGuard:
         for mode in (MODE_RESTRICTED, MODE_UNRESTRICTED):
             guard = make_guard(store, mode, {"testchain": (WHITELISTED.lower(),)})
             delegatecall = exec_transaction_calldata(WHITELISTED, operation=1)
-            with pytest.raises(GuardError, match="may not delegatecall"):
+            with pytest.raises(GuardError) as refused:
                 guard.check_transaction("testchain", SAFE, 0, delegatecall)
+            # the reference's text, which carries no operation value
+            assert str(refused.value) == texts.GUARD_NO_DELEGATECALL
             # enableModule/addOwnerWithThreshold/setGuard are all self-calls
             self_call = exec_transaction_calldata(SAFE, data=b"\x61\x0b\x59\x25")
-            with pytest.raises(GuardError, match="may not call itself"):
+            with pytest.raises(GuardError) as refused:
                 guard.check_transaction("testchain", SAFE, 0, self_call)
+            assert str(refused.value) == texts.GUARD_NO_SELF_CALL
+
+    @pytest.mark.parametrize(
+        ("rule", "chain", "to", "value", "data"),
+        GUARD_RULE_CASES,
+    )
+    def test_every_guardrail_refusal_names_its_rule(  # pylint: disable=too-many-arguments
+        self,
+        store: SettingsStore,
+        monkeypatch: pytest.MonkeyPatch,
+        rule: str,
+        chain: str,
+        to: str,
+        value: int,
+        data: str,
+    ) -> None:
+        """Each rule's whole refusal, so every call site's arguments are pinned."""
+        monkeypatch.setattr(
+            guard_module,
+            "MECH_MARKETPLACES",
+            {"testchain": frozenset({FLOOR_MARKETPLACE})},
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "token_approve_targets",
+            lambda _chain: {PAYMENT_TOKEN.lower(): TRACKER.lower()},
+        )
+        guard = make_guard(store, MODE_RESTRICTED, {"testchain": ()})
+        with pytest.raises(GuardError) as refused:
+            guard.check_transaction(chain, to, value, data)
+        assert str(refused.value) == GUARD_REFUSALS[rule]
+
+    def test_a_refused_raw_digest_names_its_rule(self, store: SettingsStore) -> None:
+        """The raw-digest refusal carries the broker's prefix and its rule id."""
+        guard = make_guard(store, MODE_RESTRICTED)
+        with pytest.raises(GuardError) as refused:
+            guard.check_sign_digest(b"\x00" * 32)
+        assert str(refused.value).startswith("guardrail: rule 'raw-digest': ")
 
     def test_the_floor_holds_where_no_safe_is_configured(
         self, store: SettingsStore
@@ -5536,7 +5648,14 @@ class TestMech:
         assert info["mech"] == OTHER
         assert info["payment_type"] == "NATIVE"
         assert info["payment_token"] == "native"
-        assert info["default_max_payment"] == str(10**17)
+        assert info["default_max_payment"] == 10**17
+        # the reference's integer amounts: a JSON number, never a string
+        assert (
+            type(info["default_max_payment"]) is int
+        )  # pylint: disable=unidiomatic-typecheck
+        assert (
+            type(info["max_delivery_rate"]) is int
+        )  # pylint: disable=unidiomatic-typecheck
         assert info["service_id"] == 42
         assert info["tools"] == ["prediction-online"]
         # this mech published an endpoint, so nothing bars the default flow
@@ -5559,7 +5678,8 @@ class TestMech:
         assert info["terms"] == VALORY_TERMS_NOTICE
         assert info["terms_url"] == "https://www.valory.xyz/terms/mechs"
         assert info["delivery"] == {"received_requests": 120}
-        assert info["payment"] == {"type": "native"}
+        assert info["payment_info"] == {"type": "native"}
+        assert "payment" not in info  # B12: `payment` is only ever an integer
         # the report's other keys survive the merge
         assert info["tools"] == ["prediction-online"]
         assert "report_note" not in info
@@ -5675,7 +5795,8 @@ class TestMech:
             "age_days": (datetime.now(timezone.utc) - SAMPLE_CREATED_AT).days,
             "note": manager_module.DELIVERY_NOTE,
         }
-        assert info["payment"] == {
+        assert "payment" not in info
+        assert info["payment_info"] == {
             "type": "native",
             "note": manager_module.PAYMENT_NOTE,
         }
@@ -6066,7 +6187,7 @@ class TestMech:
         info = mech_service.tools(chain="robinhood", priority_mech=OTHER)
         assert info["payment_type"] == "USDC_TOKEN"
         assert info["payment_token"] == "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
-        assert info["default_max_payment"] == "100000"
+        assert info["default_max_payment"] == 100000
         unknown_chain = mech_service.tools(chain="testchain", priority_mech=OTHER)
         assert unknown_chain["payment_token"] is None
 
@@ -7122,11 +7243,11 @@ class TestMech:
         self._stall(mech_service, app_config.mech_hard_cancel_after + 1)
         if case == "guardrail":
             refused = SignerError("the operator's guardrail settings do not allow it")
-            refused.__cause__ = GuardError("not whitelisted")
+            refused.__cause__ = GuardError(texts.guard_not_allowed(OTHER, "testchain"))
             patched_mech.raises = refused
         if case == "guardrail-wrapped":  # as mech-client's agent-mode executor does
             refused = SignerError("the operator's guardrail settings do not allow it")
-            refused.__cause__ = GuardError("not whitelisted")
+            refused.__cause__ = GuardError(texts.guard_not_allowed(OTHER, "testchain"))
             wrapped = Exception(f"Failed to execute Safe transaction: {refused}")
             wrapped.__cause__ = refused
             patched_mech.raises = wrapped
@@ -8796,15 +8917,14 @@ class TestMcpGuardrailTools:
         monkeypatch.setattr(test_signer, "check", fake_check)
         assert await tools["preflight_transaction"](
             "testchain", OTHER, 5, "0xab", via_safe=False
-        ) == {"allowed": True}
+        ) == {"permitted": True}
         assert calls[0] == {
             "chain": "testchain",
             "target": OTHER,
             "value": 5,
             "data": "0xab",
             "via_safe": False,
-            # called in-process, with no token: held as capped (fail closed)
-            "intent": Capped(None),
+            "run_intent_gate": False,
         }
 
     async def test_preflight_tool_carries_the_refusal(
@@ -8818,8 +8938,8 @@ class TestMcpGuardrailTools:
             test_signer, "check", lambda *a, **k: ("the guardrail said no", [])
         )
         assert await tools["preflight_transaction"]("testchain", OTHER) == {
-            "allowed": False,
-            "reason": "the guardrail said no",
+            "permitted": False,
+            "rule": "the guardrail said no",
         }
 
     async def test_preflight_tool_answers_through_the_real_guardrail(
@@ -8828,14 +8948,13 @@ class TestMcpGuardrailTools:
         test_signer: Signer,
         guard: Guard,
     ) -> None:
-        """End to end, unmocked: the tool, the signer and the gate together."""
+        """End to end, unmocked: the tool, the signer and the guardrail together."""
         test_signer.set_guard(guard)
         assert await tools["preflight_transaction"]("testchain", OTHER) == {
-            "allowed": True
+            "permitted": True
         }
         refused = await tools["preflight_transaction"]("testchain", SAFE)
-        assert refused["allowed"] is False
-        assert "may not call itself" in refused["reason"]
+        assert refused == {"permitted": False, "rule": texts.GUARD_NO_SELF_CALL}
 
     async def test_mech_tools_tool_delegates(
         self,

@@ -27,16 +27,22 @@ import logging
 import typing as t
 
 from hexbytes import HexBytes
-from web3.exceptions import TimeExhausted
+from web3 import Web3
+from web3.exceptions import TimeExhausted, TransactionNotFound
 
+from connect.input_errors import is_tx_hash
 from connect.signer import Signer
 
 RECEIPT_POLL_SECONDS = 2
 MAX_RECEIPT_TIMEOUT = 300
 RECEIPT_ERROR = (
     "the transaction was sent, but its receipt could not be read (the cause is "
-    "in Connect's log); check it with transaction_status before resending"
+    "in Connect's log); check it with transaction_status: not_found does not "
+    "prove it was not sent, so resend only under the same request_id"
 )
+
+# how a transaction settled, as the send tools and transaction_status say it
+SettlementStatus = t.Literal["success", "reverted", "pending", "not_found"]
 
 logger = logging.getLogger("agent")
 
@@ -50,7 +56,7 @@ def settled(
 ) -> dict:
     """Return the hash, and how it settled if the caller waited.
 
-    When the caller waits, a top-level `status` says which of pending / mined /
+    When the caller waits, a top-level `status` says which of pending / success /
     reverted it is, so a reverted execTransaction is not read as success from a
     receipt whose 0/1 is buried a level down. And once the transaction is
     broadcast the hash is never dropped: a post-send RPC error is reported as
@@ -68,17 +74,17 @@ def settled(
         # either, so a malformed one is reported pending, not raised
         return mined_result(tx_hash, receipt)
     except TimeExhausted:
-        return {"tx_hash": tx_hash, "status": "pending"}
+        return pending(tx_hash)
     except Exception:  # pylint: disable=broad-exception-caught
         # the send already happened; a receipt-read hiccup must not lose the
         # hash. Its text is the RPC library's (an RPC URL may carry a key), so
         # it goes to the log, and the caller gets Connect's own words.
         logger.warning("could not read the receipt of %s", tx_hash, exc_info=True)
-        return {"tx_hash": tx_hash, "status": "pending", "receipt_error": RECEIPT_ERROR}
+        return {**pending(tx_hash), "receipt_error": RECEIPT_ERROR}
 
 
 def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
-    """Return a settled receipt with `mined`/`reverted` lifted to a top-level status.
+    """Return a settled receipt with `success`/`reverted` and its block lifted up.
 
     Every tool that hands back a mined receipt goes through here, so a caller
     reads one field to tell success from a revert — the 0/1 is never left buried
@@ -86,10 +92,42 @@ def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
     """
     info = _receipt_to_dict(receipt)
     return {
-        "tx_hash": tx_hash,
-        "status": "mined" if info["status"] == 1 else "reverted",
+        **_status(tx_hash, "success" if info["status"] == 1 else "reverted"),
+        "block": info["block_number"],
         "receipt": info,
     }
+
+
+def settlement(w3: Web3, tx_hash: str) -> dict:
+    """Return how a hash settled: mined, held unmined (`pending`) or unknown.
+
+    A malformed hash can never resolve, so it is simply `not_found`.
+    """
+    if not is_tx_hash(tx_hash):
+        return not_found(tx_hash)
+    try:
+        receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
+    except TransactionNotFound:
+        try:
+            w3.eth.get_transaction(HexBytes(tx_hash))
+        except TransactionNotFound:
+            return not_found(tx_hash)
+        return pending(tx_hash)
+    return mined_result(tx_hash, receipt)
+
+
+def pending(tx_hash: str) -> dict:
+    """Return the answer for a transaction sent but not yet mined."""
+    return _status(tx_hash, "pending")
+
+
+def not_found(tx_hash: str) -> dict:
+    """Return the answer for a hash the chain does not know, or a malformed one."""
+    return _status(tx_hash, "not_found")
+
+
+def _status(tx_hash: str, status: SettlementStatus) -> dict:
+    return {"tx_hash": tx_hash, "status": status}
 
 
 def _receipt_to_dict(receipt: t.Mapping[str, t.Any]) -> dict:

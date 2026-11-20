@@ -29,7 +29,9 @@ import difflib
 import typing as t
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic.json_schema import SkipJsonSchema
 from pydantic_core import PydanticCustomError
 
 from connect.activity import ActivityLog
@@ -43,29 +45,37 @@ HINTS: dict[str, dict[str, str]] = {
 
 
 def unknown_parameters_message(
-    given: t.Iterable[str], expected: t.Collection[str]
+    given: t.Iterable[str],
+    expected: t.Collection[str],
+    published: t.Collection[str] | None = None,
 ) -> str | None:
-    """Say which parameters are unknown and what was expected, or None if none are."""
+    """Say which parameters are unknown and what was expected, or None if none are.
+
+    `published` is what the refusal names and hints at, when it differs from
+    what is accepted: a parameter kept out of the published schema is taken
+    but never advertised.
+    """
     unknown = sorted(set(given) - set(expected))
     if not unknown:
         return None
+    named = set(expected if published is None else published)
     parts = []
     for name in unknown:
         hint = next(
             (
                 aliases[name]
                 for wanted, aliases in HINTS.items()
-                if wanted in expected and name in aliases
+                if wanted in named and name in aliases
             ),
             None,
         )
         if hint is None:
-            close = difflib.get_close_matches(name, list(expected), n=1)
+            close = difflib.get_close_matches(name, list(named), n=1)
             hint = close[0] if close else None
         parts.append(f"'{name}' (did you mean '{hint}'?)" if hint else f"'{name}'")
     return (
         f"unknown parameter {', '.join(parts)}; this call takes "
-        f"{', '.join(sorted(expected))}"
+        f"{', '.join(sorted(named))}"
     )
 
 
@@ -75,18 +85,43 @@ OnRefusal = t.Callable[[str], None]
 
 
 def _check_known(
-    cls: type[BaseModel], data: t.Any, on_refusal: OnRefusal | None = None
+    cls: type[BaseModel],
+    data: t.Any,
+    on_refusal: OnRefusal | None = None,
+    unread: t.Collection[str] = frozenset(),
 ) -> t.Any:
-    """Before-validator body: refuse a mapping that carries unknown keys."""
+    """Before-validator body: refuse a mapping that carries unknown keys.
+
+    `unread` are fields this position neither lists nor reads (S3): a strict
+    model refuses them by name like any other unknown key.
+    """
     if isinstance(data, dict):
-        expected = {field.alias or name for name, field in cls.model_fields.items()}
-        message = unknown_parameters_message(data, expected)
+        fields = [
+            (name, field)
+            for name, field in cls.model_fields.items()
+            if (field.alias or name) not in unread
+        ]
+        expected = {field.alias or name for name, field in fields}
+        published = {
+            field.alias or name
+            for name, field in fields
+            if not any(isinstance(m, SkipJsonSchema) for m in field.metadata)
+        }
+        message = unknown_parameters_message(data, expected, published)
         if message is not None:
             if on_refusal is not None:
                 on_refusal(message)
             # typed, so the HTTP audit finds its own refusals by type, not text
             raise PydanticCustomError(UNKNOWN_PARAMETER_RULE, message)
     return data
+
+
+class AuditedRefusal(ToolError):
+    """A tool call's refusal already recorded where it was refused.
+
+    An unknown parameter under `strict_parameters`: the strict model audits
+    it, so the mount does not audit it twice.
+    """
 
 
 class StrictBody(BaseModel):
@@ -101,9 +136,14 @@ class StrictBody(BaseModel):
 
 
 def strict_arg_model(
-    model: type[BaseModel], on_refusal: OnRefusal | None = None
+    model: type[BaseModel],
+    on_refusal: OnRefusal,
+    unread: t.Collection[str] = frozenset(),
 ) -> type[BaseModel]:
-    """Return a subclass of an MCP tool's argument model that refuses unknown keys."""
+    """Return a subclass of an MCP tool's argument model that refuses unknown keys.
+
+    `unread` fields count as unknown: the position does not take them.
+    """
 
     class Strict(model):  # type: ignore[valid-type, misc]
         """The tool's arguments, with unknown ones refused by name."""
@@ -113,14 +153,22 @@ def strict_arg_model(
         @model_validator(mode="before")
         @classmethod
         def _refuse_unknown(cls, data: t.Any) -> t.Any:
-            return _check_known(cls, data, on_refusal)
+            return _check_known(cls, data, on_refusal, unread)
 
     Strict.__name__ = Strict.__qualname__ = model.__name__
     return Strict
 
 
-def make_tools_strict(mcp: FastMCP, activity: ActivityLog) -> None:
-    """Make every registered tool refuse arguments it does not take, audited."""
+def make_tools_strict(
+    mcp: FastMCP,
+    activity: ActivityLog,
+    unread: t.Callable[[str], t.Collection[str]],
+) -> None:
+    """Make every registered tool refuse arguments it does not take, audited.
+
+    `unread(tool)` names what this position does not take of a tool's own
+    arguments (`tool_schema.unread`), so those are refused by name too.
+    """
     for tool in mcp._tool_manager.list_tools():  # pylint: disable=protected-access
 
         def audit(message: str, name: str = tool.name) -> None:
@@ -128,18 +176,26 @@ def make_tools_strict(mcp: FastMCP, activity: ActivityLog) -> None:
                 "refusal", rule=UNKNOWN_PARAMETER_RULE, tool=name, reason=message
             )
 
-        tool.fn_metadata.arg_model = strict_arg_model(tool.fn_metadata.arg_model, audit)
+        tool.fn_metadata.arg_model = strict_arg_model(
+            tool.fn_metadata.arg_model, audit, unread(tool.name)
+        )
+
+
+def unknown_parameter_errors(
+    errors: t.Iterable[t.Mapping[str, t.Any]],
+) -> list[t.Mapping[str, t.Any]]:
+    """Return the validation errors that are unknown-parameter refusals."""
+    return [e for e in errors if e.get("type") == UNKNOWN_PARAMETER_RULE]
 
 
 def audit_unknown_parameters(
     activity: ActivityLog, path: str, errors: t.Iterable[t.Mapping[str, t.Any]]
 ) -> None:
     """Record an HTTP body's unknown-parameter refusal in the activity log."""
-    for error in errors:
-        if error.get("type") == UNKNOWN_PARAMETER_RULE:
-            activity.record(
-                "refusal",
-                rule=UNKNOWN_PARAMETER_RULE,
-                path=path,
-                reason=str(error.get("msg", "")),
-            )
+    for error in unknown_parameter_errors(errors):
+        activity.record(
+            "refusal",
+            rule=UNKNOWN_PARAMETER_RULE,
+            path=path,
+            reason=str(error.get("msg", "")),
+        )

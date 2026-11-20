@@ -36,16 +36,19 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from eth_utils import to_checksum_address
 from hexbytes import HexBytes
+from mcp.server.fastmcp import FastMCP
 from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound, Web3RPCError
 
 from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig
 from connect.guard import Guard
+from connect.intent import APPROVAL, TRANSFER_SINGLE
 from connect.mech import MechService
 from connect.server import auth as auth_module
 from connect.server.app import create_app
 from connect.server.auth import GrantStore
+from connect.server.mcp_tools import build_mcp
 from connect.settings import (
     MODE_UNRESTRICTED,
     Protected,
@@ -55,6 +58,7 @@ from connect.settings import (
     derive_mac_key,
 )
 from connect.signer import Signer, _ChainState
+from connect.switches import PRODUCTION, Switches
 from connect.workspace import Workspace
 
 TEST_PASSWORD = "test-password"  # nosec B105
@@ -351,6 +355,7 @@ class FakeEth:
         self.priority_fee_raises = False
         self.contracts: set[str] = set()
         self.receipt_waits: list[float] = []  # the timeout of each receipt wait
+        self.mempool: set[str] = set()  # hashes known to the node but unmined
         self._lock = threading.Lock()
 
     def get_balance(self, address: str) -> int:
@@ -366,6 +371,13 @@ class FakeEth:
         if self.receipt is None:
             raise TransactionNotFound(f"{tx_hash!r} not mined")
         return self.receipt
+
+    def get_transaction(self, tx_hash: object) -> dict:
+        """Return a transaction the node knows, or raise TransactionNotFound."""
+        key = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
+        if key.removeprefix("0x") not in self.mempool:
+            raise TransactionNotFound(f"{tx_hash!r} not found")
+        return {"hash": tx_hash}
 
     def wait_for_transaction_receipt(
         self, tx_hash: object, timeout: float = 120, poll_latency: float = 0.1
@@ -430,16 +442,44 @@ NATIVE_LOG = "0x" + "ee" * 20
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
-def native_transfer_log(src: str, dst: str, amount: int) -> dict:
-    """Return the synthetic log eth_simulateV1's traceTransfers emits for value."""
+def _hex_word(n: int) -> str:
+    """Return a number as one 32-byte ABI word, without 0x."""
+    return hex(n)[2:].rjust(64, "0")
+
+
+def _topic(address: str) -> str:
+    """Return an address as a log topic."""
+    return "0x" + address.lower().removeprefix("0x").rjust(64, "0")
+
+
+def approval_log(token: str, owner: str, spender: str, amount: int) -> dict:
+    """Return an ERC-20 Approval log: `owner` lets `spender` move `amount`."""
     return {
-        "address": NATIVE_LOG,
+        "address": token,
+        "topics": [APPROVAL, _topic(owner), _topic(spender)],
+        "data": "0x" + _hex_word(amount),
+    }
+
+
+def transfer_log(src: str, dst: str, amount: int, address: str = NATIVE_LOG) -> dict:
+    """Return a Transfer log: the synthetic native one, or a token's at `address`."""
+    return {
+        "address": address,
         "topics": [
             TRANSFER_TOPIC,
-            "0x" + src.lower().removeprefix("0x").rjust(64, "0"),
-            "0x" + dst.lower().removeprefix("0x").rjust(64, "0"),
+            _topic(src),
+            _topic(dst),
         ],
-        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
+        "data": "0x" + _hex_word(amount),
+    }
+
+
+def position_out_log(holder: str, contract: str, to: str, amount: int = 1) -> dict:
+    """Return an ERC-1155 TransferSingle moving `amount` of id 7 from `holder` to `to`."""
+    return {
+        "address": contract,
+        "topics": [TRANSFER_SINGLE, _topic(holder), _topic(holder), _topic(to)],
+        "data": "0x" + _hex_word(7) + _hex_word(amount),
     }
 
 
@@ -485,7 +525,7 @@ class FakeProvider:
         logs = list(self.logs)
         value = int(call["value"], 16)
         if value and self.traced:
-            logs.insert(0, native_transfer_log(call["from"], call["to"], value))
+            logs.insert(0, transfer_log(call["from"], call["to"], value))
         result: dict[str, t.Any] = {
             "status": self.status,
             "returnData": "0x",
@@ -503,7 +543,7 @@ class FakeProvider:
     def _prepaid(self, read: dict, when: int) -> dict:
         """Answer one prepaid balance read, before (0) or after (1) the call."""
         balance = self.prepaid[read["to"]][when]
-        data = "0x" + hex(balance)[2:].rjust(64, "0")
+        data = "0x" + _hex_word(balance)
         return {"status": "0x1", "returnData": data, "gasUsed": "0x5208", "logs": []}
 
 
@@ -522,7 +562,7 @@ def canary_result(block: dict, traced: bool = True) -> dict:
     balance = int(overrides.get(canary["from"].lower(), {}).get("balance", "0x0"), 16)
     if not traced or balance < value:
         return {"status": "0x0", "returnData": "0x", "gasUsed": "0x5208", "logs": []}
-    logs = [native_transfer_log(canary["from"], canary["to"], value)]
+    logs = [transfer_log(canary["from"], canary["to"], value)]
     return {"status": "0x1", "returnData": "0x", "gasUsed": "0x5208", "logs": logs}
 
 
@@ -558,7 +598,13 @@ def test_signer(
     account: LocalAccount, app_config: AppConfig, activity: ActivityLog, fake_w3: FakeW3
 ) -> Signer:
     """Signer wired to the fake Web3 client."""
-    signer = Signer(account=account, config=app_config, activity=activity)
+    return on_fake_chain(
+        Signer(account=account, config=app_config, activity=activity), fake_w3
+    )
+
+
+def on_fake_chain(signer: Signer, fake_w3: "FakeW3") -> Signer:
+    """Wire a signer's test chain to the fake Web3 client, and return it."""
     signer._chains._states["testchain"] = (  # pylint: disable=protected-access
         _ChainState(w3=t.cast(Web3, fake_w3), lock=threading.Lock(), chain_id=31337)
     )
@@ -602,17 +648,72 @@ def mech_service(
 
 
 @pytest.fixture
-def make_app(
-    guard: Guard, settings_store: SettingsStore, mech_service: MechService
-) -> t.Callable:
-    """Return an app factory threading the guard/settings/mech wiring."""
+def signer_with(
+    test_signer: Signer,
+    account: LocalAccount,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    fake_w3: "FakeW3",
+) -> t.Callable[[Switches], Signer]:
+    """Return a factory for the test signer at a switch set, the set's one source."""
 
-    def _make(
+    def _with(switches: Switches) -> Signer:
+        if switches == test_signer.switches:
+            return test_signer
+        return on_fake_chain(
+            Signer(account, app_config, activity, switches=switches), fake_w3
+        )
+
+    return _with
+
+
+@pytest.fixture
+def make_mcp(  # pylint: disable=too-many-arguments
+    signer_with: t.Callable[[Switches], Signer],
+    app_config: AppConfig,
+    activity: ActivityLog,
+    guard: Guard,
+    mech_service: MechService,
+    settings_store: SettingsStore,
+) -> t.Callable[..., FastMCP]:
+    """Return a factory for the MCP server over the test wiring, per switch set."""
+
+    def _make(switches: Switches = PRODUCTION) -> FastMCP:
+        return build_mcp(
+            signer_with(switches),
+            app_config,
+            activity,
+            guard=guard,
+            mech=mech_service,
+            settings_store=settings_store,
+            grants=grant_store("workspace-token"),
+        )
+
+    return _make
+
+
+@pytest.fixture
+def make_app(
+    guard: Guard,
+    settings_store: SettingsStore,
+    mech_service: MechService,
+    signer_with: t.Callable[[Switches], Signer],
+) -> t.Callable:
+    """Return an app factory threading the guard/settings/mech wiring.
+
+    `switches` other than the signer's own builds the test signer at that set,
+    since the signer is the one source of a build's switches.
+    """
+
+    def _make(  # pylint: disable=too-many-arguments
         signer: Signer,
         config: AppConfig,
         activity: ActivityLog,
         token: str = "tok",  # nosec B107
+        switches: Switches | None = None,
     ) -> t.Any:
+        if switches is not None and switches != signer.switches:
+            signer = signer_with(switches)
         # the app's signing endpoints must honor the same guard the app serves
         signer.set_guard(guard)
         return create_app(
@@ -746,9 +847,49 @@ def _no_handed_token() -> t.Iterator[None]:
         yield
 
 
+class FakeGate:
+    """A stand-in for the signer a grant store fronts: held ids and switches."""
+
+    def __init__(
+        self,
+        held: t.Callable[[str, bool], bool] = lambda request_id, via_safe: False,
+        switches: Switches = PRODUCTION,
+    ) -> None:
+        """Hold the request-id check and the switch positions."""
+        self._held = held
+        self.switches = switches
+
+    def holds_request(self, request_id: str, via_safe: bool) -> bool:
+        """Whether the stand-in holds this request id."""
+        return self._held(request_id, via_safe)
+
+
+class FakeBoundary:
+    """A stand-in MCP app boundary for the mount: named tools, an input check."""
+
+    def __init__(
+        self,
+        tools: t.Iterable[str],
+        check: t.Callable[[str, dict], None] | None = None,
+    ) -> None:
+        """Hold the tool names and the check (none passes every call)."""
+        self._tools = frozenset(tools)
+        self._check = check
+
+    def tool_names(self) -> frozenset[str]:
+        """Return the tool names."""
+        return self._tools
+
+    def check_call(self, name: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
+        """Run the check, which refuses by raising `ToolError`."""
+        if self._check is not None:
+            self._check(name, arguments)
+        return arguments
+
+
 def grant_store(token: str) -> GrantStore:
     """Return a GrantStore over a signer that holds no request id."""
-    return GrantStore(token, held=lambda request_id, via_safe: False)
+    return GrantStore(token, signer=FakeGate())
 
 
 # a minted token's expiry, far enough out never to pass during a test

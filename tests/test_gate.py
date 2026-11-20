@@ -21,11 +21,13 @@
 
 import json
 import logging
+import re
 import typing as t
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from mcp.server.fastmcp import FastMCP
 from web3 import Web3
 from web3.exceptions import Web3RPCError
 
@@ -35,9 +37,7 @@ from connect import signer as signer_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
-from connect.mech import MechService
-from connect.server.mcp_tools import build_mcp
-from connect.settings import SettingsStore
+from connect.input_errors import InputError
 from connect.signer import SERVER_BUILT, Signer, SignerError
 from connect.signer_errors import (
     SEND_FAILED,
@@ -46,8 +46,23 @@ from connect.signer_errors import (
     cause_of,
     logged_cause,
 )
+from connect.switches import PRODUCTION, Switches, TEST_INTERFACE
+from connect.texts import (
+    EXEC_UNDECODABLE,
+    GUARD_NO_DELEGATECALL,
+    GUARD_NO_SELF_CALL,
+    GUARD_UNDECODABLE,
+    guard_marketplace,
+)
 
-from tests.conftest import FakeW3, audit_entries, grant_store, pay
+from tests.conftest import (
+    FakeW3,
+    approval_log,
+    audit_entries,
+    pay,
+    position_out_log,
+    transfer_log,
+)
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -57,38 +72,27 @@ TOKEN_CALL = "0x" + "12" * 4
 TOKEN_TOKEN = "unit-test-token"  # nosec B105
 
 
-def _approval_log(amount: int) -> dict:
-    return {
-        "address": TOKEN,
-        "topics": [
-            "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
-            "0x" + SAFE[2:].rjust(64, "0"),
-            "0x" + SPENDER[2:].rjust(64, "0"),
-        ],
-        "data": "0x" + hex(amount)[2:].rjust(64, "0"),
-    }
+def _rules(problems: list[str]) -> list[str]:
+    """Return the rule ids of a simulation's problem strings, in order."""
+    rules = []
+    for problem in problems:
+        match = re.fullmatch(r"intent gate: rule '([^']+)' \(.*\)", problem, re.S)
+        assert match is not None, problem
+        rules.append(match[1])
+    return rules
+
+
+def _approval_log(amount: int, owner: str = SAFE) -> dict:
+    return approval_log(TOKEN, owner, SPENDER, amount)
 
 
 @pytest.fixture
-def tools(  # pylint: disable=too-many-arguments
-    test_signer: Signer,
-    app_config: AppConfig,
-    activity: ActivityLog,
-    guard: Guard,
-    mech_service: MechService,
-    settings_store: SettingsStore,
+def tools(
+    test_signer: Signer, guard: Guard, make_mcp: t.Callable[..., FastMCP]
 ) -> dict[str, t.Callable]:
     """Return the registered MCP tool functions keyed by name."""
     test_signer.set_guard(guard)
-    mcp = build_mcp(
-        test_signer,
-        app_config,
-        activity,
-        guard=guard,
-        mech=mech_service,
-        settings_store=settings_store,
-        grants=grant_store("workspace-token"),
-    )
+    mcp = make_mcp()
     manager = mcp._tool_manager  # pylint: disable=protected-access
     return {tool.name: tool.fn for tool in manager.list_tools()}
 
@@ -96,16 +100,141 @@ def tools(  # pylint: disable=too-many-arguments
 class TestSignerGate:
     """The gate sits after the guard on every agent-originated send."""
 
-    def test_value_without_an_intent_is_refused_and_audited(
+    def test_a_send_with_no_intent_may_spend_its_own_value(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Strict policy: a no-intent send that does only what it says goes through."""
+        test_signer.send_via_safe("testchain", EOA, value=5)
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_a_no_intent_approval_is_refused_and_audited(
         self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
     ) -> None:
-        """No intent, value moves: refused naming missing-intent, nothing sent."""
-        with pytest.raises(SignerError, match="rule 'missing-intent'"):
-            test_signer.send_via_safe("testchain", EOA, value=5)
+        """Strict policy: no intent declares no approvals, so granting one is refused."""
+        fake_w3.provider.logs = [_approval_log(10)]
+        with pytest.raises(SignerError, match="rule 'undeclared-approval'"):
+            test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
         assert not fake_w3.eth.sent
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
-        assert entry["rule"] == "missing-intent"
-        assert entry["to"] == EOA
+        assert entry["rule"] == "undeclared-approval"
+        assert entry["to"] == TOKEN
+
+    def test_a_no_intent_send_is_held_to_its_own_value_and_target(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Strict policy: a spend beyond the value or another recipient is refused."""
+        fake_w3.provider.logs = [transfer_log(SAFE, SPENDER, 3)]
+        with pytest.raises(SignerError) as refused:
+            test_signer.send_via_safe("testchain", EOA, value=5)
+        assert "rule 'overspend' (native: spends 8, intent allows 5)" in str(
+            refused.value
+        )
+        assert f"rule 'undeclared-recipient' ({SPENDER})" in str(refused.value)
+        assert not fake_w3.eth.sent
+
+    @pytest.mark.parametrize("strict", [True, False])
+    def test_a_no_intent_token_spend_is_refused_only_under_strict(
+        self,
+        signer_with: t.Callable[[Switches], Signer],
+        fake_w3: FakeW3,
+        strict: bool,
+    ) -> None:
+        """Strict names the implied limit; simulate-only sends the same call."""
+        signer = signer_with(PRODUCTION if strict else TEST_INTERFACE)
+        fake_w3.eth.contracts.add(SPENDER)  # paid to a contract: no recipient rule
+        fake_w3.provider.logs = [transfer_log(SAFE, SPENDER, 4, address=TOKEN)]
+        if strict:
+            with pytest.raises(SignerError) as refused:
+                signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
+            assert str(refused.value) == (
+                f"intent gate: rule 'overspend' ({TOKEN}: spends 4, intent allows 0)"
+                ". Nothing was sent."
+            )
+            assert not fake_w3.eth.sent
+        else:
+            signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
+            assert len(fake_w3.eth.sent) == 1
+
+    @pytest.mark.parametrize("switches", [PRODUCTION, TEST_INTERFACE])
+    def test_a_capped_token_moves_no_position_in_either_position(
+        self,
+        signer_with: t.Callable[[Switches], Signer],
+        fake_w3: FakeW3,
+        switches: Switches,
+    ) -> None:
+        """A capped token's no-intent call keeps positions, under either policy."""
+        signer = signer_with(switches)
+        fake_w3.eth.contracts.add(EOA)  # the position's taker: no recipient rule
+        fake_w3.provider.logs = [position_out_log(SAFE, TOKEN, EOA)]
+        with pytest.raises(SignerError) as refused:
+            signer.send_via_safe(
+                "testchain", TOKEN, data=TOKEN_CALL, intent=intent_module.Capped(None)
+            )
+        assert str(refused.value) == (
+            f"intent gate: rule 'token-cap-positions' (moves {TOKEN} #7 out, and a "
+            "value-capped token may not move positions). Nothing was sent."
+        )
+        assert not fake_w3.eth.sent
+
+    @pytest.mark.parametrize(
+        ("log", "rule"),
+        [
+            (transfer_log(SAFE, SPENDER, 4, address=TOKEN), "overspend"),
+            (approval_log(TOKEN, SAFE, SPENDER, 10), "undeclared-approval"),
+        ],
+    )
+    def test_a_capped_token_s_no_intent_call_is_held_under_simulate_only(
+        self,
+        signer_with: t.Callable[[Switches], Signer],
+        fake_w3: FakeW3,
+        log: dict,
+        rule: str,
+    ) -> None:
+        """No cap could bound it otherwise: its own value and target, nothing else."""
+        signer = signer_with(TEST_INTERFACE)
+        fake_w3.eth.contracts.add(SPENDER)
+        fake_w3.provider.logs = [log]
+        with pytest.raises(SignerError, match=f"rule '{rule}'"):
+            signer.send_via_safe(
+                "testchain", TOKEN, data=TOKEN_CALL, intent=intent_module.Capped(None)
+            )
+        assert not fake_w3.eth.sent
+
+    def test_a_no_intent_eoa_exec_transaction_is_held_to_its_inner_call(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """Strict reads the safe's call inside it: 7 to EOA, and nothing more."""
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        calldata = safe_module.exec_transaction(
+            target=EOA, value=7, data="0x", owner=test_signer.address
+        )
+        test_signer.send("testchain", SAFE, data=calldata)
+        assert len(fake_w3.eth.sent) == 1
+        fake_w3.provider.logs = [transfer_log(SAFE, SPENDER, 2)]
+        with pytest.raises(SignerError) as refused:
+            test_signer.send("testchain", SAFE, data=calldata)
+        assert "rule 'overspend' (native: spends 9, intent allows 7)" in str(
+            refused.value
+        )
+        assert f"rule 'undeclared-recipient' ({SPENDER})" in str(refused.value)
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_the_simulate_only_policy_refuses_only_a_revert(
+        self, signer_with: t.Callable[[Switches], Signer], fake_w3: FakeW3
+    ) -> None:
+        """The bench's policy: an undeclared approval mines, a revert is refused."""
+        signer = signer_with(TEST_INTERFACE)
+        fake_w3.provider.logs = [_approval_log(10)]
+        signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
+        assert len(fake_w3.eth.sent) == 1
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        with pytest.raises(SignerError, match=r"rule 'reverts' \(execution reverted\)"):
+            signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
+        assert len(fake_w3.eth.sent) == 1
 
     def test_the_safe_path_simulates_the_safes_own_call(
         self, test_signer: Signer, fake_w3: FakeW3
@@ -188,7 +317,10 @@ class TestSignerGate:
         """Some RPCs answer the call's error as a string, not an object."""
         fake_w3.provider.status = "0x0"
         fake_w3.provider.error = "execution reverted"
-        with pytest.raises(SignerError, match="'reverts': .*execution reverted"):
+        with pytest.raises(
+            SignerError,
+            match=r"^intent gate: rule 'reverts' \(execution reverted\)\. Nothing was sent\.$",
+        ):
             test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL)
         assert not fake_w3.eth.sent
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
@@ -208,7 +340,7 @@ class TestSignerGate:
     ) -> None:
         """A caller's typo is refused as one, not as an RPC that cannot simulate."""
         send = test_signer.send_via_safe if via_safe else test_signer.send
-        with pytest.raises(SignerError, match="'bad-calldata': cannot decode"):
+        with pytest.raises(SignerError, match=r"rule 'bad-calldata' \(cannot decode"):
             send("testchain", TOKEN, data=data)
         assert fake_w3.provider.simulated == []
         assert not fake_w3.eth.sent
@@ -222,7 +354,7 @@ class TestSignerGate:
         simulated = test_signer.simulate(
             "testchain", TOKEN, data=data, via_safe=via_safe
         )
-        assert simulated["problems"][0]["rule"] == "bad-calldata"
+        assert _rules(simulated["problems"])[0] == "bad-calldata"
         assert fake_w3.provider.simulated == []
 
     def test_an_unavailable_simulation_is_logged(
@@ -335,19 +467,24 @@ class TestSignerGate:
         assert repr(SERVER_BUILT) == "SERVER_BUILT"
 
     def test_unaudited_refusal_records_nothing(
-        self, test_signer: Signer, store_path: t.Any
+        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
     ) -> None:
         """audit=False callers audit outcomes themselves, refusals included."""
+        fake_w3.provider.logs = [_approval_log(10)]
         with pytest.raises(SignerError):
-            test_signer.send_via_safe("testchain", EOA, value=5, audit=False)
+            test_signer.send_via_safe("testchain", TOKEN, data=TOKEN_CALL, audit=False)
         assert not [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
 
-    def test_check_reports_the_gate_problems(self, test_signer: Signer) -> None:
+    def test_check_reports_the_gate_problems(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
         """A dry run answers what the send would: the same rules, nothing spent."""
-        reason, problems = test_signer.check("testchain", EOA, value=5)
+        fake_w3.provider.logs = [_approval_log(10)]
+        reason, problems = test_signer.check("testchain", TOKEN, data=TOKEN_CALL)
         assert reason is not None
-        assert "missing-intent" in reason
-        assert [p["rule"] for p in problems] == ["missing-intent"]
+        assert "undeclared-approval" in reason
+        assert [p["rule"] for p in problems] == ["undeclared-approval"]
+        fake_w3.provider.logs = []
         assert test_signer.check(
             "testchain", EOA, value=5, intent=pay(EOA, 5), via_safe=False
         ) == (None, [])
@@ -358,7 +495,7 @@ class TestSignerGate:
         """send_transaction to the safe with execTransaction moves the safe's assets.
 
         Simulated as the EOA it would look like it moves nothing; the gate
-        simulates the call inside it, as the safe, so it needs an intent.
+        simulates the call inside it, as the safe, so the safe's grant counts.
         """
         from connect import (
             safe as safe_module,  # pylint: disable=import-outside-toplevel
@@ -367,21 +504,131 @@ class TestSignerGate:
         calldata = safe_module.exec_transaction(
             target=EOA, value=7, data="0xabcdef", owner=test_signer.address
         )
-        with pytest.raises(SignerError, match="'missing-intent'"):
+        fake_w3.provider.logs = [_approval_log(10)]  # granted by the safe
+        with pytest.raises(SignerError, match="'undeclared-approval'"):
             test_signer.send("testchain", SAFE, data=calldata)
         assert fake_w3.provider.simulated[-1]["from"] == SAFE
         assert fake_w3.provider.simulated[-1]["to"] == EOA
         assert fake_w3.provider.simulated[-1]["data"] == "0xabcdef"
+        fake_w3.provider.logs = []
         test_signer.send("testchain", SAFE, data=calldata, intent=pay(EOA, 7))
         assert len(fake_w3.eth.sent) == 1
         with pytest.raises(SignerError, match="may not also carry value"):
             test_signer.send(
                 "testchain", SAFE, value=1, data=calldata, intent=pay(EOA, 7)
             )
-        with pytest.raises(ValueError, match="could not decode"):
+        with pytest.raises(
+            InputError, match="^could not decode execTransaction calldata$"
+        ):
             safe_module.SafeExec.decode("0x6a761202" + "zz")
         with pytest.raises(ValueError, match="not execTransaction"):
             safe_module.SafeExec.decode("0x12345678")
+
+    def test_undecodable_exec_transaction_is_logged_with_where_it_went(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The caller gets the fixed line; the log names chain, target and cause."""
+        undecodable = "0x6a761202" + "00" * 4
+        with caplog.at_level("WARNING", logger="agent"), pytest.raises(SignerError):
+            test_signer.send("testchain", SAFE, data=undecodable)
+        (record,) = [
+            r for r in caplog.records if r.message.startswith(EXEC_UNDECODABLE)
+        ]
+        prefix = f"{EXEC_UNDECODABLE} to {SAFE} on testchain (8 bytes): "
+        assert record.levelname == "WARNING"
+        assert record.message.startswith(prefix)
+        assert len(record.message) > len(prefix)  # eth_abi's cause, logged only
+        assert not fake_w3.eth.sent
+
+    def test_with_no_guardrail_attached_the_floor_still_refuses_a_delegatecall(
+        self, test_signer: Signer, fake_w3: FakeW3, store_path: t.Any
+    ) -> None:
+        """No build lifts the floor: a guardless signer refuses as the guard would."""
+        with pytest.raises(SignerError) as refused:
+            test_signer.send_via_safe("testchain", EOA, operation=1)
+        assert str(refused.value) == GUARD_NO_DELEGATECALL
+        assert not fake_w3.eth.sent
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "blocked"]
+        assert entry["reason"] == GUARD_NO_DELEGATECALL
+
+    @pytest.mark.parametrize("case", ["delegatecall", "self-call", "marketplace"])
+    def test_with_no_guardrail_attached_the_dry_run_holds_the_floor(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        case: str,
+    ) -> None:
+        """Preflight answers a floor refusal as the send gives it, guard or none."""
+        from connect import (
+            guard as guard_module,  # pylint: disable=import-outside-toplevel
+        )
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        market = "0x" + "5b" * 20
+        monkeypatch.setattr(
+            guard_module, "MECH_MARKETPLACES", {"testchain": frozenset({market})}
+        )
+        owner = test_signer.address
+        target, data, expected = {
+            "delegatecall": (
+                SAFE,
+                safe_module.exec_transaction(EOA, 0, "0x", owner, operation=1),
+                GUARD_NO_DELEGATECALL,
+            ),
+            "self-call": (
+                SAFE,
+                safe_module.exec_transaction(SAFE, 0, "0x", owner),
+                GUARD_NO_SELF_CALL,
+            ),
+            "marketplace": (market, "0x", guard_marketplace(market, "testchain")),
+        }[case]
+        reason, _ = test_signer.check(
+            "testchain", target, data=data, via_safe=False, run_intent_gate=False
+        )
+        assert reason == expected
+        with pytest.raises(SignerError) as refused:
+            test_signer.send("testchain", target, data=data)
+        assert str(refused.value) == expected
+        assert not fake_w3.eth.sent
+
+    def test_with_no_guardrail_attached_the_mech_flow_still_reaches_its_marketplace(
+        self,
+        test_signer: Signer,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The floor refuses the agent a marketplace, never the server's own request."""
+        from connect import (
+            guard as guard_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        market = "0x" + "5b" * 20
+        monkeypatch.setattr(
+            guard_module, "MECH_MARKETPLACES", {"testchain": frozenset({market})}
+        )
+        test_signer.send("testchain", market, data="0x", intent=SERVER_BUILT)
+        assert len(fake_w3.eth.sent) == 1
+
+    def test_a_fault_in_the_decoder_is_not_read_as_bad_input(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only the hex and eth_abi's decoding errors are the caller's input."""
+        from connect import (
+            safe as safe_module,  # pylint: disable=import-outside-toplevel
+        )
+
+        def broken(*_args: t.Any) -> t.NoReturn:
+            raise TypeError("a fault in Connect's own types")
+
+        monkeypatch.setattr(safe_module, "abi_decode", broken)
+        with pytest.raises(TypeError):
+            safe_module.SafeExec.decode("0x6a761202" + "00" * 4)
 
     @pytest.mark.parametrize("field", [6, 7, 8])
     def test_an_eoa_exec_transaction_may_not_pay_a_gas_refund(
@@ -432,7 +679,7 @@ class TestSignerGate:
 
         A selector check that stripped only `0x` would simulate the EOA's own
         call, which moves nothing, and the safe's execTransaction inside would
-        be signed with no intent; approveHash would slip past its refusal.
+        be signed unchecked; approveHash would slip past its refusal.
         """
         from connect import (
             safe as safe_module,  # pylint: disable=import-outside-toplevel
@@ -441,14 +688,15 @@ class TestSignerGate:
         calldata = safe_module.exec_transaction(
             target=EOA, value=7, data="0xabcdef", owner=test_signer.address
         )
-        with pytest.raises(SignerError, match="'missing-intent'"):
+        fake_w3.provider.logs = [_approval_log(10)]
+        with pytest.raises(SignerError, match="'undeclared-approval'"):
             test_signer.send("testchain", SAFE, data="0X" + calldata[2:])
         assert fake_w3.provider.simulated[-1]["from"] == SAFE
         with pytest.raises(SignerError, match="'approve-hash'"):
             test_signer.send("testchain", SAFE, data="0Xd4d9bdcd" + "ab" * 32)
         assert fake_w3.eth.sent == []
         rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-        assert rules == ["missing-intent", "approve-hash"]
+        assert rules == ["undeclared-approval", "approve-hash"]
 
     def test_the_floor_reads_an_uppercase_hex_prefix(
         self, test_signer: Signer, guard: Guard, fake_w3: FakeW3
@@ -484,7 +732,8 @@ class TestSignerGate:
         calldata = safe_module.exec_transaction(
             target=EOA, value=7, data="0x", owner=test_signer.address
         )
-        with pytest.raises(SignerError, match="'missing-intent'"):
+        fake_w3.provider.logs = [_approval_log(10, owner=lower)]
+        with pytest.raises(SignerError, match="'undeclared-approval'"):
             test_signer.send("testchain", lower, data=calldata)
         assert fake_w3.provider.simulated[-1]["from"].lower() == lower
 
@@ -516,10 +765,11 @@ class TestSignerGate:
         moving = safe_module.exec_transaction(
             target=EOA, value=7, data="0x", owner=test_signer.address
         )
+        fake_w3.provider.logs = [_approval_log(10)]
         reason, problems = test_signer.check(
             "testchain", SAFE, data=moving, via_safe=False
         )
-        assert "'missing-intent'" in str(reason)
+        assert "'undeclared-approval'" in str(reason)
         assert fake_w3.provider.simulated[-1]["from"] == SAFE
         args: list = [EOA, 0, b"", 1, 0, 0, 0, safe_module.ZERO_ADDRESS]
         args += [safe_module.ZERO_ADDRESS, b""]
@@ -527,8 +777,8 @@ class TestSignerGate:
         delegate += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()
         result = test_signer.simulate("testchain", SAFE, data=delegate, via_safe=False)
         assert result["fits_intent"] is False
-        assert result["problems"][0]["rule"] == "bad-exec-transaction"
-        assert "DELEGATECALL" in result["problems"][0]["detail"]
+        assert _rules(result["problems"])[0] == "bad-exec-transaction"
+        assert GUARD_NO_DELEGATECALL in result["problems"][0]
         args[3], args[6] = 0, 1
         refund = "0x" + safe_module.EXEC_TRANSACTION_SELECTOR
         refund += encode(safe_module.EXEC_TRANSACTION_TYPES, args).hex()
@@ -539,7 +789,14 @@ class TestSignerGate:
         bad = test_signer.simulate(
             "testchain", SAFE, data="0x6a761202zz", via_safe=False
         )
-        assert bad["problems"][0]["rule"] == "bad-exec-transaction"
+        assert bad["problems"] == [
+            f"intent gate: rule 'bad-exec-transaction' ({GUARD_UNDECODABLE})"
+        ]
+        self_call = safe_module.exec_transaction(SAFE, 0, "0x", test_signer.address)
+        own = test_signer.simulate("testchain", SAFE, data=self_call, via_safe=False)
+        assert own["problems"] == [
+            f"intent gate: rule 'bad-exec-transaction' ({GUARD_NO_SELF_CALL})"
+        ]
 
     def test_a_replay_answers_before_the_gate(
         self, test_signer: Signer, fake_w3: FakeW3
@@ -762,7 +1019,7 @@ def test_an_unreadable_prepaid_tracker_table_refuses_every_send_unsimulated(
         verdict = test_signer.simulate("testchain", EOA, value=value)
     assert not fake_w3.eth.sent
     assert not fake_w3.provider.simulated
-    assert [p["rule"] for p in verdict["problems"]] == ["simulation-unavailable"]
+    assert _rules(verdict["problems"]) == ["simulation-unavailable"]
     record, _ = [r for r in caplog.records if "cannot simulate" in r.message]
     assert "ValueError raised at:" in record.message
     assert "in unreadable" in record.message
@@ -871,11 +1128,61 @@ class TestSimulate:
         """The asset diff plus fits_intent and problems."""
         result = test_signer.simulate("testchain", EOA, value=5)
         assert result["native"] == "-5"
-        assert result["fits_intent"] is None  # no intent given
-        assert [p["rule"] for p in result["problems"]] == ["missing-intent"]
+        assert result["fits_intent"] is True  # strict: held to what it says
+        assert result["problems"] == []
         fits = test_signer.simulate("testchain", EOA, value=5, intent=pay(EOA, 5))
         assert fits["fits_intent"] is True
         assert fits["problems"] == []
+
+    def test_strict_simulation_answers_as_the_send_would(
+        self, test_signer: Signer, fake_w3: FakeW3
+    ) -> None:
+        """A no-intent approval is reported, as the send refuses it."""
+        fake_w3.provider.logs = [_approval_log(10)]
+        result = test_signer.simulate("testchain", TOKEN, data=TOKEN_CALL)
+        assert result["fits_intent"] is False
+        assert _rules(result["problems"]) == ["undeclared-approval"]
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        reverted = test_signer.simulate("testchain", EOA, value=5)
+        assert _rules(reverted["problems"])[0] == "reverts"
+
+    def test_simulate_only_answers_a_no_intent_call_with_no_verdict(
+        self, signer_with: t.Callable[[Switches], Signer], fake_w3: FakeW3
+    ) -> None:
+        """The bench's position: no verdict, and a revert shows in the diff alone."""
+        signer = signer_with(TEST_INTERFACE)
+        fake_w3.provider.logs = [_approval_log(10)]
+        granted = signer.simulate("testchain", TOKEN, data=TOKEN_CALL)
+        assert (granted["fits_intent"], granted["problems"]) == (None, [])
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        result = signer.simulate("testchain", EOA, value=5)
+        assert result["ok"] is False
+        assert result["fits_intent"] is None
+        assert result["problems"] == []
+
+    def test_a_capped_simulation_answers_as_the_send_would_under_simulate_only(
+        self, signer_with: t.Callable[[Switches], Signer], fake_w3: FakeW3
+    ) -> None:
+        """A capped token is held even here, so its dry run gives a verdict."""
+        signer = signer_with(TEST_INTERFACE)
+        fake_w3.eth.contracts.add(EOA)
+        fake_w3.provider.logs = [position_out_log(SAFE, TOKEN, EOA)]
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        result = signer.simulate(
+            "testchain", TOKEN, data=TOKEN_CALL, intent=intent_module.Capped(None)
+        )
+        assert result["fits_intent"] is False
+        assert _rules(result["problems"]) == ["reverts", "token-cap-positions"]
+
+    def test_a_problem_is_the_reference_s_string(self, test_signer: Signer) -> None:
+        """Each problem reads `intent gate: rule '<id>' (<detail>)`."""
+        result = test_signer.simulate("testchain", EOA, value=5, intent=pay(EOA, 4))
+        assert result["problems"] == [
+            "intent gate: rule 'overspend' (native: spends 5, intent allows 4)"
+        ]
 
     def test_bad_intent_and_unavailable_rpc(
         self, test_signer: Signer, fake_w3: FakeW3
@@ -883,10 +1190,10 @@ class TestSimulate:
         """Neither yields a diff; both say why."""
         bad = test_signer.simulate("testchain", EOA, intent=[1])
         assert bad["fits_intent"] is False
-        assert bad["problems"][0]["rule"] == "bad-intent"
+        assert _rules(bad["problems"])[0] == "bad-intent"
         fake_w3.provider.unavailable = True
         down = test_signer.simulate("testchain", EOA, via_safe=False)
-        assert down["problems"][0]["rule"] == "simulation-unavailable"
+        assert _rules(down["problems"])[0] == "simulation-unavailable"
 
     def test_needs_a_safe_on_the_safe_path(
         self, test_signer: Signer, app_config: AppConfig
@@ -908,20 +1215,32 @@ class TestTools:
             "testchain", EOA, 5, intent=pay(EOA, 5)
         )
         assert result["tx_hash"].startswith("0x")
-        with pytest.raises(SignerError, match="missing-intent"):
-            await tools["safe_transaction"]("testchain", EOA, 5)
+        with pytest.raises(SignerError, match="undeclared-recipient"):
+            await tools["safe_transaction"](
+                "testchain", EOA, 5, intent={"spend": {"native": "5"}}
+            )
 
-    async def test_preflight_reports_problems(
-        self, tools: dict[str, t.Callable]
+    async def test_preflight_runs_no_gate(
+        self, tools: dict[str, t.Callable], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A gate refusal comes back with its problems listed."""
-        refused = await tools["preflight_transaction"]("testchain", EOA, 5)
-        assert refused["allowed"] is False
-        assert refused["problems"][0]["rule"] == "missing-intent"
-        allowed = await tools["preflight_transaction"](
-            "testchain", EOA, 5, intent=pay(EOA, 5)
+        """A value-moving call with no intent is permitted, and nothing simulated."""
+        monkeypatch.setattr(
+            intent_module, "simulate", lambda *a, **k: pytest.fail("simulated")
         )
-        assert allowed == {"allowed": True}
+        assert await tools["preflight_transaction"]("testchain", EOA, 5) == {
+            "permitted": True
+        }
+
+    async def test_preflight_permits_a_call_that_would_revert(
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
+    ) -> None:
+        """The guardrail permits these bytes; whether they revert is not asked."""
+        fake_w3.provider.status = "0x0"
+        fake_w3.provider.error = {"message": "execution reverted"}
+        assert await tools["preflight_transaction"](
+            "testchain", TOKEN, data=TOKEN_CALL
+        ) == {"permitted": True}
+        assert fake_w3.provider.simulated == []
 
     async def test_simulate_transaction_tool(
         self, tools: dict[str, t.Callable]
@@ -944,8 +1263,8 @@ class TestTools:
         assert await tools["chain_call"]("testchain", EOA, "0x", "pending") == {
             "result": "pending"
         }
-        assert await tools["get_abi"]("testchain", EOA) == {"a": EOA}
-        decoded = await tools["decode_calldata"]("testchain", "0x095ea7b3")
+        assert await tools["get_abi"](EOA, chain="testchain") == {"a": EOA}
+        decoded = await tools["decode_calldata"]("0x095ea7b3", chain="testchain")
         assert decoded["signature"] == "approve(address,uint256)"
 
 
@@ -956,13 +1275,18 @@ def test_http_routes_take_an_intent(
     make_app: t.Callable,
     fake_w3: FakeW3,
 ) -> None:
-    """Skill scripts pass intents through the HTTP routes; a missing one is a 400."""
+    """Skill scripts pass intents through the HTTP routes; one the call breaks is a 400."""
     app = make_app(test_signer, app_config, activity, token=TOKEN_TOKEN)
     headers = {"Authorization": f"Bearer {TOKEN_TOKEN}"}
     with TestClient(app, base_url="http://127.0.0.1:8716") as client:
         refused = client.post(
             "/safe-transaction",
-            json={"chain": "testchain", "target": EOA, "value": 5},
+            json={
+                "chain": "testchain",
+                "target": EOA,
+                "value": 5,
+                "intent": {"spend": {"native": 5}},
+            },
             headers=headers,
         )
         sent = client.post(
@@ -976,5 +1300,5 @@ def test_http_routes_take_an_intent(
             headers=headers,
         )
     assert refused.status_code == 400
-    assert "missing-intent" in refused.json()["detail"]
+    assert "undeclared-recipient" in refused.json()["detail"]
     assert sent.status_code == 200

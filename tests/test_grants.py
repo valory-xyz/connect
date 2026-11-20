@@ -27,33 +27,41 @@ import typing as t
 
 import pytest
 from fastapi.testclient import TestClient
+from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from connect import intent as intent_module
 from connect import signer as signer_module
+from connect import texts
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.server import auth as auth_module
 from connect.server import mcp_tools as mcp_tools_module
 from connect.server import signer_routes as signer_routes_module
 from connect.server.auth import (
+    ACTION_SCOPES,
     AuthFailureLimiter,
-    AuthMiddleware,
     GrantRefused,
     GrantStore,
     TokenGrant,
     WORKSPACE_GRANT,
     narrower,
 )
+from connect.server.mcp_auth import AuthMiddleware
 from connect.signer import Signer
+from connect.switches import Switches, TEST_INTERFACE
+from connect.texts import AMOUNT_REFUSED, CAP_REFUSED
 
 from tests.conftest import (
+    FakeBoundary,
+    FakeGate,
     FakeW3,
     TOKEN_EXPIRES_AT,
     advance_token_clock,
     audit_entries,
     grant_store,
     pay,
+    position_out_log,
 )
 
 WORKSPACE = "workspace-token"  # nosec B105
@@ -690,10 +698,11 @@ def test_http_capped_token_is_refused_above_its_cap(
 def test_http_a_fall_of_the_prepaid_mech_balance_is_held_to_the_intent_and_caps(
     client: TestClient, fake_w3: FakeW3, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A safe call that spends the prepaid mech balance needs an intent, within caps.
+    """A safe call that spends the prepaid mech balance is held to an intent, in caps.
 
-    No intent is `missing-intent`, an intent short of the fall `overspend`,
-    and one that declares it past the token's cap `token-cap-per-tx`.
+    No intent declares no spend beyond the call's own value, so the fall is
+    `overspend`; so is an intent short of it; one that declares it past the
+    token's cap is `token-cap-per-tx`.
     """
     tracker = "0x" + "7e" * 20
     monkeypatch.setattr(
@@ -708,7 +717,10 @@ def test_http_a_fall_of_the_prepaid_mech_balance_is_held_to_the_intent_and_caps(
             "/safe-transaction", json={**body, "intent": intent}, headers=_bearer(token)
         )
 
-    assert "missing-intent" in send(capped, None).json()["detail"]
+    assert (
+        "rule 'overspend' (native: spends 6, intent allows 0)"
+        in send(capped, None).json()["detail"]
+    )
     assert "overspend" in send(capped, {"spend": {"native": 5}}).json()["detail"]
     over = send(capped, {"spend": {"native": 6}})
     assert (over.status_code, "token-cap-per-tx" in over.json()["detail"]) == (
@@ -760,7 +772,11 @@ class TestMcpMiddleware:
         store = grant_store(WORKSPACE)
         reader = store.mint(WORKSPACE, grant(scopes=["read"]))
         middleware = AuthMiddleware(
-            lambda *a: None, store, activity, AuthFailureLimiter()
+            lambda *a: None,
+            store,
+            activity,
+            AuthFailureLimiter(),
+            boundary=FakeBoundary(["wallet_info", "safe_transaction"]),
         )
         return middleware, reader
 
@@ -787,16 +803,12 @@ class TestMcpMiddleware:
         """The session reads the rule in the tool error; nothing reaches the server."""
         middleware, reader = setup
         body = json.dumps(
-            [
-                {"jsonrpc": "2.0", "method": "notifications/initialized"},
-                "junk",
-                {
-                    "jsonrpc": "2.0",
-                    "id": 7,
-                    "method": "tools/call",
-                    "params": {"name": "safe_transaction", "arguments": "x"},
-                },
-            ]
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {"name": "safe_transaction", "arguments": "x"},
+            }
         ).encode()
         sent, seen = await self._call(middleware, reader, body)
         assert seen == []
@@ -807,6 +819,137 @@ class TestMcpMiddleware:
         (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
         assert entry["tool"] == "safe_transaction"
 
+    async def test_a_batch_is_refused_whole_before_anything_is_authorized(
+        self,
+        setup: tuple[AuthMiddleware, str],
+        monkeypatch: pytest.MonkeyPatch,
+        store_path: t.Any,
+    ) -> None:
+        """No call in a batch is checked, drawn on or passed: the server serves one."""
+        middleware, reader = setup
+        authorized: list[str] = []
+        grants = middleware._grants  # pylint: disable=protected-access
+        monkeypatch.setattr(
+            grants, "authorize", lambda _t, name, _a, **_k: authorized.append(name)
+        )
+        call = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "safe_transaction", "arguments": {"value": 5}},
+        }
+        body = json.dumps([{**call, "id": 1}, {**call, "id": 2}]).encode()
+        sent, seen = await self._call(middleware, reader, body)
+        assert seen == []
+        assert authorized == []
+        answer = json.loads(sent[1]["body"])
+        assert answer == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": texts.BATCH_REFUSED},
+        }
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry["rule"] == "batch"
+
+    async def test_an_input_refusal_is_the_tool_s_own_error(
+        self,
+        activity: ActivityLog,
+        store_path: t.Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The mount runs the tool's input check first and answers it as isError."""
+
+        def check(name: str, arguments: dict) -> None:
+            raise ToolError(f"{name} refused {sorted(arguments)}")
+
+        grants = grant_store(WORKSPACE)
+        authorized: list[str] = []
+        monkeypatch.setattr(
+            grants, "authorize", lambda _t, name, _a, **_k: authorized.append(name)
+        )
+        middleware = AuthMiddleware(
+            lambda *a: None,
+            grants,
+            activity,
+            AuthFailureLimiter(),
+            boundary=FakeBoundary(["safe_transaction"], check),
+        )
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "safe_transaction", "arguments": {"target": "x"}},
+            }
+        ).encode()
+        sent, seen = await self._call(middleware, WORKSPACE, body)
+        assert seen == []
+        assert json.loads(sent[1]["body"]) == {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [
+                    {"type": "text", "text": "safe_transaction refused ['target']"}
+                ],
+                "isError": True,
+            },
+        }
+        assert authorized == []  # the check comes first, and refused
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry == {
+            **entry,
+            "rule": "invalid-request",
+            "tool": "safe_transaction",
+            "reason": "safe_transaction refused ['target']",
+        }
+
+    async def test_a_body_nested_past_the_parser_is_a_parse_error(
+        self, setup: tuple[AuthMiddleware, str], store_path: t.Any
+    ) -> None:
+        """A body json cannot read for depth is refused, never a 500."""
+        middleware, reader = setup
+        sent, seen = await self._call(middleware, reader, b"[" * 200_000)
+        assert seen == []
+        assert json.loads(sent[1]["body"]) == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": texts.BODY_TOO_DEEP},
+        }
+        (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+        assert entry["rule"] == "body-too-deep"
+
+    @pytest.mark.parametrize(
+        ("tools", "name", "passed"),
+        [
+            (["wallet_info"], "no_such_tool", True),  # unknown: the app answers
+            (["wallet_info", "unscoped"], "unscoped", False),  # registered: refused
+        ],
+    )
+    async def test_only_a_name_no_tool_answers_to_passes_unauthorized(
+        self,
+        activity: ActivityLog,
+        tools: list[str],
+        name: str,
+        passed: bool,
+    ) -> None:
+        """The mount fails closed: a registered tool with no scope is refused."""
+        store = grant_store(WORKSPACE)
+        middleware = AuthMiddleware(
+            lambda *a: None,
+            store,
+            activity,
+            AuthFailureLimiter(),
+            boundary=FakeBoundary(tools),
+        )
+        call = json.dumps(
+            {"method": "tools/call", "params": {"name": name, "arguments": {}}}
+        ).encode()
+        sent, seen = await self._call(middleware, WORKSPACE, call)
+        if passed:
+            assert seen[0] == call
+        else:
+            assert not seen
+            assert "token-scope" in json.loads(sent[1]["body"])["error"]["message"]
+
     async def test_a_malformed_body_is_left_to_the_server(
         self, setup: tuple[AuthMiddleware, str]
     ) -> None:
@@ -814,9 +957,10 @@ class TestMcpMiddleware:
         middleware, reader = setup
         _, seen = await self._call(middleware, reader, b"{not json")
         assert seen[0] == b"{not json"
+        # a call naming no tool authorizes nothing, so the server answers it
         call = json.dumps({"method": "tools/call", "params": None}).encode()
-        sent, _ = await self._call(middleware, reader, call)
-        assert "token-scope" in json.loads(sent[1]["body"])["error"]["message"]
+        _, seen = await self._call(middleware, reader, call)
+        assert seen[0] == call
 
 
 async def test_a_disconnect_before_any_body_is_passed_on(activity: ActivityLog) -> None:
@@ -828,7 +972,11 @@ async def test_a_disconnect_before_any_body_is_passed_on(activity: ActivityLog) 
         seen.append(await receive())
 
     middleware = AuthMiddleware(
-        inner, grant_store(WORKSPACE), activity, AuthFailureLimiter()
+        inner,
+        grant_store(WORKSPACE),
+        activity,
+        AuthFailureLimiter(),
+        boundary=FakeBoundary(ACTION_SCOPES),
     )
     messages = [{"type": "http.disconnect"}, {"type": "http.disconnect"}]
 
@@ -854,20 +1002,6 @@ SAFE = "0x" + "22" * 20
 POSITIONS = "0x" + "4d" * 20
 
 
-def _position_out_log(holder: str = SAFE) -> dict:
-    """Return an ERC-1155 TransferSingle moving one position out of `holder`."""
-    return {
-        "address": POSITIONS,
-        "topics": [
-            intent_module.TRANSFER_SINGLE,
-            "0x" + holder[2:].lower().rjust(64, "0"),
-            "0x" + holder[2:].lower().rjust(64, "0"),
-            "0x" + RECIPIENT[2:].rjust(64, "0"),
-        ],
-        "data": "0x" + hex(7)[2:].rjust(64, "0") + hex(3)[2:].rjust(64, "0"),
-    }
-
-
 def _mint_capped(client: TestClient) -> str:
     minted = client.post(
         "/tokens",
@@ -882,7 +1016,7 @@ def test_http_capped_token_may_not_move_a_position(
     client: TestClient, fake_w3: FakeW3, store_path: t.Any
 ) -> None:
     """No cap bounds a position, so a capped token moves none out; others may."""
-    fake_w3.provider.logs = [_position_out_log()]
+    fake_w3.provider.logs = [position_out_log(SAFE, POSITIONS, RECIPIENT, amount=3)]
     body = {
         "chain": "testchain",
         "target": POSITIONS,
@@ -907,7 +1041,7 @@ def test_mcp_capped_token_may_not_move_a_position(
 ) -> None:
     """Through the real MCP mount, on both send tools: the tool sees the token."""
     holder = SAFE if tool == "safe_transaction" else test_signer.address
-    fake_w3.provider.logs = [_position_out_log(holder)]
+    fake_w3.provider.logs = [position_out_log(holder, POSITIONS, RECIPIENT, amount=3)]
     call = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -931,35 +1065,33 @@ def test_mcp_capped_token_may_not_move_a_position(
     assert len(fake_w3.eth.sent) == 1
 
 
-@pytest.mark.parametrize("tool", ["preflight_transaction", "simulate_transaction"])
-def test_mcp_dry_runs_hold_a_capped_token_as_the_send_would(
-    client: TestClient, fake_w3: FakeW3, tool: str
+def test_mcp_simulation_holds_a_capped_token_as_the_send_would(
+    client: TestClient, fake_w3: FakeW3
 ) -> None:
-    """A capped token's preflight and simulation answer as its real call would."""
-    fake_w3.provider.logs = [_position_out_log()]
-    call = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": tool,
-            "arguments": {
-                "chain": "testchain",
-                "target": POSITIONS,
-                "intent": {"recipients": [RECIPIENT]},
-            },
-        },
-    }
-    headers = {"Accept": "application/json, text/event-stream"}
+    """A capped token's simulation sees the position leave, as its send would.
+
+    Preflight does not: it is the guardrail's verdict alone and simulates
+    nothing, so it permits the same call the send refuses by the position cap.
+    """
+    fake_w3.provider.logs = [position_out_log(SAFE, POSITIONS, RECIPIENT, amount=3)]
+    arguments = {"chain": "testchain", "target": POSITIONS}
+    simulated = {**arguments, "intent": {"recipients": [RECIPIENT]}}
     capped = client.post(
         "/tokens",
         json={"scopes": ["read", "tx"], "max_value_per_tx": {"native": 5}, **LIVE},
         headers=_bearer(WORKSPACE),
     ).json()["token"]
-    refused = client.post("/mcp/", json=call, headers={**headers, **_bearer(capped)})
-    assert "token-cap-positions" in refused.text
-    allowed = client.post("/mcp/", json=call, headers={**headers, **_bearer(WORKSPACE)})
-    assert "token-cap-positions" not in allowed.text
+
+    def answer(token: str, tool: str, args: dict) -> str:
+        return _mcp_call(client, token, tool, args).text
+
+    assert "token-cap-positions" in answer(capped, "simulate_transaction", simulated)
+    assert "token-cap-positions" not in answer(
+        WORKSPACE, "simulate_transaction", simulated
+    )
+    preflight = answer(capped, "preflight_transaction", arguments)
+    assert '\\"permitted\\": true' in preflight
+    assert "token-cap-positions" not in preflight
     assert not fake_w3.eth.sent
 
 
@@ -967,7 +1099,9 @@ def test_http_sign_and_send_holds_a_capped_token_to_its_positions(
     client: TestClient, fake_w3: FakeW3, test_signer: Signer
 ) -> None:
     """The EOA route wraps a capped token's intent as the safe route does."""
-    fake_w3.provider.logs = [_position_out_log(test_signer.address)]
+    fake_w3.provider.logs = [
+        position_out_log(test_signer.address, POSITIONS, RECIPIENT, amount=3)
+    ]
     body = {
         "chain": "testchain",
         "to": POSITIONS,
@@ -1001,28 +1135,156 @@ def test_mcp_value_that_is_not_finite_is_a_bad_value_refusal(
         },
     )
     assert answer.status_code == 200
-    assert "rule 'bad-value'" in answer.text
+    assert _tool_error(answer) == texts.AMOUNT_INEXACT(float("inf"))
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-    assert rules == ["bad-value"]
+    assert rules == ["invalid-request"]
 
 
-@pytest.mark.parametrize("tool", sorted(auth_module.TOOL_AMOUNTS))
+def _tool_error(response: t.Any) -> str:
+    """Return the text of an `isError` tool result answered by the mount."""
+    result = response.json()["result"]
+    assert result["isError"] is True
+    return result["content"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "safe_transaction",
+        "send_transaction",
+        "preflight_transaction",
+        "simulate_transaction",
+    ],
+)
 def test_mcp_an_amount_from_2_53_on_is_refused_at_the_mount_before_any_draw(
     client: TestClient, fake_w3: FakeW3, store_path: t.Any, tool: str
 ) -> None:
-    """A JSON number from 2^53 on may already be rounded: refused, naming the rule."""
-    (name,) = auth_module.TOOL_AMOUNTS[tool]
-    arguments = (
-        {"prompt": "q", "tool": "t"}
-        if tool == "mech_request"
-        else {"chain": "testchain", "target": RECIPIENT}
-    )
-    refused = _mcp_call(client, WORKSPACE, tool, {**arguments, name: 2**53})
-    assert _refused_rule(refused) == "bad-value"
-    assert "2^53 - 1" in refused.json()["error"]["message"]
-    rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-    assert rules == ["bad-value"]
+    """A JSON number from 2^53 on may be rounded: the tool's own refusal, no draw."""
+    key = "to" if tool == "send_transaction" else "target"
+    arguments = {"chain": "testchain", key: RECIPIENT, "value": 2**53}
+    refused = _mcp_call(client, WORKSPACE, tool, arguments)
+    assert _tool_error(refused) == texts.AMOUNT_INEXACT(2**53)
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert entry["rule"] == "invalid-request"
+    assert entry["tool"] == tool
     assert not fake_w3.eth.sent
+
+
+def test_mcp_a_malformed_amount_is_refused_without_echoing_it(
+    client: TestClient, fake_w3: FakeW3
+) -> None:
+    """Over the transport too, the refusal names the argument and never the value."""
+    marker = "MARKER-" + "9" * 40
+    answers = [
+        _mcp_call(
+            client,
+            WORKSPACE,
+            "safe_transaction",
+            {"chain": "testchain", "target": RECIPIENT, "value": marker},
+        ),
+        _mcp_call(
+            client,
+            WORKSPACE,
+            "mech_request",
+            {"prompt": "q", "tool": "t", "max_payment": marker},
+        ),
+    ]
+    assert [_tool_error(answer) for answer in answers] == [
+        f"invalid request: ValidationError: value: Value error, {AMOUNT_REFUSED}",
+        f"invalid request: ValidationError: max_payment: Value error, {CAP_REFUSED}",
+    ]
+    assert not fake_w3.eth.sent
+
+
+def test_mcp_a_malformed_address_is_refused_before_the_budget_is_drawn(
+    client: TestClient, fake_w3: FakeW3, store_path: t.Any
+) -> None:
+    """The mount checks the arguments as sent before authorize draws on a budget."""
+    capped = _session_capped(client)  # 10 native for the session
+    arguments = {"chain": "testchain", "value": 5, "intent": pay(RECIPIENT, 5)}
+    refused = _mcp_call(
+        client, capped, "safe_transaction", {**arguments, "target": "0x12"}
+    )
+    reason = "target must be a 0x address (40 hex digits), got '0x12'"
+    assert _tool_error(refused) == reason
+    (entry,) = [e for e in audit_entries(store_path) if e["kind"] == "refusal"]
+    assert entry == {
+        **entry,
+        "rule": "invalid-request",
+        "tool": "safe_transaction",
+        "reason": reason,
+    }
+    whole = {"chain": "testchain", "value": 10, "intent": pay(RECIPIENT, 10)}
+    sent = _mcp_call(client, capped, "safe_transaction", {**whole, "target": RECIPIENT})
+    assert _refused_rule(sent) is None  # the session's 10 are all still there
+    assert len(fake_w3.eth.sent) == 1
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_mcp_the_cap_reads_an_unknown_intent_key_as_the_gate_does(  # pylint: disable=too-many-arguments
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    make_app: t.Callable,
+    fake_w3: FakeW3,
+    strict: bool,
+) -> None:
+    """Under strict_parameters it is refused before any draw; otherwise it is ignored."""
+    app = make_app(
+        test_signer,
+        app_config,
+        activity,
+        token=WORKSPACE,
+        switches=Switches(strict_parameters=strict),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        capped = _session_capped(client)  # 10 native for the session
+        intent = {**pay(RECIPIENT, 10), "limit": 1}
+        arguments = {"chain": "testchain", "target": RECIPIENT, "value": 10}
+        first = _mcp_call(
+            client, capped, "safe_transaction", {**arguments, "intent": intent}
+        )
+        if not strict:  # ignored by the cap and the gate alike: sent, 10 drawn
+            assert _refused_rule(first) is None
+            assert len(fake_w3.eth.sent) == 1
+            return
+        assert _refused_rule(first) == "bad-intent"
+        sent = _mcp_call(
+            client,
+            capped,
+            "safe_transaction",
+            {**arguments, "intent": pay(RECIPIENT, 10)},
+        )
+        assert _refused_rule(sent) is None  # the session's 10 are all still there
+    assert len(fake_w3.eth.sent) == 1
+
+
+def test_mcp_the_cap_reads_only_what_the_tool_reads(
+    test_signer: Signer,
+    app_config: AppConfig,
+    activity: ActivityLog,
+    make_app: t.Callable,
+    fake_w3: FakeW3,
+) -> None:
+    """With S3 off, send_transaction's intent is unread, so no cap counts it."""
+    app = make_app(
+        test_signer, app_config, activity, token=WORKSPACE, switches=TEST_INTERFACE
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+        capped = _mint_capped(client)  # 5 native per transaction
+        answer = _mcp_call(
+            client,
+            capped,
+            "send_transaction",
+            {
+                "chain": "testchain",
+                "to": RECIPIENT,
+                "value": 1,
+                "intent": {"spend": {"native": "100"}, "recipients": [RECIPIENT]},
+            },
+        )
+        assert _refused_rule(answer) is None  # the 100 the tool never reads
+    assert len(fake_w3.eth.sent) == 1
 
 
 def test_mcp_a_mech_cap_from_2_53_on_reaches_the_flow_exactly(
@@ -1062,11 +1324,12 @@ def test_mcp_a_mech_cap_from_2_53_on_reaches_the_flow_exactly(
                     {"token": RECIPIENT, "spender": RECIPIENT, "amount": 2**53}
                 ]
             },
-            "intent.approvals[0].amount",
+            "intent.approvals.0.amount",
         ),
     ],
 )
 @pytest.mark.parametrize("tool", ["safe_transaction", "simulate_transaction"])
+@pytest.mark.parametrize("as_string", [False, True])
 def test_mcp_an_intent_amount_a_json_number_may_have_rounded_is_refused_at_the_mount(  # pylint: disable=too-many-arguments
     client: TestClient,
     fake_w3: FakeW3,
@@ -1074,18 +1337,27 @@ def test_mcp_an_intent_amount_a_json_number_may_have_rounded_is_refused_at_the_m
     tool: str,
     intent: dict,
     where: str,
+    as_string: bool,
 ) -> None:
-    """Every amount inside an intent follows the value rule, named by where it sits."""
+    """Every amount inside an intent follows the value rule, named by where it sits.
+
+    A JSON-string intent is decoded first, as the tool decodes it.
+    """
     refused = _mcp_call(
         client,
         WORKSPACE,
         tool,
-        {"chain": "testchain", "target": RECIPIENT, "intent": intent},
+        {
+            "chain": "testchain",
+            "target": RECIPIENT,
+            "intent": json.dumps(intent) if as_string else intent,
+        },
     )
-    assert _refused_rule(refused) == "bad-value"
-    assert refused.json()["error"]["message"].startswith(f"rule 'bad-value': {where}:")
+    assert _tool_error(refused) == (
+        f"invalid request: ValidationError: {where}: Value error, {AMOUNT_REFUSED}"
+    )
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
-    assert rules == ["bad-value"]
+    assert rules == ["invalid-request"]
     assert not fake_w3.eth.sent
 
 
@@ -1295,7 +1567,9 @@ def test_a_spared_retry_never_sends_fresh_after_the_first_send_fails(  # pylint:
 def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
     """The exemption covers what this token drew for the id, and nothing more."""
     held: set = set()
-    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: (rid, via_safe) in held)
+    store = GrantStore(
+        WORKSPACE, signer=FakeGate(lambda rid, via_safe: (rid, via_safe) in held)
+    )
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     other = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     store.authorize(capped, "safe_transaction", {"value": 6, "request_id": "r1"})
@@ -1320,7 +1594,7 @@ def test_a_held_request_id_is_drawn_only_past_this_token_s_own_draw() -> None:
 
 def test_a_retry_s_record_keeps_the_most_drawn_per_asset() -> None:
     """A retry declaring less, or leaving an asset out, lowers nothing on record."""
-    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True)
+    store = GrantStore(WORKSPACE, signer=FakeGate(lambda rid, via_safe: True))
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 20, USDC: 5}))
 
     def send(request_id: str, value: int, usdc: int = 0) -> None:
@@ -1347,7 +1621,7 @@ def test_a_forgotten_request_id_is_drawn_in_full(
 ) -> None:
     """Past the bound a draw is forgotten, which only ever draws again."""
     monkeypatch.setattr(auth_module, "MAX_DRAWN_REQUEST_IDS", 1)
-    store = GrantStore(WORKSPACE, held=lambda rid, via_safe: True)
+    store = GrantStore(WORKSPACE, signer=FakeGate(lambda rid, via_safe: True))
     capped = store.mint(WORKSPACE, grant(max_value_per_session={"native": 10}))
     store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r1"})
     store.authorize(capped, "safe_transaction", {"value": 4, "request_id": "r2"})
@@ -1402,12 +1676,9 @@ def test_mcp_preflight_answers_with_the_token_s_cap_and_draws_nothing(
     headers = {"Accept": "application/json, text/event-stream", **_bearer(capped)}
 
     def call(tool: str, value: int) -> str:
-        arguments = {
-            "chain": "testchain",
-            "target": RECIPIENT,
-            "value": value,
-            "intent": pay(RECIPIENT, value),
-        }
+        arguments = {"chain": "testchain", "target": RECIPIENT, "value": value}
+        if tool != "preflight_transaction":  # preflight takes no intent
+            arguments["intent"] = pay(RECIPIENT, value)
         body = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -1417,10 +1688,10 @@ def test_mcp_preflight_answers_with_the_token_s_cap_and_draws_nothing(
         return client.post("/mcp/", json=body, headers=headers).text
 
     over = call("preflight_transaction", 6)
-    assert '\\"allowed\\": false' in over
+    assert '\\"permitted\\": false' in over
     assert "token-cap-per-tx" in over
     for _ in range(2):  # a dry run draws nothing on the session budget
-        assert '\\"allowed\\": true' in call("preflight_transaction", 5)
+        assert '\\"permitted\\": true' in call("preflight_transaction", 5)
     assert "tx_hash" in call("safe_transaction", 5)
     spent = call("preflight_transaction", 1)
     assert "token-cap-per-session" in spent
@@ -1450,7 +1721,7 @@ def test_mcp_preflight_answers_a_read_only_token_as_its_send_would(
     }
     headers = {"Accept": "application/json, text/event-stream", **_bearer(reader)}
     answer = client.post("/mcp/", json=body, headers=headers).text
-    assert '\\"allowed\\": false' in answer
+    assert '\\"permitted\\": false' in answer
     assert "token-scope" in answer
     (checked,) = [e for e in audit_entries(store_path) if e["kind"] == "checked"]
     assert "token-scope" in checked["reason"]
@@ -1471,9 +1742,15 @@ def _mcp_call(client: TestClient, token: str, tool: str, arguments: dict) -> t.A
 
 
 def _refused_rule(response: t.Any) -> str | None:
-    """Return the rule of a JSON-RPC -32001 refusal, or None if not refused."""
+    """Return the rule of a refusal over `/mcp`, or None if not refused.
+
+    A grant refusal is a JSON-RPC -32001 naming its rule. Any `isError` answer
+    reads as `invalid-request`: in these tests it is the mount's input check.
+    """
     if not response.headers["content-type"].startswith("application/json"):
         return None
+    if (response.json().get("result") or {}).get("isError"):
+        return "invalid-request"
     error = response.json().get("error") or {}
     if error.get("code") != -32001:
         return None
@@ -1517,14 +1794,14 @@ def test_mcp_mech_request_is_held_to_the_token_s_mech_caps(
 
     assert pay_mech(max_payment="101") == "token-mech-payment-cap"
     assert pay_mech() == "token-mech-payment-cap"  # omitted: the default is no cap
-    assert pay_mech(max_payment=1.5) == "bad-value"
+    assert pay_mech(max_payment=1.5) == "invalid-request"
     assert pay_mech(max_payment="100") is None
     assert pay_mech(max_payment="100") == "token-mech-session-cap"  # 200 > 150
     assert pay_mech(max_payment=50) is None
     assert asked == [100, 50]
     rules = [e["rule"] for e in audit_entries(store_path) if e["kind"] == "refusal"]
     assert rules == ["token-mech-payment-cap"] * 2 + [
-        "bad-value",
+        "invalid-request",
         "token-mech-session-cap",
     ]
 

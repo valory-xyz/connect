@@ -26,34 +26,62 @@ that also serves the Pearl endpoints.
 """
 
 import asyncio
+import functools
+import logging
 import typing as t
 
-from hexbytes import HexBytes
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import Tool as MCPTool
 from mcp.types import ToolAnnotations
-from pydantic import BeforeValidator, ConfigDict, Field, with_config
+from pydantic import BeforeValidator, ConfigDict, Field, ValidationError, with_config
+from pydantic.json_schema import SkipJsonSchema
 from typing_extensions import TypedDict
-from web3.exceptions import TransactionNotFound
 
 from connect import chain_read
 from connect import settings as settings_config
 from connect import wallet
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.guard import Guard
+from connect.guard import Guard, GuardError
+from connect.idempotency import InFlightError
+from connect.input_errors import InputError, check_arguments, checked_hex
 from connect.intent import AgentIntent, parse_amount, parse_tool_amount
-from connect.mech import DEFAULT_RESULT_TIMEOUT, MechService
+from connect.mech import DEFAULT_RESULT_TIMEOUT, MechError, MechService
 from connect.mech_allowances import TopUpBudget
+from connect.safe import OPERATION_CALL, Operation
+from connect.server import tool_schema
 from connect.server.auth import (
     GrantRefused,
     GrantStore,
     is_replay,
     request_token,
 )
-from connect.server.receipts import mined_result, settled
-from connect.server.strict import make_tools_strict
+from connect.server.receipts import settled, settlement
+from connect.server.strict import (
+    AuditedRefusal,
+    make_tools_strict,
+    unknown_parameter_errors,
+)
 from connect.settings import SettingsStore
-from connect.signer import Signer
+from connect.signer import Signer, SignerError
+from connect.signer_errors import logged_cause
+from connect.switches import Switches
+from connect.texts import (
+    AMOUNT_REFUSED,
+    CAP_REFUSED,
+    CHAIN_REQUIRED,
+    GET_ABI_DESCRIPTION,
+    INVALID_REQUEST,
+    REQUEST_CONTEXT_NOTE,
+    SERVER_INFO,
+    TOOL_DESCRIPTIONS,
+    TRANSACTION_STATUS_DESCRIPTION,
+    UNKNOWN_TOOL,
+    VALUE_REFUSED,
+    WEI_DESCRIPTION,
+    tool_failed,
+)
 
 # tools that read and never sign, broadcast or pay: harnesses may run them
 # without asking the operator
@@ -67,11 +95,8 @@ def _amount_text(value: t.Any) -> str:
     """
     try:
         return str(parse_tool_amount(value))
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"rule 'bad-value': {e}; pass a decimal or 0x-hex string of base "
-            f"units (got {value!r})"
-        ) from e
+    except (TypeError, ValueError) as e:  # Connect's words: no value, no int()'s
+        raise ValueError(AMOUNT_REFUSED) from e
 
 
 # a base-unit amount on the tool surface: declared a string, so a client
@@ -79,7 +104,7 @@ def _amount_text(value: t.Any) -> str:
 Amount = t.Annotated[
     str,
     BeforeValidator(_amount_text),
-    Field(description="base units, as a decimal or 0x-hex string"),
+    Field(description=WEI_DESCRIPTION),
 ]
 
 
@@ -94,17 +119,14 @@ def _cap_text(value: t.Any) -> str:
     try:
         return str(parse_amount(value))
     except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"rule 'bad-value': {e}; pass a whole number of base units, as an "
-            f"integer or a decimal or 0x-hex string (got {value!r})"
-        ) from e
+        raise ValueError(CAP_REFUSED) from e
 
 
 # a base-unit cap on the tool surface: a string or any whole JSON integer
 Cap = t.Annotated[
     str,
     BeforeValidator(_cap_text),
-    Field(description="base units, as an integer or a decimal or 0x-hex string"),
+    Field(description=WEI_DESCRIPTION),
 ]
 
 
@@ -129,6 +151,149 @@ class ToolIntent(TypedDict, total=False):
     approvals: list[ToolApproval] | None
 
 
+RequestContext = t.Annotated[dict | None, Field(description=REQUEST_CONTEXT_NOTE)]
+
+
+# the tools whose `target` may be passed as `to`, as the reference accepts it
+TOOLS_TAKING_TO_FOR_TARGET = frozenset(
+    {"safe_transaction", "preflight_transaction", "simulate_transaction"}
+)
+
+# errors whose text Connect wrote for the caller; any other is a library's or
+# a bug's, which may carry an RPC URL and key, so it is logged, not forwarded
+CALLER_ERRORS: tuple[type[Exception], ...] = (
+    InputError,
+    SignerError,
+    GuardError,
+    GrantRefused,
+    MechError,
+    InFlightError,
+)
+
+
+logger = logging.getLogger("agent")
+
+
+def with_aliases(tool: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
+    """Return a tool's arguments with `to` read as `target` where it aliases it.
+
+    A non-empty `target` wins when both are given: the reference reads
+    `a.get("target") or a.get("to")`.
+    """
+    if tool not in TOOLS_TAKING_TO_FOR_TARGET or "to" not in arguments:
+        return arguments
+    aliased = {k: v for k, v in arguments.items() if k != "to"}
+    if not aliased.get("target"):
+        aliased["target"] = arguments["to"]
+    return aliased
+
+
+def argument_problems(error: ValidationError) -> str:
+    """Say what was wrong with each argument, never echoing the value sent."""
+    return "; ".join(
+        (
+            ".".join(str(part) for part in issue["loc"]) + ": " + issue["msg"]
+            if issue["loc"]
+            else issue["msg"]
+        )
+        for issue in error.errors()
+    )
+
+
+class ConnectMCP(FastMCP):
+    """FastMCP with the reference's call boundary.
+
+    A refusal Connect wrote reaches the agent verbatim, any other error as
+    `tool_failed`; FastMCP's `Error executing tool <name>: ` prefix would hide
+    the markers the bench's broker reads.
+    """
+
+    def __init__(self, *, switches: Switches, **settings: t.Any) -> None:
+        """Build the server, reporting the reference's serverInfo version.
+
+        `switches` decide what the listing publishes (`tool_schema`).
+        """
+        super().__init__(**settings)
+        self._switches = switches
+        # FastMCP takes no version; unset, the MCP SDK reports its own
+        self._mcp_server.version = SERVER_INFO["version"]
+
+    async def list_tools(self) -> list[MCPTool]:
+        """List the tools, each argument presented as the reference presents it."""
+        return [
+            tool.model_copy(
+                update={
+                    "inputSchema": tool_schema.published(
+                        tool.name, tool.inputSchema, self._switches
+                    )
+                }
+            )
+            for tool in await super().list_tools()
+        ]
+
+    def tool_names(self) -> frozenset[str]:
+        """Return the names of the registered tools."""
+        return frozenset(tool.name for tool in self._tool_manager.list_tools())
+
+    def check_call(self, name: str, arguments: dict[str, t.Any]) -> dict[str, t.Any]:
+        """Refuse a registered tool's malformed arguments; return them aliased.
+
+        The one input check: every address and hex argument as sent, then the
+        tool's own model (amounts, types, strictness). The MCP mount runs it
+        before authorizing, so a refused call never draws on a budget and
+        reads the same over the transport as in process.
+
+        :raises ToolError: the refusal, in the words the agent reads.
+        """
+        tool = self._tool_manager.get_tool(name)
+        if tool is None:
+            raise ToolError(UNKNOWN_TOOL(name))
+        try:  # the arguments' check is Connect's; one inside a tool body is not
+            check_arguments(arguments)
+            unread = sorted(tool_schema.unread(name, self._switches) & arguments.keys())
+            if unread and not self._switches.strict_parameters:  # strict names them
+                logger.warning(
+                    "ignored %s on %s: extra_tool_parameters is off", unread, name
+                )
+                arguments = {k: v for k, v in arguments.items() if k not in unread}
+            arguments = with_aliases(name, arguments)
+            metadata = tool.fn_metadata
+            metadata.arg_model.model_validate(metadata.pre_parse_json(arguments))
+            # the model refuses a missing required field; an empty one is none too
+            listed = tool_schema.published(name, tool.parameters, self._switches)
+            empty = [
+                f"{field}: Field required"
+                for field in listed["required"]
+                if arguments.get(field) == ""
+            ]
+            if empty:
+                raise InputError(INVALID_REQUEST("ValidationError", "; ".join(empty)))
+        except InputError as e:
+            raise ToolError(str(e)) from e
+        except ValidationError as e:
+            audited = bool(unknown_parameter_errors(e.errors()))
+            refusal = AuditedRefusal if audited else ToolError
+            raise refusal(
+                INVALID_REQUEST(type(e).__name__, argument_problems(e))
+            ) from e
+        except Exception as e:  # e.g. a JSON intent nested past the stack
+            logger.error("tool %s failed: %s", name, logged_cause(e))
+            raise ToolError(tool_failed(name)) from e
+        return arguments
+
+    async def call_tool(self, name: str, arguments: dict[str, t.Any]) -> t.Any:
+        """Call a tool, raising its own error text with no transport prefix."""
+        arguments = self.check_call(name, arguments)
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as e:
+            cause = e.__cause__ or e
+            if isinstance(cause, (ToolError, *CALLER_ERRORS)):
+                raise ToolError(str(cause)) from cause
+            logger.error("tool %s failed: %s", name, logged_cause(cause))
+            raise ToolError(tool_failed(name)) from cause
+
+
 def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-locals
     signer: Signer,
     config: AppConfig,
@@ -138,7 +303,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     mech: MechService,
     settings_store: SettingsStore,
     grants: GrantStore,
-) -> FastMCP:
+) -> ConnectMCP:
     """Build mcp."""
     # Read once per build: tool registration happens here while wallet_info's
     # mode key is added per call, and one snapshot keeps the MCP surface
@@ -147,23 +312,18 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
     # the constant only changes with a rebuild, so the surfaces cannot
     # actually diverge in a running process.
     expose_mode = settings_config.EXPOSE_MODE_TO_AGENT
-    mcp = FastMCP(
-        name="connect",
-        instructions=(
-            "Signing service for this Pearl agent: it holds the key, you name "
-            "the actions. Act on-chain with safe_transaction; a guardrail may "
-            "refuse, and every refusal names the rule it violated."
-        ),
+    # no instructions at initialize: the reference sends none
+    mcp = ConnectMCP(
+        switches=signer.switches,
+        name=SERVER_INFO["name"],
         stateless_http=True,
         streamable_http_path="/",
     )
 
-    @mcp.tool(annotations=READ_ONLY)
-    async def wallet_info() -> dict:
-        """Agent EOA and per-chain safes and native token balances.
-
-        Act only on `actionable_chains`; the rest say `not_actionable_because`.
-        """
+    @mcp.tool(description=TOOL_DESCRIPTIONS["wallet_info"], annotations=READ_ONLY)
+    async def wallet_info(chain: str | None = None) -> dict:
+        """Report the EOA, the safes and their balances; `chain` is ignored."""
+        del chain
 
         def _run() -> dict:
             overview = wallet.wallet_overview(config, signer)
@@ -173,7 +333,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
 
         return await asyncio.to_thread(_run)
 
-    @mcp.tool()
+    @mcp.tool(description=TOOL_DESCRIPTIONS["safe_transaction"])
     async def safe_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         target: str,
@@ -185,25 +345,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         request_id: str | None = None,
         wait_for_receipt: bool = False,
         timeout: int = 60,
+        operation: SkipJsonSchema[Operation] = OPERATION_CALL,
     ) -> dict:
-        """Make the service safe call `target` — the normal way to act on-chain.
-
-        `target`/`value`/`data` are the call the safe makes; any value carried
-        leaves the safe, not the EOA. `value` is base units as a decimal or
-        0x-hex string. Returns {tx_hash}, plus a top-level
-        `status` (mined / reverted / pending) and the receipt when
-        wait_for_receipt. Reusing a request_id replays the original tx_hash
-        instead of spending twice.
-        `intent` is required whenever the call moves value (spends or sends
-        anything of the safe's, or grants an approval): {spend: {token: max},
-        receive_min: {token: min}, recipients: [eoa, ...], approvals: [{token,
-        spender, amount}]}, tokens as addresses (any case) or "native", amounts
-        in base units as decimal or 0x-hex strings, like `value`. The call is
-        simulated before it is signed and refused, naming the rule, if it would
-        do more than the intent allows.
-        """
+        """Have the service safe make one call."""
         return await _dispatch(
-            signer.send_via_safe,
+            functools.partial(signer.send_via_safe, operation=operation),
             signer,
             chain=chain,
             address=target,
@@ -216,7 +362,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             timeout=timeout,
         )
 
-    @mcp.tool()
+    @mcp.tool(description=TOOL_DESCRIPTIONS["send_transaction"])
     async def send_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         to: str,
@@ -229,12 +375,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         wait_for_receipt: bool = False,
         timeout: int = 60,
     ) -> dict:
-        """Sign and broadcast a transaction from the agent EOA — the rarer path.
-
-        `to` is the EOA's own recipient, not a call the safe makes, and the
-        EOA's funds are for gas: to spend or act on-chain use safe_transaction.
-        Returns, request_id and `intent` semantics are safe_transaction's.
-        """
+        """Send one transaction from the agent EOA."""
         return await _dispatch(
             signer.send,
             signer,
@@ -249,7 +390,9 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             timeout=timeout,
         )
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(
+        description=TOOL_DESCRIPTIONS["preflight_transaction"], annotations=READ_ONLY
+    )
     async def preflight_transaction(
         chain: str,
         target: str,
@@ -257,23 +400,14 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         data: str = "0x",
         *,
         via_safe: bool = True,
-        intent: ToolIntent | None = None,
         ctx: Context | None = None,
     ) -> dict:
-        """Ask whether a call would be permitted, before you build on it.
-
-        Takes what safe_transaction takes (or send_transaction's, with
-        via_safe=false) and answers {allowed}, plus the same `reason` the real
-        call would have refused with. Nothing is signed, broadcast or paid for.
-        `allowed` means your token, the guardrail and the intent gate permit
-        these bytes at head — with the `intent` you give, as the real call
-        would be checked; any `problems` name the gate's rules.
-        """
+        """Answer whether the token and the guardrail permit a call; nothing is simulated."""
         refused = _token_refusal(
             grants,
             ctx,
             "safe_transaction" if via_safe else "send_transaction",
-            {"chain": chain, "value": value, "intent": intent},
+            {"chain": chain, "value": value, "intent": None},
         )
         if refused is not None:  # audited as the gate's own dry runs are
             activity.record(
@@ -285,24 +419,23 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
                 probed_value=str(value),
                 via_safe=via_safe,
             )
-            return {"allowed": False, "reason": refused}
-        reason, problems = await asyncio.to_thread(
+            return {"permitted": False, "rule": refused}
+        reason, _ = await asyncio.to_thread(
             signer.check,
             chain,
             target,
             value=parse_amount(value),
             data=data,
             via_safe=via_safe,
-            intent=_for_token(grants, ctx, intent),
+            run_intent_gate=False,
         )
         if reason is None:
-            return {"allowed": True}
-        result: dict = {"allowed": False, "reason": reason}
-        if problems:
-            result["problems"] = problems
-        return result
+            return {"permitted": True}
+        return {"permitted": False, "rule": reason}
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(
+        description=TOOL_DESCRIPTIONS["simulate_transaction"], annotations=READ_ONLY
+    )
     async def simulate_transaction(  # pylint: disable=too-many-arguments
         chain: str,
         target: str,
@@ -313,18 +446,7 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         intent: ToolIntent | None = None,
         ctx: Context | None = None,
     ) -> dict:
-        """Simulate a call at head and say what it does to the safe's assets.
-
-        Returns the asset diff — `native` and `tokens` deltas (each token with
-        its `symbol`, display only; both count `prepaid`, any fall of the
-        safe's prepaid mech balance), `recipients`
-        (each with `contract`), `approvals`, ERC-721/1155 `positions`,
-        `called` (the target plus every contract that emitted a log; one
-        called without emitting is not listed), `revert`, `gas_used` — with
-        `fits_intent` (null without an intent) and the `problems` the send
-        would be refused for. Nothing is signed. via_safe=false simulates
-        send_transaction's call from the EOA.
-        """
+        """Simulate a call and report its asset diff."""
         return await asyncio.to_thread(
             signer.simulate,
             chain,
@@ -335,75 +457,44 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             intent=_for_token(grants, ctx, intent),
         )
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(description=TOOL_DESCRIPTIONS["chain_call"], annotations=READ_ONLY)
     async def chain_call(chain: str, to: str, data: str, block: str = "latest") -> dict:
-        """Read a contract with eth_call: {result} or {reverted, reason}."""
+        """Read a contract with eth_call."""
         return await asyncio.to_thread(
             chain_read.chain_call, signer.w3(chain), to, data, block
         )
 
-    @mcp.tool(annotations=READ_ONLY)
-    async def get_abi(chain: str, address: str) -> dict:
-        """Report what Connect can say about a contract's ABI, following EIP-1967.
+    @mcp.tool(description=GET_ABI_DESCRIPTION, annotations=READ_ONLY)
+    async def get_abi(address: str, chain: str | None = None) -> dict:
+        """Report the ABI Connect ships for a contract, on `chain` or the instance's."""
+        on = chain or config.instance_chain
+        if on is None:
+            raise InputError(CHAIN_REQUIRED)
+        return await asyncio.to_thread(chain_read.get_abi, signer.w3(on), address)
 
-        Only ABIs Connect ships: well-known contracts by address on the chains
-        they are deployed to (`verified`, for the queried address alone; a
-        proxy's implementation has its own `implementation_verified`) and the
-        standard interfaces a contract answers to; no explorer lookup.
+    @mcp.tool(description=TOOL_DESCRIPTIONS["decode_calldata"], annotations=READ_ONLY)
+    async def decode_calldata(
+        data: str, address: str | None = None, chain: str | None = None
+    ) -> dict:
+        """Decode calldata against the signatures Connect ships; `chain` is ignored.
+
+        `address` is ignored too, once the boundary has checked its shape.
         """
-        return await asyncio.to_thread(chain_read.get_abi, signer.w3(chain), address)
-
-    @mcp.tool(annotations=READ_ONLY)
-    async def decode_calldata(chain: str, data: str) -> dict:
-        """Decode calldata against the signatures Connect ships.
-
-        Returns {selector, signature, args}. A call it cannot decode carries
-        `error` instead of `args` (an unknown selector, calldata that is not
-        hex or is too large, arguments that do not fit or decode too large),
-        with `signature` when one matched the selector. `chain` is accepted
-        for symmetry with the other read tools; decoding needs no RPC.
-        """
+        del address, chain
         return chain_read.decode_calldata(data)
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(description=TRANSACTION_STATUS_DESCRIPTION, annotations=READ_ONLY)
     async def transaction_status(chain: str, tx_hash: str) -> dict:
-        """Settlement of a transaction: mined / reverted / pending.
+        """Report how a transaction settled."""
+        return await asyncio.to_thread(lambda: settlement(signer.w3(chain), tx_hash))
 
-        A malformed hash or a failing RPC raises rather than reporting
-        "pending": a hash that can never resolve must not be polled forever.
-        """
-        try:
-            valid = len(bytes.fromhex(tx_hash.removeprefix("0x"))) == 32
-        except ValueError:
-            valid = False
-        if not valid:
-            raise ValueError("tx_hash must be a 0x-prefixed 32-byte hex string")
-
-        def _run() -> dict:
-            w3 = signer.w3(chain)
-            try:
-                receipt = w3.eth.get_transaction_receipt(HexBytes(tx_hash))
-            except TransactionNotFound:
-                return {"tx_hash": tx_hash, "status": "pending"}
-            return mined_result(tx_hash, receipt)
-
-        return await asyncio.to_thread(_run)
-
-    @mcp.tool()
+    @mcp.tool(description=TOOL_DESCRIPTIONS["sign_message"])
     async def sign_message(digest: str) -> dict:
-        """Sign a raw 32-byte digest (0x-hex), unprefixed.
-
-        The off-chain mech flow does not use this tool: it signs its own
-        SafeMessage-wrapped request-id digest internally, through a
-        server-only allowance that no MCP tool reaches.
-        """
-        try:
-            raw = bytes.fromhex(digest.removeprefix("0x"))
-        except ValueError as e:
-            raise ValueError(f"digest must be a 0x-hex string: {e}") from e
+        """Sign a raw 32-byte digest with the agent EOA."""
+        raw = bytes.fromhex(checked_hex("digest", digest)[2:])
         return {"signature": await asyncio.to_thread(signer.sign_digest, raw)}
 
-    @mcp.tool()
+    @mcp.tool(description=TOOL_DESCRIPTIONS["mech_request"])
     async def mech_request(  # pylint: disable=too-many-arguments
         prompt: str,
         tool: str,
@@ -415,38 +506,10 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
         timeout: float = 300,
         max_payment: Cap | None = None,
         request_id: str | None = None,
-        request_context: dict | None = None,
+        request_context: RequestContext = None,
         ctx: Context | None = None,
     ) -> dict:
-        """Send a request to an Olas mech (AI service) and wait for its delivery.
-
-        The safe pays, so `chain` defaults to a configured chain that has one.
-        Off-chain by default: few mechs can serve that, so check
-        `offchain_capable` with mech_tools first; legacy_on_chain=true goes
-        through the marketplace instead.
-        Off-chain the report also carries mech-client's `operator`,
-        `delivery`, `payment` and `benchmarks`, decided before paying.
-        Refused before paying if the mech's price exceeds max_payment
-        (base units of the mech's payment asset, default 0.1 of that asset;
-        mech_tools reports the asset as payment_token). An automatic top-up
-        of the safe's prepaid balance (`auto_deposit`, on a mech's HTTP 402)
-        deposits at most max_payment too, and draws on the same session
-        budget as the price.
-        On timeout the ids come back as `pending_request_ids` for mech_result.
-        `request_id` is an id you invent before sending (not one of the
-        `request_ids` that come back): repeating it never sends again — it
-        resumes that request and returns its report marked `replayed`. Choose
-        one whenever you would not want to pay twice to find out what
-        happened; a request that failed after payment refuses replay and says
-        so, since only you can decide to risk a second payment.
-        `request_context` is an optional dict handed to the tool alongside the
-        prompt. The trader sends `market_id`, `type`, `description`,
-        `market_prob`, `market_close_at`, `market_liquidity_usd`, `amm_fee`
-        and `market_spread`, dropping any it has no value for; each is
-        optional and ignored by a tool that does not read it. It reaches the
-        mech, and legacy_on_chain=true also publishes it to IPFS for good —
-        put nothing private in it.
-        """
+        """Send a mech request and wait for its delivery."""
         # mech-client manages its own event loops (asyncio.run + sync gql):
         # it must run in a worker thread, never on the server loop
         return await asyncio.to_thread(
@@ -464,34 +527,21 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             top_up_budget=_top_up_budget(grants, ctx),
         )
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(description=TOOL_DESCRIPTIONS["mech_result"], annotations=READ_ONLY)
     async def mech_result(
         request_id: str, timeout: float = DEFAULT_RESULT_TIMEOUT
     ) -> dict:
-        """Check whether a mech has since answered a request whose wait timed out.
-
-        Poll the ids from `pending_request_ids`. Already paid for, so this
-        resumes the watch and never resends. Returns {delivered, result}; a
-        restart of this server clears what can be polled.
-        """
+        """Resume the watch on a request whose wait timed out."""
         return await asyncio.to_thread(mech.result, request_id, timeout=timeout)
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(description=TOOL_DESCRIPTIONS["mech_tools"], annotations=READ_ONLY)
     async def mech_tools(
         chain: str | None = None,
         priority_mech: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> dict:
-        """Discover Olas mechs and the tools they serve, for use with mech_request.
-
-        Without priority_mech: a page of live mechs, most deliveries first
-        (`total` says how many exist). With it: that mech's payment type,
-        service id, tool names for mech_request's `tool`, and
-        `offchain_capable` — false means only legacy_on_chain=true reaches it,
-        and `offchain_note` says why. The report also carries mech-client's
-        `operator`, `delivery`, `payment` and `benchmarks`.
-        """
+        """List mechs, or one mech's tools and terms."""
         # same as mech_request: the sync gql subgraph client refuses to run
         # on an already-running loop
         return await asyncio.to_thread(
@@ -513,8 +563,11 @@ def build_mcp(  # pylint: disable=unused-argument, too-many-arguments, too-many-
             """
             return await asyncio.to_thread(lambda: settings_store.load().to_dict())
 
-    # a parameter a tool does not take is refused by name, never dropped
-    make_tools_strict(mcp, activity)
+    if signer.switches.strict_parameters:
+        # a parameter a tool does not take is refused by name, never dropped
+        make_tools_strict(
+            mcp, activity, lambda tool: tool_schema.unread(tool, signer.switches)
+        )
     return mcp
 
 
@@ -604,7 +657,7 @@ async def _dispatch(  # pylint: disable=too-many-arguments
     try:
         amount = parse_amount(value)
     except (TypeError, ValueError) as e:
-        raise ValueError(f"value must be a non-negative amount in wei: {e}") from e
+        raise InputError(VALUE_REFUSED) from e
 
     def _run() -> dict:
         tx_hash = method(

@@ -38,6 +38,7 @@ from connect.server import app as app_module
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import Signer, SignerError, _ChainState
 from connect.signer_errors import SEND_FAILED
+from connect.switches import PRODUCTION, Switches
 from connect.wallet import AgentTopUp, plan_agent_topup
 
 from tests.conftest import FakeW3, audit_entries
@@ -51,6 +52,9 @@ REQUIREMENTS = {
     "agent": {NATIVE_ASSET: AGENT_NATIVE},
     "safe": {NATIVE_ASSET: SAFE_NATIVE},
 }
+
+
+OFF = Switches(agent_topup_at_boot=False)
 
 
 class BalancesW3(FakeW3):
@@ -644,6 +648,30 @@ class TestTopUpTask:
         at_shutdown = len(checks)
         time.sleep(0.1)
         assert len(checks) == at_shutdown
+
+    @pytest.mark.parametrize(("switches", "started"), [(PRODUCTION, 1), (OFF, 0)])
+    def test_is_started_only_with_the_switch_on(  # pylint: disable=too-many-arguments
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+        switches: Switches,
+        started: int,
+    ) -> None:
+        """The lifespan starts the job per agent_topup_at_boot, decided at startup."""
+        starts: list[tuple] = []
+
+        def job(*args: t.Any) -> t.Coroutine[t.Any, t.Any, None]:
+            starts.append(args)  # at the call, not when the task first runs
+            return asyncio.sleep(0)
+
+        monkeypatch.setattr(app_module, "top_up_agent", job)
+        app = make_app(test_signer, app_config, activity, switches=switches)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            pass  # the lifespan has created its tasks once startup returns
+        assert len(starts) == started
 
     def test_funds_status_reads_the_task_s_outcomes(
         self,

@@ -34,6 +34,7 @@ from typing import TypedDict
 
 from web3 import Web3
 
+from connect.input_errors import InputError
 from connect.run_goal import check_target
 
 logger = logging.getLogger("agent")
@@ -144,7 +145,7 @@ class AppConfig:  # pylint: disable=too-many-instance-attributes
         try:
             return self.chains[name.lower()]
         except KeyError:
-            raise ValueError(
+            raise InputError(
                 f"unknown chain '{name}'; configured chains: {sorted(self.chains)}"
             ) from None
 

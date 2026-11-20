@@ -26,6 +26,7 @@ from web3 import Web3
 from web3.exceptions import ContractLogicError
 
 from connect import chain_read
+from connect.input_errors import InputError
 
 TOKEN = "0x" + "70" * 20
 PROXY = "0x" + "71" * 20
@@ -109,20 +110,53 @@ def test_chain_call_reports_result_or_revert() -> None:
 @pytest.mark.parametrize(
     ("to", "data", "block", "match"),
     [
-        ("0x1234", "0x", "latest", None),
-        (TOKEN, "313ce567", "latest", "0x-hex"),
-        (TOKEN, "0xzz", "latest", None),
+        (
+            "0x1234",
+            "0x",
+            "latest",
+            r"^to must be a 0x address \(40 hex digits\), got '0x1234'$",
+        ),
+        (
+            "7070707070707070707070707070707070707070",
+            "0x",
+            "latest",
+            "^to must be a 0x address",
+        ),
+        (
+            TOKEN,
+            "0xzz",
+            "latest",
+            r"^data must be hex \(0x and whole bytes\), got '0xzz'$",
+        ),
+        (TOKEN, "0x31 3c", "latest", "^data must be hex"),
         (TOKEN, "0x", "yesterday", "block must be"),
         (TOKEN, "0x", "-1", "block must be >= 0"),
     ],
 )
 def test_chain_call_refuses_a_malformed_argument_rather_than_reverting(
-    to: str, data: str, block: str, match: str | None
+    to: str, data: str, block: str, match: str
 ) -> None:
     """A typo is the caller's mistake: it raises, it never reads as a revert."""
     w3 = _w3()
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(InputError, match=match):
         chain_read.chain_call(t.cast(Web3, w3), to, data, block)
+
+
+def test_chain_call_takes_data_with_or_without_0x() -> None:
+    """As the reference's hex check does, a bare hex string is the same bytes."""
+    w3 = _w3()
+    assert chain_read.chain_call(
+        t.cast(Web3, w3), TOKEN, "313ce567"
+    ) == chain_read.chain_call(t.cast(Web3, w3), TOKEN, "0x313ce567")
+
+
+def test_get_abi_refuses_a_malformed_address_by_name() -> None:
+    """get_abi's address is checked as chain_call's is, in the reference's words."""
+    with pytest.raises(InputError) as refused:
+        chain_read.get_abi(t.cast(Web3, _w3()), "0x12")
+    assert (
+        str(refused.value) == "address must be a 0x address (40 hex digits), got '0x12'"
+    )
 
 
 def test_chain_call_takes_a_block_tag_or_number() -> None:
@@ -338,3 +372,17 @@ def test_a_bad_signature_in_the_tables_is_not_blamed_on_the_calldata(
     monkeypatch.setitem(chain_read.SELECTORS, "0xdeadbeef", ["broken(uintx)"])
     with pytest.raises(Exception, match="uintx"):  # noqa: PT011
         chain_read.decode_calldata("0xdeadbeef" + "00" * 32)
+
+
+def test_a_length_past_the_index_range_does_not_decode() -> None:
+    """eth_abi's OverflowError on a huge `bytes` length is bad input, not a fault."""
+    from connect.safe import (  # pylint: disable=import-outside-toplevel
+        EXEC_TRANSACTION_SELECTOR,
+    )
+
+    head = "".join(
+        hex(0x140 if i in (2, 9) else 0)[2:].rjust(64, "0") for i in range(10)
+    )
+    data = "0x" + EXEC_TRANSACTION_SELECTOR + head + hex(2**255)[2:].rjust(64, "0")
+    decoded = chain_read.decode_calldata(data)
+    assert decoded["error"] == "the arguments do not decode as this signature"

@@ -42,11 +42,11 @@ from connect.server import pearl_routes, settings_routes, signer_routes, strict
 from connect.server.auth import (
     ALLOWED_HOSTS,
     AuthFailureLimiter,
-    AuthMiddleware,
     GrantStore,
     RequireAuth,
     require_local_origin,
 )
+from connect.server.mcp_auth import AuthMiddleware
 from connect.server.mcp_tools import build_mcp
 from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
 from connect.settings import MODE_RESTRICTED, SettingsStore
@@ -170,10 +170,11 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     mech: MechService,
     workspace: Workspace,
 ) -> FastAPI:
-    """Create app."""
+    """Create app, at the signer's switch positions (`connect.switches`)."""
+    switches = signer.switches
     # the run's token is the workspace's scoped token (read + mech + tx);
     # narrower ones are minted from it through POST /tokens
-    grants = GrantStore(token, held=signer.holds_request)
+    grants = GrantStore(token, signer=signer)
     mcp = build_mcp(
         signer,
         config,
@@ -186,12 +187,15 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
 
     @asynccontextmanager
     async def lifespan(running: FastAPI) -> t.AsyncIterator[None]:
-        tasks = (
-            asyncio.create_task(refresh_performance(activity)),
-            asyncio.create_task(
-                top_up_agent(config, signer, guard, activity, running.state.topped_up)
-            ),
-        )
+        tasks = [asyncio.create_task(refresh_performance(activity))]
+        if switches.agent_topup_at_boot:
+            tasks.append(
+                asyncio.create_task(
+                    top_up_agent(
+                        config, signer, guard, activity, running.state.topped_up
+                    )
+                )
+            )
         try:
             async with mcp.session_manager.run():
                 yield
@@ -236,13 +240,19 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     app.include_router(
         settings_routes.router, dependencies=[Depends(require_local_origin)]
     )
-    app.include_router(
-        signer_routes.router,
-        dependencies=[Depends(RequireAuth(grants, activity, limiter))],
-    )
+    signing_auth = [Depends(RequireAuth(grants, activity, limiter))]
+    app.include_router(signer_routes.router, dependencies=signing_auth)
+    if switches.rest_signing_routes:
+        app.include_router(signer_routes.eoa_router, dependencies=signing_auth)
     app.mount(
         "/mcp",
-        AuthMiddleware(mcp.streamable_http_app(), grants, activity, limiter),
+        AuthMiddleware(
+            mcp.streamable_http_app(),
+            grants,
+            activity,
+            limiter,
+            boundary=mcp,
+        ),
     )
 
     # the agent UI last, so it can own / without shadowing an endpoint: routes

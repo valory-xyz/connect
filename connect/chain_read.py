@@ -35,7 +35,9 @@ from eth_utils import keccak, to_checksum_address
 from web3 import Web3
 from web3.exceptions import ContractLogicError
 
+from connect.input_errors import InputError, checked_address, checked_hex
 from connect.safe import calldata_hex
+from connect.texts import block_invalid, block_negative
 
 # EIP-1967: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
 IMPLEMENTATION_SLOT = int(
@@ -232,13 +234,10 @@ def chain_call(w3: Web3, to: str, data: str, block: str = "latest") -> dict:
 
     Only a revert is reported as one: an RPC that is down or times out raises,
     so an unreachable chain never reads as a contract that said no, and a
-    malformed argument raises ValueError naming it before anything is asked.
+    malformed argument raises InputError naming it before anything is asked.
     """
-    address = to_checksum_address(to)  # ValueError: not an address
-    data = data or "0x"
-    if not data.startswith("0x"):
-        raise ValueError(f"data must be 0x-hex, got '{data}'")
-    bytes.fromhex(data[2:])  # ValueError: not hex
+    address = to_checksum_address(checked_address("to", to))
+    data = checked_hex("data", data or "0x")
     try:
         raw = w3.eth.call(
             {"to": address, "data": t.cast(t.Any, data)},
@@ -264,11 +263,9 @@ def _block(block: str) -> t.Any:
     try:
         number = int(block, 0)
     except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"block must be one of {', '.join(BLOCK_TAGS)} or a number, got '{block}'"
-        ) from e
+        raise InputError(block_invalid(BLOCK_TAGS, block)) from e
     if number < 0:
-        raise ValueError(f"block must be >= 0, got {number}")
+        raise InputError(block_negative(number))
     return number
 
 
@@ -321,7 +318,7 @@ def get_abi(w3: Web3, address: str) -> dict:
     is storage the contract writes itself, so whatever it points at is
     reported as `implementation_verified`, never as the contract's own.
     """
-    address = to_checksum_address(address)
+    address = to_checksum_address(checked_address("address", address))
     chain_id = int(w3.eth.chain_id)
     verified, signatures = _interfaces(w3, address, chain_id)
     report: dict = {
@@ -387,7 +384,9 @@ def _decode_args(signature: str, args_raw: bytes) -> tuple | None:
     types = _split_types(signature.partition("(")[2][:-1])
     try:
         return tuple(abi_decode(types, args_raw))
-    except DecodingError:  # the bytes do not fit; a bad signature still raises
+    # the bytes do not fit (a length past the index range raises an
+    # ArithmeticError, as in safe.SafeExec.decode); a bad signature still raises
+    except (DecodingError, ArithmeticError):
         return None
 
 

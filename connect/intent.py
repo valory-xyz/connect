@@ -27,7 +27,17 @@ import re
 import typing as t
 
 from connect.chains import NATIVE_ERC20_FACES as _FACES
+from connect.input_errors import MAX_EXACT_JSON_INT
 from connect.safe import ZERO_ADDRESS, calldata_hex
+from connect.texts import (
+    GATE_PROBLEM,
+    NOT_SENT_SUFFIX,
+    gate_overspend,
+    gate_receive_min,
+    gate_token_cap_positions,
+    gate_undeclared_approval,
+    gate_undeclared_recipient,
+)
 
 TokenKey = str  # an ERC-20 address, lower-case, or "native"
 NATIVE = "native"
@@ -69,7 +79,6 @@ NATIVE_ERC20_FACES = frozenset(_FACES.values())
 Rule = t.Literal[
     "reverts",
     "bad-intent",
-    "missing-intent",
     "overspend",
     "receive-min",
     "undeclared-recipient",
@@ -100,6 +109,8 @@ class Intent(t.TypedDict, total=False):
     approvals: list[IntentApproval]
     # set only through Capped, never by a caller: no position may leave
     positions_locked: bool
+    # set only by `implied_intent`, never by a caller
+    implied: bool
 
 
 class Capped(t.NamedTuple):
@@ -632,47 +643,85 @@ def _erc1155_items(kind: str, data: str) -> list[tuple[int, int]]:
     ]
 
 
-def is_value_moving(diff: AssetDiff) -> bool:
-    """Whether the transaction spends, sends or grants anything of the sender's."""
-    if int(diff["native"]) < 0:
-        return True
-    if any(int(entry["delta"]) < 0 for entry in diff["tokens"].values()):
-        return True
-    if any(int(entry["delta"]) < 0 for entry in diff["positions"]):
-        return True
-    return any(entry["amount"] != "0" for entry in diff["approvals"])
+def implied_intent(value: int, target: str, *, positions_locked: bool) -> Intent:
+    """Return a no-intent call's implied intent: its own value, to its own target.
+
+    Nothing else: a position leaving is an overspend, or `token-cap-positions`
+    when `positions_locked`.
+    """
+    return Intent(
+        spend={NATIVE: value} if value else {},
+        receive_min={},
+        recipients=[target.lower()],
+        approvals=[],
+        positions_locked=positions_locked,
+        implied=True,
+    )
 
 
-def parse_intent(raw: t.Any) -> tuple[Intent | None, list[Problem]]:
-    """Validate a caller's intent; return it normalised, or a bad-intent problem."""
+def parse_intent(
+    raw: t.Any, *, strict_parameters: bool
+) -> tuple[Intent | None, list[Problem]]:
+    """Validate a caller's intent; return it normalised, or a bad-intent problem.
+
+    A key the gate does not read, in the intent or an approval, is ignored, as
+    the reference ignores it (`ignored_keys` names it for the log);
+    `strict_parameters` (the switch) refuses it instead. Every reader passes
+    the switch, so the grant store's cap and the gate read one intent one way.
+    An ignored key declares nothing: a misspelled `spend` leaves nothing to
+    spend, and a misspelled `receive_min` sets no floor.
+    """
     if not isinstance(raw, Capped):
-        return _parse(raw)
-    parsed, problems = _parse(raw.raw)
+        return _parse(raw, strict_parameters)
+    parsed, problems = _parse(raw.raw, strict_parameters)
     if parsed is not None:
         parsed["positions_locked"] = True
     return parsed, problems
 
 
-def _parse(raw: t.Any) -> tuple[Intent | None, list[Problem]]:
+def _parse(raw: t.Any, strict: bool) -> tuple[Intent | None, list[Problem]]:
     if raw is None:
         return None, []
     if not isinstance(raw, dict):
         return None, [_bad("the intent must be an object")]
-    unknown = sorted(set(raw) - {"spend", "receive_min", "recipients", "approvals"})
-    if unknown:
+    unknown = sorted(set(raw) - _INTENT_KEYS)
+    if strict and unknown:
         return None, [_bad(f"unknown intent keys {unknown}")]
     try:
         intent = Intent(
             spend=_amounts(raw.get("spend") or {}, "spend"),
             receive_min=_amounts(raw.get("receive_min") or {}, "receive_min"),
             recipients=[_address(a) for a in raw.get("recipients") or []],
-            approvals=[_approval(a) for a in raw.get("approvals") or []],
+            approvals=[_approval(a, strict) for a in raw.get("approvals") or []],
         )
     except KeyError as e:
         return None, [_bad(f"an intent approval is missing {e}")]
     except (TypeError, ValueError, AttributeError) as e:
         return None, [_bad(str(e))]
     return intent, []
+
+
+_INTENT_KEYS = {"spend", "receive_min", "recipients", "approvals"}
+_APPROVAL_KEYS = {"token", "spender", "amount"}
+
+
+def ignored_keys(raw: t.Any) -> list[str]:
+    """Name each key of a raw intent the gate does not read, cut to 40 characters.
+
+    Names only, never a value: a value could be anything the agent sent.
+    """
+    raw = raw.raw if isinstance(raw, Capped) else raw
+    if not isinstance(raw, dict):
+        return []
+    names = sorted(str(k)[:40] for k in set(raw) - _INTENT_KEYS)
+    approvals = raw.get("approvals")
+    for index, approval in enumerate(approvals if isinstance(approvals, list) else []):
+        if isinstance(approval, dict):
+            names += [
+                f"approvals[{index}].{str(k)[:40]}"
+                for k in sorted(set(approval) - _APPROVAL_KEYS, key=str)
+            ]
+    return names
 
 
 def _bad(detail: str) -> Problem:
@@ -710,11 +759,6 @@ def parse_amount(value: t.Any) -> int:
     return parsed
 
 
-# the largest integer a JSON number carries exactly (an IEEE-754 double's):
-# 2^53 + 1 is the first a double cannot hold, and it rounds to 2^53
-MAX_EXACT_JSON_INT = 2**53 - 1
-
-
 def parse_tool_amount(value: t.Any) -> int:
     """Parse a base-unit amount from the agent tool surface, where it is a string.
 
@@ -733,25 +777,6 @@ def parse_tool_amount(value: t.Any) -> int:
                 "as a decimal or 0x-hex string"
             )
     return parse_amount(value)
-
-
-def intent_amounts(raw: t.Any) -> list[tuple[str, t.Any]]:
-    """Return each base-unit amount a raw intent declares, named by where it sits.
-
-    Only what has an intent's shape is read: `parse_intent` refuses the rest.
-    """
-    if not isinstance(raw, dict):
-        return []
-    found: list[tuple[str, t.Any]] = []
-    for where in ("spend", "receive_min"):
-        entries = raw.get(where)
-        if isinstance(entries, dict):
-            found += [(f"intent.{where}.{token}", v) for token, v in entries.items()]
-    approvals = raw.get("approvals")
-    for index, approval in enumerate(approvals if isinstance(approvals, list) else []):
-        if isinstance(approval, dict) and "amount" in approval:
-            found.append((f"intent.approvals[{index}].amount", approval["amount"]))
-    return found
 
 
 def balance_key(key: t.Any) -> TokenKey:
@@ -777,11 +802,11 @@ def _amounts(raw: t.Any, where: str) -> dict[TokenKey, int]:
     return amounts
 
 
-def _approval(raw: t.Any) -> IntentApproval:
+def _approval(raw: t.Any, strict: bool) -> IntentApproval:
     if not isinstance(raw, dict):
         raise TypeError("each intent approval must be {token, spender, amount}")
-    unknown = sorted(set(raw) - {"token", "spender", "amount"})
-    if unknown:
+    unknown = sorted(set(raw) - _APPROVAL_KEYS)
+    if strict and unknown:
         raise ValueError(f"unknown intent approval keys {unknown}")
     return IntentApproval(
         token=_token(raw["token"]),
@@ -794,16 +819,8 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
     """Return every rule the simulated transaction breaks under `intent`."""
     problems: list[Problem] = []
     if not diff["ok"]:
-        problems.append(Problem(rule="reverts", detail=f"reverts: {diff['revert']}"))
-    if intent is None:
-        if is_value_moving(diff):
-            problems.append(
-                Problem(
-                    rule="missing-intent",
-                    detail="this transaction moves value, so it needs an intent "
-                    "(spend, receive_min, recipients, approvals)",
-                )
-            )
+        problems.append(Problem(rule="reverts", detail=str(diff["revert"])))
+    if intent is None:  # nothing declared: only a revert is refused
         return problems
     spend = intent.get("spend", {})
     deltas = {NATIVE: int(diff["native"])}
@@ -813,8 +830,9 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="overspend",
-                    detail=f"spends {-delta} of {token}, more than the intent's "
-                    f"{spend.get(token, 0)}",
+                    detail=gate_overspend(
+                        _named(diff, token), -delta, spend.get(token, 0)
+                    ),
                 )
             )
     for token, least in intent.get("receive_min", {}).items():
@@ -822,8 +840,9 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="receive-min",
-                    detail=f"receives {max(deltas.get(token, 0), 0)} of {token}, "
-                    f"less than the intent's minimum {least}",
+                    detail=gate_receive_min(
+                        _named(diff, token), deltas.get(token, 0), least
+                    ),
                 )
             )
     allowed = set(intent.get("recipients", []))
@@ -832,8 +851,7 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="undeclared-recipient",
-                    detail=f"sends to {entry['address']}, an account the intent's "
-                    "recipients do not name",
+                    detail=gate_undeclared_recipient(entry["address"]),
                 )
             )
     granted = intent.get("approvals", [])
@@ -850,25 +868,83 @@ def check_intent(diff: AssetDiff, intent: Intent | None) -> list[Problem]:
             problems.append(
                 Problem(
                     rule="undeclared-approval",
-                    detail=f"approves {entry['spender']} for {entry['amount']} of "
-                    f"{entry['token']}, which the intent's approvals do not cover",
+                    detail=gate_undeclared_approval(
+                        _named(diff, entry["token"]),
+                        entry["spender"],
+                        entry["amount"],
+                    ),
                 )
             )
-    if intent.get("positions_locked"):
-        for position in diff["positions"]:
-            if int(position["delta"]) < 0:
-                problems.append(
-                    Problem(
-                        rule="token-cap-positions",
-                        detail=f"moves {position['token']} #{position['id']} out, "
-                        "and a value-capped token may not move positions",
-                    )
+    # a capped token's rule replaces overspend, so each position is reported once
+    for position in _leaving(diff):
+        where = f"{position['token']} #{position['id']}"
+        if intent.get("positions_locked"):
+            problems.append(
+                Problem(
+                    rule="token-cap-positions",
+                    detail=gate_token_cap_positions(where),
                 )
+            )
+        elif intent.get("implied"):
+            problems.append(
+                Problem(
+                    rule="overspend",
+                    detail=gate_overspend(where, -int(position["delta"]), 0),
+                )
+            )
     return problems
 
 
+def _leaving(diff: AssetDiff) -> list[dict]:
+    """Return the positions the call moves out of the sender."""
+    return [p for p in diff["positions"] if int(p["delta"]) < 0]
+
+
+def no_intent_hold(
+    value: int, target: str, *, hold_uncapped: bool, capped: bool
+) -> Intent | None:
+    """Return what a call with no intent is held to, or None for a revert check alone.
+
+    When `hold_uncapped` (any `no_intent_policy` but `simulate-only`), and
+    always under a capped token (which no cap could bound otherwise), it is
+    held to its own value and target (`implied_intent`), a capped token's with
+    no position leaving.
+    """
+    if not (hold_uncapped or capped):
+        return None
+    return implied_intent(value, target, positions_locked=capped)
+
+
+def simulation_answer(
+    diff: AssetDiff | None, held_to: Intent | None, problems: list[Problem]
+) -> dict:
+    """Return what `simulate_transaction` answers: the diff, and its verdict.
+
+    A call refused before it was simulated (no diff) answers
+    `fits_intent: false` with its problems. A simulated call held to nothing
+    (`held_to` None: no intent, `simulate-only`, no capped token) answers no
+    verdict and no problems, as the reference does: a revert shows in the
+    diff's own `ok` and `revert`, not as a problem.
+    """
+    texts = [problem_text(p) for p in problems]
+    if diff is None:
+        return {"fits_intent": False, "problems": texts}
+    if held_to is None:
+        return {**diff, "fits_intent": None, "problems": []}
+    return {**diff, "fits_intent": not problems, "problems": texts}
+
+
+def problem_text(problem: Problem) -> str:
+    """Return one problem as the reference words it."""
+    return GATE_PROBLEM(problem["rule"], problem["detail"])
+
+
 def refusal_message(problems: list[Problem]) -> str:
-    """Return the one-line refusal a session reads: every rule, each named."""
-    return "refused by the intent gate: " + "; ".join(
-        f"rule '{p['rule']}': {p['detail']}" for p in problems
-    )
+    """Return the one-line refusal a session reads: every rule, then not-sent."""
+    return "; ".join(problem_text(p) for p in problems) + NOT_SENT_SUFFIX
+
+
+def _named(diff: AssetDiff, token: str) -> str:
+    """Return how a problem names a token: its symbol, else its key."""
+    entry = diff["tokens"].get(token)
+    return (entry or {}).get("symbol") or token

@@ -35,6 +35,7 @@ from aea_ledger_ethereum import rpc_rotation
 from aea_ledger_ethereum.rpc_rotation import RotatingHTTPProvider
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
+from mcp.server.fastmcp import FastMCP
 from mech_client import NonceAllocator
 from mech_client.utils import logger as mech_client_logger
 from web3 import Web3
@@ -58,17 +59,18 @@ from connect.config import (
     STORE_PATH_ENV,
     load_config,
 )
-from connect.guard import Guard
+from connect.input_errors import InputError
 from connect.keystore import KeystoreError, load_account
 from connect.mech import MechService
 from connect.run_goal import RunGoal
-from connect.server import receipts
-from connect.server.auth import AuthFailureLimiter, AuthMiddleware
-from connect.server.mcp_tools import build_mcp
-from connect.settings import SettingsStore
-from connect.signer import Signer, SignerError, _IdempotencyCache
+from connect.send_cache import IdempotencyCache
+from connect.server.auth import ACTION_SCOPES, AuthFailureLimiter
+from connect.server.mcp_auth import AuthMiddleware
+from connect.signer import Signer, SignerError
+from connect.switches import PRODUCTION, Switches
 
 from tests.conftest import (
+    FakeBoundary,
     FakeW3,
     TEST_PASSWORD,
     audit_entries,
@@ -316,6 +318,24 @@ class TestMain:
         app = served[0].config.app
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
             assert client.get("/healthcheck").json() == {"is_healthy": True}
+
+    def test_main_builds_the_production_switch_positions(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        boot_env: Path,
+        served: list[StubServer],
+    ) -> None:
+        """Pearl's entrypoint passes no switches, so it serves PRODUCTION."""
+        monkeypatch.setattr("sys.stdin", io.StringIO(TEST_PASSWORD + "\n"))
+        assert main_module.main(["--password-stdin"]) == 0
+        app = served[0].config.app
+        assert app.state.signer.switches == PRODUCTION  # the build's one source
+        assert PRODUCTION == Switches()
+
+    def test_the_binary_excludes_the_test_interface(self) -> None:
+        """The PyInstaller build leaves connect.testing out of Pearl's binary."""
+        spec = Path(__file__).parent.parent / "packaging" / "pyinstaller.spec"
+        assert 'excludes=["connect.testing"]' in spec.read_text(encoding="utf-8")
 
     @pytest.mark.usefixtures("tty_stdin")
     def test_main_password_tty_happy_path(
@@ -1090,6 +1110,17 @@ def test_keystore_valid_json_but_not_keystore(tmp_path: Path) -> None:
 class TestAuthMiddlewareASGI:
     """Direct ASGI-level tests of the MCP mount auth."""
 
+    @pytest.fixture
+    def middleware(self, activity: ActivityLog) -> AuthMiddleware:
+        """Return the mount's auth over a store holding the workspace token "tok"."""
+        return AuthMiddleware(
+            lambda *a: None,
+            grant_store("tok"),
+            activity,
+            AuthFailureLimiter(),
+            boundary=FakeBoundary(ACTION_SCOPES),
+        )
+
     @staticmethod
     async def _run(
         middleware: AuthMiddleware, scope: dict
@@ -1112,19 +1143,13 @@ class TestAuthMiddlewareASGI:
         await middleware(scope, receive, send)
         return sent, passed
 
-    async def test_non_http_passthrough(self, activity: ActivityLog) -> None:
+    async def test_non_http_passthrough(self, middleware: AuthMiddleware) -> None:
         """Lifespan scopes bypass auth."""
-        middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
-        )
         _, passed = await self._run(middleware, {"type": "lifespan"})
         assert passed == ["lifespan"]
 
-    async def test_bad_origin_rejected(self, activity: ActivityLog) -> None:
+    async def test_bad_origin_rejected(self, middleware: AuthMiddleware) -> None:
         """Cross-origin requests get 403."""
-        middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
-        )
         scope = {
             "type": "http",
             "headers": [(b"origin", b"https://evil.example")],
@@ -1133,29 +1158,22 @@ class TestAuthMiddlewareASGI:
         assert sent[0]["status"] == 403
         assert not passed
 
-    async def test_bad_token_rejected(self, activity: ActivityLog) -> None:
+    async def test_bad_token_rejected(self, middleware: AuthMiddleware) -> None:
         """Missing token gets 401."""
-        middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
-        )
         sent, passed = await self._run(middleware, {"type": "http", "headers": []})
         assert sent[0]["status"] == 401
         assert not passed
 
-    async def test_websocket_scope_refused_cleanly(self, activity: ActivityLog) -> None:
+    async def test_websocket_scope_refused_cleanly(
+        self, middleware: AuthMiddleware
+    ) -> None:
         """Websocket scopes never reach the inner app; the handshake is closed."""
-        middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
-        )
         sent, passed = await self._run(middleware, {"type": "websocket", "headers": []})
         assert not passed
         assert sent == [{"type": "websocket.close"}]
 
-    async def test_valid_request_passes(self, activity: ActivityLog) -> None:
+    async def test_valid_request_passes(self, middleware: AuthMiddleware) -> None:
         """Correct token reaches the inner app."""
-        middleware = AuthMiddleware(
-            lambda *a: None, grant_store("tok"), activity, AuthFailureLimiter()
-        )
         scope = {"type": "http", "headers": [(b"authorization", b"Bearer tok")]}
         _, passed = await self._run(middleware, scope)
         assert passed == ["http"]
@@ -1165,25 +1183,9 @@ class TestMcpTools:
     """MCP tool behavior via the registered tool functions."""
 
     @pytest.fixture
-    def tools(  # pylint: disable=too-many-arguments
-        self,
-        test_signer: Signer,
-        app_config: AppConfig,
-        activity: ActivityLog,
-        guard: Guard,
-        mech_service: MechService,
-        settings_store: SettingsStore,
-    ) -> dict[str, t.Callable]:
+    def tools(self, make_mcp: t.Callable[..., FastMCP]) -> dict[str, t.Callable]:
         """Return the registered tool functions keyed by name."""
-        mcp = build_mcp(
-            test_signer,
-            app_config,
-            activity,
-            guard=guard,
-            mech=mech_service,
-            settings_store=settings_store,
-            grants=grant_store("workspace-token"),
-        )
+        mcp = make_mcp()
         manager = mcp._tool_manager  # pylint: disable=protected-access
         return {tool.name: tool.fn for tool in manager.list_tools()}
 
@@ -1292,7 +1294,11 @@ class TestMcpTools:
         assert fake_w3.eth.sent  # the premise: it really was broadcast first
         assert result["status"] == "pending"
         assert result["tx_hash"].startswith("0x")
-        assert result["receipt_error"] == receipts.RECEIPT_ERROR  # not the RPC's text
+        assert result["receipt_error"] == (  # not the RPC's text, and the replay advice
+            "the transaction was sent, but its receipt could not be read (the cause "
+            "is in Connect's log); check it with transaction_status: not_found does "
+            "not prove it was not sent, so resend only under the same request_id"
+        )
 
     async def test_safe_transaction_rejects_a_negative_value(
         self, tools: dict[str, t.Callable]
@@ -1357,15 +1363,17 @@ class TestMcpTools:
     async def test_transaction_status(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
-        """transaction_status reports pending, then mined, then reverted.
+        """transaction_status reports not_found, pending, success, then reverted.
 
-        It speaks the same top-level status the send tools do, so a tx polled
-        here after a pending send is read the same way — a revert is not a
-        success-shaped dict a caller reads past.
+        `pending` is a hash the node holds unmined, `not_found` one it does
+        not know; a revert is its own status, never a success-shaped dict.
         """
         tx_hash = "0x" + "11" * 32
-        pending = await tools["transaction_status"]("testchain", tx_hash)
-        assert pending["status"] == "pending"
+        unknown = await tools["transaction_status"]("testchain", tx_hash)
+        assert unknown == {"tx_hash": tx_hash, "status": "not_found"}
+        fake_w3.eth.mempool.add("11" * 32)
+        unmined = await tools["transaction_status"]("testchain", tx_hash)
+        assert unmined == {"tx_hash": tx_hash, "status": "pending"}
         fake_w3.eth.receipt = {
             "status": 1,
             "blockNumber": 7,
@@ -1373,20 +1381,34 @@ class TestMcpTools:
             "logs": [],
         }
         mined = await tools["transaction_status"]("testchain", tx_hash)
-        assert mined["status"] == "mined"
-        assert mined["receipt"]["block_number"] == 7
+        assert mined["status"] == "success"
+        assert mined["block"] == 7
         fake_w3.eth.receipt = {**fake_w3.eth.receipt, "status": 0}
         reverted = await tools["transaction_status"]("testchain", tx_hash)
         assert reverted["status"] == "reverted"
 
     async def test_transaction_status_rejects_malformed_hash(
-        self, tools: dict[str, t.Callable]
+        self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
-        """A hash that can never resolve raises instead of polling as pending."""
-        with pytest.raises(ValueError, match="32-byte"):
-            await tools["transaction_status"]("testchain", "0xzz")
-        with pytest.raises(ValueError, match="32-byte"):
-            await tools["transaction_status"]("testchain", "0x1234")
+        """A malformed hash is not_found, as the reference answers, with no RPC."""
+
+        def no_rpc(_hash: object) -> dict:
+            raise AssertionError("a malformed hash must not reach the RPC")
+
+        fake_w3.eth.get_transaction_receipt = no_rpc  # type: ignore[method-assign,assignment]
+        fake_w3.eth.get_transaction = no_rpc  # type: ignore[method-assign,assignment]
+        for malformed in (
+            "0xzz",
+            "0x1234",
+            "0x" + "11" * 31,
+            "0x" + "11" * 33,
+            "0x" + "11" * 16 + " " + "11" * 16,
+            "0x" + "11" * 32 + "\n",
+        ):
+            assert await tools["transaction_status"]("testchain", malformed) == {
+                "tx_hash": malformed,
+                "status": "not_found",
+            }
 
     async def test_transaction_status_surfaces_rpc_errors(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
@@ -1410,15 +1432,18 @@ class TestMcpTools:
     async def test_sign_message_rejects_bad_hex(
         self, tools: dict[str, t.Callable]
     ) -> None:
-        """Malformed digests get a clean error, matching the HTTP route."""
-        with pytest.raises(ValueError, match="0x-hex"):
+        """A malformed digest is refused in the reference's words."""
+        with pytest.raises(InputError) as refused:
             await tools["sign_message"]("0xzz")
+        assert (
+            str(refused.value) == "digest must be hex (0x and whole bytes), got '0xzz'"
+        )
 
     async def test_send_transaction_rejects_negative_value(
         self, tools: dict[str, t.Callable], fake_w3: FakeW3
     ) -> None:
         """Negative amounts fail fast, before reaching the signer."""
-        with pytest.raises(ValueError, match="non-negative"):
+        with pytest.raises(InputError, match="non-negative"):
             await tools["send_transaction"]("testchain", "0x" + "aa" * 20, value=-1)
         assert not fake_w3.eth.sent
 
@@ -1577,13 +1602,13 @@ class TestSignerExtras:
 
     def test_idempotency_cache_returns_cached_inside_run(self) -> None:
         """run() itself replays a completed key (guards the racing-caller path)."""
-        cache = _IdempotencyCache()
+        cache = IdempotencyCache()
         assert cache.run("k", "s", lambda: "0xaaa") == "0xaaa"
         assert cache.run("k", "s", lambda: "0xbbb") == "0xaaa"  # action not re-run
 
     def test_idempotency_cache_evicts_oldest(self) -> None:
         """The result cache is bounded; the oldest replays are dropped first."""
-        cache = _IdempotencyCache(max_results=2)
+        cache = IdempotencyCache(max_results=2)
         cache.run("a", "s", lambda: "0xa")
         cache.run("b", "s", lambda: "0xb")
         cache.run("c", "s", lambda: "0xc")

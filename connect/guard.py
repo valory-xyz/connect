@@ -87,19 +87,36 @@ from connect.safe import (
     calldata_hex,
     decode_approve,
     decode_deposit,
+    decode_exec,
+    is_exec_transaction,
 )
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
+from connect.texts import (
+    GUARD_NO_DELEGATECALL,
+    GUARD_NO_SELF_CALL,
+    GUARD_OUTER_VALUE,
+    GUARD_RAW_DIGEST,
+    GUARD_REFUND,
+    GUARD_UNDECODABLE,
+    GuardText,
+    guard_exec_transaction_only,
+    guard_marketplace,
+    guard_no_safe,
+    guard_not_allowed,
+    guard_payment_token_approve,
+    guard_safe_only,
+)
 
 logger = logging.getLogger("agent")
 
 
 class GuardError(Exception):
-    """A transaction or signing request denied by the guardrail."""
+    """A transaction or signing request denied by the guardrail (`texts.GuardText`)."""
 
+    def __init__(self, text: GuardText) -> None:
+        """Hold the refusal."""
+        super().__init__(text)
 
-# The escalation clause every operator-changeable refusal ends with; one
-# literal so the two call sites cannot drift apart.
-_ASK_OPERATOR = "ask the operator to change them via the agent UI if it is required"
 
 # How long a registered allowance stays consumable. Arming must happen before
 # the request leaves: mech-client swallows the 402 -> deposit -> retry cycle
@@ -130,6 +147,53 @@ class _DepositAllowance:
 
 # the handle allow_safe_deposit_once returns, for revoke_safe_deposit
 DepositGrant = _DepositAllowance
+
+
+def exec_floor(chain: str, to: str, data: str) -> SafeExec | None:
+    """Enforce the floor's execTransaction rules; return the call it decoded.
+
+    Every execTransaction is decoded and checked, whatever it targets and
+    whether or not a safe is configured on `chain`: the floor protects any safe
+    the agent reaches, and "protected only if configured" would be a hole an
+    unconfigured chain walks straight through. Calldata that cannot be decoded
+    cannot be judged, so it is refused. `to` is the contract the call is sent
+    to, the safe whose call this is: a safe calling itself is how it changes
+    its own owners, modules or guard.
+
+    :raises GuardError: `undecodable-exec-transaction`, `no-delegatecall` or
+        `no-self-call`.
+    """
+    if not is_exec_transaction(data):
+        return None
+    try:
+        exec_call = decode_exec(data, chain=chain, to=to)
+    except ValueError as e:
+        raise GuardError(GUARD_UNDECODABLE) from e
+    if exec_call.operation != OPERATION_CALL:
+        raise GuardError(GUARD_NO_DELEGATECALL)
+    if exec_call.to.lower() == to.lower():
+        raise GuardError(GUARD_NO_SELF_CALL)
+    return exec_call
+
+
+def floor(chain: str, to: str, data: str, *, server_built: bool) -> SafeExec | None:
+    """Enforce every rule no mode and no build lifts; return the call decoded.
+
+    `exec_floor`, then the marketplace rule: a mech marketplace takes only the
+    requests the server's mech flow composes (`server_built`), from the EOA or
+    the safe. The guard runs this first, and the signer runs it alone when no
+    guardrail is attached, on a send and on a dry run alike.
+
+    :raises GuardError: one of `exec_floor`'s rules, or `marketplace`.
+    """
+    chain = chain.lower()
+    exec_call = exec_floor(chain, to, data)
+    if not server_built:
+        called = {to.lower()} | ({exec_call.to.lower()} if exec_call else set())
+        marketplaces = sorted(called & MECH_MARKETPLACES.get(chain, frozenset()))
+        if marketplaces:
+            raise GuardError(guard_marketplace(marketplaces[0], chain))
+    return exec_call
 
 
 class Guard:
@@ -268,10 +332,7 @@ class Guard:
             self._purge_expired()
             if self._allowed_digests.pop(bytes(digest), None) is not None:
                 return
-        raise GuardError(
-            "raw digest signing is disabled by the operator's guardrail "
-            f"settings; {_ASK_OPERATOR}"
-        )
+        raise GuardError(GUARD_RAW_DIGEST)
 
     def check_transaction(  # pylint: disable=too-many-arguments
         self,
@@ -295,21 +356,7 @@ class Guard:
         chain = chain.lower()
         safe = self._config.chain(chain).safe_address
         calldata = calldata_hex(data)
-        exec_call = None
-        if calldata.startswith(EXEC_TRANSACTION_SELECTOR):
-            # decode and floor-check every execTransaction, whatever it targets
-            # and whether or not a safe is configured here: the floor protects
-            # any safe the agent reaches, and "protected only if configured"
-            # would be a hole an unconfigured chain walks straight through.
-            try:
-                exec_call = SafeExec.decode(calldata)
-            except ValueError as e:
-                # calldata we cannot parse is calldata we cannot judge, so it
-                # is refused rather than waved through
-                raise GuardError(str(e)) from e
-            self._check_floor(to, exec_call)
-        if not server_built:
-            self._check_marketplace(chain, to, exec_call)
+        exec_call = floor(chain, to, calldata, server_built=server_built)
         if self._store.load().protected.mode == MODE_RESTRICTED:
             self._check_restricted(
                 chain,
@@ -319,39 +366,6 @@ class Guard:
                 calldata=calldata,
                 exec_call=exec_call,
                 consume=consume,
-            )
-
-    def _check_floor(self, target: str, exec_call: "SafeExec") -> None:
-        """Enforce the two rules no mode lifts; see the module docstring for why.
-
-        `target` is the contract the execTransaction is sent to — the safe
-        whose call this is. A safe calling itself is how it changes its own
-        owners, modules or guard.
-        """
-        if exec_call.operation != OPERATION_CALL:
-            raise GuardError(
-                "the safe may not delegatecall (got operation="
-                f"{exec_call.operation}) — the guardrail never allows it"
-            )
-        if exec_call.to.lower() == target.lower():
-            raise GuardError(
-                "the safe may not call itself (owner, module and guard changes "
-                "are made that way) — the guardrail never allows it"
-            )
-
-    @staticmethod
-    def _check_marketplace(chain: str, to: str, exec_call: "SafeExec | None") -> None:
-        """Refuse a call to a mech marketplace, by the EOA or by the safe.
-
-        In every mode: a marketplace takes only the requests the server's
-        mech flow composes; see the module docstring.
-        """
-        called = {to.lower()} | ({exec_call.to.lower()} if exec_call else set())
-        marketplaces = sorted(called & MECH_MARKETPLACES.get(chain, frozenset()))
-        if marketplaces:
-            raise GuardError(
-                f"the mech marketplace {marketplaces[0]} on {chain} takes only the "
-                "requests Connect composes; send a mech request with mech_request"
             )
 
     def _check_restricted(  # pylint: disable=too-many-arguments
@@ -367,34 +381,20 @@ class Guard:
     ) -> None:
         """Restricted mode: the safe CALLs a whitelisted address, or nothing."""
         if safe is None:
-            raise GuardError(
-                f"the operator's guardrail settings allow no transactions on "
-                f"chain '{chain}' (no service safe is configured there)"
-            )
+            raise GuardError(guard_no_safe(chain))
         if to.lower() != safe.lower():
-            raise GuardError(
-                f"the operator's guardrail settings only allow transactions "
-                f"targeting the service safe {safe}, not {to}"
-            )
+            raise GuardError(guard_safe_only(safe, to))
         if exec_call is None:
             raise GuardError(
-                "the guardrail requires calls to the safe to be execTransaction "
-                f"(selector 0x{EXEC_TRANSACTION_SELECTOR}), got 0x{calldata[:8]}"
+                guard_exec_transaction_only(EXEC_TRANSACTION_SELECTOR, calldata[:8])
             )
         if value != 0:
-            raise GuardError(
-                "the guardrail forbids native value on the outer transaction "
-                "of an execTransaction call"
-            )
+            raise GuardError(GUARD_OUTER_VALUE)
         # A non-zero gasPrice makes the safe pay a refund (in gasToken, to
         # refundReceiver or tx.origin) — funds leaving the safe past the
         # whitelist. The standard flow always zeroes all three fields.
         if exec_call.pays_refund:
-            raise GuardError(
-                "the guardrail requires execTransaction refund fields to be "
-                "zero (gasPrice=0, gasToken=0x0, refundReceiver=0x0) — a gas "
-                "refund would pay out of the safe past the allowed targets"
-            )
+            raise GuardError(GUARD_REFUND)
         tracker = token_approve_targets(chain).get(exec_call.to.lower())
         if tracker is not None:
             # a mech payment token: the safe may only approve it for the tracker,
@@ -402,21 +402,13 @@ class Guard:
             # would allow those; a token-paid mech needs just this approve)
             spender = decode_approve(exec_call.data)
             if spender is None or spender.lower() != tracker:
-                raise GuardError(
-                    f"the guardrail only allows approve(spender={tracker}) on "
-                    f"the payment token {exec_call.to}"
-                )
+                raise GuardError(guard_payment_token_approve(tracker, exec_call.to))
             return
         whitelist = self._store.load().protected.whitelist
         if exec_call.to.lower() not in whitelist.get(chain, ()):
             if self._consume_deposit_allowance(chain, exec_call, consume=consume):
                 return
-            # the whitelist is not editable through the API yet, so pointing at
-            # it would send the operator down a path that does not exist
-            raise GuardError(
-                f"the operator's guardrail settings do not allow the safe to "
-                f"call {exec_call.to} on {chain}; {_ASK_OPERATOR}"
-            )
+            raise GuardError(guard_not_allowed(exec_call.to, chain))
 
     def _consume_deposit_allowance(
         self, chain: str, exec_call: "SafeExec", *, consume: bool

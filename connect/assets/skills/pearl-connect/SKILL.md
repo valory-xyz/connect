@@ -51,7 +51,8 @@ cannot tell you is which to reach for:
 - `preflight_transaction` — ask whether a call would be permitted before you
   build on it. Reach for it when a plan depends on a call being allowed: a
   refusal here costs nothing, one discovered mid-flow can leave a
-  half-finished position.
+  half-finished position. It checks your token and the guardrail and
+  simulates nothing; `simulate_transaction` tells you what the call would do.
 - `transaction_status` — settle a hash you already hold.
 - `sign_message` — raw digests, **unprefixed** (plain ecrecover semantics).
 - `mech_tools`, `mech_request`, `mech_result` — see "Mech requests" below.
@@ -65,9 +66,9 @@ take `to`.
 
 ## Intents
 
-Every `safe_transaction` or `send_transaction` that **moves value** — spends
-or sends anything (native coin, a token, an NFT position) or grants an
-approval — needs an `intent`, saying what it may do:
+A `safe_transaction` or `send_transaction` that does more than send its own
+`value` to its own target — spends a token or an NFT position, pays anyone
+else, or grants an approval — needs an `intent`, saying what it may do:
 
 ```json
 {"spend": {"native": "10000", "0xtoken...": "500"},
@@ -84,9 +85,11 @@ more than that. What a refusal won't tell you:
 - A Permit2 grant (`approve` on Permit2, or a permit the router carries) is
   always declared as an approval of the token to its spender, even within an
   existing allowance.
-- A call that moves nothing (a claim, a vote) needs no intent.
+- A call with no intent may spend only its own `value`, pay only its target,
+  grant no approval and move no position out; a call that moves nothing (a
+  claim, a vote) needs none.
 - `simulation-unavailable` means Connect cannot simulate on that chain: no
-  value-moving call can be sent there.
+  call can be sent there until it can.
 
 The bundled skills attach the intents of the calls they build.
 
@@ -262,10 +265,9 @@ tx_hash = signer.send_transaction(                              # sent by the sa
 )
 ```
 
-A call that moves value needs an intent, and only `signer.send_transaction`
-carries one. `.transact()` and `w3.eth.send_transaction` send the bare call,
-so they work only for calls that move nothing of the safe's; anything else is
-refused as `missing-intent`.
+Only `signer.send_transaction` carries an intent; `.transact()` and
+`w3.eth.send_transaction` send the bare call, which is held to what a call
+with no intent may do (see "Intents" above).
 
 Two things `connect()` handles that hand-rolled web3 code gets wrong: PoA
 chains (Polygon above all) pad `extraData` past 32 bytes and break every block

@@ -50,8 +50,9 @@ from connect import intent as intent_module
 from connect.activity import ActivityLog
 from connect.chain_read import UNIVERSAL_ROUTER_NAME, known_contract
 from connect.chains import chain_info
+from connect.send_cache import MAX_CACHED_RESULTS
 from connect.server.strict import StrictBody
-from connect.signer import MAX_CACHED_RESULTS
+from connect.switches import Switches
 
 Scope = t.Literal["read", "mech", "tx"]
 SCOPES: tuple[Scope, ...] = ("read", "mech", "tx")
@@ -92,48 +93,6 @@ ACTION_SCOPES: dict[str, Scope] = {
     "send_transaction": "tx",
     "sign_message": "tx",
 }
-
-
-# the base-unit amounts each MCP tool takes, declared as strings in its schema
-# (`mcp_tools.Amount`) and read by `intent.parse_tool_amount` at the mount;
-# those inside an `intent` (`mcp_tools.ToolIntent`) are read the same way
-TOOL_AMOUNTS: dict[str, tuple[str, ...]] = {
-    "safe_transaction": ("value",),
-    "send_transaction": ("value",),
-    "preflight_transaction": ("value",),
-    "simulate_transaction": ("value",),
-}
-# the base-unit caps: a bound the mech's exact price is checked against, never
-# itself spent, so a JSON integer of any size is taken (`mcp_tools.Cap`,
-# `intent.parse_amount`); a float, a bool or a negative is still refused
-TOOL_CAPS: dict[str, tuple[str, ...]] = {
-    "mech_request": ("max_payment",),
-}
-
-
-def check_tool_amounts(tool: str, arguments: t.Mapping[str, t.Any]) -> None:
-    """Refuse a tool call whose amount a JSON number may already have rounded.
-
-    Every amount `TOOL_AMOUNTS` names, and every one inside the `intent`; a
-    cap `TOOL_CAPS` names need only be a whole number of base units.
-
-    :raises GrantRefused: `bad-value`, naming the argument, before any
-        budget is drawn on.
-    """
-    amounts = [(name, arguments.get(name)) for name in TOOL_AMOUNTS.get(tool, ())]
-    amounts += intent_module.intent_amounts(_intent_argument(arguments))
-    caps = [(name, arguments.get(name)) for name in TOOL_CAPS.get(tool, ())]
-    for reader, named in (
-        (intent_module.parse_tool_amount, amounts),
-        (intent_module.parse_amount, caps),
-    ):
-        for name, raw in named:
-            if raw is None:
-                continue
-            try:
-                reader(raw)
-            except (TypeError, ValueError) as e:
-                raise GrantRefused("bad-value", f"{name}: {e} (got {raw!r})") from e
 
 
 def _intent_argument(arguments: t.Mapping[str, t.Any]) -> t.Any:
@@ -262,7 +221,7 @@ def _key(token: str) -> str:
 
 
 def _declared(
-    arguments: t.Mapping[str, t.Any],
+    arguments: t.Mapping[str, t.Any], *, strict_parameters: bool
 ) -> tuple[dict[str, int], list[intent_module.IntentApproval]]:
     """Return what a call may spend, and the approvals its intent allows.
 
@@ -276,7 +235,9 @@ def _declared(
     :raises GrantRefused: a malformed intent or a value that is not a whole
         number >= 0, before any budget is drawn on.
     """
-    parsed, problems = intent_module.parse_intent(_intent_argument(arguments))
+    parsed, problems = intent_module.parse_intent(
+        _intent_argument(arguments), strict_parameters=strict_parameters
+    )
     if problems:
         raise GrantRefused("bad-intent", problems[0]["detail"])
     declared = dict((parsed or {}).get("spend", {}))
@@ -298,6 +259,17 @@ def _is_universal_router(spender: str, chain: t.Any) -> bool:
     return known is not None and known.name == UNIVERSAL_ROUTER_NAME
 
 
+class GateView(t.Protocol):
+    """What the grant store reads of the signer whose gate it fronts."""
+
+    @property
+    def switches(self) -> Switches:
+        """The signer's switch positions."""
+
+    def holds_request(self, request_id: str, via_safe: bool) -> bool:
+        """Whether the signer holds this request id, completed or still sending."""
+
+
 class GrantStore:  # pylint: disable=too-many-instance-attributes
     """The bearer tokens this process honours, and what each may do.
 
@@ -305,15 +277,20 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
     """
 
     def __init__(
-        self, workspace_token: str, *, held: t.Callable[[str, bool], bool]
+        self,
+        workspace_token: str,
+        *,
+        signer: GateView,
     ) -> None:
         """Hold the workspace token, the root every other token is minted from.
 
-        `held(request_id, via_safe)` says whether the signer holds that request
-        id, completed or still sending (`Signer.holds_request`): a call
-        repeating it then sends nothing new.
+        `signer` is the one whose gate this store's caps front: its
+        `holds_request(request_id, via_safe)` says whether a call repeats one
+        it already holds (sending nothing new), and its `switches` are the one
+        source of `strict_parameters`, so the cap reads an intent as the gate.
         """
-        self._held = held
+        self._held = signer.holds_request
+        self._strict_parameters = signer.switches.strict_parameters
         # what each (token, action, request_id) has drawn, so a retry of a
         # request this token already paid for is not drawn again; forgotten
         # past the bound, which only draws again
@@ -568,7 +545,9 @@ class GrantStore:  # pylint: disable=too-many-instance-attributes
         draw: bool,
     ) -> bool:
         """Hold a send to the caps; return whether a retry's draw was relieved."""
-        declared, approvals = _declared(arguments)  # refuses malformed first
+        declared, approvals = _declared(  # refuses malformed first
+            arguments, strict_parameters=self._strict_parameters
+        )
         self._check_approvals(grant, approvals)
         per_tx = grant.max_value_per_tx
         if per_tx is not None:
@@ -693,7 +672,7 @@ ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 
 MAX_AUTH_FAILURES = 10
 AUTH_FAILURE_WINDOW_SECONDS = 60.0
-_RATE_LIMIT_MESSAGE = "too many failed authentication attempts; retry later"
+RATE_LIMIT_MESSAGE = "too many failed authentication attempts; retry later"
 
 
 class AuthFailureLimiter:
@@ -777,7 +756,7 @@ class RequireAuth:
                 status_code=403, detail="cross-origin requests are not allowed"
             )
         if self._limiter.blocked():
-            raise HTTPException(status_code=429, detail=_RATE_LIMIT_MESSAGE)
+            raise HTTPException(status_code=429, detail=RATE_LIMIT_MESSAGE)
         token = self._grants.lookup(request.headers.get("authorization"))
         if token is None:
             self._fail(request.url.path, "bad token")
@@ -791,143 +770,12 @@ class RequireAuth:
         self._limiter.record_failure()
 
 
-class AuthMiddleware:
-    """Pure-ASGI equivalent of RequireAuth for mounted sub-apps (the MCP mount)."""
-
-    def __init__(
-        self,
-        app: t.Callable,
-        grants: GrantStore,
-        activity: ActivityLog,
-        limiter: AuthFailureLimiter,
-    ) -> None:
-        """Initialize."""
-        self._app = app
-        self._grants = grants
-        self._activity = activity
-        self._limiter = limiter
-
-    async def __call__(self, scope: t.Any, receive: t.Any, send: t.Any) -> None:
-        """Enforce Origin locality + bearer token, then delegate."""
-        if scope["type"] == "lifespan":
-            await self._app(scope, receive, send)
-            return
-        if scope["type"] != "http":
-            if scope["type"] == "websocket":
-                await send({"type": "websocket.close"})
-            return  # nothing serves non-http scopes
-        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
-        path = scope.get("path", "")
-        if not origin_is_local(headers.get("origin")):
-            # audited, never brake-counted — see RequireAuth for the rationale
-            self._activity.record("auth_failed", path=path, reason="cross-origin")
-            await _reject(send, 403, "cross-origin requests are not allowed")
-            return
-        if self._limiter.blocked():
-            await _reject(send, 429, _RATE_LIMIT_MESSAGE)
-            return
-        token = self._grants.lookup(headers.get("authorization"))
-        if token is None:
-            self._fail(path, "bad token")
-            await _reject(send, 401, "invalid or missing bearer token")
-            return
-        body = await _read_body(receive)
-        replays: set[tuple[str, str]] = set()
-        refusal = self._refusal(token, body, replays)
-        if refusal is not None:
-            await _send_json(send, 200, refusal)
-            return
-        # read back by the send tools through the MCP request context
-        scope.setdefault("state", {}).update({AUTH_TOKEN: token, REPLAYS: replays})
-        await self._app(scope, _replay(body, receive), send)
-
-    def _refusal(
-        self, token: str, body: bytes, replays: set[tuple[str, str]]
-    ) -> dict | None:
-        """Return a JSON-RPC error for the first tool call this token may not make.
-
-        Each call relieved as a retry is added to `replays` as (tool, request id).
-        """
-        try:
-            message = json.loads(body or b"null")
-        except ValueError:
-            return None  # the MCP server answers a malformed body itself
-        for call in message if isinstance(message, list) else [message]:
-            if not isinstance(call, dict) or call.get("method") != "tools/call":
-                continue
-            params = call.get("params")
-            params = params if isinstance(params, dict) else {}
-            arguments = params.get("arguments")
-            arguments = arguments if isinstance(arguments, dict) else {}
-            name = str(params.get("name"))
-            try:
-                check_tool_amounts(name, arguments)
-                if self._grants.authorize(token, name, arguments):
-                    replays.add((name, str(arguments["request_id"])))
-            except GrantRefused as e:
-                self._activity.record(
-                    "refusal", rule=e.rule, tool=params.get("name"), reason=str(e)
-                )
-                return {
-                    "jsonrpc": "2.0",
-                    "id": call.get("id"),
-                    "error": {"code": -32001, "message": e.message},
-                }
-        return None
-
-    def _fail(self, path: str, reason: str) -> None:
-        self._activity.record("auth_failed", path=path, reason=reason)
-        self._limiter.record_failure()
-
-
 def require_local_origin(request: Request) -> None:
     """Router dependency: reject cross-origin requests (no token involved)."""
     if not origin_is_local(request.headers.get("origin")):
         raise HTTPException(
             status_code=403, detail="cross-origin requests are not allowed"
         )
-
-
-async def _reject(send: t.Any, status: int, message: str) -> None:
-    await _send_json(send, status, {"error": message})
-
-
-async def _send_json(send: t.Any, status: int, payload: t.Any) -> None:
-    await send(
-        {
-            "type": "http.response.start",
-            "status": status,
-            "headers": [(b"content-type", b"application/json")],
-        }
-    )
-    await send({"type": "http.response.body", "body": json.dumps(payload).encode()})
-
-
-async def _read_body(receive: t.Any) -> bytes:
-    """Read the whole request body, so its tool calls can be authorized."""
-    chunks = []
-    while True:
-        message = await receive()
-        if message["type"] != "http.request":
-            break
-        chunks.append(message.get("body", b""))
-        if not message.get("more_body"):
-            break
-    return b"".join(chunks)
-
-
-def _replay(body: bytes, receive: t.Any) -> t.Callable[[], t.Awaitable[dict]]:
-    """Return a receive that yields the read body, then the real stream."""
-    sent = False
-
-    async def replay() -> dict:
-        nonlocal sent
-        if not sent:
-            sent = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        return await receive()
-
-    return replay
 
 
 def authorize_route(

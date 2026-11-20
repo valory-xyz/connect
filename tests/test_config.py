@@ -40,6 +40,7 @@ from connect.config import (
     configure_mech_indexers,
     load_config,
 )
+from connect.input_errors import InputError
 
 
 @pytest.fixture(autouse=True)
@@ -247,7 +248,7 @@ def test_mech_settle_timeout_and_gap_retries_are_configurable(tmp_path: Path) ->
 def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:
     """Test unknown chain lookup raises."""
     config = load_config(base_env(tmp_path))
-    with pytest.raises(ValueError, match="unknown chain"):
+    with pytest.raises(InputError, match="unknown chain 'solana'"):
         config.chain("solana")
 
 

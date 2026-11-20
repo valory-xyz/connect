@@ -66,7 +66,8 @@ class Call(t.TypedDict):
     """One call the safe makes, as the signer expects it.
 
     `intent` is what the call may do (spend caps, the least it must receive,
-    recipients, approvals); the signer refuses a value-moving call without one.
+    recipients, approvals); with none, the signer holds the call to its own
+    value and target, with no approval.
     """
 
     to: str
@@ -548,10 +549,9 @@ SIGNER_REFUSALS: dict[int, tuple[str, ...]] = {
         "unknown chain '",
         "no service safe is configured for chain '",
         "cannot compose the safe call: ",
-        "the safe may not call itself ",
-        "the operator's guardrail settings do not allow the safe to call ",
-        "the guardrail only allows approve(spender=",
-        "refused by the intent gate: ",
+        # every guardrail and intent-gate refusal, whichever rule it names
+        "guardrail: rule ",
+        "intent gate: rule ",
     ),
     # a scoped token's refusal names its rule: an expired token is a 401
     401: ("invalid or missing bearer token", "rule 'token-expired': "),

@@ -51,7 +51,8 @@ other non-aea agent. It:
      body overrides the saved preference for that launch alone, without
      rewriting what the operator chose
    - a bearer-authed signing surface: `POST /safe-transaction` (the safe's call:
-     `target`, `value`, `data`), `POST /sign-and-send` (the EOA's: `to`,
+     `target`, `value`, `data`), `POST /sign-and-send` (the EOA's, routed only
+     with the `rest_signing_routes` switch, on in Pearl: `to`,
      `value`, `data`; both also take `request_id`, `intent`, and
      `wait_for_receipt`/`timeout`, answering `status` and the receipt as the
      MCP send tools do), `POST /sign-message`, `GET /wallet`. A send failure
@@ -77,11 +78,46 @@ other non-aea agent. It:
      mech-client's `redacted_cause`, its class and its text with every URL
      cut to scheme and host and every path or query cut. The `log.txt` line
      also says where each link was raised (file, line and function, never
-     its text), so a bug in Connect's own code is located. Every body and
-     every MCP tool refuses a parameter it does not take, with an error naming
-     the ones it does (`to` on the safe path is pointed at `target`); read-only
-     tools carry `readOnlyHint`
-   - MCP (streamable HTTP) at `/mcp` with tools `wallet_info`,
+     its text), so a bug in Connect's own code is located. Every body
+     refuses a parameter it does not take, with an error naming the ones it
+     does (`to` on the safe path is pointed at `target`); an MCP tool ignores
+     one, as OnchainBench's reference does, only when the `strict_parameters`
+     switch is off (on in Pearl, off for the bench; see
+     [Bench parity](#bench-parity));
+     read-only tools carry `readOnlyHint`
+   - MCP (streamable HTTP) at `/mcp`, its published descriptions, initialize
+     answer (`serverInfo` is `connect.texts.SERVER_INFO`, the reference's name
+     and version, with no `instructions`) and error texts OnchainBench's reference ones (see
+     [Bench parity](#bench-parity)): a failed tool call reads the refusing
+     code's own text, with no `Error executing tool` prefix (an error Connect
+     did not word for the caller reads `<tool> failed (the cause is in
+     Connect's log)` instead, its cause logged; a malformed argument reads
+     `invalid request: ValidationError: <argument>: <problem>`, never the
+     value sent, and every address argument — `target`, `to`, `address`,
+     `priority_mech` — or hex argument — `data`, `digest` — the reference's
+     `must be a 0x address` / `must be hex` text, and a `value` or
+     `max_payment` a JSON number may have rounded the reference's
+     `amount … is not an exact integer` text, checked on the arguments as
+     sent, before any alias is read and before a token's budget is drawn
+     on), an unknown tool
+     reads `unknown tool <name>`, and the safe-call tools take `to` as an alias
+     of an empty or absent `target`. Each tool requires what the reference
+     requires (`get_abi` needs only `address`, reading the instance's chain,
+     the one its safe is on, when `chain` is omitted, and `decode_calldata`
+     only `data`), and a required field that is missing or empty is refused
+     by name: `invalid request: ValidationError: <field>: Field required`.
+     Every argument the reference takes is taken: `wallet_info`'s
+     `chain` and `decode_calldata`'s `address` and `chain` are accepted and
+     ignored (its `address` is still checked for shape), and `safe_transaction` (on MCP only) reads an
+     unpublished `operation`, 0 (CALL) or 1 (DELEGATECALL), so a DELEGATECALL is refused by the
+     guardrail's `no-delegatecall` rule rather than by a parameter check. Three texts stay Connect's own: `get_abi`'s description,
+     until its answers match the reference's; `transaction_status`'s, which
+     names `pending` too; and the warning on
+     `mech_request`'s `request_context` field that `legacy_on_chain=true`
+     publishes it to IPFS for good. `transaction_status` answers `success` (with its `block`),
+     `reverted`, `pending` (a transaction the node holds but has not mined) or
+     `not_found` (a hash the node does not know, or a malformed one); a send that
+     waited reports `success` / `reverted` / `pending`. The tools are `wallet_info`,
      `safe_transaction`, `send_transaction`, `preflight_transaction`,
      `simulate_transaction`, `transaction_status`, `chain_call`, `get_abi`,
      `decode_calldata`,
@@ -95,7 +131,7 @@ other non-aea agent. It:
      `value`, so a client that cannot hold the number exactly passes it
      exactly; a JSON integer up to 2^53 - 1 is still taken, and a float, or
      an integer from 2^53 on, is refused (`bad-value`) at the mount, before any
-     budget is drawn on. `max_payment` is the one exception: it is a cap on a
+     budget is drawn on, in the tool's own words and as its error. `max_payment` is the one exception: it is a cap on a
      price that is checked exactly, never an amount that is spent, so it takes
      a whole JSON integer of any size too (OCB sends its model budget that
      way).
@@ -226,10 +262,10 @@ the agent's reach and give the agent only a minted, capped child token
 
 ## Intent gate
 
-After the guardrail, every agent-originated value-moving send (`safe_transaction`
-and `send_transaction`, MCP and HTTP alike) must carry an **intent** — spend
-caps per token, minimum receive, allowed recipients, approvals — and is
-simulated at head over the chain's RPC with `eth_simulateV1`
+After the guardrail, every agent-originated send (`safe_transaction` and
+`send_transaction`, MCP and HTTP alike) may carry an **intent** — spend caps
+per token, minimum receive, allowed recipients, approvals — and is simulated
+at head over the chain's RPC with `eth_simulateV1`
 (`traceTransfers: true`, `validation: false`) before it is signed. The asset
 diff comes from the simulated logs (`connect/intent.py`): no fork, no trace, so
 `called` lists the target plus every contract that emitted a log. Native value
@@ -241,11 +277,34 @@ and never counted. A WETH `Deposit`/`Withdrawal` is counted only when the same
 token logged no `Transfer` mint to (or burn from) the sender, since
 Solmate- and OpenZeppelin-style wrappers log both for one wrap. The rules, each named in
 the refusal and recorded as an activity `refusal` entry: `reverts`,
-`bad-intent`, `missing-intent`, `overspend`, `receive-min`,
+`bad-intent`, `overspend`, `receive-min`,
 `undeclared-recipient` (EOAs only, an EIP-7702 delegated EOA counted as one;
 burns to the zero address skipped) and
 `undeclared-approval` (a 0 approval is not checked; `setApprovalForAll` counts
-as a maximum, even when revoking). Only the CELO face's `Transfer` is native:
+as a maximum, even when revoking). A send with no intent is held to the
+`no_intent_policy` switch ([Bench parity](#bench-parity)): Pearl's `strict`
+reads it as declaring only what the call itself says (a spend of its own
+`value` in native, its target as the one recipient, no approvals and no
+position leaving) and refuses whatever goes beyond that by the rule it breaks,
+so a plain transfer needs no intent. The bench's `simulate-only` refuses a
+no-intent send only when it reverts. Under a capped token, which no cap could
+otherwise bound, a no-intent call is held to its own value and target under
+either policy, and a position leaving is `token-cap-positions`, not
+`overspend` (`intent.no_intent_hold`). A refusal is its problems in
+OnchainBench's reference words, joined with `; ` and closed with
+`. Nothing was sent.`: each problem reads `intent gate: rule '<id>' (<detail>)`,
+the detail as the reference words it (`overspend`: `<symbol>: spends <n>,
+intent allows <m>`; `receive-min`: `<symbol>: receives <n>, intent needs <m>`;
+`undeclared-recipient`: the address; `undeclared-approval`: `<symbol> to
+<spender>, <amount>`; `reverts`: the revert reason), a token named by its
+`symbol()` where it has one. `simulate_transaction`'s `problems` are the same
+strings, and it answers a no-intent call as the send would: under `strict`
+the call is held to what it says, so `fits_intent` and `problems` are those
+of the implied intent; under `simulate-only` it answers `fits_intent: null`
+and no problems, a revert showing only in the diff's `ok` and `revert`,
+except under a capped token, held as above, which gets a verdict. Under
+either position, a call that cannot be simulated, or an EOA call refused
+before simulation, answers `fits_intent: false` with its problem. Only the CELO face's `Transfer` is native:
 its `Approval` is an approval like any other, and an intent naming the face in
 `spend` or `receive_min` means `"native"` (naming both is `bad-intent`). Under a
 value-capped token the gate also refuses any ERC-721/1155 position leaving the
@@ -263,10 +322,15 @@ bytes (a space or a newline included) is refused before anything reaches the
 RPC (`bad-calldata`), on a send, `preflight_transaction`
 and `simulate_transaction` alike, rather than reading as an RPC that cannot
 simulate. An RPC that cannot simulate is also logged to `log.txt` with the
-cause, since every agent send on that chain is refused until it can. A key
-an intent does not know, at its top level or in an approval, is `bad-intent`,
-naming the key, on every surface: a misspelled `receive_min` is refused, never
-dropped. An amount in an intent is a whole number
+cause, since every agent send on that chain is refused until it can. In Pearl
+(the `strict_parameters` switch on) a key an intent does not know, at its top
+level or in an approval, is `bad-intent`, naming the key, and the cap of a
+scoped token refuses it before drawing on any budget. For the bench (off) it
+is ignored on every surface, as OnchainBench's reference ignores it: the intent
+is checked on the keys it does carry, so a misspelled `spend` allows no spend
+and a misspelled `receive_min` sets no floor, and the gate logs the ignored
+keys to `log.txt` once per call, by name with the call's chain and target,
+never a value. An amount in an intent is a whole number
 of base units, never truncated. On the HTTP routes a float or a bool there is
 `bad-intent`. The MCP tools hold it to the `value` rule (a decimal or 0x-hex
 string, or a JSON integer up to 2^53 - 1) and refuse anything else as
@@ -289,7 +353,7 @@ balance trackers, the simulation reads `mapRequesterBalances(sender)` at each
 tracker before and after the call, in the same simulated block, and a fall is
 spent of the tracker's asset (`"native"`, or its payment token), listed under
 `prepaid` and counted in `native`/`tokens`, so it needs an intent whose
-`spend` covers it and draws on the token's caps; a rise (a deposit) is no
+`spend` covers it (no intent allows only the call's own value) and draws on the token's caps; a rise (a deposit) is no
 spend of its own, and a read that does not answer fails closed as
 `simulation-unavailable`. So does a tracker table mech-client cannot give
 (a malformed `MECHX_LEDGER_CHAIN_ID` or `MECHX_GAS_LIMIT` in Connect's
@@ -307,8 +371,9 @@ agent top-up — pass the private `SERVER_BUILT` marker and skip the gate; they
 are bounded by `max_payment` and the top-up plan, and while restricted by their
 single-use allowances. The diff names each token's `symbol()` for the reader
 (display only: nothing is checked against it, and a token without one reads
-as `""`). `preflight_transaction` and `simulate_transaction` take
-the same `intent` and report the gate's `problems` without signing.
+as `""`). `simulate_transaction` takes the same `intent` and reports the
+gate's `problems` without signing; `preflight_transaction` checks no intent
+rules and simulates nothing (below).
 
 The gate holds **transactions**. `sign_message` signs a raw digest for the
 uncapped workspace token in the default mode, and a digest can be a safe
@@ -401,6 +466,9 @@ Two rules hold in **every** mode, and no setting lifts them: the safe may not
 `addOwnerWithThreshold`, `setGuard` — the ways a Safe changes what it *is*).
 Both would outlive a switch back to restricted mode, so the guardrail refuses
 them regardless of mode; the reasoning lives at the top of `connect/guard.py`.
+The signer holds both, and the marketplace rule below, even with no guardrail
+attached (`guard.floor`), on a send and a dry run alike, so no build of Connect
+lifts them either.
 A third holds in every mode too: the mech marketplace takes only the calls the
 server's own mech flow composes (`mech_request`, bounded by `max_payment` and
 the token's mech budget). A call to the chain's marketplace (every
@@ -410,6 +478,18 @@ and still covers an address a later pin moved away from) through any
 agent-facing send path — `safe_transaction`, `send_transaction` (to the
 marketplace, or an `execTransaction` carrying a call to it) and their HTTP
 routes — is refused, and `preflight_transaction` answers the same.
+
+Every guardrail refusal begins `guardrail: rule '<id>': `, the prefix
+OnchainBench's broker reads as "not sent". The floor and whitelist texts are
+the reference's, verbatim (`connect.texts`): `no-delegatecall`,
+`no-self-call` and `whitelist` (naming the safe's call target and the chain).
+Connect's own rules use the same form, and are the same under every
+`Switches` position, their texts in `connect.texts` beside the reference's
+(`GuardRule` names every rule id): `marketplace`,
+`undecodable-exec-transaction` (an
+`execTransaction` it cannot decode) and, in restricted mode, `no-safe`,
+`safe-only`, `exec-transaction-only`, `outer-value`, `refund`,
+`payment-token-approve` and `raw-digest`.
 
 On that floor, the signer enforces one of two persistent modes. The modes are
 an operator concept only: agent-facing surfaces (the MCP tools, `GET /wallet`,
@@ -451,11 +531,19 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   deposit allowance described above.
 
 The agent can ask before it spends: `preflight_transaction` composes the same
-bytes the send would and runs them past the same gate, answering `{allowed}`
-plus the refusal the real call would have raised — the calling token's caps
-included, checked first as the MCP mount checks the send, without drawing on its
-session budget. Nothing is signed or broadcast, and no single-use allowance is
-spent — the reasoning for that is at the top of `connect/guard.py`.
+bytes the send would and runs them past the same guardrail, answering
+`{"permitted": true}`, or `{"permitted": false, "rule": ...}` carrying the
+refusal the real call would have raised — the calling token's caps included,
+checked first as the MCP mount checks the send, without drawing on its
+session budget. As in OnchainBench's reference, it is the guardrail's verdict
+on these bytes and nothing more: nothing is simulated and the intent rules are
+not checked; only calldata that is not strictly hex is refused first, as the
+gate's `bad-calldata`. So `permitted` does not mean the call will succeed
+on-chain or pass the gate (`simulate_transaction` answers that). The token
+check before it is the scoped-token feature's, which keeps its production
+position until that feature gets its switch. Nothing is signed or
+broadcast, and no single-use allowance is spent — the reasoning for that is at
+the top of `connect/guard.py`.
 
 Asking is not a new capability: a refused send never reached the chain either,
 because the gate runs before signing. What asking avoids is the audit entry, so
@@ -624,12 +712,16 @@ gate's `token-cap-positions`). Refusals name their rule (`token-scope`,
 `token-expired`, `token-expiry-required`, `token-mech-cap-required`,
 `token-limit`, `token-cap-per-tx`, `token-cap-per-session`, `token-cap-sign`
 (a raw digest refused to a value-capped token),
-`token-mech-payment-cap`, `token-mech-session-cap`, and `bad-value` for an
-amount that is not a whole number >= 0, which the HTTP routes name `bad-intent`
-when it sits in an intent), come back as the HTTP 403/401 detail or the MCP tool
+`token-mech-payment-cap`, `token-mech-session-cap`, and, on the HTTP routes,
+`bad-value` for an amount that is not a whole number >= 0, named `bad-intent`
+when it sits in an intent), come back as the HTTP 403/401 detail or a JSON-RPC
 error, and are recorded as activity `refusal` entries. MCP calls are authorized
 in the mount's middleware, which reads each JSON-RPC `tools/call` before the
-MCP server does, and stamps the token on the request; whether its intent is
+MCP server does: it first runs the tool's own input check, so a malformed call
+(address, hex, amount, an unknown parameter under `strict_parameters`) is
+answered as the tool's error, in its words, and audited once, as
+`invalid-request`, before any budget is drawn on; it refuses a batch body, or
+one nested too deep to parse, whole; and it stamps the token on the request; whether its intent is
 held as capped is decided from the token in one place (`GrantStore.intent_for`)
 for both surfaces, and a call with no known token is treated as capped. A mech
 payment never draws on `max_value_per_session`: its asset is the mech's,
@@ -884,8 +976,10 @@ on-chain record from the marketplace indexer: requests received,
 self-delivered and delivered by others, the creation time in ISO 8601 UTC and
 `age_days`; its `note` says the counters cover on-chain requests and off-chain
 requests the mech settled on-chain, so an off-chain request that was never
-delivered appears nowhere. `payment` names the method with no price, since the
-contract quotes the charge at request time. The record is only an aid to
+delivered appears nowhere. The report's `payment` label, which names the
+method with no price since the contract quotes the charge at request time, is
+answered as `payment_info`: in every mech answer `payment` is only ever an
+integer. The record is only an aid to
 choosing: when the manifest or the indexer cannot be read, mech-client reports
 the terms alone and says so in `report_note`.
 
@@ -951,6 +1045,59 @@ exactly as it clears `mech_result`'s pending ids; and it keeps the last 1024
 ids, so an id replayed long after that many others pays again. An id is also
 bound to what it asked — reusing one for a different prompt, tool, chain, mech,
 flow or `request_context` is refused rather than answering the wrong question.
+
+## Bench parity
+
+OnchainBench tests agents against a reference implementation of Connect's
+agent-visible surface, and Connect matches it so the bench can import real
+Connect. Two public modules carry that contract:
+
+- `connect.texts` — every agent-visible text whose wording is part of it (every
+  tool description, the guardrail and intent-gate refusals, the markers the
+  bench's broker classifies — `guardrail: rule `, `. Nothing was sent.`,
+  `transaction 0x` — and the mech, amount and transport errors). Most are the
+  reference's word for word, the inexact-amount text included (its value cut to
+  60 characters, as an address's is). Connect's own are: the guardrail rules it
+  adds beyond the floor and the whitelist, its gate and decode details
+  (`gate_token_cap_positions`, `EXEC_UNDECODABLE`), `AMOUNT_REFUSED` /
+  `CAP_REFUSED` for an amount that is not one, `VALUE_REFUSED`, `tool_failed`,
+  `BATCH_REFUSED`, `BODY_TOO_DEEP`, `CHAIN_REQUIRED`, the block texts and the
+  descriptions it keeps (`get_abi`'s,
+  `transaction_status`'s and `request_context`'s field note). The bench imports
+  the module, so a rename fails its suite.
+- `connect.switches` — `Switches`, one position per feature only Connect has
+  and per protection Pearl keeps. `PRODUCTION` is what Pearl runs;
+  `TEST_INTERFACE` is the reference's behaviour. The set is given once, to
+  `Signer(..., switches=)`, and `create_app` / `build_mcp` read it from the
+  signer, so one build cannot mix two sets: no env var,
+  setting or route can set one, `__main__` passes none, and the release binary
+  excludes `connect.testing`. So far: `no_intent_policy` (`strict` in Pearl,
+  `simulate-only` for the bench; see [Intent gate](#intent-gate)),
+  `strict_parameters` (on in Pearl: an MCP tool refuses an argument it does
+  not take, a Connect extra unlisted while `extra_tool_parameters` is off
+  included, and the gate an intent key it does not read, each by name; off for
+  the bench, both are ignored), `extra_tool_parameters` (on in Pearl: the arguments only
+  Connect has, `wait_for_receipt` and `timeout` on the send tools, `intent` on
+  `send_transaction`, `via_safe` on `simulate_transaction`, `block` on
+  `chain_call`, `limit` and `offset` on `mech_tools`, `timeout` on
+  `mech_result`, `legacy_on_chain` and `request_context` on `mech_request`;
+  off, they are neither listed nor read, and one sent anyway is logged), `rich_intent_schema` (on in Pearl:
+  `intent` listed as its typed definitions; off, a bare object),
+  `rest_signing_routes` (`POST /sign-and-send`; on in Pearl) and
+  `agent_topup_at_boot` (the [Agent top-up](#agent-top-up); on in Pearl).
+
+The tool listing presents every argument as the reference does, in both
+positions: a bare type, with no title, default or nullable union; `value` and
+`max_payment` as strings carrying the reference's base-units description;
+`mech_request`'s `timeout` as an integer; each tool's `required` set the
+reference's, and `readOnlyHint` on exactly the reference's nine read-only
+tools. With Pearl's extras off, the listing equals the reference's field for
+field.
+
+Mech amounts are JSON integers, as the reference answers them: `mech_tools`'
+`max_delivery_rate` and `default_max_payment`, and `mech_request`'s
+`payment`, so an agent compares a price with its own `max_payment` without
+parsing.
 
 ## Development
 

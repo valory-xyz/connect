@@ -28,7 +28,7 @@ from web3 import Web3
 
 from connect import intent
 
-from tests.conftest import canary_result, native_transfer_log
+from tests.conftest import canary_result, transfer_log
 
 SAFE = "0x" + "22" * 20
 EOA = "0x" + "aa" * 20
@@ -104,8 +104,8 @@ def test_native_and_token_spend_are_netted_per_asset() -> None:
     """The diff is what left and arrived at the sender, per asset."""
     diff = simulate(
         [
-            native_transfer_log(SAFE, CONTRACT, 100),
-            native_transfer_log(CONTRACT, SAFE, 30),
+            transfer_log(SAFE, CONTRACT, 100),
+            transfer_log(CONTRACT, SAFE, 30),
             transfer(TOKEN, SAFE, CONTRACT, 40),
             transfer(TOKEN, CONTRACT, SAFE, 15),
         ]
@@ -127,7 +127,7 @@ def test_celo_native_moves_from_both_sources_are_summed() -> None:
     """
     diff = simulate(
         [
-            native_transfer_log(SAFE, EOA, 7),
+            transfer_log(SAFE, EOA, 7),
             transfer(CELO_FACE, SAFE, EOA, 3),
         ]
     )
@@ -146,23 +146,25 @@ def test_an_approval_by_the_celo_face_is_an_approval() -> None:
             "infinite": True,
         }
     ]
-    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
-    assert rules(intent.check_intent(diff, intent.parse_intent({})[0])) == [
-        "undeclared-approval"
-    ]
+    assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
+    assert rules(
+        intent.check_intent(diff, intent.parse_intent({}, strict_parameters=False)[0])
+    ) == ["undeclared-approval"]
 
 
 def test_a_spend_naming_the_celo_face_is_a_native_spend() -> None:
     """Face moves are booked under native, so an intent naming the face is too."""
     parsed, problems = intent.parse_intent(
-        {"spend": {CELO_FACE.upper().replace("0X", "0x"): 3}}
+        {"spend": {CELO_FACE.upper().replace("0X", "0x"): 3}}, strict_parameters=False
     )
     assert problems == []
     assert parsed is not None
     assert parsed["spend"] == {"native": 3}
     diff = simulate([transfer(CELO_FACE, SAFE, CONTRACT, 3)])
     assert rules(intent.check_intent(diff, parsed)) == []
-    _, twice = intent.parse_intent({"spend": {"native": 1, CELO_FACE: 2}})
+    _, twice = intent.parse_intent(
+        {"spend": {"native": 1, CELO_FACE: 2}}, strict_parameters=False
+    )
     assert rules(twice) == ["bad-intent"]
     assert "twice" in twice[0]["detail"]
 
@@ -179,7 +181,7 @@ def test_polygons_own_log_transfer_is_not_counted() -> None:
         ],
         "data": "0x" + _word(5) + _word(0) + _word(0),
     }
-    diff = simulate([native_transfer_log(SAFE, EOA, 5), log_transfer])
+    diff = simulate([transfer_log(SAFE, EOA, 5), log_transfer])
     assert diff["native"] == "-5"
     assert diff["tokens"] == {}
 
@@ -196,7 +198,7 @@ def test_burns_and_self_transfers_are_not_recipients() -> None:
     assert intent.check_intent(diff, {"spend": {TOKEN: 4}}) == []
 
 
-def test_an_nft_approval_is_value_moving_and_checked() -> None:
+def test_an_nft_approval_is_checked() -> None:
     """ERC-721 Approval has every field indexed; it is a grant like any other."""
 
     def nft_approval(spender: str) -> dict:
@@ -216,7 +218,7 @@ def test_an_nft_approval_is_value_moving_and_checked() -> None:
             "id": "9",
         }
     ]
-    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
     assert rules(intent.check_intent(diff, {})) == ["undeclared-approval"]
     cleared = simulate([nft_approval("0x" + "00" * 20)])
     assert intent.check_intent(cleared, None) == []  # approving nobody clears it
@@ -441,25 +443,47 @@ def rules(problems: list[intent.Problem]) -> list[str]:
     return [p["rule"] for p in problems]
 
 
-def test_value_moving_needs_an_intent() -> None:
-    """Any spend, NFT out or non-zero approval without an intent is refused."""
-    assert rules(intent.check_intent(_diff(native="-1"), None)) == ["missing-intent"]
-    assert rules(intent.check_intent(_diff(tokens={TOKEN: {"delta": "-1"}}), None)) == [
-        "missing-intent"
-    ]
-    assert rules(
-        intent.check_intent(
-            _diff(positions=[{"token": TOKEN, "id": "1", "delta": "-1"}]), None
-        )
-    ) == ["missing-intent"]
-    assert rules(
-        intent.check_intent(
+IMPLIED = intent.implied_intent(0, EOA, positions_locked=False)
+
+
+@pytest.mark.parametrize(
+    ("diff", "rule"),
+    [
+        (_diff(native="-1"), "overspend"),
+        (_diff(tokens={TOKEN: {"symbol": "T", "delta": "-1"}}), "overspend"),
+        (_diff(positions=[{"token": TOKEN, "id": "1", "delta": "-1"}]), "overspend"),
+        (
             _diff(approvals=[{"token": TOKEN, "spender": SPENDER, "amount": "1"}]),
-            None,
-        )
-    ) == ["missing-intent"]
-    # a claim moves nothing of the sender's, so it needs none
-    assert intent.check_intent(_diff(tokens={TOKEN: {"delta": "3"}}), None) == []
+            "undeclared-approval",
+        ),
+        (
+            _diff(recipients=[{"address": SPENDER, "contract": False}]),
+            "undeclared-recipient",
+        ),
+    ],
+)
+def test_the_strict_policy_holds_a_no_intent_call_to_what_it_says(
+    diff: intent.AssetDiff, rule: str
+) -> None:
+    """No spend beyond the call's value, no approval, no recipient but the target."""
+    assert rules(intent.check_intent(diff, IMPLIED)) == [rule]
+    assert intent.check_intent(diff, None) == []
+
+
+def test_the_implied_intent_allows_the_call_s_own_value_and_target() -> None:
+    """The value the call carries, to its own target, is what it declared."""
+    implied = intent.implied_intent(5, EOA.upper(), positions_locked=True)
+    diff = _diff(native="-5", recipients=[{"address": EOA, "contract": False}])
+    assert intent.check_intent(diff, implied) == []
+    assert implied["positions_locked"] is True
+    moved = _diff(positions=[{"token": TOKEN, "id": "7", "delta": "-1"}])
+    # one report per position: a capped token's lock names it, not overspend
+    assert rules(intent.check_intent(moved, implied)) == ["token-cap-positions"]
+    (problem,) = intent.check_intent(moved, IMPLIED)
+    assert problem == {
+        "rule": "overspend",
+        "detail": f"{TOKEN} #7: spends 1, intent allows 0",
+    }
 
 
 def test_a_token_the_spend_does_not_name_may_not_be_spent_at_all() -> None:
@@ -513,7 +537,9 @@ def test_a_tool_amount_is_a_json_integer_only_while_a_double_holds_it_exactly() 
 @pytest.mark.parametrize("raw", [0.9, 1.0, True])
 def test_an_amount_is_never_truncated(raw: t.Any) -> None:
     """A float minimum of 0.9 must not become 0: floats and bools are refused."""
-    _, problems = intent.parse_intent({"receive_min": {TOKEN: raw}})
+    _, problems = intent.parse_intent(
+        {"receive_min": {TOKEN: raw}}, strict_parameters=False
+    )
     assert rules(problems) == ["bad-intent"]
     assert "whole number" in problems[0]["detail"]
 
@@ -566,7 +592,7 @@ def test_any_call_on_an_rpc_that_ignores_trace_transfers_fails_closed(
     value: int,
 ) -> None:
     """A zero-value call can move native internally: the canary must be traced."""
-    logs = [native_transfer_log(SAFE, EOA, value)] if value else []
+    logs = [transfer_log(SAFE, EOA, value)] if value else []
     with pytest.raises(intent.SimulationUnavailable, match="traceTransfers"):
         intent.simulate(
             rpc_with(logs, traced=False),
@@ -618,7 +644,7 @@ def test_an_answer_without_the_canary_is_simulation_unavailable() -> None:
 
 def test_a_value_send_the_rpc_did_not_trace_fails_closed() -> None:
     """With no native Transfer log, a value send would look like it moves nothing."""
-    for logs in ([], [native_transfer_log(SAFE, EOA, 3)]):
+    for logs in ([], [transfer_log(SAFE, EOA, 3)]):
         with pytest.raises(intent.SimulationUnavailable, match="traceTransfers"):
             intent.simulate(
                 rpc_with(logs),
@@ -629,7 +655,7 @@ def test_a_value_send_the_rpc_did_not_trace_fails_closed() -> None:
                 get_code=lambda a: b"",
             )
     traced = intent.simulate(
-        rpc_with([native_transfer_log(SAFE, EOA, 5)]),
+        rpc_with([transfer_log(SAFE, EOA, 5)]),
         sender=SAFE,
         to=EOA,
         value=5,
@@ -666,14 +692,19 @@ def test_a_permit2_grant_is_an_approval_the_intent_must_declare(event: str) -> N
             "via": "permit2",
         }
     ]
-    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
     assert rules(intent.check_intent(diff, {})) == ["undeclared-approval"]
     declared = {
         "approvals": [
             {"token": TOKEN, "spender": SPENDER, "amount": intent.MAX_UINT160}
         ]
     }
-    assert intent.check_intent(diff, intent.parse_intent(declared)[0]) == []
+    assert (
+        intent.check_intent(
+            diff, intent.parse_intent(declared, strict_parameters=False)[0]
+        )
+        == []
+    )
     elsewhere = simulate([{**log, "address": TOKEN}])  # not Permit2: not its grant
     assert elsewhere["approvals"] == []
     for_another = simulate(
@@ -761,7 +792,8 @@ def test_parse_intent_normalises_and_refuses_bad_shapes() -> None:
             "spend": {"NATIVE": "0x10", TOKEN.upper().replace("0X", "0x"): 5},
             "recipients": [EOA.upper().replace("0X", "0x")],
             "approvals": [{"token": TOKEN, "spender": SPENDER, "amount": 1}],
-        }
+        },
+        strict_parameters=False,
     )
     assert problems == []
     assert parsed == {
@@ -770,7 +802,7 @@ def test_parse_intent_normalises_and_refuses_bad_shapes() -> None:
         "recipients": [EOA],
         "approvals": [{"token": TOKEN, "spender": SPENDER, "amount": 1}],
     }
-    assert intent.parse_intent(None) == (None, [])
+    assert intent.parse_intent(None, strict_parameters=False) == (None, [])
     for bad in (
         "spend 5",
         {"spend": {"native": -1}},
@@ -779,16 +811,46 @@ def test_parse_intent_normalises_and_refuses_bad_shapes() -> None:
         {"recipients": ["0x12"]},
         {"approvals": ["x"]},
         {"approvals": [{"token": TOKEN}]},
-        {"limit": 1},
     ):
-        _, problems = intent.parse_intent(bad)
+        _, problems = intent.parse_intent(bad, strict_parameters=False)
         assert rules(problems) == ["bad-intent"], bad
 
 
-def test_an_unknown_approval_key_is_refused_by_name() -> None:
-    """An approval with a key it does not know is bad-intent, naming the key."""
+def test_an_unread_intent_key_is_ignored_unless_strict() -> None:
+    """The intent is read on the keys it carries; strict_parameters refuses the rest."""
     approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": 2}
-    parsed, problems = intent.parse_intent({"approvals": [approval]})
+    raw = {"spend": {"native": 3}, "limit": 1, "approvals": [approval]}
+    parsed, problems = intent.parse_intent(raw, strict_parameters=False)
+    assert problems == []
+    assert parsed == {
+        "spend": {"native": 3},
+        "receive_min": {},
+        "recipients": [],
+        "approvals": [{"token": TOKEN, "spender": SPENDER, "amount": 1}],
+    }
+    _, problems = intent.parse_intent({"limit": 1}, strict_parameters=True)
+    assert problems == [
+        intent.Problem(rule="bad-intent", detail="unknown intent keys ['limit']")
+    ]
+
+
+def test_an_ignored_intent_key_is_named_never_its_value() -> None:
+    """The names the gate logs: top-level and per approval, each cut to 40."""
+    long_key = "k" * 100
+    approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": "SECRET-2"}
+    raw = {"recieve_min": {"native": "SECRET-1"}, long_key: 1, "approvals": [approval]}
+    names = intent.ignored_keys(intent.Capped(raw))
+    assert names == ["k" * 40, "recieve_min", "approvals[0].max"]
+    assert "SECRET" not in str(names)
+    assert intent.ignored_keys("not an intent") == []
+
+
+def test_an_unknown_approval_key_is_refused_by_name_under_strict() -> None:
+    """Under strict_parameters, an approval with a key it does not know is bad-intent, by name."""
+    approval = {"token": TOKEN, "spender": SPENDER, "amount": 1, "max": 2}
+    parsed, problems = intent.parse_intent(
+        {"approvals": [approval]}, strict_parameters=True
+    )
     assert parsed is None
     assert problems == [
         intent.Problem(rule="bad-intent", detail="unknown intent approval keys ['max']")
@@ -804,7 +866,8 @@ def test_refusal_message_names_every_rule() -> None:
         ]
     )
     assert message == (
-        "refused by the intent gate: rule 'overspend': a; rule 'reverts': b"
+        "intent gate: rule 'overspend' (a); intent gate: rule 'reverts' (b). "
+        "Nothing was sent."
     )
 
 
@@ -873,7 +936,7 @@ def _simulate_prepaid(rpc: intent.Rpc) -> intent.AssetDiff:
 
 
 def test_a_fall_of_the_prepaid_mech_balance_is_spent_of_its_asset() -> None:
-    """A call that lowers the safe's prepaid balance moves value: it needs an intent.
+    """A call that lowers the safe's prepaid balance spends it: an intent must cover it.
 
     The fall is spent of the tracker's asset, held to the intent's spend; a
     rise (a deposit) is no spend of its own.
@@ -884,8 +947,7 @@ def test_a_fall_of_the_prepaid_mech_balance_is_spent_of_its_asset() -> None:
     assert diff["prepaid"] == [
         {"tracker": TRACKER, "token": intent.NATIVE, "delta": "-60"}
     ]
-    assert intent.is_value_moving(diff)
-    assert rules(intent.check_intent(diff, None)) == ["missing-intent"]
+    assert intent.check_intent(diff, None) == []  # no intent: only a revert counts
     assert rules(intent.check_intent(diff, {"spend": {"native": 59}})) == ["overspend"]
     assert intent.check_intent(diff, {"spend": {"native": 60}}) == []
     token = _simulate_prepaid(_prepaid_rpc({TRACKER: (1, 1), OLAS_TRACKER: (9, 2)}))
@@ -945,3 +1007,55 @@ def test_the_prepaid_read_is_mech_client_s_tracker_view() -> None:
         (view,) = [e for e in entries if e.get("name") == "mapRequesterBalances"]
         assert [i["type"] for i in view["inputs"]] == ["address"]
         assert [o["type"] for o in view["outputs"]] == ["uint256"]
+
+
+SPENT = intent.Intent(spend={TOKEN: 4}, receive_min={}, recipients=[], approvals=[])
+NOTHING_DECLARED = intent.Intent(spend={}, receive_min={}, recipients=[], approvals=[])
+
+
+@pytest.mark.parametrize(
+    ("diff", "parsed", "expected"),
+    [
+        (
+            _diff(tokens={TOKEN: {"symbol": "USDC", "delta": "-5"}}),
+            SPENT,
+            "intent gate: rule 'overspend' (USDC: spends 5, intent allows 4)",
+        ),
+        (
+            _diff(tokens={TOKEN: {"symbol": "", "delta": "-5"}}),
+            SPENT,
+            f"intent gate: rule 'overspend' ({TOKEN}: spends 5, intent allows 4)",
+        ),
+        (
+            _diff(tokens={TOKEN: {"symbol": "USDC", "delta": "-3"}}),
+            intent.Intent(
+                spend={TOKEN: 3}, receive_min={TOKEN: 2}, recipients=[], approvals=[]
+            ),
+            "intent gate: rule 'receive-min' (USDC: receives -3, intent needs 2)",
+        ),
+        (
+            _diff(recipients=[{"address": EOA, "contract": False}]),
+            NOTHING_DECLARED,
+            f"intent gate: rule 'undeclared-recipient' ({EOA})",
+        ),
+        (
+            _diff(
+                tokens={TOKEN: {"symbol": "USDC", "delta": "0"}},
+                approvals=[{"token": TOKEN, "spender": CONTRACT, "amount": "7"}],
+            ),
+            NOTHING_DECLARED,
+            f"intent gate: rule 'undeclared-approval' (USDC to {CONTRACT}, 7)",
+        ),
+        (
+            _diff(ok=False, revert="execution reverted"),
+            NOTHING_DECLARED,
+            "intent gate: rule 'reverts' (execution reverted)",
+        ),
+    ],
+)
+def test_each_problem_reads_as_the_reference_words_it(
+    diff: intent.AssetDiff, parsed: intent.Intent, expected: str
+) -> None:
+    """The detail names a token by its symbol, else its address, unclamped."""
+    (problem,) = intent.check_intent(diff, parsed)
+    assert intent.problem_text(problem) == expected

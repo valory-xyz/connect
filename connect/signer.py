@@ -25,7 +25,6 @@ and send_via_safe() are its two callers; off-chain mech requests use
 Signer.sign_digest(). The key never leaves this module's LocalAccount.
 """
 
-import hashlib
 import logging
 import threading
 import typing as t
@@ -44,7 +43,13 @@ from connect import intent as intent_module
 from connect import safe as safe_module
 from connect.activity import ActivityLog
 from connect.config import AppConfig
-from connect.guard import Guard, GuardError
+from connect.guard import Guard, GuardError, exec_floor, floor
+from connect.safe import OPERATION_CALL, Operation
+from connect.send_cache import (
+    IdempotencyCache,
+    call_stamp,
+    safe_request_key,
+)
 from connect.settings import prepaid_balance_trackers
 from connect.signer_errors import (
     SEND_UNKNOWN,
@@ -54,6 +59,8 @@ from connect.signer_errors import (
     logged_cause,
     send_failure,
 )
+from connect.switches import PRODUCTION, Switches
+from connect.texts import VALUE_REFUSED
 
 logger = logging.getLogger("agent")
 
@@ -133,9 +140,8 @@ class _ChainPool:
                 request_kwargs={"timeout": 30},
             )
         )
-        # PoA chains (Polygon above all) pad extraData past 32 bytes, which
-        # web3's default block formatter refuses — making every send there
-        # fail at fee estimation. The middleware is a no-op on non-PoA chains.
+        # PoA chains (Polygon above all) pad extraData past 32 bytes, which web3
+        # refuses, failing every send at fee estimation; a no-op elsewhere.
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         state = _ChainState(w3=w3, lock=threading.Lock(), chain_id=w3.eth.chain_id)
         with self._lock:
@@ -144,132 +150,10 @@ class _ChainPool:
             return self._states.setdefault(chain, state)
 
 
-MAX_CACHED_RESULTS = 1024
-
-
-class _Sent(t.NamedTuple):
-    """What a request id's send left: its hash, and whether the RPC took it."""
-
-    tx_hash: str
-    stamp: str
-    # False for a broadcast the RPC never answered (SendUnknown)
-    confirmed: bool
-
-
-def _same_call(key: str, cached: _Sent, stamp: str) -> str:
-    """Return the cached tx hash.
-
-    :raises SignerError: on a different call.
-    :raises SendUnknown: again, for a broadcast that may not have landed.
-    """
-    if cached.stamp != stamp:
-        raise SignerError(
-            f"request id '{key}' was already used for a different call; "
-            "choose a new id rather than replaying this one, which would "
-            "report a transaction that was never sent for it"
-        )
-    if not cached.confirmed:
-        raise SendUnknown(cached.tx_hash, held=True)
-    return cached.tx_hash
-
-
-def _call_stamp(chain: str, to: str, value: int, data: str) -> str:
-    """Fingerprint the call a request id stands for."""
-    raw = "\x1f".join((chain.lower(), to.lower(), str(value), (data or "0x").lower()))
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 COMPOSE_FAILED = (
     "cannot compose the safe call: the target must be an address, the value a "
     "whole amount and the data hex"
 )
-
-
-def _safe_request_key(request_id: str) -> str:
-    """Return send_via_safe's idempotency key: its own namespace, apart from send's.
-
-    The same id on the EOA path is a different logical action and must not
-    collide with it.
-    """
-    return f"safe:{request_id}"
-
-
-class _IdempotencyCache:
-    """At-most-once execution of actions keyed by caller-chosen request ids."""
-
-    def __init__(self, max_results: int = MAX_CACHED_RESULTS) -> None:
-        """Initialize."""
-        self._lock = threading.Lock()
-        self._max_results = max_results
-        self._results: dict[str, _Sent] = {}
-        self._in_flight: set[str] = set()  # request_ids currently executing
-
-    def run(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
-        """Run action at most once per key.
-
-        A completed key returns its cached result; a key whose action is still
-        executing raises (the caller retries after the original settles); a
-        failed attempt releases the key so a retry can run the action again,
-        except a broadcast that may have landed (`SendUnknown`), whose hash is
-        kept as the key's unconfirmed result so a retry raises it again.
-
-        :raises SignerError: when the key was used for a different call.
-        :raises SendUnknown: for a key whose broadcast may not have landed.
-        """
-        with self._lock:
-            cached = self._results.get(key)
-            if cached is not None:
-                return _same_call(key, cached, stamp)
-            if key in self._in_flight:
-                raise SignerError(
-                    f"request '{key}' is already in flight; retry shortly"
-                )
-            self._in_flight.add(key)
-        return self._execute(key, stamp, action)
-
-    def cached(self, key: str, stamp: str) -> str | None:
-        """Return the result of a completed run of this key, if any.
-
-        :raises SignerError: when the key was used for a different call.
-        :raises SendUnknown: for a key whose broadcast may not have landed.
-        """
-        with self._lock:
-            cached = self._results.get(key)
-        return None if cached is None else _same_call(key, cached, stamp)
-
-    def holds(self, key: str) -> bool:
-        """Whether a run of this key completed or is running: a new run sends nothing."""
-        with self._lock:
-            return key in self._results or key in self._in_flight
-
-    def _execute(self, key: str, stamp: str, action: t.Callable[[], str]) -> str:
-        try:
-            result = action()
-        except SendUnknown as e:
-            # it may have landed: re-running would sign a second transaction
-            # at the next nonce, so a retry raises this hash again instead,
-            # never as a confirmed send, and its receipt settles whether it
-            # was mined
-            self._store(key, _Sent(e.tx_hash, stamp, confirmed=False))
-            raise
-        except Exception:
-            with self._lock:
-                self._in_flight.discard(key)
-            raise
-        self._store(key, _Sent(result, stamp, confirmed=True))
-        return result
-
-    def _store(self, key: str, sent: _Sent) -> None:
-        # cache the result and release the reservation atomically, so no retry
-        # can observe "not cached and not in flight" after a success
-        with self._lock:
-            self._results[key] = sent
-            self._in_flight.discard(key)
-            # bound memory over a long run: a request_id evicted here and
-            # retried much later re-broadcasts, which is the right trade at
-            # that distance — retries cluster within seconds of the original
-            while len(self._results) > self._max_results:
-                del self._results[next(iter(self._results))]
 
 
 class Signer:
@@ -281,14 +165,22 @@ class Signer:
         config: AppConfig,
         activity: ActivityLog,
         guard: Guard | None = None,
+        *,
+        switches: Switches = PRODUCTION,
     ) -> None:
-        """Initialize."""
+        """Initialize; see `connect.switches` for `switches`."""
         self._account = account
+        self._switches = switches
         self._activity = activity
         self._config = config
         self._chains = _ChainPool(config)
-        self._requests = _IdempotencyCache()
+        self._requests = IdempotencyCache()
         self._guard = guard
+
+    @property
+    def switches(self) -> Switches:
+        """Return the switch set this build runs, the one source of it."""
+        return self._switches
 
     def set_guard(self, guard: Guard) -> None:
         """Attach the guardrail; the boot path passes it to the constructor."""
@@ -308,7 +200,7 @@ class Signer:
         send_via_safe's namespace.
         """
         return self._requests.holds(
-            _safe_request_key(request_id) if via_safe else request_id
+            safe_request_key(request_id) if via_safe else request_id
         )
 
     def w3(self, chain: str) -> Web3:
@@ -333,8 +225,8 @@ class Signer:
         With a request_id the call is idempotent: repeating a completed send
         returns the original tx hash without rebroadcasting. audit=False is for
         a caller that audits the outcome itself, under its own kind. `intent`
-        is what the transaction may do; a value-moving one without it is
-        refused (`SERVER_BUILT` is for the server's own transactions).
+        is what the transaction may do; without one, the `no_intent_policy`
+        switch decides (`SERVER_BUILT` is for the server's own transactions).
         `replay_only` answers only from the request id's completed send (see
         `_send_guarded`).
         """
@@ -376,7 +268,7 @@ class Signer:
         """
         if replay_only and request_id is None:
             raise SignerError("a replay-only send needs the request id it replays")
-        stamp = _call_stamp(chain, to, value, data)
+        stamp = call_stamp(chain, to, value, data)
         if request_id is not None:
             # a completed send stays answerable even if the guardrail has
             # tightened since — the transaction already happened; nothing
@@ -458,7 +350,13 @@ class Signer:
         raise SignerError(intent_module.refusal_message(problems))
 
     def _compose_safe_call(
-        self, chain: str, target: str, value: int, data: str
+        self,
+        chain: str,
+        target: str,
+        value: int,
+        data: str,
+        *,
+        operation: Operation = OPERATION_CALL,
     ) -> tuple[str, str]:
         """Wrap one inner call for the safe; returns (safe address, calldata).
 
@@ -476,7 +374,7 @@ class Signer:
             )
         try:
             calldata = safe_module.exec_transaction(
-                target=target, value=value, data=data, owner=self.address
+                target, value, data, self.address, operation
             )
         except (EncodingError, ValueError, TypeError, OverflowError) as e:
             # composition fails on the caller's input, not the chain — a 400, the
@@ -496,28 +394,28 @@ class Signer:
         audit: bool = True,
         intent: t.Any = None,
         replay_only: bool = False,
+        operation: Operation = OPERATION_CALL,
     ) -> str:
         """Act as the service safe: wrap one inner call and send it.
 
-        `target`, `value` and `data` are the call the *safe* makes — most carry
-        no value at all (an approve, a stake, a claim); any they do carry leaves
-        the safe rather than the EOA. The distinct parameter name is deliberate:
-        this is not send()'s outer recipient, and the two must not be confused.
-
-        The composed transaction goes through _send_guarded(), the one path
-        send() takes too, so it meets the same guard and intent gate as
-        anything else — a caller of the gate, not a way around it.
+        `target`, `value` and `data` are the call the *safe* makes; any value
+        leaves the safe, not the EOA. The distinct name is deliberate: this is
+        not send()'s outer recipient. The composed transaction goes through
+        _send_guarded(), the one path send() takes too, so it meets the same
+        guard and intent gate as anything else.
         """
         problem = intent_module.calldata_problem(data)
         if problem is not None:  # composing it would fail on the same bytes
             self._refuse(chain, target, value, [problem], audit=audit)
-        safe, calldata = self._compose_safe_call(chain, target, value, data)
+        safe, calldata = self._compose_safe_call(
+            chain, target, value, data, operation=operation
+        )
         return self._send_guarded(
             chain,
             safe,
             value=0,  # the outer transaction carries none; the safe pays
             data=calldata,
-            request_id=None if request_id is None else _safe_request_key(request_id),
+            request_id=None if request_id is None else safe_request_key(request_id),
             gas=gas,
             audit=audit,
             # the gate simulates the call the safe makes, as the safe: that is
@@ -537,7 +435,7 @@ class Signer:
         :raises _GateRefused: what the gate cannot hold to an intent — the
             safe's approveHash (it pre-approves a transaction by hash, which
             anyone may then execute), and an execTransaction that also carries
-            EOA value, pays a gas refund or is not a CALL.
+            EOA value or pays a gas refund, and what `exec_floor` refuses.
         """
         calldata = safe_module.calldata_hex(data)
         if calldata.startswith(safe_module.APPROVE_HASH_SELECTOR):
@@ -555,20 +453,16 @@ class Signer:
             or not safe_module.is_exec_transaction(data)
         ):
             return own
-        try:
-            exec_call = safe_module.SafeExec.decode(data)
-        except ValueError as e:
+        try:  # exec_floor's rules, worded as the send's guardrail words them
+            # is_exec_transaction held above, so exec_floor decodes a call
+            exec_call = t.cast(safe_module.SafeExec, exec_floor(chain, to, data))
+        except GuardError as e:
             raise _GateRefused("bad-exec-transaction", str(e)) from e
         if value:
             raise _GateRefused(
                 "bad-exec-transaction",
                 "an execTransaction to a safe may not also carry value from the "
                 "EOA; send the value as part of the safe's own call",
-            )
-        if exec_call.operation != safe_module.OPERATION_CALL:
-            raise _GateRefused(
-                "bad-exec-transaction",
-                "an execTransaction may only CALL (operation 0), never DELEGATECALL",
             )
         if exec_call.pays_refund:
             raise _GateRefused(
@@ -632,17 +526,34 @@ class Signer:
     def _evaluate(
         self, chain: str, call: _GateCall, raw_intent: t.Any
     ) -> tuple[intent_module.AssetDiff | None, intent_module.Intent | None, list]:
-        """Simulate a call and check it: (diff, parsed intent, problems).
+        """Simulate a call and check it: (diff, intent it was held to, problems).
 
         The one path the send-time gate and simulate_transaction share, so the
-        two cannot answer differently about the same call.
+        two cannot answer differently about the same call. The intent is
+        `intent.no_intent_hold`'s for a call with none: None means a revert
+        check alone.
         """
         problem = intent_module.calldata_problem(call.data)
         if problem is not None:
             return None, None, [problem]
-        parsed, problems = intent_module.parse_intent(raw_intent)
+        parsed, problems = intent_module.parse_intent(
+            raw_intent, strict_parameters=self._switches.strict_parameters
+        )
         if problems:
             return None, None, problems
+        ignored = intent_module.ignored_keys(raw_intent)
+        if ignored:  # a misspelled key declares nothing, so the operator is told
+            logger.warning(
+                "ignored intent keys %s on a call to %s on %s", ignored, call.to, chain
+            )
+        held_to = parsed
+        if parsed is None:
+            held_to = intent_module.no_intent_hold(
+                call.value,
+                call.to,
+                hold_uncapped=self._switches.holds_no_intent_calls,
+                capped=isinstance(raw_intent, intent_module.Capped),
+            )
         try:
             diff = self._simulate(chain, call)
         except intent_module.SimulationUnavailable as e:
@@ -657,7 +568,7 @@ class Signer:
             )
             return (
                 None,
-                parsed,
+                held_to,
                 [
                     intent_module.Problem(
                         rule="simulation-unavailable",
@@ -666,7 +577,7 @@ class Signer:
                     )
                 ],
             )
-        return diff, parsed, intent_module.check_intent(diff, parsed)
+        return diff, held_to, intent_module.check_intent(diff, held_to)
 
     def _gate_problems(
         self, chain: str, call: _GateCall, raw_intent: t.Any
@@ -692,15 +603,8 @@ class Signer:
             try:
                 call = self._eoa_gate(chain, target, value, data)
             except _GateRefused as e:
-                return {"fits_intent": False, "problems": [e.problem]}
-        diff, parsed, problems = self._evaluate(chain, call, intent)
-        if diff is None:
-            return {"fits_intent": False, "problems": problems}
-        return {
-            **diff,
-            "fits_intent": None if parsed is None else not problems,
-            "problems": problems,
-        }
+                return intent_module.simulation_answer(None, None, [e.problem])
+        return intent_module.simulation_answer(*self._evaluate(chain, call, intent))
 
     def _sender(self, chain: str, via_safe: bool) -> str:
         """Whose call it is: the chain's safe, or the agent EOA."""
@@ -740,10 +644,12 @@ class Signer:
         data: str = "0x",
         via_safe: bool = True,
         intent: t.Any = None,
+        run_intent_gate: bool = True,
     ) -> tuple[str | None, list[intent_module.Problem]]:
         """Ask the guardrail, then the intent gate, consuming and signing nothing.
 
         Returns the refusal (None if the call passes) and the gate's problems.
+        `run_intent_gate=False` asks the guardrail alone: nothing is simulated.
         """
         probed_target, probed_value = target, value
         problems: list[intent_module.Problem] = []
@@ -769,9 +675,9 @@ class Signer:
                     target, data = self._compose_safe_call(chain, target, value, data)
                     value = 0
                 elif value < 0:
-                    raise SignerError("value must be a non-negative amount in wei")
+                    raise SignerError(VALUE_REFUSED)
                 reason = self._refused_by_guard(chain, target, value, data)
-                if reason is None:
+                if reason is None and run_intent_gate:
                     try:
                         problems = self._gate_problems(chain, gate(), intent)
                     except _GateRefused as e:
@@ -796,18 +702,40 @@ class Signer:
     def _refused_by_guard(
         self, chain: str, to: str, value: int, data: str
     ) -> str | None:
-        """Ask the guardrail about a composed transaction, consuming nothing."""
-        if self._guard is None:
-            logger.error(
-                "the signing choke point has no guardrail attached; every "
-                "request would be permitted"
-            )
-            return None
+        """Ask the guardrail about a composed transaction, consuming nothing.
+
+        With no guardrail attached the floor still answers, as on a send.
+        """
         try:
-            self._guard.check_transaction(chain, to, value, data, consume=False)
+            self._guard_or_floor(chain, to, value, data, consume=False)
         except GuardError as e:
             return str(e)
         return None
+
+    def _guard_or_floor(  # pylint: disable=too-many-arguments
+        self,
+        chain: str,
+        to: str,
+        value: int,
+        data: str,
+        *,
+        consume: bool = True,
+        server_built: bool = False,
+    ) -> None:
+        """Ask the guardrail, or, with none attached, the floor no build lifts.
+
+        :raises GuardError: the refusal.
+        """
+        if self._guard is not None:
+            self._guard.check_transaction(
+                chain, to, value, data, consume=consume, server_built=server_built
+            )
+            return
+        logger.error(
+            "the signing choke point has no guardrail attached; only the floor's "
+            "rules apply"
+        )
+        floor(chain, to, data, server_built=server_built)
 
     def _send(  # pylint: disable=too-many-arguments
         self,
@@ -940,12 +868,8 @@ class Signer:
         server_built: bool,
     ) -> None:
         """Consult the guardrail; a denial is audited and surfaced as SignerError."""
-        if self._guard is None:
-            return
         try:
-            self._guard.check_transaction(
-                chain, to, value, data, server_built=server_built
-            )
+            self._guard_or_floor(chain, to, value, data, server_built=server_built)
         except GuardError as e:
             if audit:
                 self._activity.record(
