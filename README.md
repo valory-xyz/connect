@@ -924,7 +924,10 @@ comes back marked `replayed`.
 A request that returned before its delivery reports the ids still awaited in
 `pending_request_ids`; one whose delivery could not be read in that wait
 carries the cause in `watch_errors`, keyed by id; a chat delivery that cannot
-be read leaves the cause in `chat_error` instead of losing the report. The
+be read leaves the cause in `chat_error` instead of losing the report. A run
+the mech could not answer is named in `failed_runs` with its error and fault,
+and `reported_charges` carries what the mech reported charging for each
+request; both come back from `mech_result` too. The
 request was paid for, so the report is never lost to a failed read:
 `mech_result` picks it up.
 

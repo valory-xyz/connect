@@ -41,6 +41,8 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from fastapi.testclient import TestClient
 from mech_client import (
+    FAULT_CLIENT,
+    FAULT_MECH,
     MechInfo,
     MechPriceExceeded,
     MetadataRead,
@@ -49,6 +51,7 @@ from mech_client import (
     PreSignHook,
     RequestIdMismatch,
     RequestIdRpcError,
+    RunFailure,
 )
 from mech_client import balance_tracker as mech_balance_tracker
 from mech_client import nonces as mech_nonces_module
@@ -2008,6 +2011,11 @@ def request_plan(priced: PricedMech, **overrides: t.Any) -> RequestPlan:
     return RequestPlan(**{**fields, **overrides})
 
 
+# a failed run's error as the mech reports it, and the cap it is charged
+FAILED_RUN_ERROR = "InvalidRequestError: Model not-a-real-model is not supported."
+RATE_CAP = 20000
+
+
 def native_mech_info(rate: int) -> tuple:
     """Canned (payment_type, service_id, rate) for a native-payment mech."""
     return (PaymentType(NATIVE_PAYMENT_TYPE), 42, rate)
@@ -2671,6 +2679,119 @@ class TestMech:
             top_up_budget=None,
         )
         assert len(patched_mech.calls) == 2
+
+    @pytest.mark.parametrize("legacy_on_chain", [False, True])
+    @pytest.mark.parametrize("rate", [1, 10**16])
+    def test_the_signed_cap_is_the_mech_s_price(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        legacy_on_chain: bool,
+        rate: int,
+    ) -> None:
+        """The cap mech-client signs is the price Connect budgets deposits on."""
+        patched_mech.info = native_mech_info(rate)
+        mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=legacy_on_chain,
+            priority_mech=OTHER,
+            top_up_budget=None,
+        )
+        (call,) = patched_mech.calls
+        assert call["max_cost"] == rate
+        assert call["max_cost"] != call["max_price"]  # not the request's budget
+
+    @pytest.mark.parametrize(
+        ("delivery", "outcomes"),
+        [
+            (
+                DeliveryResult("ab", {"answer": "42"}, None),
+                {},
+            ),
+            (
+                DeliveryResult("ab", {"answer": "42"}, None, actual_delivery_rate=7),
+                {"reported_charges": {"ab": "7"}},
+            ),
+            (
+                DeliveryResult(
+                    "ab",
+                    {"status": "failed", "error": FAILED_RUN_ERROR},
+                    None,
+                    actual_delivery_rate=RATE_CAP,
+                    failure=RunFailure(error=FAILED_RUN_ERROR, fault=FAULT_CLIENT),
+                ),
+                {
+                    "failed_runs": {
+                        "ab": {"error": FAILED_RUN_ERROR, "fault": FAULT_CLIENT}
+                    },
+                    "reported_charges": {"ab": str(RATE_CAP)},
+                },
+            ),
+            (
+                DeliveryResult(
+                    "ab",
+                    {"status": "failed", "error": FAILED_RUN_ERROR},
+                    None,
+                    failure=RunFailure(error=FAILED_RUN_ERROR, fault=FAULT_MECH),
+                ),
+                {
+                    "failed_runs": {
+                        "ab": {"error": FAILED_RUN_ERROR, "fault": FAULT_MECH}
+                    }
+                },
+            ),
+        ],
+    )
+    def test_a_request_reports_failed_runs_and_charges(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        delivery: DeliveryResult,
+        outcomes: dict,
+    ) -> None:
+        """A failed run is named with its fault, apart from the answer; charges as reported."""
+        patched_mech.result["deliveries"] = {"ab": delivery}
+        result = mech_service.request(
+            "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        for key in ("failed_runs", "reported_charges"):
+            assert result.get(key) == outcomes.get(key)
+
+    def test_a_polled_failed_run_is_reported_with_its_fault(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mech_result names a failed run too, not only the request's first answer."""
+        patched_mech.result["deliveries"] = {}  # still pending after the send
+        mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
+        )
+        failed = DeliveryResult(
+            "ab",
+            {"status": "failed", "error": FAILED_RUN_ERROR},
+            None,
+            actual_delivery_rate=RATE_CAP,
+            failure=RunFailure(error=FAILED_RUN_ERROR, fault=FAULT_MECH),
+        )
+
+        async def _watch(*_: object) -> dict:
+            return {"ab": failed}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_watch))
+        delivery = mech_service.result("ab")
+        assert delivery["failed_runs"] == {
+            "ab": {"error": FAILED_RUN_ERROR, "fault": FAULT_MECH}
+        }
+        assert delivery["reported_charges"] == {"ab": str(RATE_CAP)}
 
     def test_delivered_request_leaves_nothing_pending(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService

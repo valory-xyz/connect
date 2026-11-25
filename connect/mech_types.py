@@ -24,6 +24,7 @@ import logging
 import typing as t
 
 from mech_client import (
+    DeliveryResult,
     NonceRefused,
     RULE_ANSWER_UNKNOWN,
     RULE_NONCE_TAKEN,
@@ -252,6 +253,30 @@ def published_tools(document: t.Any) -> list[str]:
 def request_key(request_id: object) -> str:
     """Normalize a caller's request id: mech-client's are bare lowercase hex."""
     return str(request_id).lower().removeprefix("0x")
+
+
+def delivery_outcomes(deliveries: t.Mapping[str, DeliveryResult]) -> dict:
+    """Return what the mech reported beyond the answers, keyed by request id.
+
+    `failed_runs` holds each run the mech could not answer (its error and
+    whose fault it was); the mech still settles it, at the charge it reports.
+    `reported_charges` holds the charge the mech reported for each request,
+    in base units of its payment asset. A key is absent when nothing has it.
+    """
+    failed = {
+        key: {"error": d.failure.error, "fault": d.failure.fault}
+        for key, d in deliveries.items()
+        if d.failure is not None
+    }
+    charges = {
+        key: str(d.actual_delivery_rate)
+        for key, d in deliveries.items()
+        if d.actual_delivery_rate is not None
+    }
+    return {
+        **({"failed_runs": failed} if failed else {}),
+        **({"reported_charges": charges} if charges else {}),
+    }
 
 
 # what a caller is told of a failure whose words are a library's, which may

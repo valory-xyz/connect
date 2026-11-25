@@ -219,6 +219,12 @@ composing a prompt:
   (`{schema_version, requestId, result, tool, …}`), but a mech that answers
   inline off-chain returns its envelope instead, with the answer under
   `response` — check for that key before assuming.
+- `failed_runs[request_id]` names a run the mech could not answer, with its
+  `error` and `fault` (`client` when the request could not be run as sent,
+  `mech` when the mech failed). Its `delivery_results` entry is the failure,
+  not an answer. The mech still charges for it: `reported_charges[request_id]`
+  is what the mech reported charging for each request, in base units of its
+  payment asset, at most the price the request was sent at.
 - `delivery_urls[request_id]` is the result file's URL, absent for an inline
   answer, where the envelope's `content_cid` names the document instead. An id
   whose file the mech delivered but nobody could read yet stays in

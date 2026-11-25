@@ -81,6 +81,7 @@ from connect.mech_types import (
     RequestPlan,
     SPEND_UNCERTAIN,
     answer_lost,
+    delivery_outcomes,
     not_bought,
     over_max_payment,
     published_tools,
@@ -742,6 +743,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     # spends the rest
                     timeout=min(timeout, ACK_WAIT_SECONDS),
                     max_price=plan.max_payment,
+                    max_cost=plan.priced.rate,
                     **extra,
                 )
             )
@@ -879,7 +881,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             payload["delivery_urls"] = urls
         if waiting:
             payload["pending_request_ids"] = waiting
-        return payload
+        return {**payload, **delivery_outcomes(deliveries)}
 
     def result(
         self, request_id: str, *, timeout: float = DEFAULT_RESULT_TIMEOUT
@@ -940,6 +942,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 salt=pending.salt,
             )
         self._activity.record("mech_result", chain=pending.chain, request_id=key)
+        report.update(delivery_outcomes({key: split[key]}))
         url = split[key].url
         return {**report, "result": data[key], **({"url": url} if url else {})}
 

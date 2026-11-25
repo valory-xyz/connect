@@ -1674,7 +1674,7 @@ wheels = [
 
 [[package]]
 name = "mech-client"
-version = "0.26.2"
+version = "0.27.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -1689,9 +1689,9 @@ dependencies = [
     { name = "setuptools" },
     { name = "tabulate" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5e/c3/1b27359460fdb3fa7f372b20566f6a2d2eac59589d5b622818d436776a2c/mech_client-0.26.2.tar.gz", hash = "sha256:d7f1327a32ef80ff188bc064f5d9730ed6f5cf8a060644d058b7e4ab6c41df2a", size = 287208, upload-time = "2026-11-20T10:56:35.439Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7d/2a/040b0fa7647c3a2a705981bf59500dc53d49545b464882616457480e1936/mech_client-0.27.0.tar.gz", hash = "sha256:0365c6b9687080a6b08dea4a922104c28819863c22df032d3dd45655ca083d66", size = 300058, upload-time = "2026-11-25T12:04:59.05Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/22/86db75d1c2da25108ca7f788ff17b12f04dd10653ead52daee3e429be317/mech_client-0.26.2-py3-none-any.whl", hash = "sha256:0b3250e755e2018659199cf73febf61def9a531a4b1067e8332947dff2912ead", size = 366336, upload-time = "2026-11-20T10:56:34.477Z" },
+    { url = "https://files.pythonhosted.org/packages/47/68/bacace4a4dd0d2286982fcd01255e98eec63316b44b5fd420ad89606b7fe/mech_client-0.27.0-py3-none-any.whl", hash = "sha256:4e6eaba875463d3e07f111b13f439221300c0c89b26ee59e3d9fd175a06bd63c", size = 377938, upload-time = "2026-11-25T12:04:57.722Z" },
 ]
 
 [[package]]
@@ -1849,7 +1849,7 @@ requires-dist = [
     { name = "eth-account", specifier = ">=0.13.7,<0.14" },
     { name = "fastapi", specifier = ">=0.139.2,<0.140" },
     { name = "mcp", specifier = "==1.28.1" },
-    { name = "mech-client", specifier = "==0.26.2" },
+    { name = "mech-client", specifier = "==0.27.0" },
     { name = "open-aea-ledger-ethereum", specifier = "==2.2.10" },
     { name = "tomli-w", specifier = ">=1.2.0,<2" },
     { name = "uvicorn", specifier = ">=0.54.0,<0.55" },
