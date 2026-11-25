@@ -66,6 +66,7 @@ from mech_client.domain.tools.manager import ToolManager
 from mech_client.infrastructure.config import PaymentType
 from mech_client.infrastructure.ipfs import metadata as ipfs_metadata
 from mech_client.infrastructure.subgraph.queries import MechRecord
+from mech_client.services import marketplace_service as marketplace_module
 from mech_client.services.marketplace_service import (
     MAX_DERIVED_CAP_FACTOR,
     MarketplaceService,
@@ -1941,6 +1942,11 @@ class TestSignerGuardIntegration:
             )
 
 
+def _view_bytes(value: bytes | str) -> bytes:
+    """Read a contract view argument: bytes, or the 0x hex mech-client passes."""
+    return bytes.fromhex(value[2:]) if isinstance(value, str) else bytes(value)
+
+
 class FakeMarketplaceContract:
     """Marketplace contract stand-in: domain reads and an honest getRequestId.
 
@@ -1979,9 +1985,9 @@ class FakeMarketplaceContract:
             marketplace=self.address,
             mech=mech,
             requester=requester,
-            data=bytes(data),
+            data=_view_bytes(data),
             delivery_rate=rate,
-            payment_type=bytes(payment_type),
+            payment_type=_view_bytes(payment_type),
             nonce=nonce,
         )
 
@@ -2032,6 +2038,19 @@ def priced_manifest(expected_cost: dict | None) -> dict:
 # a failed run's error as the mech reports it, and the cap it is charged
 FAILED_RUN_ERROR = "InvalidRequestError: Model not-a-real-model is not supported."
 RATE_CAP = 20000
+
+
+async def _failed_later(*_: object) -> dict:
+    """Answer a delivery watch with a run the mech failed and charged for."""
+    return {
+        "ab": DeliveryResult(
+            "ab",
+            {"status": "failed", "error": FAILED_RUN_ERROR},
+            None,
+            actual_delivery_rate=RATE_CAP,
+            failure=RunFailure(error=FAILED_RUN_ERROR, fault=FAULT_MECH),
+        )
+    }
 
 
 def native_mech_info(rate: int) -> tuple:
@@ -2732,6 +2751,73 @@ class TestMech:
         assert call["max_cost"] == cap
         assert result["payment"] == cap
 
+    @pytest.mark.parametrize(
+        "expected_cost", [{"asset": "native", "amount": str(ON_CHAIN_RATE)}, None]
+    )
+    def test_mech_client_signs_the_cap_connect_reports_as_payment(
+        self, monkeypatch: pytest.MonkeyPatch, expected_cost: dict | None
+    ) -> None:
+        """The pinned mech-client's real `send_request` signs the rate Connect sizes by.
+
+        Guards the pin: only the chain, the signature, the POST and the
+        delivery watch are faked, so a mech-client that treats `max_cost`
+        differently fails here.
+        """
+        manifest = priced_manifest(expected_cost)
+        posted: list[dict] = []
+
+        def post(url: str, payload: dict) -> t.Any:
+            posted.append(payload)
+            accepted = marketplace_module.requests.Response()
+            accepted.status_code = 200
+            accepted._content = b"{}"  # pylint: disable=protected-access
+            return accepted
+
+        class _Watcher:
+            def __init__(self, *args: object) -> None:
+                pass
+
+            async def watch(self, request_ids: list) -> dict:
+                return {}
+
+        monkeypatch.setattr(marketplace_module, "OffchainDeliveryWatcher", _Watcher)
+        service = MarketplaceService.__new__(MarketplaceService)
+        contract = FakeMarketplaceContract()
+        info = MechInfo(OTHER, 42, PaymentType.NATIVE, ON_CHAIN_RATE)
+        for name, value in {
+            "mech_config": SimpleNamespace(priority_mech_address=OTHER),
+            "tool_manager": SimpleNamespace(
+                read_tools_metadata=lambda service_id: metadata_read(manifest),
+                offchain_url_from_metadata=lambda service_id, read: manifest["url"],
+            ),
+            "marketplace_contract": lambda: contract,
+            "mech_info": lambda mech: info,
+            "requester": lambda: SAFE,
+            "_validate_tools": lambda *args: None,
+            "_log_terms_notice": lambda *args: None,
+            "_sign_request_digest": lambda sender, request_id: "0x" + "ab" * 65,
+            "_do_offchain_post": post,
+        }.items():
+            monkeypatch.setattr(service, name, value, raising=False)
+        on_chain = PricedMech(OTHER, 42, ON_CHAIN_RATE, PaymentType.NATIVE.value)
+        priced = mech_budget.offchain_priced(service, on_chain, PRICED_TOOL, manifest)
+        result = asyncio.run(
+            service.send_request(
+                prompts=("q",),
+                tools=(PRICED_TOOL,),
+                priority_mech=OTHER,
+                use_offchain=True,
+                max_cost=priced.rate,
+                max_price=10**18,
+                nonces=[contract.nonce],
+            )
+        )
+        (payload,) = posted
+        assert payload["delivery_rate"] == priced.rate
+        assert "nonce_mode" not in payload  # Connect's nonces stay sequential
+        reported = mech_budget.charged({}, priced.rate, result)["payment"]
+        assert reported == payload["delivery_rate"] * len(result["request_ids"])
+
     def test_an_onchain_request_pays_the_on_chain_price(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
@@ -2775,6 +2861,52 @@ class TestMech:
             e for e in audit_entries(store_path) if e["kind"] == "mech_request_blocked"
         ]
         assert blocked["reason"] == "over-derived-cap"
+        assert str(2 * over) in blocked["detail"]  # the cap it would have signed
+        assert not patched_mech.prepaid.deposits
+        kinds = audit_kinds(store_path)
+        assert "mech_prefund" not in kinds
+        assert "mech_offchain_digest" not in kinds
+
+    def test_a_cap_over_the_budget_is_refused_though_the_on_chain_price_fits(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """Off-chain the budget binds the signed cap, not the on-chain price."""
+        patched_mech.info = native_mech_info(ON_CHAIN_RATE)
+        patched_mech.metadata = priced_manifest(
+            {"asset": "native", "amount": str(ON_CHAIN_RATE)}
+        )
+        budget = 2 * ON_CHAIN_RATE - 1  # above the on-chain price, below the cap
+        with pytest.raises(MechNotSent, match="would be signed a cap of"):
+            mech_service.request(
+                "q",
+                PRICED_TOOL,
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=budget,
+                top_up_budget=None,
+            )
+        assert not patched_mech.calls
+        assert not patched_mech.report_calls  # refused before the report's lookups
+        assert not patched_mech.prepaid.deposits
+        (blocked,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request_blocked"
+        ]
+        assert blocked["reason"] == "over-max-payment"
+        assert "mech_offchain_digest" not in audit_kinds(store_path)
+        # the same budget pays the on-chain price, worded as a charge there
+        mech_service.request(
+            "q",
+            PRICED_TOOL,
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            max_payment=budget,
+            top_up_budget=None,
+        )
+        assert len(patched_mech.calls) == 1
 
     def test_a_cap_at_mech_client_s_limit_is_sent(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -2848,6 +2980,94 @@ class TestMech:
         )
         for key in ("failed_runs", "reported_charges"):
             assert result.get(key) == outcomes.get(key)
+        # a failed run's body stays where every delivery is read from
+        assert result["delivery_results"] == {"ab": delivery.data}
+
+    def test_a_failed_run_beside_an_answered_one_is_named_alone(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Only the failed id is in `failed_runs`; both keep their delivery and charge."""
+        failure_body = {"status": "failed", "error": FAILED_RUN_ERROR}
+        patched_mech.result["request_ids"] = ["ab", "cd"]
+        patched_mech.result["deliveries"] = {
+            "ab": DeliveryResult("ab", {"answer": "42"}, None, actual_delivery_rate=7),
+            "cd": DeliveryResult(
+                "cd",
+                failure_body,
+                None,
+                actual_delivery_rate=RATE_CAP,
+                failure=RunFailure(error=FAILED_RUN_ERROR, fault=None),
+            ),
+        }
+        result = mech_service.request(
+            "q",
+            "t",
+            chain="testchain",
+            legacy_on_chain=True,
+            priority_mech=OTHER,
+            top_up_budget=None,
+        )
+        assert result["failed_runs"] == {
+            "cd": {"error": FAILED_RUN_ERROR, "fault": None}
+        }
+        assert result["reported_charges"] == {"ab": "7", "cd": str(RATE_CAP)}
+        assert result["delivery_results"] == {
+            "ab": {"answer": "42"},
+            "cd": failure_body,
+        }
+
+    def test_a_run_that_fails_after_the_ack_is_reported_as_failed(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The usual off-chain order: accepted first, the failure read by the resumed watch."""
+        patched_mech.result["deliveries"] = {}  # acknowledged, not yet run
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_failed_later))
+        result = mech_service.request(
+            "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        assert "pending_request_ids" not in result
+        assert result["failed_runs"] == {
+            "ab": {"error": FAILED_RUN_ERROR, "fault": FAULT_MECH}
+        }
+        assert result["reported_charges"] == {"ab": str(RATE_CAP)}
+        assert result["delivery_results"] == {
+            "ab": {"status": "failed", "error": FAILED_RUN_ERROR}
+        }
+
+    def test_a_replay_reports_a_run_that_failed_since(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A replay that picks up a failed run names it, and so does every replay after."""
+        patched_mech.result = {
+            "tx_hash": "0x" + "11" * 32,
+            "request_ids": ["ab"],
+            "deliveries": {},
+            "receipt": AttributeDict({"blockNumber": 4321}),
+        }
+
+        async def _silent(*_: object) -> dict:
+            return {}
+
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_silent))
+        first = self._job(mech_service, "job-failed")
+        assert first["pending_request_ids"] == ["ab"]
+        assert "failed_runs" not in first
+        monkeypatch.setattr(MechService, "_watch", staticmethod(_failed_later))
+        for _ in range(2):  # the pick-up, then the stored report
+            again = self._job(mech_service, "job-failed")
+            assert again["replayed"] is True
+            assert again["failed_runs"] == {
+                "ab": {"error": FAILED_RUN_ERROR, "fault": FAULT_MECH}
+            }
+            assert again["reported_charges"] == {"ab": str(RATE_CAP)}
+            assert "pending_request_ids" not in again
+        assert len(patched_mech.calls) == 1  # paid once
 
     def test_a_polled_failed_run_is_reported_with_its_fault(
         self,
@@ -3693,7 +3913,7 @@ class TestMech:
                 seen.update(kwargs)
                 return {"ab": "delivered"}
 
-        # patched on connect.mech, the module-level names _watch actually calls
+        # patched on connect.mech_types, where watch_delivery looks them up
         monkeypatch.setattr(mech_types_module, "OffchainDeliveryWatcher", _Watcher)
         monkeypatch.setattr(mech_types_module, "OnchainDeliveryWatcher", _Watcher)
         service = SimpleNamespace(

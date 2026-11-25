@@ -150,12 +150,13 @@ SPEND_UNCERTAIN = "uncertain"
 
 
 class PricedMech(t.NamedTuple):
-    """The mech a request will pay, with the price the cap must bind."""
+    """The mech a request will pay, with the per-request rate its bounds bind."""
 
     mech: str
     service_id: int
-    # per-request price in the mech's payment asset base units (wei for
-    # native mechs, token base units for OLAS/USDC ones)
+    # per request, in the mech's payment asset base units (wei for native
+    # mechs, token base units for OLAS/USDC ones): the mech's on-chain price,
+    # or off-chain the cap the request signs (`mech_budget.offchain_priced`)
     rate: int
     payment_type: str
 
@@ -212,12 +213,19 @@ class RequestPlan(t.NamedTuple):
         return not self.offchain
 
 
-def over_max_payment(mech: str, price: int, max_payment: int) -> str:
-    """Word the refusal of a mech whose price is above the request's budget."""
+def over_max_payment(
+    mech: str, price: int, max_payment: int, signed_cap: bool = False
+) -> str:
+    """Word the refusal of a mech whose price is above the request's budget.
+
+    Off-chain the figure is the cap the request would sign (`signed_cap`),
+    not a charge.
+    """
+    what = "would be signed a cap of" if signed_cap else "charges"
     return (
-        f"mech {mech} charges {price} per request (in its payment asset base "
+        f"mech {mech} {what} {price} per request (in its payment asset base "
         f"units), above max_payment={max_payment}; pass a higher max_payment "
-        "to accept that price"
+        "to accept that"
     )
 
 
@@ -260,13 +268,7 @@ def request_key(request_id: object) -> str:
 
 
 def delivery_outcomes(deliveries: t.Mapping[str, DeliveryResult]) -> dict:
-    """Return what the mech reported beyond the answers, keyed by request id.
-
-    `failed_runs` holds each run the mech could not answer (its error and
-    whose fault it was); the mech still settles it, at the charge it reports.
-    `reported_charges` holds the charge the mech reported for each request,
-    in base units of its payment asset. A key is absent when nothing has it.
-    """
+    """Return the `failed_runs` and `reported_charges` maps, each only when non-empty."""
     failed = {
         key: {"error": d.failure.error, "fault": d.failure.fault}
         for key, d in deliveries.items()
@@ -281,6 +283,13 @@ def delivery_outcomes(deliveries: t.Mapping[str, DeliveryResult]) -> dict:
         **({"failed_runs": failed} if failed else {}),
         **({"reported_charges": charges} if charges else {}),
     }
+
+
+def merge_outcomes(payload: dict, report: t.Mapping) -> None:
+    """Add a `result()` report's `failed_runs` and `reported_charges` to `payload`."""
+    for field in ("failed_runs", "reported_charges"):
+        if report.get(field):
+            payload[field] = {**(payload.get(field) or {}), **report[field]}
 
 
 # what a caller is told of a failure whose words are a library's, which may

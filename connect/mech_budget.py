@@ -26,6 +26,7 @@ from mech_client.infrastructure.config.payment_config import PaymentType
 from mech_client.services.marketplace_service import (
     MAX_DERIVED_CAP_FACTOR,
     MarketplaceService,
+    UINT256_MAX,
 )
 
 from connect.mech_types import MechError, MechNotSent, PricedMech, said
@@ -84,33 +85,35 @@ def price_mech(service: MarketplaceService, chain: str, mech: str) -> PricedMech
 def offchain_priced(
     service: MarketplaceService, priced: PricedMech, tool: str, document: t.Any
 ) -> PricedMech:
-    """Return `priced` at the cap an off-chain request for `tool` signs.
+    """Return `priced` at the cap mech-client signs for an off-chain `tool`.
 
-    That is mech-client's own default cap: twice the expected cost the mech's
-    manifest publishes for the tool in its payment asset, or the mech's
-    on-chain price when it publishes none it can use. Every bound a request
-    is sized by (prefund, top-up, the reported payment) reads this rate.
-
-    :raises MechNotSent: for a cap more than mech-client's
-        `MAX_DERIVED_CAP_FACTOR` times the on-chain price, which mech-client
-        does not sign without an explicit cap
+    :raises MechNotSent: for a derived cap mech-client signs only with an
+        explicit `max_cost`. Connect has no such override yet, so a mech
+        pricing a tool that far above its on-chain price cannot be used
+        through Connect; that is intended for now.
     """
-    try:
-        cap = service._resolve_signed_rate(  # pylint: disable=protected-access
+    kind = PaymentType(priced.payment_type)
+
+    def cap(advertised_max: int) -> int:
+        return service._resolve_signed_rate(  # pylint: disable=protected-access
             tools=(tool,),
             metadata=document,
-            payment_type=PaymentType(priced.payment_type),
-            advertised_max=priced.rate,
+            payment_type=kind,
+            advertised_max=advertised_max,
             max_cost=None,
             use_offchain=True,
         )
+
+    try:
+        return priced._replace(rate=cap(priced.rate))
     except ValueError as e:
+        derived = cap(UINT256_MAX)  # the same cap, with no limit to refuse it
         raise MechNotSent(
-            f"mech {priced.mech} publishes an expected cost for {tool} that puts "
-            f"its cap over {MAX_DERIVED_CAP_FACTOR}x its on-chain price of "
-            f"{priced.rate}; not sent"
+            f"mech {priced.mech} prices {tool} at a cap of {derived}, more than "
+            f"{MAX_DERIVED_CAP_FACTOR}x its on-chain price of {priced.rate}; "
+            "this server does not sign a cap that far above it, so the tool "
+            "cannot be requested here"
         ) from e
-    return priced._replace(rate=int(cap))
 
 
 def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:

@@ -55,13 +55,18 @@ from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
 from mech_client.services.marketplace_service import MarketplaceService
 from safe_eth.eth import EthereumClient
 
-from connect import mech_budget
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances, TopUpBudget, read_map_nonces
-from connect.mech_budget import DEFAULT_MAX_PAYMENT, charged, payment_report, price_mech
+from connect.mech_budget import (
+    DEFAULT_MAX_PAYMENT,
+    charged,
+    offchain_priced,
+    payment_report,
+    price_mech,
+)
 from connect.mech_queue import HardCancelRefused, MechQueue
 from connect.mech_signer import MechSigner
 from connect.mech_stamp import canonical_context, metadata_extras, request_stamp
@@ -79,6 +84,7 @@ from connect.mech_types import (
     SPEND_UNCERTAIN,
     answer_lost,
     delivery_outcomes,
+    merge_outcomes,
     not_bought,
     over_max_payment,
     published_tools,
@@ -451,6 +457,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         still_waiting: list[str] = []
         unrecoverable: list[str] = []
         errors: dict[str, str] = {}
+        outcomes: dict = {}
         for key in waiting:
             try:
                 report = self.result(key, timeout=timeout)
@@ -461,6 +468,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 errors[key] = str(e)
                 still_waiting.append(key)
             else:
+                merge_outcomes(outcomes, report)
                 if report.get("url"):
                     urls[key] = report["url"]
                 if report.get("delivered"):
@@ -468,6 +476,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 else:
                     still_waiting.append(key)
         merged = {**payload, "delivery_results": delivered, "replayed": True}
+        merge_outcomes(merged, outcomes)
         if urls:
             merged["delivery_urls"] = urls
         merged.pop("pending_request_ids", None)
@@ -515,6 +524,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     "default budget for; pass max_payment to set one"
                 )
         extra_attributes: dict | None
+        read = None
         if not legacy_on_chain:
             # mech-client discovers the endpoint mid-flow and fails there with
             # a message about metadata, which reads as a transient gateway
@@ -528,13 +538,19 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     f"mech {priority_mech} (service {service_id}) cannot serve "
                     f"off-chain requests: {blocker}"
                 )
-            try:  # off-chain, the cap it signs is what the request may cost
-                priced = mech_budget.offchain_priced(
-                    service, priced, tool, read.document
-                )
+            try:
+                priced = offchain_priced(service, priced, tool, read.document)
             except MechNotSent as e:
                 self._blocked(chain, tool, "over-derived-cap", str(e))
                 raise
+        if priced.rate > max_payment:
+            detail = f"{priced.rate} > {max_payment}"
+            self._blocked(chain, tool, "over-max-payment", detail)
+            signed = read is not None
+            raise MechNotSent(
+                over_max_payment(priority_mech, priced.rate, max_payment, signed)
+            )
+        if read is not None:
             # before any allowance is armed, so a failure here spends nothing
             terms = service.tool_manager.mech_report_or_terms(
                 priority_mech, read.document
@@ -542,28 +558,22 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             # the pinned metadata salt: a resend of the allocator's nonce
             # signs the same request id
             extra_attributes = metadata_extras(request_context)
-            offchain = True
             if auto_deposit:
                 auto_deposit = self._allowances.keeps_auto_deposit(chain, priced)
         else:
             # nothing reads the document on-chain, so no operator link here
             terms = service.tool_manager.terms_report(priority_mech, None)
-            offchain = False
             extra_attributes = (
                 None
                 if request_context is None
                 else {"request_context": request_context}
             )
-        if priced.rate > max_payment:
-            detail = f"{priced.rate} > {max_payment}"
-            self._blocked(chain, tool, "over-max-payment", detail)
-            raise MechNotSent(over_max_payment(priority_mech, priced.rate, max_payment))
         return RequestPlan(
             chain=chain,
             service=service,
             priced=priced,
             extra_attributes=extra_attributes,
-            offchain=offchain,
+            offchain=read is not None,
             auto_deposit=auto_deposit,
             tool=tool,
             max_payment=max_payment,
@@ -720,6 +730,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 logger.warning("could not read the delivery for %s: %s", key, e)
                 payload.setdefault("watch_errors", {})[key] = str(e)
                 continue
+            merge_outcomes(payload, report)
             if report.get("url"):
                 payload.setdefault("delivery_urls", {})[key] = report["url"]
             if report.get("delivered"):
