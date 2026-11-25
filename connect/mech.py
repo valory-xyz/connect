@@ -50,20 +50,17 @@ from mech_client import (
     offchain_blocker,
     send_with_nonce,
 )
-from mech_client.domain.delivery import (
-    OffchainDeliveryWatcher,
-    OnchainDeliveryWatcher,
-)
 from mech_client.infrastructure.config.payment_config import PaymentType
 from mech_client.infrastructure.subgraph.queries import query_mm_mechs_info
 from mech_client.services.marketplace_service import MarketplaceService
 from safe_eth.eth import EthereumClient
 
+from connect import mech_budget
 from connect.activity import ActivityLog
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
-from connect.mech_allowances import Armed, MechAllowances, TopUpBudget, read_map_nonces
+from connect.mech_allowances import MechAllowances, TopUpBudget, read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT, charged, payment_report, price_mech
 from connect.mech_queue import HardCancelRefused, MechQueue
 from connect.mech_signer import MechSigner
@@ -89,6 +86,7 @@ from connect.mech_types import (
     request_key,
     request_label,
     said,
+    watch_delivery,
 )
 from connect.signer import Signer, SignerError
 from connect.signer_errors import cause_of
@@ -516,12 +514,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     f"mech {priority_mech} is paid in an asset this server has no "
                     "default budget for; pass max_payment to set one"
                 )
-        if priced.rate > max_payment:
-            detail = f"{priced.rate} > {max_payment}"
-            self._blocked(chain, tool, "over-max-payment", detail)
-            raise MechNotSent(over_max_payment(priority_mech, priced.rate, max_payment))
         extra_attributes: dict | None
-        armed: Armed = []
         if not legacy_on_chain:
             # mech-client discovers the endpoint mid-flow and fails there with
             # a message about metadata, which reads as a transient gateway
@@ -535,6 +528,13 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                     f"mech {priority_mech} (service {service_id}) cannot serve "
                     f"off-chain requests: {blocker}"
                 )
+            try:  # off-chain, the cap it signs is what the request may cost
+                priced = mech_budget.offchain_priced(
+                    service, priced, tool, read.document
+                )
+            except MechNotSent as e:
+                self._blocked(chain, tool, "over-derived-cap", str(e))
+                raise
             # before any allowance is armed, so a failure here spends nothing
             terms = service.tool_manager.mech_report_or_terms(
                 priority_mech, read.document
@@ -554,6 +554,10 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 if request_context is None
                 else {"request_context": request_context}
             )
+        if priced.rate > max_payment:
+            detail = f"{priced.rate} > {max_payment}"
+            self._blocked(chain, tool, "over-max-payment", detail)
+            raise MechNotSent(over_max_payment(priority_mech, priced.rate, max_payment))
         return RequestPlan(
             chain=chain,
             service=service,
@@ -564,7 +568,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             tool=tool,
             max_payment=max_payment,
             terms=terms,
-            armed=armed,
+            armed=[],
             top_up_budget=top_up_budget,
             prefunded=Prefunded(),
         )
@@ -946,20 +950,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         url = split[key].url
         return {**report, "result": data[key], **({"url": url} if url else {})}
 
-    @staticmethod
-    async def _watch(
-        service: MarketplaceService,
-        pending: PendingDelivery,
-        key: str,
-        timeout: float,
-    ) -> dict:
-        """Run the watcher for the flow this request was sent through."""
-        if pending.offchain:
-            url = service.tool_manager.get_offchain_url(pending.service_id)
-            return await OffchainDeliveryWatcher(url, timeout).watch([key])
-        contract = service.marketplace_contract()
-        watcher = OnchainDeliveryWatcher(contract, service.ledger_api, timeout)
-        return await watcher.watch([key], from_block=pending.from_block)
+    _watch = staticmethod(watch_delivery)
 
     def _refused(self, request_id: str, reason: str, detail: str) -> None:
         """Audit a replay refused on its id, before raising it to the caller."""

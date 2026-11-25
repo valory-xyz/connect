@@ -66,6 +66,10 @@ from mech_client.domain.tools.manager import ToolManager
 from mech_client.infrastructure.config import PaymentType
 from mech_client.infrastructure.ipfs import metadata as ipfs_metadata
 from mech_client.infrastructure.subgraph.queries import MechRecord
+from mech_client.services.marketplace_service import (
+    MAX_DERIVED_CAP_FACTOR,
+    MarketplaceService,
+)
 from web3 import Web3
 from web3.datastructures import AttributeDict
 
@@ -74,6 +78,7 @@ from connect import mech as mech_module
 from connect import mech_allowances as allowances_module
 from connect import mech_budget
 from connect import mech_queue as mech_queue_module
+from connect import mech_types as mech_types_module
 from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
@@ -2011,6 +2016,19 @@ def request_plan(priced: PricedMech, **overrides: t.Any) -> RequestPlan:
     return RequestPlan(**{**fields, **overrides})
 
 
+# a mech's on-chain price, and the tool a manifest prices
+ON_CHAIN_RATE = 10**16
+PRICED_TOOL = "tool"
+
+
+def priced_manifest(expected_cost: dict | None) -> dict:
+    """Build a reachable mech's manifest that prices PRICED_TOOL at `expected_cost`."""
+    manifest: dict = {"tools": [PRICED_TOOL], "url": "https://mech.example/offchain"}
+    if expected_cost is not None:
+        manifest["toolMetadata"] = {PRICED_TOOL: {"expectedCost": expected_cost}}
+    return manifest
+
+
 # a failed run's error as the mech reports it, and the cap it is charged
 FAILED_RUN_ERROR = "InvalidRequestError: Model not-a-real-model is not supported."
 RATE_CAP = 20000
@@ -2023,6 +2041,9 @@ def native_mech_info(rate: int) -> tuple:
 
 class FakeMarketplaceService:
     """Captures send_request kwargs and serves canned mech info."""
+
+    # mech-client's own cap derivation: it reads only its arguments
+    _resolve_signed_rate = MarketplaceService._resolve_signed_rate
 
     def __init__(self) -> None:
         """Initialize."""
@@ -2680,28 +2701,97 @@ class TestMech:
         )
         assert len(patched_mech.calls) == 2
 
-    @pytest.mark.parametrize("legacy_on_chain", [False, True])
-    @pytest.mark.parametrize("rate", [1, 10**16])
-    def test_the_signed_cap_is_the_mech_s_price(
+    @pytest.mark.parametrize(
+        ("expected_cost", "cap"),
+        [
+            # a priced mech: twice the tool's expected cost
+            ({"asset": "native", "amount": str(ON_CHAIN_RATE)}, 2 * ON_CHAIN_RATE),
+            ({"asset": "native", "amount": "3"}, 6),
+            # unpriced, or unusable: the mech's on-chain price
+            (None, ON_CHAIN_RATE),
+            ({"asset": "usdc", "amount": str(ON_CHAIN_RATE)}, ON_CHAIN_RATE),
+            ({"asset": "native", "amount": "not-a-number"}, ON_CHAIN_RATE),
+            ({"asset": "native", "amount": "-5"}, ON_CHAIN_RATE),
+            ({"amount": str(ON_CHAIN_RATE)}, ON_CHAIN_RATE),
+        ],
+    )
+    def test_an_offchain_request_signs_mech_client_s_default_cap(
         self,
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
-        legacy_on_chain: bool,
-        rate: int,
+        expected_cost: dict | None,
+        cap: int,
     ) -> None:
-        """The cap mech-client signs is the price Connect budgets deposits on."""
-        patched_mech.info = native_mech_info(rate)
+        """The cap and the reported payment follow the manifest's expected cost."""
+        patched_mech.info = native_mech_info(ON_CHAIN_RATE)
+        patched_mech.metadata = priced_manifest(expected_cost)
+        result = mech_service.request(
+            "q", PRICED_TOOL, chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        (call,) = patched_mech.calls
+        assert call["max_cost"] == cap
+        assert result["payment"] == cap
+
+    def test_an_onchain_request_pays_the_on_chain_price(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """On-chain the marketplace charges the posted price, whatever the manifest says."""
+        patched_mech.info = native_mech_info(ON_CHAIN_RATE)
+        patched_mech.metadata = priced_manifest(
+            {"asset": "native", "amount": str(ON_CHAIN_RATE)}
+        )
         mech_service.request(
             "q",
-            "t",
+            PRICED_TOOL,
             chain="testchain",
-            legacy_on_chain=legacy_on_chain,
+            legacy_on_chain=True,
             priority_mech=OTHER,
             top_up_budget=None,
         )
-        (call,) = patched_mech.calls
-        assert call["max_cost"] == rate
-        assert call["max_cost"] != call["max_price"]  # not the request's budget
+        assert patched_mech.calls[0]["max_cost"] == ON_CHAIN_RATE
+
+    def test_a_derived_cap_far_above_the_on_chain_price_is_not_sent(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """Over mech-client's limit it is refused, audited, and nothing is spent."""
+        patched_mech.info = native_mech_info(ON_CHAIN_RATE)
+        over = MAX_DERIVED_CAP_FACTOR * ON_CHAIN_RATE // 2 + 1
+        patched_mech.metadata = priced_manifest(
+            {"asset": "native", "amount": str(over)}
+        )
+        with pytest.raises(MechNotSent, match="on-chain price"):
+            mech_service.request(
+                "q",
+                PRICED_TOOL,
+                chain="testchain",
+                priority_mech=OTHER,
+                top_up_budget=None,
+            )
+        assert not patched_mech.calls
+        (blocked,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_request_blocked"
+        ]
+        assert blocked["reason"] == "over-derived-cap"
+
+    def test_a_cap_at_mech_client_s_limit_is_sent(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Exactly at the limit, the derived cap goes out."""
+        patched_mech.info = native_mech_info(ON_CHAIN_RATE)
+        at = MAX_DERIVED_CAP_FACTOR * ON_CHAIN_RATE // 2
+        patched_mech.metadata = priced_manifest({"asset": "native", "amount": str(at)})
+        mech_service.request(
+            "q",
+            PRICED_TOOL,
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=10**18,
+            top_up_budget=None,
+        )
+        assert patched_mech.calls[0]["max_cost"] == 2 * at
 
     @pytest.mark.parametrize(
         ("delivery", "outcomes"),
@@ -3604,8 +3694,8 @@ class TestMech:
                 return {"ab": "delivered"}
 
         # patched on connect.mech, the module-level names _watch actually calls
-        monkeypatch.setattr(mech_module, "OffchainDeliveryWatcher", _Watcher)
-        monkeypatch.setattr(mech_module, "OnchainDeliveryWatcher", _Watcher)
+        monkeypatch.setattr(mech_types_module, "OffchainDeliveryWatcher", _Watcher)
+        monkeypatch.setattr(mech_types_module, "OnchainDeliveryWatcher", _Watcher)
         service = SimpleNamespace(
             tool_manager=SimpleNamespace(
                 get_offchain_url=lambda service_id: "https://mech.example/offchain"
@@ -4251,6 +4341,42 @@ class TestMech:
         assert prefund["amount"] == str(cap)
         assert prefund["balance"] == "0"
         assert prefund["tracker"] == TRACKER
+
+    @pytest.mark.parametrize(
+        ("expected_cost", "deposited"),
+        [
+            # priced at twice 1e16: 1.5e16 does not cover one call, so the
+            # armed cap (10x the signed cap) goes in
+            ({"asset": "native", "amount": str(ON_CHAIN_RATE)}, 20 * ON_CHAIN_RATE),
+            # unpriced: one call at the on-chain price is covered, no deposit
+            (None, None),
+        ],
+    )
+    def test_the_prefund_is_sized_from_the_signed_cap(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+        expected_cost: dict | None,
+        deposited: int | None,
+    ) -> None:
+        """A priced mech holds the cap per call, so the balance is checked against it."""
+        self._native_tracker(monkeypatch)
+        patched_mech.info = native_mech_info(ON_CHAIN_RATE)
+        patched_mech.metadata = priced_manifest(expected_cost)
+        patched_mech.prepaid.balance = ON_CHAIN_RATE * 3 // 2
+        fake_w3.eth.balance = 10**18
+        mech_service.request(
+            "q",
+            PRICED_TOOL,
+            chain="testchain",
+            priority_mech=OTHER,
+            max_payment=10**18,
+            top_up_budget=None,
+        )
+        expected = [] if deposited is None else [(deposited, "native")]
+        assert patched_mech.prepaid.deposits == expected
 
     def test_a_balance_that_covers_a_call_is_left_alone(  # pylint: disable=too-many-arguments
         self,

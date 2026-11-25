@@ -32,6 +32,10 @@ from mech_client import (
     RequestIdMismatch,
     RequestIdRpcError,
 )
+from mech_client.domain.delivery import (
+    OffchainDeliveryWatcher,
+    OnchainDeliveryWatcher,
+)
 from mech_client.services.marketplace_service import MarketplaceService
 
 from connect.signer_errors import SendUnknown, SignerError, logged_cause
@@ -345,3 +349,15 @@ def answer_lost(error: Exception, held: str, what: str, note: str) -> MechAnswer
         [held],
         getattr(error.__cause__, "deposited", 0),
     )
+
+
+async def watch_delivery(
+    service: MarketplaceService, pending: PendingDelivery, key: str, timeout: float
+) -> dict:
+    """Run the watcher for the flow this request was sent through."""
+    if pending.offchain:
+        url = service.tool_manager.get_offchain_url(pending.service_id)
+        return await OffchainDeliveryWatcher(url, timeout).watch([key])
+    contract = service.marketplace_contract()
+    watcher = OnchainDeliveryWatcher(contract, service.ledger_api, timeout)
+    return await watcher.watch([key], from_block=pending.from_block)

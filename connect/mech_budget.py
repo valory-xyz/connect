@@ -23,9 +23,12 @@ import typing as t
 
 from mech_client import payment_token
 from mech_client.infrastructure.config.payment_config import PaymentType
-from mech_client.services.marketplace_service import MarketplaceService
+from mech_client.services.marketplace_service import (
+    MAX_DERIVED_CAP_FACTOR,
+    MarketplaceService,
+)
 
-from connect.mech_types import MechError, PricedMech, said
+from connect.mech_types import MechError, MechNotSent, PricedMech, said
 
 # The agent's per-request spending budget, not a guardrail: the caller picks
 # max_payment per call and the server does not clamp it — the guardrail only
@@ -76,6 +79,38 @@ def price_mech(service: MarketplaceService, chain: str, mech: str) -> PricedMech
         rate=int(info.max_delivery_rate),
         payment_type=str(info.payment_type.value),
     )
+
+
+def offchain_priced(
+    service: MarketplaceService, priced: PricedMech, tool: str, document: t.Any
+) -> PricedMech:
+    """Return `priced` at the cap an off-chain request for `tool` signs.
+
+    That is mech-client's own default cap: twice the expected cost the mech's
+    manifest publishes for the tool in its payment asset, or the mech's
+    on-chain price when it publishes none it can use. Every bound a request
+    is sized by (prefund, top-up, the reported payment) reads this rate.
+
+    :raises MechNotSent: for a cap more than mech-client's
+        `MAX_DERIVED_CAP_FACTOR` times the on-chain price, which mech-client
+        does not sign without an explicit cap
+    """
+    try:
+        cap = service._resolve_signed_rate(  # pylint: disable=protected-access
+            tools=(tool,),
+            metadata=document,
+            payment_type=PaymentType(priced.payment_type),
+            advertised_max=priced.rate,
+            max_cost=None,
+            use_offchain=True,
+        )
+    except ValueError as e:
+        raise MechNotSent(
+            f"mech {priced.mech} publishes an expected cost for {tool} that puts "
+            f"its cap over {MAX_DERIVED_CAP_FACTOR}x its on-chain price of "
+            f"{priced.rate}; not sent"
+        ) from e
+    return priced._replace(rate=int(cap))
 
 
 def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:

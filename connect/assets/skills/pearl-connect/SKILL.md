@@ -214,7 +214,10 @@ composing a prompt:
   default, and the request then needs an explicit one) caps what one
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with
-  `mech_tools(priority_mech=...)` (`max_delivery_rate`).
+  `mech_tools(priority_mech=...)` (`max_delivery_rate`). Off-chain, a mech
+  whose manifest publishes an expected cost for the tool is offered twice
+  that cost instead; the request is charged the run's real cost, at most
+  that, and `payment` in the answer is that offer.
 - `delivery_results[request_id]` is normally the result file
   (`{schema_version, requestId, result, tool, …}`), but a mech that answers
   inline off-chain returns its envelope instead, with the answer under
