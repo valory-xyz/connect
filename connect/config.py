@@ -111,6 +111,13 @@ class StakingConfig:
     activity_checker: str
     service_id: int
 
+    def __post_init__(self) -> None:
+        """Refuse service id 0, which names no service."""
+        if self.service_id <= 0:
+            raise ValueError(
+                f"staking service id must be positive, not {self.service_id}"
+            )
+
 
 @dataclass
 class ChainConfig:

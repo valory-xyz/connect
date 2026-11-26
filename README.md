@@ -583,7 +583,9 @@ on chain, off-chain requests included.
   next check retries. Like the agent top-up, those are the call's whole audit
   and never count as the agent's activity. It is no MCP tool and draws on no
   token's budget. In restricted mode it passes through a one-shot allowance
-  for exactly `checkpoint()`, no value, to the configured staking contract.
+  for exactly `checkpoint()`, no value, to the configured staking contract,
+  which only the server's own (`SERVER_BUILT`) send can spend and a failed
+  send withdraws.
 - **Eviction.** Connect never stops itself, evicted or not: the session keeps
   its wallet and earns no rewards until the eviction ends.
 

@@ -214,7 +214,7 @@ def checkpoint_if_due(
         )
         wait_mined(w3, tx_hash)
     except Exception as e:  # pylint: disable=broad-exception-caught
-        # cause_of, not the text: an RPC library's words may carry the RPC key
+        guard.revoke_checkpoint(chain=chain, staking_contract=staking.staking_contract)
         logger.warning(
             "staking checkpoint on %s failed (tx %s): %s",
             chain,

@@ -131,14 +131,6 @@ class _DepositAllowance:
     expires: float
 
 
-@dataclass(frozen=True)
-class _CheckpointAllowance:
-    """One pre-authorized EOA checkpoint() call, keyed by its chain."""
-
-    staking_contract: str  # lowercase
-    expires: float
-
-
 # the handle allow_safe_deposit_once returns, for revoke_safe_deposit
 DepositGrant = _DepositAllowance
 
@@ -158,8 +150,8 @@ class Guard:
         self._allowed_digests: dict[bytes, float] = {}
         # pre-authorized deposits; entries are consumed by check_transaction
         self._deposit_allowances: list[_DepositAllowance] = []
-        # chain -> its one armed checkpoint
-        self._checkpoint_allowances: dict[str, _CheckpointAllowance] = {}
+        # (chain, staking contract), both lowercase -> monotonic expiry
+        self._checkpoint_allowances: dict[tuple[str, str], float] = {}
 
     def mode(self) -> str:
         """Return the currently enforced mode."""
@@ -224,18 +216,18 @@ class Guard:
         )
 
     def allow_checkpoint_once(self, *, chain: str, staking_contract: str) -> None:
-        """Permit one restricted-mode checkpoint() call by the agent EOA.
-
-        Server-side callers only (the staking checkpoint). The contract is the
-        one Pearl configured, and the call carries no value and no argument:
-        it can only close an epoch, which anyone may do. It replaces any
-        earlier one on the chain, which a failed call left.
-        """
+        """Permit one restricted-mode checkpoint() by the agent EOA on `chain`, replacing any earlier one."""
         with self._allowance_lock:
             self._purge_expired()
-            self._checkpoint_allowances[chain.lower()] = _CheckpointAllowance(
-                staking_contract=staking_contract.lower(),
-                expires=time.monotonic() + ALLOWANCE_TTL,
+            self._checkpoint_allowances[(chain.lower(), staking_contract.lower())] = (
+                time.monotonic() + ALLOWANCE_TTL
+            )
+
+    def revoke_checkpoint(self, *, chain: str, staking_contract: str) -> None:
+        """Withdraw an unused checkpoint allowance; a no-op once used or expired."""
+        with self._allowance_lock:
+            self._checkpoint_allowances.pop(
+                (chain.lower(), staking_contract.lower()), None
             )
 
     def revoke_digest(self, digest: bytes) -> None:
@@ -281,14 +273,14 @@ class Guard:
         self._deposit_allowances = [
             a for a in self._deposit_allowances if a.expires > now
         ]
-        for chain, checkpoint in list(self._checkpoint_allowances.items()):
-            if checkpoint.expires <= now:
+        for (chain, contract), expiry in list(self._checkpoint_allowances.items()):
+            if expiry <= now:
                 logger.warning(
                     "checkpoint allowance to %s on %s expired unconsumed",
-                    checkpoint.staking_contract,
+                    contract,
                     chain,
                 )
-                del self._checkpoint_allowances[chain]
+                del self._checkpoint_allowances[(chain, contract)]
 
     def check_sign_digest(self, digest: bytes) -> None:
         """Raise unless this digest may be signed; consumes its allowance.
@@ -355,6 +347,7 @@ class Guard:
                 calldata=calldata,
                 exec_call=exec_call,
                 consume=consume,
+                server_built=server_built,
             )
 
     def _check_floor(self, target: str, exec_call: "SafeExec") -> None:
@@ -400,13 +393,18 @@ class Guard:
         calldata: str,
         exec_call: "SafeExec | None",
         consume: bool,
+        server_built: bool,
     ) -> None:
         """Restricted mode: the safe CALLs a whitelisted address, or nothing.
 
         The exceptions are the server's own allowances, each its exact call.
         """
-        if exec_call is None and self._consume_checkpoint_allowance(
-            chain, to=to, value=value, calldata=calldata, consume=consume
+        if (
+            server_built
+            and exec_call is None
+            and self._consume_checkpoint_allowance(
+                chain, to=to, value=value, calldata=calldata, consume=consume
+            )
         ):
             return
         if safe is None:
@@ -467,13 +465,13 @@ class Guard:
         """Consume the chain's checkpoint allowance if this EOA call is exactly it."""
         if value != 0 or calldata != CHECKPOINT_SELECTOR:
             return False
+        key = (chain, to.lower())
         with self._allowance_lock:
             self._purge_expired()
-            allowance = self._checkpoint_allowances.get(chain)
-            if allowance is None or allowance.staking_contract != to.lower():
+            if key not in self._checkpoint_allowances:
                 return False
             if consume:
-                del self._checkpoint_allowances[chain]
+                del self._checkpoint_allowances[key]
             return True
 
     def _consume_deposit_allowance(

@@ -54,7 +54,7 @@ from connect.guard import Guard
 from connect.server import app as app_module
 from connect.server import pearl_routes
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
-from connect.signer import Signer, SignerError
+from connect.signer import SERVER_BUILT, Signer, SignerError
 from connect.workspace import SESSION_NOTICE_FILE
 
 from tests.conftest import FakeW3, audit_entries
@@ -337,6 +337,12 @@ class TestConfig:
         assert [r.levelname for r in caplog.records] == ["ERROR"]
         assert "staking read as unstaked" in caplog.text
 
+    @pytest.mark.parametrize("service_id", [0, -1])
+    def test_a_program_names_a_service(self, service_id: int) -> None:
+        """StakingConfig refuses an id that names no service."""
+        with pytest.raises(ValueError, match="must be positive"):
+            dataclasses.replace(PROGRAM, service_id=service_id)
+
 
 class TestRequestMade:
     """request_made_this_epoch, against the Basius-style requirement."""
@@ -362,10 +368,7 @@ class TestRequestMade:
     ) -> None:
         """The count since the checkpoint against what the checker will need."""
         fake = StakingW3(safe_requests=safe_requests, ts_checkpoint=ts_checkpoint)
-        assert (
-            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
-            is expected
-        )
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM) is expected
         to, data = next(
             c for c in fake.calls if c[1][:4] == _sel("getMultisigNonces(address)")
         )
@@ -393,9 +396,7 @@ class TestRequestMade:
         monkeypatch.setattr(time, "time", lambda: float(NOW + 5 * DAY))
         fake = StakingW3(safe_requests=10, ts_checkpoint=NOW - 2 * DAY)
         fake.chain_time = chain_time
-        assert (
-            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM) is expected
-        )
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM) is expected
 
     def test_a_service_staked_after_the_checkpoint_is_measured_from_its_stake(
         self,
@@ -479,9 +480,7 @@ class TestReminder:
         """An RPC failure is logged, without the RPC's words, and reminds nothing."""
         w3.fail = ConnectionError("http://rpc.example/secret-key unreachable")
         with caplog.at_level(logging.WARNING, logger="agent"):
-            assert (
-                staking.staking_reminder(staked_config, test_signer) is None
-            )
+            assert staking.staking_reminder(staked_config, test_signer) is None
         assert "could not read the staking state on testchain" in caplog.text
         assert "secret-key" not in caplog.text
 
@@ -621,6 +620,40 @@ class TestCheckpoint:
         assert entry["staking_contract"] == STAKING_CONTRACT
         payload = (staked_config.store_path / PERFORMANCE_FILE).read_text()
         assert '"last_activity": null' in payload
+
+    def test_a_send_that_fails_before_the_guard_leaves_no_allowance(  # pylint: disable=too-many-arguments
+        self,
+        staked_config: AppConfig,
+        test_signer: Signer,
+        settings_store: SettingsStore,
+        activity: ActivityLog,
+        w3: StakingW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A send that never reached the guard: its allowance is withdrawn."""
+        settings_store.save(
+            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+        )
+        guard = Guard(settings_store, staked_config, agent_signer=test_signer.address)
+        test_signer.set_guard(guard)
+        w3.ts_checkpoint = NOW - DAY
+        send = test_signer.send
+
+        def failing(*_: t.Any, **__: t.Any) -> str:
+            raise ConnectionError("rpc down")
+
+        monkeypatch.setattr(test_signer, "send", failing)
+        assert (
+            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
+            is None
+        )
+        with pytest.raises(SignerError, match="only allow transactions targeting"):
+            send(
+                "testchain",
+                STAKING_CONTRACT,
+                data=staking.CHECKPOINT_DATA,
+                intent=SERVER_BUILT,
+            )
 
     def test_no_rewards_left_sends_nothing(  # pylint: disable=too-many-arguments
         self,
@@ -789,11 +822,46 @@ class TestGuardAllowance:
             chain="testchain", staking_contract=STAKING_CONTRACT
         )
         with pytest.raises(Exception, match="only allow transactions targeting"):
-            restricted.check_transaction("testchain", to, value, data)
+            restricted.check_transaction(
+                "testchain", to, value, data, server_built=True
+            )
         # the allowance is still there for the exact call
         restricted.check_transaction(
-            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, server_built=True
         )
+
+    def test_an_agent_send_of_the_same_call_is_refused(self, restricted: Guard) -> None:
+        """Only the server's own send spends it: an agent's exact copy is refused."""
+        restricted.allow_checkpoint_once(
+            chain="testchain", staking_contract=STAKING_CONTRACT
+        )
+        with pytest.raises(Exception, match="only allow transactions targeting"):
+            restricted.check_transaction(
+                "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+            )
+        restricted.check_transaction(
+            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, server_built=True
+        )
+
+    def test_a_revoked_allowance_admits_nothing(self, restricted: Guard) -> None:
+        """revoke_checkpoint withdraws it; revoking none is a no-op."""
+        restricted.revoke_checkpoint(
+            chain="testchain", staking_contract=STAKING_CONTRACT
+        )
+        restricted.allow_checkpoint_once(
+            chain="testchain", staking_contract=STAKING_CONTRACT
+        )
+        restricted.revoke_checkpoint(
+            chain="TESTCHAIN", staking_contract=STAKING_CONTRACT.lower()
+        )
+        with pytest.raises(Exception, match="only allow transactions targeting"):
+            restricted.check_transaction(
+                "testchain",
+                STAKING_CONTRACT,
+                0,
+                staking.CHECKPOINT_DATA,
+                server_built=True,
+            )
 
     def test_applies_to_its_own_chain_only(
         self, restricted: Guard, app_config: AppConfig
@@ -807,10 +875,14 @@ class TestGuardAllowance:
         )
         with pytest.raises(Exception, match="only allow transactions targeting"):
             restricted.check_transaction(
-                "otherchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+                "otherchain",
+                STAKING_CONTRACT,
+                0,
+                staking.CHECKPOINT_DATA,
+                server_built=True,
             )
         restricted.check_transaction(
-            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, server_built=True
         )
 
     def test_a_dry_run_consumes_nothing(self, restricted: Guard) -> None:
@@ -819,14 +891,23 @@ class TestGuardAllowance:
             chain="testchain", staking_contract=STAKING_CONTRACT
         )
         restricted.check_transaction(
-            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, consume=False
+            "testchain",
+            STAKING_CONTRACT,
+            0,
+            staking.CHECKPOINT_DATA,
+            consume=False,
+            server_built=True,
         )
         restricted.check_transaction(
-            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, server_built=True
         )
         with pytest.raises(Exception, match="only allow transactions targeting"):
             restricted.check_transaction(
-                "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+                "testchain",
+                STAKING_CONTRACT,
+                0,
+                staking.CHECKPOINT_DATA,
+                server_built=True,
             )
 
     def test_an_allowance_expires(
@@ -845,7 +926,11 @@ class TestGuardAllowance:
         with caplog.at_level(logging.WARNING, logger="agent"):
             with pytest.raises(Exception, match="only allow transactions targeting"):
                 restricted.check_transaction(
-                    "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+                    "testchain",
+                    STAKING_CONTRACT,
+                    0,
+                    staking.CHECKPOINT_DATA,
+                    server_built=True,
                 )
         assert "checkpoint allowance" in caplog.text
 
