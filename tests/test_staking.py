@@ -332,6 +332,11 @@ class TestRequestMade:
         )
         assert to == CHECKER
         assert abi_decode(["address"], data[4:]) == (Web3.to_checksum_address(SAFE),)
+        to, data = next(
+            c for c in fake.calls if c[1][:4] == _sel("getServiceInfo(uint256)")
+        )
+        assert to == STAKING_CONTRACT
+        assert abi_decode(["uint256"], data[4:]) == (SERVICE_ID,)
 
     def test_no_staking_record_is_an_error(self) -> None:
         """An empty record cannot be read as "made" or "not made"."""
@@ -905,14 +910,18 @@ class TestSessionNotice:
         """A read past the time limit: no reminder, an old one cleared, launched."""
         monkeypatch.setattr(pearl_routes, "REMINDER_READ_SECONDS", 0.01)
         answered = threading.Event()
+        read_done = threading.Event()
+        held: list[bool] = []
 
         def slow(config: AppConfig, signer: Signer) -> str:
             """Answer only once the launch has answered.
 
-            A launch that waited on it would get the reminder after the bound,
-            and write it, failing the asserts below instead of hanging.
+            `held` records whether the launch made it wait out the bound: a
+            launch that blocked on the read, by any route, never sets
+            `answered` before the read gives up.
             """
-            answered.wait(timeout=5)
+            held.append(not answered.wait(timeout=5))
+            read_done.set()
             return staking.STAKING_REMINDER
 
         monkeypatch.setattr(staking, "staking_reminder", slow)
@@ -923,6 +932,8 @@ class TestSessionNotice:
                 assert client.post("/session").json()["launched"] is True
         finally:
             answered.set()
+        assert read_done.wait(timeout=5)
+        assert held == [False]
         assert not self._notice(app_config).exists()
         assert "took over" in caplog.text
 
