@@ -232,7 +232,9 @@ class TestConfig:
             config = load_config(env)
         assert config.staking is None
         assert not staking.is_staked(config)
-        (record,) = [r for r in caplog.records if "no single instance chain" in r.message]
+        (record,) = [
+            r for r in caplog.records if "no single instance chain" in r.message
+        ]
         assert record.levelname == "ERROR"
         assert record.message == (
             "staking read as unstaked: no single instance chain "
