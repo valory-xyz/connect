@@ -567,9 +567,10 @@ on chain, off-chain requests included.
   skip it whenever that clock runs behind the chain. Otherwise it is sent once
   that timestamp has passed and `availableRewards()` is above 0 (with none left
   a checkpoint changes nothing, so it would be due, and paid for, on every
-  check). All four reads are taken at one block, so another service's
-  checkpoint mined between them cannot read as a rebaseline. If so the agent
-  EOA calls it, with its own gas. A mined call is audited as
+  check). When one is worth sending, the agent EOA calls it, with its own gas.
+  The reads behind that decision, and the reminder's, are taken at one block,
+  one behind the head: another service's checkpoint mined between them cannot
+  read as a rebaseline, and an RPC node a block behind still has it. A mined call is audited as
   `staking_checkpoint`, anything else as `staking_checkpoint_failed`, and the
   next check retries. Like the agent top-up, those are the call's whole audit
   and never count as the agent's activity. It is no MCP tool and draws on no

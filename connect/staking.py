@@ -50,8 +50,8 @@ logger = logging.getLogger("agent")
 
 # the reminder the session gives while the epoch's request is not made
 STAKING_REMINDER = (
-    "This agent is staked. Make one Marketplace request today to earn your OLAS "
-    "staking rewards."
+    "This agent is staked. Make one Marketplace request today to become eligible "
+    "for OLAS activity rewards."
 )
 
 # livenessRatio is requests per second, scaled by 1e18
@@ -67,8 +67,18 @@ def _selector(signature: str) -> bytes:
     return bytes.fromhex(selector_of(signature)[2:])
 
 
+def _read_block(w3: Web3) -> BlockIdentifier:
+    """The block every read of one decision is taken at: one behind the head.
+
+    Pinned, so another service's checkpoint mined between the reads cannot
+    mix two blocks; one behind, so a load-balanced RPC node a block behind the
+    one that answered the block number still has it.
+    """
+    return max(w3.eth.block_number - 1, 0)
+
+
 def _call(
-    w3: Web3, to: str, data: bytes, types: list[str], block: BlockIdentifier = "latest"
+    w3: Web3, to: str, data: bytes, types: list[str], block: BlockIdentifier
 ) -> tuple:
     """Run one eth_call and decode what it returns."""
     raw = w3.eth.call(
@@ -77,15 +87,10 @@ def _call(
     return abi_decode(types, bytes(raw))
 
 
-def _uint(w3: Web3, to: str, signature: str, block: BlockIdentifier = "latest") -> int:
+def _uint(w3: Web3, to: str, signature: str, block: BlockIdentifier) -> int:
     """Read a no-argument uint256 view."""
     (value,) = _call(w3, to, _selector(signature), ["uint256"], block)
     return int(value)
-
-
-def is_staked(config: AppConfig) -> bool:
-    """Whether Pearl staked this instance with a program Connect can use."""
-    return config.staking is not None
 
 
 def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
@@ -93,12 +98,14 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
 
     :raises ValueError: when the contract holds no record of the service.
     """
+    block = _read_block(w3)
     (nonces,) = _call(
         w3,
         staking.activity_checker,
         _selector("getMultisigNonces(address)")
         + abi_encode(["address"], [Web3.to_checksum_address(staking.safe)]),
         ["uint256[]"],
+        block,
     )
     ((_, _, staked_nonces, _, _, _),) = _call(
         w3,
@@ -106,6 +113,7 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
         _selector("getServiceInfo(uint256)")
         + abi_encode(["uint256"], [staking.service_id]),
         ["(address,address,uint256[],uint256,uint256,uint256)"],
+        block,
     )
     if len(staked_nonces) <= REQUEST_COUNT_INDEX:
         raise ValueError(
@@ -113,9 +121,11 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
             f"{staking.staking_contract}"
         )
     eligible = nonces[REQUEST_COUNT_INDEX] - staked_nonces[REQUEST_COUNT_INDEX]
-    liveness_period = _uint(w3, staking.staking_contract, "livenessPeriod()")
-    since_checkpoint = now - _uint(w3, staking.staking_contract, "tsCheckpoint()")
-    ratio = _uint(w3, staking.activity_checker, "livenessRatio()")
+    liveness_period = _uint(w3, staking.staking_contract, "livenessPeriod()", block)
+    since_checkpoint = now - _uint(
+        w3, staking.staking_contract, "tsCheckpoint()", block
+    )
+    ratio = _uint(w3, staking.activity_checker, "livenessRatio()", block)
     # ceil(max(livenessPeriod, since_checkpoint) * ratio / 1e18), in integers
     required = -(
         -max(liveness_period, since_checkpoint) * ratio // LIVENESS_RATIO_SCALE
@@ -149,9 +159,7 @@ def staking_reminder(
 
 def _checkpoint_worth_sending(w3: Web3, contract: str, now: int) -> bool:
     """Whether checkpoint() is due and worth sending (README, "Staking")."""
-    # one block for every read: another service's checkpoint landing between
-    # them would read as a pending rebaseline
-    block = w3.eth.block_number
+    block = _read_block(w3)
     next_at = _uint(w3, contract, "getNextRewardCheckpointTimestamp()", block)
     ts_checkpoint = _uint(w3, contract, "tsCheckpoint()", block)
     liveness_period = _uint(w3, contract, "livenessPeriod()", block)

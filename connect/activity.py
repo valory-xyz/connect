@@ -41,6 +41,9 @@ ACTIVITY_LOG_FILE = "activity_log.jsonl"
 PERFORMANCE_FILE = "agent_performance.json"
 MAX_LOG_BYTES = 5 * 1024 * 1024  # rotate to .1 beyond this
 ACTIVITY_GOAL_KEY = "activity_goal"
+# the agent top-up's audit kinds (README, "Agent top-up")
+AGENT_TOPUP_KIND = "agent_topup"
+AGENT_TOPUP_FAILED_KIND = "agent_topup_failed"
 # the staking checkpoint's audit kinds (README, "Staking")
 STAKING_CHECKPOINT_KIND = "staking_checkpoint"
 STAKING_CHECKPOINT_FAILED_KIND = "staking_checkpoint_failed"
@@ -48,8 +51,8 @@ STAKING_CHECKPOINT_FAILED_KIND = "staking_checkpoint_failed"
 # performance card (README, "Agent top-up", "Staking")
 HOUSEKEEPING_KINDS = frozenset(
     {
-        "agent_topup",
-        "agent_topup_failed",
+        AGENT_TOPUP_KIND,
+        AGENT_TOPUP_FAILED_KIND,
         STAKING_CHECKPOINT_KIND,
         STAKING_CHECKPOINT_FAILED_KIND,
     }

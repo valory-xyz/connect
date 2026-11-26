@@ -33,7 +33,12 @@ from fastapi.exceptions import RequestValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from connect import staking, wallet
-from connect.activity import ActivityLog, PERFORMANCE_FILE
+from connect.activity import (
+    AGENT_TOPUP_FAILED_KIND,
+    AGENT_TOPUP_KIND,
+    PERFORMANCE_FILE,
+    ActivityLog,
+)
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
@@ -104,14 +109,16 @@ def _send_agent_topup(  # pylint: disable=too-many-arguments,too-many-positional
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.exception("agent top-up of %d wei on %s failed", amount, chain)
         activity.record(
-            "agent_topup_failed",
+            AGENT_TOPUP_FAILED_KIND,
             chain=chain,
             value=str(amount),
             tx_hash=tx_hash,
             error=str(e),
         )
         return False
-    activity.record("agent_topup", chain=chain, value=str(amount), tx_hash=tx_hash)
+    activity.record(
+        AGENT_TOPUP_KIND, chain=chain, value=str(amount), tx_hash=tx_hash
+    )
     return True
 
 
@@ -163,7 +170,7 @@ async def checkpoint_staking(
 
     Unstaked, it never starts: the program cannot change without a restart.
     """
-    if not staking.is_staked(config):
+    if config.staking is None:
         return
     while True:
         try:

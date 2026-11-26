@@ -113,9 +113,10 @@ class StakingW3(FakeW3):
         self.record = record
         self.fail: Exception | None = None
         self.calls: list[tuple[str, bytes]] = []
-        # another service's checkpoint, mined right after the next read of
-        # "latest": a read pinned to a block still sees the state before it
-        self.checkpoint_lands_after_next_read = False
+        # another service's checkpoint, mined after the block the reads are
+        # pinned to (one behind the head): any other block sees it landed
+        self.other_checkpoint_landed = False
+        self.blocks: list[object] = []
         self.eth.call = self._call  # type: ignore[attr-defined]
         self.eth.block_number = 1_000  # type: ignore[attr-defined]
         self.eth.receipt = {"status": 1}
@@ -126,12 +127,19 @@ class StakingW3(FakeW3):
             raise self.fail
         to, data = tx["to"], bytes(tx["data"])
         self.calls.append((to, data))
-        if self.checkpoint_lands_after_next_read and block == "latest":
-            self.checkpoint_lands_after_next_read = False
-            answer = self._answer(to, data)
+        self.blocks.append(block)
+        if self.other_checkpoint_landed and block != self.pinned_block:
             self.ts_checkpoint += DAY
-            return answer
+            try:
+                return self._answer(to, data)
+            finally:
+                self.ts_checkpoint -= DAY
         return self._answer(to, data)
+
+    @property
+    def pinned_block(self) -> int:
+        """The block the staking reads must all be taken at."""
+        return self.eth.block_number - 1  # type: ignore[attr-defined]
 
     def _answer(self, to: str, data: bytes) -> bytes:
         """Answer one read from the current state."""
@@ -244,7 +252,6 @@ class TestConfig:
         with caplog.at_level(logging.WARNING, logger="agent"):
             config = load_config(env)
         assert config.staking is None
-        assert not staking.is_staked(config)
         (record,) = [
             r for r in caplog.records if "no single instance chain" in r.message
         ]
@@ -267,7 +274,6 @@ class TestConfig:
             )
         )
         assert config.staking == dataclasses.replace(PROGRAM, chain="gnosis")
-        assert staking.is_staked(config)
 
     @pytest.mark.parametrize(
         "staking_env",
@@ -286,7 +292,6 @@ class TestConfig:
         """Unset or the zero address is unstaked, quietly."""
         config = load_config(self._env(tmp_path, **staking_env))
         assert config.staking is None
-        assert not staking.is_staked(config)
 
     @pytest.mark.parametrize(
         "staking_env",
@@ -352,6 +357,9 @@ class TestRequestMade:
         )
         assert to == STAKING_CONTRACT
         assert abi_decode(["uint256"], data[4:]) == (SERVICE_ID,)
+        # all five reads at one block, one behind the head
+        assert len(fake.blocks) == 5
+        assert set(fake.blocks) == {fake.pinned_block}
 
     def test_no_staking_record_is_an_error(self) -> None:
         """An empty record cannot be read as "made" or "not made"."""
@@ -623,7 +631,7 @@ class TestCheckpoint:
         next-checkpoint time with a new tsCheckpoint.
         """
         test_signer.set_guard(guard)
-        w3.checkpoint_lands_after_next_read = True
+        w3.other_checkpoint_landed = True
         assert (
             staking.checkpoint_if_due(
                 staked_config, test_signer, guard, activity, now=_now
@@ -631,6 +639,8 @@ class TestCheckpoint:
             is None
         )
         assert not w3.eth.sent
+        # every read, not only the first, at the one pinned block
+        assert w3.blocks and set(w3.blocks) == {w3.pinned_block}
 
     def test_a_failed_read_sends_nothing(  # pylint: disable=too-many-arguments
         self,
