@@ -697,16 +697,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         settle_payment(payload, plan.priced.rate)
         record_failed_runs(self._activity, plan.chain, payload)
         if plan.offchain:
-            by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
-            got = result.get("deliveries") or {}
-            self.queue.stamp(
-                plan.chain,
-                [
-                    (nonce, got[key].data, got[key].url)
-                    for key, nonce in by_key
-                    if key in got and got[key].data is not None
-                ],
-            )
+            self.queue.sent(plan.chain, result)
         try:  # paid and delivered by now: a delivery it cannot read loses nothing
             if is_chat_prompt(prompt):
                 for data in (payload.get("delivery_results") or {}).values():
@@ -785,7 +776,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 ) from e
 
         def in_flight() -> int:
-            return self.queue.in_flight(plan.chain, safe, read_map())
+            return self.queue.in_flight(plan.chain, safe, read_map(), contract)
 
         self._allowances.prefund(plan, safe, in_flight)
 

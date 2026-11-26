@@ -54,7 +54,6 @@ from connect.config import (
     AppConfig,
     ChainConfig,
     MECH_NONCE_MODES,
-    MECH_NONCE_MODE_SEQUENTIAL,
 )
 from connect.guard import Guard
 from connect.mech import MechError, MechService
@@ -978,9 +977,9 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     before the request is sent and the mech never has to ask. The third
     rides that balance straight through, depositing nothing at all.
 
-    With explicit nonces a request holds no queue slot, so the prepaid bar
-    counts no request in flight: the balance the first left covers each
-    later call (nothing settles on the fork), and neither prepays.
+    Both nonce modes fund it the same way: an explicit request holds no
+    queue slot, but Connect counts it in flight until the marketplace
+    records it (nothing settles on the fork).
 
     The mech endpoint is local (no live mech serves a fork); everything else
     — marketplace reads, nonces, digests, signing, the deposit transaction —
@@ -1068,12 +1067,11 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
 
     # the mech-side validation a real mech performs all passed
     assert endpoint.validation_errors == []
-    # the tracker holds the shortfall the mech asked for and any prepaid cap
-    prepaid = prepaid_cap if nonce_mode == MECH_NONCE_MODE_SEQUENTIAL else 0
-    assert endpoint.paid == endpoint.required + prepaid
+    # the tracker holds the shortfall the mech asked for and the prepaid cap
+    assert endpoint.paid == endpoint.required + prepaid_cap
     assert (
         int(w3.eth.get_balance(Web3.to_checksum_address(safe_address)))
-        == safe_balance_before - endpoint.required - prepaid
+        == safe_balance_before - endpoint.required - prepaid_cap
     )
     # every request was served and delivered
     for result in (first, second, third):
@@ -1085,16 +1083,15 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     kinds = audit_kinds(store_path)
     assert kinds.count("mech_offchain_digest") == 3
     # one per deposit the flow armed: the first request's refused prepaid
-    # deposit and its 402 top-up, the second's prepaid deposit (sequential
-    # only) and its send, and the third's send
-    assert kinds.count("mech_deposit_allowance") == 4 + bool(prepaid)
+    # deposit and its 402 top-up, the second's prepaid deposit and its send,
+    # and the third's send
+    assert kinds.count("mech_deposit_allowance") == 5
     assert kinds.count("sign_message") == 3
     assert kinds.count("mech_request") == 3
     # the prepaid deposit the second request made, and the one it was refused
-    prefunds = [e for e in entries if e["kind"] == "mech_prefund"]
-    assert [(e["amount"], e["tracker"]) for e in prefunds] == (
-        [(str(prepaid_cap), tracker)] if prepaid else []
-    )
+    (prefund,) = [e for e in entries if e["kind"] == "mech_prefund"]
+    assert prefund["amount"] == str(prepaid_cap)
+    assert prefund["tracker"] == tracker
     assert kinds.count("mech_deposit_refused") == 1
     # a guard denial would mean a deposit the allowance did not cover
     assert "blocked" not in kinds

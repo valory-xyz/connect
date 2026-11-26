@@ -720,7 +720,9 @@ nonce and a 15-minute settle deadline per request, and the mech settles it on
 its own, in any order, so no request waits on another's slot. A mech without
 explicit nonces answers with a 503 and mech-client resends the request
 sequentially. An explicit request takes no slot in the queue below, so a slot
-it still holds does not block it. Setting
+it still holds does not block it; the prepaid deposit still counts it in
+flight, from its send until the marketplace records it settled or its
+deadline passes, so one deposit covers several calls as before. Setting
 `CONNECTION_CONFIGS_CONFIG_MECH_NONCE_MODE=sequential` sends every off-chain
 request through the allocator instead, as below; mechs before v0.37 need it.
 

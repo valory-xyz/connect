@@ -68,6 +68,7 @@ from mech_client.infrastructure.ipfs import metadata as ipfs_metadata
 from mech_client.infrastructure.subgraph.queries import MechRecord
 from mech_client.services import marketplace_service as marketplace_module
 from mech_client.services.marketplace_service import (
+    EXPLICIT_NONCE_DEADLINE_SECONDS,
     MAX_DERIVED_CAP_FACTOR,
     MarketplaceService,
 )
@@ -1965,13 +1966,25 @@ class FakeMarketplaceContract:
         self.domain_separator = b"\x58" * 32
         self.nonce = 5
         self.request_id_override: bytes | None = None
+        self.recorded: set[bytes] = set()  # request ids the marketplace settled
+        self.records_unreadable = False
         self.functions = SimpleNamespace(
+            mapRequestIdInfos=lambda request_id: SimpleNamespace(
+                call=lambda: self._request_info(request_id)
+            ),
             domainSeparator=lambda: SimpleNamespace(call=lambda: self.domain_separator),
             mapNonces=lambda address: SimpleNamespace(call=lambda: self.nonce),
             getRequestId=lambda *args: SimpleNamespace(
                 call=lambda: self._request_id(*args)
             ),
         )
+
+    def _request_info(self, request_id: bytes) -> tuple:
+        """mapRequestIdInfos: a settled request names its priority mech."""
+        if self.records_unreadable:
+            raise ConnectionError("rpc down")
+        mech = OTHER if bytes(request_id) in self.recorded else "0x" + "00" * 20
+        return (mech, mech, "0x" + "00" * 20, 0, 0, b"\x00" * 32)
 
     def _request_id(
         self,
@@ -6912,6 +6925,90 @@ class TestMech:
         )
         assert patched_mech.calls[-1]["nonce_mode"] == MECH_NONCE_MODE_EXPLICIT
         assert mech_service.queue.in_flight("testchain", SAFE, 0) == 1  # still held
+
+    def _explicit_ask(self, mech_service: MechService) -> str:
+        """Send one explicit request; return its request id."""
+        result = mech_service.request(
+            "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        (key,) = result["request_ids"]
+        return key
+
+    def test_an_explicit_request_is_in_flight_until_the_marketplace_records_it(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """It still owes the balance its charge, so the prepaid bar counts it."""
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        patched_mech.result["request_ids"] = ["ab"]
+        key = self._explicit_ask(mech_service)
+        contract = patched_mech.contract
+        assert mech_service.queue.in_flight("testchain", SAFE, 0, contract) == 1
+        assert mech_service.queue.in_flight("testchain", SAFE, 0) == 0  # slots only
+        contract.records_unreadable = True  # unknown: still counted
+        assert mech_service.queue.in_flight("testchain", SAFE, 0, contract) == 1
+        contract.records_unreadable = False
+        contract.recorded.add(bytes.fromhex(key))
+        assert mech_service.queue.in_flight("testchain", SAFE, 0, contract) == 0
+
+    def test_an_explicit_request_past_its_deadline_is_not_in_flight(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Past the signed deadline it can no longer settle, so owes nothing."""
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        patched_mech.result["request_ids"] = ["ab"]
+        now = time.time()
+        monkeypatch.setattr(mech_service.queue, "_clock", lambda: now)
+        self._explicit_ask(mech_service)
+        contract = patched_mech.contract
+        later = now + EXPLICIT_NONCE_DEADLINE_SECONDS
+        monkeypatch.setattr(mech_service.queue, "_clock", lambda: later - 1)
+        assert mech_service.queue.in_flight("testchain", SAFE, 0, contract) == 1
+        monkeypatch.setattr(mech_service.queue, "_clock", lambda: later)
+        assert mech_service.queue.in_flight("testchain", SAFE, 0, contract) == 0
+
+    def test_a_sequential_request_is_counted_by_its_slot_alone(
+        self, mech_service: MechService, patched_mech: FakeMarketplaceService
+    ) -> None:
+        """Only an explicit request is remembered apart from the allocator."""
+        patched_mech.result["request_ids"] = ["ab"]
+        self._explicit_ask(mech_service)
+        queue = mech_service.queue
+        assert queue.in_flight("testchain", SAFE, 0, patched_mech.contract) == (
+            queue.in_flight("testchain", SAFE, 0)
+        )
+
+    def test_a_second_explicit_request_prepays_for_the_first(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        fake_w3: FakeW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The balance one call left is owed to the first, so the second deposits."""
+        self._native_tracker(monkeypatch)
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        patched_mech.prepaid.balance = 10**16  # one call at the 10**16 rate
+        fake_w3.eth.balance = 10**18
+        cap = 4 * 10**16
+        for key in ("ab", "cd"):
+            patched_mech.result["request_ids"] = [key]
+            mech_service.request(
+                "q",
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                max_payment=cap,
+                top_up_budget=None,
+            )
+        assert patched_mech.prepaid.deposits == [(cap, "native")]
 
     @pytest.mark.parametrize(
         ("status", "reason", "error", "rule"),
