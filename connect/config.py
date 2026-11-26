@@ -422,7 +422,6 @@ def _parse_staking(env: dict[str, str], config: AppConfig) -> StakingConfig | No
         return None
     chain = config.instance_chain
     if chain is None:
-        # the program is for the chain carrying the safe; with none it has no chain
         logger.error(
             "staking read as unstaked: no single instance chain (chains with a safe: %s)",
             config.safe_chains or "none",

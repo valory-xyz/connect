@@ -46,7 +46,6 @@ from connect.signer_errors import cause_of, logged_cause
 
 logger = logging.getLogger("agent")
 
-# the reminder the session gives while the epoch's request is not made
 STAKING_REMINDER = (
     "This agent is staked. Make one Marketplace request today to become eligible "
     "for OLAS activity rewards."
@@ -56,7 +55,6 @@ STAKING_REMINDER = (
 LIVENESS_RATIO_SCALE = 10**18
 # the index of the Marketplace request count in the nonces both contracts keep
 REQUEST_COUNT_INDEX = 1
-# the server's one staking call: checkpoint(), no arguments
 CHECKPOINT_DATA = "0x" + CHECKPOINT_SELECTOR
 
 
@@ -74,23 +72,18 @@ def _call(
     w3: Web3, to: str, data: bytes, types: list[str], block: BlockIdentifier
 ) -> tuple:
     """Run one eth_call and decode what it returns."""
-    raw = w3.eth.call(
-        {"to": Web3.to_checksum_address(to), "data": HexBytes(data)}, block
-    )
+    raw = w3.eth.call({"to": to, "data": HexBytes(data)}, block)
     return abi_decode(types, bytes(raw))
 
 
 def _uint(w3: Web3, to: str, signature: str, block: BlockIdentifier) -> int:
     """Read a no-argument uint256 view."""
     (value,) = _call(w3, to, _selector(signature), ["uint256"], block)
-    return int(value)
+    return value
 
 
 def request_made_this_epoch(w3: Web3, staking: StakingConfig) -> bool:
-    """Whether the program's safe made the epoch's Marketplace requests.
-
-    Scores the count as RequesterActivityCheckerV2 does (every Connect program's
-    checker; README, "Staking"), over the window the contract will measure.
+    """Whether the program's safe made the epoch's Marketplace requests (README, "Staking").
 
     :raises ValueError: when the contract holds no record of this service and
         safe, or the checker answers in a shape it does not score.
@@ -133,19 +126,13 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig) -> bool:
     ratio = _uint(w3, staking.activity_checker, "livenessRatio()", block)
     # the chain's time, not this host's, as the checkpoint gate reads it
     now = w3.eth.get_block(block)["timestamp"]
-    # the contract measures from max(tsCheckpoint, tsStart) to the checkpoint,
-    # which lands no earlier than tsCheckpoint + livenessPeriod
     window = max(now, ts_checkpoint + liveness_period) - max(ts_checkpoint, ts_start)
     required = -(-window * ratio // LIVENESS_RATIO_SCALE)  # ceil, in integers
     return eligible >= required
 
 
 def staking_reminder(config: AppConfig, signer: Signer) -> str | None:
-    """Return the reminder for a session opening now, or None.
-
-    None while unstaked, once the request is made, and whenever the staking
-    state cannot be read: a failed read is logged and never reminds.
-    """
+    """Return the reminder while the epoch's request is not made, else None."""
     staking = config.staking
     if staking is None:
         return None
@@ -182,11 +169,7 @@ def checkpoint_if_due(
     guard: Guard,
     activity: ActivityLog,
 ) -> str | None:
-    """Call checkpoint() from the agent EOA once it is due; return the tx hash.
-
-    None while unstaked, while it is not worth sending, and on a failure, which
-    is logged and audited; the caller's next tick retries it.
-    """
+    """Send checkpoint() from the agent EOA once worth sending; return its tx hash, or None."""
     staking = config.staking
     if staking is None:
         return None
@@ -196,8 +179,6 @@ def checkpoint_if_due(
         w3 = signer.w3(chain)
         if not _checkpoint_worth_sending(w3, staking.staking_contract):
             return None
-        # armed only while restricted, as for the agent top-up: one armed in
-        # unrestricted mode would outlive a switch back for its TTL
         if guard.mode() == MODE_RESTRICTED:
             guard.allow_checkpoint_once(
                 chain=chain, staking_contract=staking.staking_contract
@@ -206,10 +187,7 @@ def checkpoint_if_due(
             chain,
             staking.staking_contract,
             data=CHECKPOINT_DATA,
-            # audited below under its own kind, outside the agent's activity
             audit=False,
-            # the server's own call, fixed to checkpoint() on the configured
-            # contract with no value: no session intent applies
             intent=SERVER_BUILT,
         )
         wait_mined(w3, tx_hash)

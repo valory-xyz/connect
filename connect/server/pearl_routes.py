@@ -95,11 +95,7 @@ class SessionRequest(BaseModel):
 
 
 def _staking_reminder(state: t.Any) -> str | None:
-    """Read the reminder within REMINDER_READ_SECONDS; past that, there is none.
-
-    Its reads go to the chain's RPC, which can hang for its whole timeout per
-    read, and the launch must not wait on them.
-    """
+    """Read the reminder within REMINDER_READ_SECONDS; past that, there is none."""
     reading = _REMINDER_READER.submit(
         staking.staking_reminder, state.config, state.signer
     )
@@ -116,10 +112,7 @@ def _staking_reminder(state: t.Any) -> str | None:
 
 
 def _write_session_notice(state: t.Any) -> None:
-    """Leave the session its staking reminder, or clear an earlier one.
-
-    A failure here never stops the launch: the session opens without it.
-    """
+    """Leave the session its staking reminder, or clear an earlier one."""
     try:
         state.workspace.write_session_notice(_staking_reminder(state))
     except OSError:

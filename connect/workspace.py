@@ -458,15 +458,9 @@ class Workspace:
         raise LaunchError(f"{reason} The workspace is at {self.path}")
 
     def write_session_notice(self, notice: str | None) -> None:
-        """Leave `notice` for the session about to open, or remove an old one.
-
-        The session can write its workspace, so whatever is at the name, a
-        link included, is removed rather than written through, and the file is
-        created exclusively: a link planted in between fails the write.
-        """
+        """Leave `notice` for the session, or remove an old one; never write through a link."""
         path = self.path / SESSION_NOTICE_FILE
-        if path.is_symlink() or path.exists():
-            _remove(path)
+        _remove(path)
         if notice is None:
             return
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)

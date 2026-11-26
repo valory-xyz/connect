@@ -216,7 +216,7 @@ class Guard:
         )
 
     def allow_checkpoint_once(self, *, chain: str, staking_contract: str) -> None:
-        """Permit one restricted-mode checkpoint() by the agent EOA on `chain`, replacing any earlier one."""
+        """Permit one restricted-mode checkpoint() by the agent EOA, replacing any earlier one."""
         with self._allowance_lock:
             self._purge_expired()
             self._checkpoint_allowances[(chain.lower(), staking_contract.lower())] = (

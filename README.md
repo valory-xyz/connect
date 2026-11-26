@@ -566,9 +566,9 @@ on chain, off-chain requests included.
   per launch.
 - **Checkpoint.** Nothing else in Pearl calls the permissionless
   `checkpoint()` that closes an epoch, so while staked the server checks
-  every `STAKING_CHECKPOINT_INTERVAL_SECONDS` whether one is worth sending,
-  as trader decides. A pending rebaseline (`getNextRewardCheckpointTimestamp()`
-  differs from `tsCheckpoint + livenessPeriod`) is sent at once: v0.4 then
+  every `STAKING_CHECKPOINT_INTERVAL_SECONDS` whether one is worth sending.
+  A pending rebaseline (`getNextRewardCheckpointTimestamp()` differs from
+  `tsCheckpoint + livenessPeriod`) is sent at once: the staking contract then
   answers the next checkpoint time with the current block's, so the send is
   never early, and no comparison with this host's clock is made, which would
   skip it whenever that clock runs behind the chain. Otherwise it is sent once

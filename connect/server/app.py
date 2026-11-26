@@ -68,8 +68,7 @@ PERFORMANCE_REFRESH_SECONDS = 15.0
 # requirement
 AGENT_TOPUP_INTERVAL_SECONDS = 3600.0
 
-# how often a staked instance checks whether its staking checkpoint is due: an
-# epoch is about a day, so this bounds how late Connect closes one
+# bounds how late a due checkpoint is sent
 STAKING_CHECKPOINT_INTERVAL_SECONDS = 600.0
 
 
@@ -143,6 +142,24 @@ def top_up_agent_signer(  # pylint: disable=too-many-arguments,too-many-position
             topped_up.discard(chain)
 
 
+async def _every(
+    interval: t.Callable[[], float],
+    failure: str,
+    job: t.Callable[..., object],
+    *args: t.Any,
+) -> None:
+    """Run `job(*args)` off the loop now, then every `interval()` s, until cancelled.
+
+    A failed run is logged as `failure` and never ends the loop.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(job, *args)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception(failure)
+        await asyncio.sleep(interval())
+
+
 async def top_up_agent(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     config: AppConfig,
     signer: Signer,
@@ -151,33 +168,33 @@ async def top_up_agent(  # pylint: disable=too-many-arguments,too-many-positiona
     topped_up: set[str],
 ) -> None:
     """Top up the agent EOA at start, then every interval, until cancelled."""
-    while True:
-        try:
-            await asyncio.to_thread(
-                top_up_agent_signer, config, signer, guard, activity, topped_up
-            )
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.exception("agent top-up check failed")
-        await asyncio.sleep(AGENT_TOPUP_INTERVAL_SECONDS)
+    await _every(
+        lambda: AGENT_TOPUP_INTERVAL_SECONDS,
+        "agent top-up check failed",
+        top_up_agent_signer,
+        config,
+        signer,
+        guard,
+        activity,
+        topped_up,
+    )
 
 
 async def checkpoint_staking(
     config: AppConfig, signer: Signer, guard: Guard, activity: ActivityLog
 ) -> None:
-    """Call the staking checkpoint whenever it is due, until cancelled.
-
-    Unstaked, it never starts: the program cannot change without a restart.
-    """
+    """Call the staking checkpoint whenever it is due, until cancelled; unstaked, never."""
     if config.staking is None:
         return
-    while True:
-        try:
-            await asyncio.to_thread(
-                staking.checkpoint_if_due, config, signer, guard, activity
-            )
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.exception("staking checkpoint check failed")
-        await asyncio.sleep(STAKING_CHECKPOINT_INTERVAL_SECONDS)
+    await _every(
+        lambda: STAKING_CHECKPOINT_INTERVAL_SECONDS,
+        "staking checkpoint check failed",
+        staking.checkpoint_if_due,
+        config,
+        signer,
+        guard,
+        activity,
+    )
 
 
 def create_app(  # pylint: disable=too-many-arguments,too-many-locals
