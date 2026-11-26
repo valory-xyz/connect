@@ -717,7 +717,7 @@ deployment configuration. Other chains keep their existing indexers.
 
 Off-chain requests sign explicit nonces by default
 (`CONNECTION_CONFIGS_CONFIG_MECH_NONCE_MODE`, `explicit` or `sequential`, read
-at start): mech-client picks a random nonce and a 15-minute settle deadline per
+at start; Pearl sets it through the service's `MECH_NONCE_MODE`): mech-client picks a random nonce and a 15-minute settle deadline per
 request, and the mech settles it on its own, in any order, so no request waits
 on another's slot. An explicit request takes no slot in the queue below, so a
 slot it still holds does not block it; the prepaid deposit counts it in flight
@@ -1028,7 +1028,7 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`, plus
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_NONCE_MODE,MECH_HARD_CANCEL_AFTER}`, plus
   `CONNECTION_CONFIGS_CONFIG_MECHX_{MARKETPLACE,REGISTRY}_{BASE,POLYGON}_SQUID_URL`;
   see [Base and Polygon indexers](#base-and-polygon-indexers))
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
