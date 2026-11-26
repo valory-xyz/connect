@@ -21,6 +21,7 @@
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import threading
@@ -53,11 +54,10 @@ from connect.config import (
 from connect.guard import Guard
 from connect.server import app as app_module
 from connect.server import pearl_routes
-from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import SERVER_BUILT, Signer, SignerError
 from connect.workspace import SESSION_NOTICE_FILE
 
-from tests.conftest import FakeW3, audit_entries
+from tests.conftest import FakeW3, audit_entries, end_at_sleep
 
 STAKING_CONTRACT = Web3.to_checksum_address("0x" + "5a" * 20)
 CHECKER = Web3.to_checksum_address("0x" + "c4" * 20)
@@ -65,7 +65,7 @@ SAFE = "0x" + "22" * 20
 SERVICE_ID = 42
 NOW = 1_800_000_000
 DAY = 86_400
-# ~1 request a day, as the Connect checkers are configured
+# ~1 request a day
 RATIO = 11_337_868_480_725
 PROGRAM = StakingConfig(
     chain="testchain",
@@ -220,17 +220,6 @@ def _audited(config: AppConfig, kind: str) -> list[dict]:
     return [e for e in audit_entries(config.store_path) if e["kind"] == kind]
 
 
-async def _run_until(job: t.Coroutine, done: t.Callable[[], bool]) -> None:
-    """Run `job` as a task until `done()` (or 5 s), then cancel it."""
-    task = asyncio.create_task(job)
-    deadline = time.monotonic() + 5
-    while not done() and time.monotonic() < deadline:
-        await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-
 class TestConfig:
     """The three env vars Pearl sets at deploy."""
 
@@ -339,13 +328,13 @@ class TestConfig:
 
     @pytest.mark.parametrize("service_id", [0, -1])
     def test_a_program_names_a_service(self, service_id: int) -> None:
-        """StakingConfig refuses an id that names no service."""
+        """A program refuses a service id that names no service."""
         with pytest.raises(ValueError, match="must be positive"):
             dataclasses.replace(PROGRAM, service_id=service_id)
 
 
 class TestRequestMade:
-    """request_made_this_epoch, against the Basius-style requirement."""
+    """request_made_this_epoch against the checker's requirement."""
 
     @pytest.mark.parametrize(
         ("safe_requests", "ts_checkpoint", "expected"),
@@ -440,7 +429,7 @@ class TestReminder:
     """staking_reminder, for POST /session."""
 
     def test_the_copy_is_the_adopted_one(self) -> None:
-        """The words D25/Q20 adopted, which the brief relays verbatim."""
+        """Pins the reminder text the brief relays."""
         assert staking.STAKING_REMINDER == (
             "This agent is staked. Make one Marketplace request today to become "
             "eligible for OLAS activity rewards."
@@ -485,25 +474,66 @@ class TestReminder:
         assert "secret-key" not in caplog.text
 
 
+@pytest.fixture
+def checkpoint(
+    staked_config: AppConfig, test_signer: Signer, guard: Guard, activity: ActivityLog
+) -> t.Callable[[], str | None]:
+    """Return checkpoint_if_due on the staked config, the signer wired to the guard."""
+    test_signer.set_guard(guard)
+    return functools.partial(
+        staking.checkpoint_if_due, staked_config, test_signer, guard, activity
+    )
+
+
+@pytest.fixture
+def restricted_checkpoint(
+    staked_config: AppConfig,
+    test_signer: Signer,
+    restricted_guard: Guard,
+    activity: ActivityLog,
+) -> t.Callable[[], str | None]:
+    """Return checkpoint_if_due under a restricted guard with nothing whitelisted."""
+    return functools.partial(
+        staking.checkpoint_if_due,
+        staked_config,
+        test_signer,
+        restricted_guard,
+        activity,
+    )
+
+
 class TestCheckpoint:
     """checkpoint_if_due, the lifespan's checkpoint call."""
 
-    def test_not_due_sends_nothing(  # pylint: disable=too-many-arguments
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {},
+            {"ts_checkpoint": NOW - 2 * DAY, "available_rewards": 0},
+            {"other_checkpoint_landed": True},
+        ],
+        ids=["not-due", "no-rewards-left", "another-checkpoint-between-the-reads"],
+    )
+    def test_not_worth_sending_sends_nothing(
         self,
+        checkpoint: t.Callable[[], str | None],
         staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
         w3: StakingW3,
+        state: dict,
     ) -> None:
-        """Before the next checkpoint time: nothing sent, nothing audited."""
-        test_signer.set_guard(guard)
-        assert (
-            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-            is None
-        )
+        """Not due, nothing left to pay, or no rebaseline after all: not sent.
+
+        The reads are pinned to one block, so another service's checkpoint
+        mined between them cannot pair an old next-checkpoint time with a new
+        tsCheckpoint and read as a rebaseline.
+        """
+        for name, value in state.items():
+            setattr(w3, name, value)
+        assert checkpoint() is None
         assert not w3.eth.sent
         assert not audit_entries(staked_config.store_path)
+        assert w3.blocks
+        assert set(w3.blocks) == {w3.pinned_block}
 
     def test_unstaked_reads_nothing(
         self,
@@ -522,15 +552,14 @@ class TestCheckpoint:
 
     def test_due_sends_checkpoint_from_the_eoa(  # pylint: disable=too-many-arguments
         self,
+        checkpoint: t.Callable[[], str | None],
         staked_config: AppConfig,
         test_signer: Signer,
         guard: Guard,
-        activity: ActivityLog,
         w3: StakingW3,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Due: one checkpoint() call, audited only as itself, no allowance armed."""
-        test_signer.set_guard(guard)
         w3.ts_checkpoint = NOW - DAY
         sends: list[tuple[str, str, dict]] = []
         send = test_signer.send
@@ -543,7 +572,7 @@ class TestCheckpoint:
         monkeypatch.setattr(test_signer, "send", spy)
         armed: list[dict] = []
         monkeypatch.setattr(guard, "allow_checkpoint_once", lambda **k: armed.append(k))
-        tx_hash = staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
+        tx_hash = checkpoint()
         assert tx_hash is not None
         assert tx_hash.startswith("0x")
         ((chain, to, kwargs),) = sends
@@ -569,22 +598,15 @@ class TestCheckpoint:
         assert set(w3.blocks) == {w3.pinned_block}
         assert w3.pinned_block in w3.time_blocks
 
-    def test_restricted_arms_the_allowance_it_spends(  # pylint: disable=too-many-arguments
+    def test_restricted_arms_the_allowance_it_spends(
         self,
-        staked_config: AppConfig,
+        restricted_checkpoint: t.Callable[[], str | None],
         test_signer: Signer,
-        settings_store: SettingsStore,
-        activity: ActivityLog,
         w3: StakingW3,
     ) -> None:
         """Restricted, nothing whitelisted: the allowance lets exactly one call pass."""
-        settings_store.save(
-            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
-        )
-        guard = Guard(settings_store, staked_config, agent_signer=test_signer.address)
-        test_signer.set_guard(guard)
         w3.ts_checkpoint = NOW - DAY - 1
-        assert staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
+        assert restricted_checkpoint()
         assert len(w3.eth.sent) == 1
         with pytest.raises(SignerError, match="only allow transactions targeting"):
             test_signer.send(
@@ -594,25 +616,19 @@ class TestCheckpoint:
     @pytest.mark.parametrize(
         "receipt", [{"status": 0}, None], ids=["reverted", "unmined"]
     )
-    def test_a_failed_call_is_audited_and_returns_none(  # pylint: disable=too-many-arguments
+    def test_a_failed_call_is_audited_and_returns_none(
         self,
+        checkpoint: t.Callable[[], str | None],
         staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
         w3: StakingW3,
         receipt: dict | None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A revert or a receipt that never comes: audited as failed, retried later."""
-        test_signer.set_guard(guard)
         w3.ts_checkpoint = NOW - DAY
         w3.eth.receipt = receipt
         with caplog.at_level(logging.WARNING, logger="agent"):
-            assert (
-                staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-                is None
-            )
+            assert checkpoint() is None
         (entry,) = _audited(staked_config, "staking_checkpoint_failed")
         assert entry["tx_hash"].startswith("0x")
         # the log names the transaction, so the operator can look it up
@@ -621,21 +637,14 @@ class TestCheckpoint:
         payload = (staked_config.store_path / PERFORMANCE_FILE).read_text()
         assert '"last_activity": null' in payload
 
-    def test_a_send_that_fails_before_the_guard_leaves_no_allowance(  # pylint: disable=too-many-arguments
+    def test_a_send_that_fails_before_the_guard_leaves_no_allowance(
         self,
-        staked_config: AppConfig,
+        restricted_checkpoint: t.Callable[[], str | None],
         test_signer: Signer,
-        settings_store: SettingsStore,
-        activity: ActivityLog,
         w3: StakingW3,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A send that never reached the guard: its allowance is withdrawn."""
-        settings_store.save(
-            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
-        )
-        guard = Guard(settings_store, staked_config, agent_signer=test_signer.address)
-        test_signer.set_guard(guard)
         w3.ts_checkpoint = NOW - DAY
         send = test_signer.send
 
@@ -643,10 +652,7 @@ class TestCheckpoint:
             raise ConnectionError("rpc down")
 
         monkeypatch.setattr(test_signer, "send", failing)
-        assert (
-            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-            is None
-        )
+        assert restricted_checkpoint() is None
         with pytest.raises(SignerError, match="only allow transactions targeting"):
             send(
                 "testchain",
@@ -655,89 +661,32 @@ class TestCheckpoint:
                 intent=SERVER_BUILT,
             )
 
-    def test_no_rewards_left_sends_nothing(  # pylint: disable=too-many-arguments
-        self,
-        staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
-        w3: StakingW3,
-    ) -> None:
-        """Due, but with no rewards a checkpoint changes nothing: not sent."""
-        test_signer.set_guard(guard)
-        w3.ts_checkpoint = NOW - 2 * DAY
-        w3.available_rewards = 0
-        assert (
-            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-            is None
-        )
-        assert not w3.eth.sent
-        assert not audit_entries(staked_config.store_path)
-
-    def test_a_pending_rebaseline_is_sent_without_rewards(  # pylint: disable=too-many-arguments
-        self,
-        staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
-        w3: StakingW3,
-    ) -> None:
-        """v0.4 answers the current block's time while rebaselining: sent even so."""
-        test_signer.set_guard(guard)
-        w3.available_rewards = 0
-        # tsCheckpoint + livenessPeriod is still a minute away
-        w3.next_checkpoint = NOW
-        assert staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-        assert len(w3.eth.sent) == 1
-
     @pytest.mark.parametrize(
-        "ts_checkpoint",
-        [NOW - DAY + 60, NOW - DAY - 60],
-        ids=["epoch-not-over", "epoch-overdue"],
+        ("ts_checkpoint", "next_checkpoint", "available_rewards"),
+        [
+            # tsCheckpoint + livenessPeriod is still a minute away
+            (NOW - DAY + 60, NOW, 0),
+            # the block time the contract answers, a few seconds ahead of the
+            # pinned block, on both sides of tsCheckpoint + livenessPeriod
+            (NOW - DAY + 60, NOW + 6, 10**18),
+            (NOW - DAY - 60, NOW + 6, 10**18),
+        ],
+        ids=["no-rewards-left", "epoch-not-over", "epoch-overdue"],
     )
-    def test_a_rebaseline_is_sent_with_this_clock_behind_the_chain(  # pylint: disable=too-many-arguments
+    def test_a_pending_rebaseline_is_sent(
         self,
-        staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
+        checkpoint: t.Callable[[], str | None],
         w3: StakingW3,
         ts_checkpoint: int,
+        next_checkpoint: int,
+        available_rewards: int,
     ) -> None:
-        """The block time v0.4 answers a few seconds ahead of this host: sent.
-
-        Both sides of `tsCheckpoint + livenessPeriod`: an overdue epoch's
-        block time is above it, a current one's below.
-        """
-        test_signer.set_guard(guard)
+        """A rebaseline is sent at once, rewards or not, whatever the times say."""
         w3.ts_checkpoint = ts_checkpoint
-        w3.next_checkpoint = NOW + 6
-        assert staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
+        w3.next_checkpoint = next_checkpoint
+        w3.available_rewards = available_rewards
+        assert checkpoint()
         assert len(w3.eth.sent) == 1
-
-    def test_another_checkpoint_between_the_reads_is_no_rebaseline(  # pylint: disable=too-many-arguments
-        self,
-        staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
-        w3: StakingW3,
-    ) -> None:
-        """A checkpoint mined between the reads is no rebaseline.
-
-        The reads are pinned to one block, so they cannot pair an old
-        next-checkpoint time with a new tsCheckpoint.
-        """
-        test_signer.set_guard(guard)
-        w3.other_checkpoint_landed = True
-        assert (
-            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-            is None
-        )
-        assert not w3.eth.sent
-        # every read, not only the first, at the one pinned block
-        assert w3.blocks
-        assert set(w3.blocks) == {w3.pinned_block}
 
     @pytest.mark.parametrize(
         ("chain_time", "host_time", "sent"),
@@ -749,10 +698,7 @@ class TestCheckpoint:
     )
     def test_the_due_time_is_the_chain_s_not_this_host_s(  # pylint: disable=too-many-arguments
         self,
-        staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
+        checkpoint: t.Callable[[], str | None],
         w3: StakingW3,
         monkeypatch: pytest.MonkeyPatch,
         chain_time: int,
@@ -760,29 +706,22 @@ class TestCheckpoint:
         sent: bool,
     ) -> None:
         """A host clock ahead of the chain pays for no no-op checkpoint()."""
-        test_signer.set_guard(guard)
         w3.chain_time = chain_time  # next checkpoint time is NOW + 60
         monkeypatch.setattr(time, "time", lambda: float(host_time))
-        result = staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-        assert (result is not None) is sent
+        assert (checkpoint() is not None) is sent
         assert len(w3.eth.sent) == (1 if sent else 0)
 
-    def test_a_failed_read_sends_nothing(  # pylint: disable=too-many-arguments
+    def test_a_failed_read_sends_nothing(
         self,
+        checkpoint: t.Callable[[], str | None],
         staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
         w3: StakingW3,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The due-time read failing: audited without the RPC's words, nothing sent."""
         w3.fail = ConnectionError("http://rpc.example/secret-key unreachable")
         with caplog.at_level(logging.WARNING, logger="agent"):
-            assert (
-                staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-                is None
-            )
+            assert checkpoint() is None
         assert not w3.eth.sent
         (entry,) = _audited(staked_config, "staking_checkpoint_failed")
         assert entry["tx_hash"] is None
@@ -795,222 +734,151 @@ class TestGuardAllowance:
     """allow_checkpoint_once admits exactly checkpoint() to the armed contract."""
 
     @pytest.fixture
-    def restricted(
-        self, settings_store: SettingsStore, app_config: AppConfig, test_signer: Signer
-    ) -> Guard:
-        """Return a restricted guard with an empty whitelist."""
-        settings_store.save(
-            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+    def armed(self, restricted_guard: Guard) -> Guard:
+        """Return a restricted guard, nothing whitelisted, its checkpoint armed."""
+        restricted_guard.allow_checkpoint_once(
+            chain="testchain", staking_contract=STAKING_CONTRACT
         )
-        return Guard(settings_store, app_config, agent_signer=test_signer.address)
+        return restricted_guard
+
+    def _check(self, guard: Guard, chain: str = "testchain", **kwargs: t.Any) -> None:
+        """Check the exact checkpoint() call, sent as the server's own."""
+        guard.check_transaction(
+            chain,
+            STAKING_CONTRACT,
+            0,
+            staking.CHECKPOINT_DATA,
+            server_built=True,
+            **kwargs,
+        )
 
     @pytest.mark.parametrize(
-        ("to", "value", "data"),
+        ("to", "value", "data", "server_built"),
         [
-            (STAKING_CONTRACT, 1, staking.CHECKPOINT_DATA),
-            (STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA + "00"),
-            (STAKING_CONTRACT, 0, "0x"),
-            (CHECKER, 0, staking.CHECKPOINT_DATA),
+            (STAKING_CONTRACT, 1, staking.CHECKPOINT_DATA, True),
+            (STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA + "00", True),
+            (STAKING_CONTRACT, 0, "0x", True),
+            (CHECKER, 0, staking.CHECKPOINT_DATA, True),
+            (STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, False),
         ],
-        ids=["value", "extra-data", "no-data", "other-contract"],
+        ids=["value", "extra-data", "no-data", "other-contract", "agent-send"],
     )
-    def test_refuses_anything_else(
-        self, restricted: Guard, to: str, value: int, data: str
+    def test_refuses_anything_else(  # pylint: disable=too-many-arguments
+        self, armed: Guard, to: str, value: int, data: str, server_built: bool
     ) -> None:
-        """Value, other calldata or another contract: refused, allowance kept."""
-        restricted.allow_checkpoint_once(
-            chain="testchain", staking_contract=STAKING_CONTRACT
-        )
+        """Value, other calldata, another contract or an agent's copy: refused, kept."""
         with pytest.raises(Exception, match="only allow transactions targeting"):
-            restricted.check_transaction(
-                "testchain", to, value, data, server_built=True
+            armed.check_transaction(
+                "testchain", to, value, data, server_built=server_built
             )
         # the allowance is still there for the exact call
-        restricted.check_transaction(
-            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, server_built=True
-        )
+        self._check(armed)
 
-    def test_an_agent_send_of_the_same_call_is_refused(self, restricted: Guard) -> None:
-        """Only the server's own send spends it: an agent's exact copy is refused."""
-        restricted.allow_checkpoint_once(
-            chain="testchain", staking_contract=STAKING_CONTRACT
-        )
-        with pytest.raises(Exception, match="only allow transactions targeting"):
-            restricted.check_transaction(
-                "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
-            )
-        restricted.check_transaction(
-            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, server_built=True
-        )
-
-    def test_a_revoked_allowance_admits_nothing(self, restricted: Guard) -> None:
-        """revoke_checkpoint withdraws it; revoking none is a no-op."""
-        restricted.revoke_checkpoint(
-            chain="testchain", staking_contract=STAKING_CONTRACT
-        )
-        restricted.allow_checkpoint_once(
-            chain="testchain", staking_contract=STAKING_CONTRACT
-        )
-        restricted.revoke_checkpoint(
+    def test_a_revoked_allowance_admits_nothing(self, armed: Guard) -> None:
+        """revoke_checkpoint withdraws it, whatever the address's case."""
+        armed.revoke_checkpoint(
             chain="TESTCHAIN", staking_contract=STAKING_CONTRACT.lower()
         )
         with pytest.raises(Exception, match="only allow transactions targeting"):
-            restricted.check_transaction(
-                "testchain",
-                STAKING_CONTRACT,
-                0,
-                staking.CHECKPOINT_DATA,
-                server_built=True,
-            )
+            self._check(armed)
+        # and revoking none is a no-op
+        armed.revoke_checkpoint(chain="testchain", staking_contract=STAKING_CONTRACT)
 
     def test_applies_to_its_own_chain_only(
-        self, restricted: Guard, app_config: AppConfig
+        self, armed: Guard, app_config: AppConfig
     ) -> None:
         """The exact call on another chain: refused, the armed chain's allowance kept."""
         app_config.chains["otherchain"] = ChainConfig(
             rpc_url="http://127.0.0.1:9", safe_address=SAFE
         )
-        restricted.allow_checkpoint_once(
-            chain="testchain", staking_contract=STAKING_CONTRACT
-        )
         with pytest.raises(Exception, match="only allow transactions targeting"):
-            restricted.check_transaction(
-                "otherchain",
-                STAKING_CONTRACT,
-                0,
-                staking.CHECKPOINT_DATA,
-                server_built=True,
-            )
-        restricted.check_transaction(
-            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, server_built=True
-        )
+            self._check(armed, "otherchain")
+        self._check(armed)
 
-    def test_a_dry_run_consumes_nothing(self, restricted: Guard) -> None:
+    def test_a_dry_run_consumes_nothing(self, armed: Guard) -> None:
         """consume=False answers without spending the allowance."""
-        restricted.allow_checkpoint_once(
-            chain="testchain", staking_contract=STAKING_CONTRACT
-        )
-        restricted.check_transaction(
-            "testchain",
-            STAKING_CONTRACT,
-            0,
-            staking.CHECKPOINT_DATA,
-            consume=False,
-            server_built=True,
-        )
-        restricted.check_transaction(
-            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, server_built=True
-        )
+        self._check(armed, consume=False)
+        self._check(armed)
         with pytest.raises(Exception, match="only allow transactions targeting"):
-            restricted.check_transaction(
-                "testchain",
-                STAKING_CONTRACT,
-                0,
-                staking.CHECKPOINT_DATA,
-                server_built=True,
-            )
+            self._check(armed)
 
     def test_an_allowance_expires(
         self,
-        restricted: Guard,
+        restricted_guard: Guard,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Unused past its TTL: gone, and the log says so."""
         clock = [1000.0]
         monkeypatch.setattr("connect.guard.time.monotonic", lambda: clock[0])
-        restricted.allow_checkpoint_once(
+        restricted_guard.allow_checkpoint_once(
             chain="testchain", staking_contract=STAKING_CONTRACT
         )
         clock[0] += 3600
         with caplog.at_level(logging.WARNING, logger="agent"):
             with pytest.raises(Exception, match="only allow transactions targeting"):
-                restricted.check_transaction(
-                    "testchain",
-                    STAKING_CONTRACT,
-                    0,
-                    staking.CHECKPOINT_DATA,
-                    server_built=True,
-                )
+                self._check(restricted_guard)
         assert "checkpoint allowance" in caplog.text
 
 
 class TestCheckpointTask:
     """checkpoint_staking, the lifespan task."""
 
-    def test_unstaked_never_starts(
+    def _run(
         self,
-        app_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
         monkeypatch: pytest.MonkeyPatch,
+        config: AppConfig,
+        check: t.Callable[..., None],
+    ) -> list[str]:
+        """Run the task until its second sleep; return what happened, in order."""
+        events: list[str] = []
+
+        def recorded_check(*args: t.Any) -> None:
+            """Record a check, then run the given one."""
+            events.append("check")
+            check(*args)
+
+        monkeypatch.setattr(staking, "checkpoint_if_due", recorded_check)
+        end_at_sleep(monkeypatch, events)
+        args: tuple = (config, None, None, None)
+        try:
+            asyncio.run(app_module.checkpoint_staking(*args))
+        except asyncio.CancelledError:
+            pass
+        return events
+
+    def test_unstaked_never_starts(
+        self, app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Unstaked: the task returns at once, having called nothing."""
-        called: list[int] = []
-        monkeypatch.setattr(
-            staking, "checkpoint_if_due", lambda *a, **k: called.append(1)
-        )
-        asyncio.run(
-            app_module.checkpoint_staking(app_config, test_signer, guard, activity)
-        )
-        assert not called
+        assert not self._run(monkeypatch, app_config, lambda *a: None)
 
-    def test_staked_checks_every_interval(
-        self,
-        staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_staked_checks_at_start_then_every_interval(
+        self, staked_config: AppConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Staked: a check, then one per interval, until cancelled."""
-        called: list[int] = []
-        monkeypatch.setattr(
-            staking, "checkpoint_if_due", lambda *a, **k: called.append(1)
-        )
-        monkeypatch.setattr(app_module, "STAKING_CHECKPOINT_INTERVAL_SECONDS", 0.0)
+        assert self._run(monkeypatch, staked_config, lambda *a: None) == [
+            "check",
+            "sleep 600.0",
+            "check",
+            "sleep 600.0",
+        ]
 
-        asyncio.run(
-            _run_until(
-                app_module.checkpoint_staking(
-                    staked_config, test_signer, guard, activity
-                ),
-                lambda: len(called) >= 3,
-            )
-        )
-        assert len(called) >= 3
-
-    def test_a_failed_check_does_not_end_the_task(  # pylint: disable=too-many-arguments
+    def test_a_failed_check_does_not_end_the_task(
         self,
         staked_config: AppConfig,
-        test_signer: Signer,
-        guard: Guard,
-        activity: ActivityLog,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Whatever a check raises is logged, and the next one still runs."""
-        called: list[int] = []
 
-        def failing(*_: t.Any, **__: t.Any) -> None:
+        def failing(*_: t.Any) -> None:
             """Fail every check."""
-            called.append(1)
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(staking, "checkpoint_if_due", failing)
-        monkeypatch.setattr(app_module, "STAKING_CHECKPOINT_INTERVAL_SECONDS", 0.0)
-
         with caplog.at_level(logging.ERROR, logger="agent"):
-            asyncio.run(
-                _run_until(
-                    app_module.checkpoint_staking(
-                        staked_config, test_signer, guard, activity
-                    ),
-                    lambda: len(called) >= 2,
-                )
-            )
-        assert len(called) >= 2
+            events = self._run(monkeypatch, staked_config, failing)
+        assert events.count("check") == 2
         assert "staking checkpoint check failed" in caplog.text
 
     def test_runs_with_the_app_and_stops_after(  # pylint: disable=too-many-arguments

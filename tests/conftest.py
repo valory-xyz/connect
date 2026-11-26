@@ -19,6 +19,7 @@
 
 """Shared pytest fixtures."""
 
+import asyncio
 import io
 import json
 import sys
@@ -43,10 +44,12 @@ from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
 from connect.config import AppConfig, ChainConfig, MECH_NONCE_MODE_SEQUENTIAL
 from connect.guard import Guard
 from connect.mech import MechService
+from connect.server import app as app_module
 from connect.server import auth as auth_module
 from connect.server.app import create_app
 from connect.server.auth import GrantStore
 from connect.settings import (
+    MODE_RESTRICTED,
     MODE_UNRESTRICTED,
     Protected,
     SETTINGS_FILE,
@@ -587,6 +590,33 @@ def guard(
 ) -> Guard:
     """Guard over the unrestricted test settings store."""
     return Guard(settings_store, app_config, agent_signer=account.address)
+
+
+@pytest.fixture
+def restricted_guard(
+    settings_store: SettingsStore, app_config: AppConfig, test_signer: Signer
+) -> Guard:
+    """Return a restricted guard with an empty whitelist, wired to the signer."""
+    settings_store.save(
+        Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
+    )
+    guard = Guard(settings_store, app_config, agent_signer=test_signer.address)
+    test_signer.set_guard(guard)
+    return guard
+
+
+def end_at_sleep(
+    monkeypatch: pytest.MonkeyPatch, events: list[str], count: int = 2
+) -> None:
+    """Make the server's periodic jobs record each sleep in `events`, ending at the `count`th."""
+
+    async def sleep(seconds: float) -> None:
+        """Record the sleep; end the job at the `count`th."""
+        events.append(f"sleep {seconds}")
+        if sum(e.startswith("sleep ") for e in events) == count:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(app_module.asyncio, "sleep", sleep)
 
 
 @pytest.fixture
