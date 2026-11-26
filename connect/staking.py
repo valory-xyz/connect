@@ -33,9 +33,9 @@ from web3 import Web3
 from web3.types import BlockIdentifier
 
 from connect.activity import (
+    ActivityLog,
     STAKING_CHECKPOINT_FAILED_KIND,
     STAKING_CHECKPOINT_KIND,
-    ActivityLog,
 )
 from connect.chain_read import selector_of
 from connect.config import AppConfig, StakingConfig
@@ -77,9 +77,7 @@ def _call(
     return abi_decode(types, bytes(raw))
 
 
-def _uint(
-    w3: Web3, to: str, signature: str, block: BlockIdentifier = "latest"
-) -> int:
+def _uint(w3: Web3, to: str, signature: str, block: BlockIdentifier = "latest") -> int:
     """Read a no-argument uint256 view."""
     (value,) = _call(w3, to, _selector(signature), ["uint256"], block)
     return int(value)

@@ -617,8 +617,11 @@ class TestCheckpoint:
         activity: ActivityLog,
         w3: StakingW3,
     ) -> None:
-        """The reads are pinned to one block, so a checkpoint mined between them
-        cannot pair an old next-checkpoint time with a new tsCheckpoint."""
+        """A checkpoint mined between the reads is no rebaseline.
+
+        The reads are pinned to one block, so they cannot pair an old
+        next-checkpoint time with a new tsCheckpoint.
+        """
         test_signer.set_guard(guard)
         w3.checkpoint_lands_after_next_read = True
         assert (
