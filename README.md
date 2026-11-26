@@ -559,11 +559,13 @@ on chain, off-chain requests included.
 - **Checkpoint.** Nothing else in Pearl calls the permissionless
   `checkpoint()` that closes an epoch, so while staked the server checks
   every `STAKING_CHECKPOINT_INTERVAL_SECONDS` whether one is worth sending,
-  as trader decides: `getNextRewardCheckpointTimestamp()` has passed and
-  `availableRewards()` is above 0 (with none left a checkpoint changes
-  nothing, so it would be due, and paid for, on every check), or a rebaseline
-  is pending (that timestamp differs from `tsCheckpoint + livenessPeriod`).
-  If so the agent EOA calls it, with its own gas. A mined call is audited as
+  as trader decides. It is never sent before
+  `getNextRewardCheckpointTimestamp()`, and once that has passed it is sent
+  when `availableRewards()` is above 0 (with none left a checkpoint changes
+  nothing, so it would be due, and paid for, on every check) or a rebaseline
+  is pending (that timestamp differs from `tsCheckpoint + livenessPeriod`;
+  v0.4 then answers the current block's time, so it is due at once). If so
+  the agent EOA calls it, with its own gas. A mined call is audited as
   `staking_checkpoint`, anything else as `staking_checkpoint_failed`, and the
   next check retries. Like the agent top-up, those are the call's whole audit
   and never count as the agent's activity. It is no MCP tool and draws on no

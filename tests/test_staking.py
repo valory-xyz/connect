@@ -510,14 +510,34 @@ class TestCheckpoint:
         activity: ActivityLog,
         w3: StakingW3,
     ) -> None:
-        """v0.4 signals a rebaseline by its next checkpoint time: sent even so."""
+        """v0.4 answers the current block's time while rebaselining: sent even so."""
         test_signer.set_guard(guard)
         w3.available_rewards = 0
-        w3.next_checkpoint = NOW + DAY
+        # tsCheckpoint + livenessPeriod is still a minute away
+        w3.next_checkpoint = NOW
         assert staking.checkpoint_if_due(
             staked_config, test_signer, guard, activity, now=_now
         )
         assert len(w3.eth.sent) == 1
+
+    def test_a_rebaseline_is_not_sent_before_the_next_checkpoint_time(  # pylint: disable=too-many-arguments
+        self,
+        staked_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        w3: StakingW3,
+    ) -> None:
+        """A next checkpoint time still ahead: nothing sent, whatever it signals."""
+        test_signer.set_guard(guard)
+        w3.next_checkpoint = NOW + DAY
+        assert (
+            staking.checkpoint_if_due(
+                staked_config, test_signer, guard, activity, now=_now
+            )
+            is None
+        )
+        assert not w3.eth.sent
 
     def test_a_failed_read_sends_nothing(  # pylint: disable=too-many-arguments
         self,
