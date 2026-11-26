@@ -723,7 +723,8 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         the cause in `watch_errors`, and never loses the payload.
         """
         for key in list(payload.get("pending_request_ids") or []):
-            remaining = deadline - time.monotonic()
+            # float arithmetic on an unmoved clock can land a hair above the bound
+            remaining = min(deadline - time.monotonic(), MAX_DELIVERY_TIMEOUT)
             if remaining < 1:
                 break
             try:
