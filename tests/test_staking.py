@@ -29,6 +29,7 @@ import threading
 import time
 import typing as t
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from eth_abi import decode as abi_decode
@@ -846,7 +847,9 @@ class TestCheckpointTask:
 
         monkeypatch.setattr(staking, "checkpoint_if_due", recorded_check)
         end_at_sleep(monkeypatch, events)
-        args: tuple = (config, None, None, None)
+        # a workspace not yet usable, so each tick stops after the checkpoint
+        unready = SimpleNamespace(ensure=lambda: False)
+        args: tuple = (config, None, None, None, unready)
         # end_at_sleep cancels a staked task; an unstaked one returns at once
         with contextlib.suppress(asyncio.CancelledError):
             asyncio.run(app_module.checkpoint_staking(*args))
@@ -901,6 +904,7 @@ class TestCheckpointTask:
         monkeypatch.setattr(
             staking, "checkpoint_if_due", lambda *a, **k: checks.append(a)
         )
+        monkeypatch.setattr(staking, "staking_reminder", lambda config, signer: None)
         app = make_app(test_signer, staked_config, activity)
         with TestClient(app, base_url="http://127.0.0.1:8716"):
             deadline = time.monotonic() + 5
@@ -1129,6 +1133,81 @@ class TestSessionNotice:
             lambda: None
         ).result(timeout=5)
         assert len(reads) == 1
+
+    def _tick(self, client: TestClient, app_config: AppConfig) -> None:
+        """Run one staking tick against the client's app."""
+        state = client.app.state  # type: ignore[attr-defined]
+        app_module.staking_tick(
+            app_config, state.signer, state.guard, None, state.workspace  # type: ignore[arg-type]
+        )
+
+    def test_each_tick_refreshes_the_notice(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A request made between two ticks: the second removes the notice.
+
+        So a session opened from the coding tool, with no POST /session,
+        still finds the current reminder.
+        """
+        events: list[str] = []
+        answers = [staking.STAKING_REMINDER, None]
+        monkeypatch.setattr(
+            staking, "checkpoint_if_due", lambda *a: events.append("checkpoint")
+        )
+
+        def reminder(config: AppConfig, signer: Signer) -> str | None:
+            """Answer the reminder, then nothing once the request is made."""
+            events.append("reminder")
+            return answers.pop(0)
+
+        monkeypatch.setattr(staking, "staking_reminder", reminder)
+        self._tick(client, app_config)
+        assert self._notice(app_config).read_text(encoding="utf-8") == (
+            staking.STAKING_REMINDER + "\n"
+        )
+        self._tick(client, app_config)
+        assert not self._notice(app_config).exists()
+        # the checkpoint first, so the notice reflects the state after it
+        assert events == ["checkpoint", "reminder"] * 2
+
+    def test_a_tick_writes_nothing_before_the_workspace_is_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unusable workspace: the checkpoint still runs, no notice is read."""
+        events: list[str] = []
+        monkeypatch.setattr(
+            staking, "checkpoint_if_due", lambda *a: events.append("checkpoint")
+        )
+        monkeypatch.setattr(
+            staking, "staking_reminder", lambda *a: events.append("reminder")
+        )
+        unready = SimpleNamespace(ensure=lambda: False)
+        app_module.staking_tick(None, None, None, None, unready)  # type: ignore[arg-type]
+        assert events == ["checkpoint"]
+
+    def test_an_unwritable_notice_never_ends_the_tick(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A disk error refreshing the notice is logged, not raised."""
+        monkeypatch.setattr(staking, "checkpoint_if_due", lambda *a: None)
+        monkeypatch.setattr(
+            staking, "staking_reminder", lambda config, signer: staking.STAKING_REMINDER
+        )
+
+        def broken(self: t.Any, notice: str | None) -> None:
+            raise FileExistsError("a launch's write won the race")
+
+        monkeypatch.setattr("connect.workspace.Workspace.write_session_notice", broken)
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            self._tick(client, app_config)
+        assert "could not refresh the session notice" in caplog.text
 
     def test_the_brief_tells_the_session_to_say_it(self) -> None:
         """The shipped brief names the file and says to relay it first."""

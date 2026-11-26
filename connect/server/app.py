@@ -180,20 +180,45 @@ async def top_up_agent(  # pylint: disable=too-many-arguments,too-many-positiona
     )
 
 
-async def checkpoint_staking(
-    config: AppConfig, signer: Signer, guard: Guard, activity: ActivityLog
+def staking_tick(
+    config: AppConfig,
+    signer: Signer,
+    guard: Guard,
+    activity: ActivityLog,
+    workspace: Workspace,
 ) -> None:
-    """Call the staking checkpoint whenever it is due, until cancelled; unstaked, never."""
+    """Send the checkpoint if due, then refresh the session notice from the chain.
+
+    The refresh is what keeps a session opened outside Pearl current.
+    """
+    staking.checkpoint_if_due(config, signer, guard, activity)
+    if not workspace.ensure():
+        return
+    try:
+        workspace.write_session_notice(staking.staking_reminder(config, signer))
+    except OSError:
+        logger.exception("could not refresh the session notice")
+
+
+async def checkpoint_staking(
+    config: AppConfig,
+    signer: Signer,
+    guard: Guard,
+    activity: ActivityLog,
+    workspace: Workspace,
+) -> None:
+    """Run the staking tick every interval, until cancelled; unstaked, never."""
     if config.staking is None:
         return
     await _every(
         lambda: STAKING_CHECKPOINT_INTERVAL_SECONDS,
         "staking checkpoint check failed",
-        staking.checkpoint_if_due,
+        staking_tick,
         config,
         signer,
         guard,
         activity,
+        workspace,
     )
 
 
@@ -229,7 +254,9 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
             asyncio.create_task(
                 top_up_agent(config, signer, guard, activity, running.state.topped_up)
             ),
-            asyncio.create_task(checkpoint_staking(config, signer, guard, activity)),
+            asyncio.create_task(
+                checkpoint_staking(config, signer, guard, activity, workspace)
+            ),
         )
         try:
             async with mcp.session_manager.run():

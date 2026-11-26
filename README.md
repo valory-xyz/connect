@@ -563,7 +563,11 @@ on chain, off-chain requests included.
   is logged and never reminds, and neither it nor the write can fail the
   launch. Every launch reads on one worker thread, and a read that times out
   while still queued is dropped, so a hung RPC leaves one read behind, not one
-  per launch.
+  per launch. The checkpoint's periodic tick (below) reads and writes the
+  notice the same way after each check, once the workspace is usable, so a
+  session opened from the coding tool, with no `POST /session`, finds it at
+  most one interval old. A tick and a launch writing at once cannot follow a
+  link: the loser's exclusive create fails, and that is logged.
 - **Checkpoint.** Nothing else in Pearl calls the permissionless
   `checkpoint()` that closes an epoch, so while staked the server checks
   every `STAKING_CHECKPOINT_INTERVAL_SECONDS` whether one is worth sending.
