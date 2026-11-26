@@ -138,8 +138,8 @@ address, its ABI, its signature convention — is the session's problem.
 
 ## Run window
 
-Connect has no staking epoch, so its activity goal is **one run window per
-process** of N minutes, opened when the process starts and never rolled over.
+Connect's activity goal is not a staking epoch, staked or not (see
+[Staking](#staking)): it is **one run window per process** of N minutes, opened when the process starts and never rolled over.
 Every write of `agent_performance.json` carries it as the `activity_goal`
 block Pearl reads through the middleware's `agent_performance` endpoint:
 
