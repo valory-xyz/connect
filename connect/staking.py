@@ -34,7 +34,8 @@ from web3 import Web3
 from connect.activity import ActivityLog
 from connect.chain_read import selector_of
 from connect.config import AppConfig, StakingConfig
-from connect.guard import CHECKPOINT_SELECTOR, Guard
+from connect.guard import Guard
+from connect.safe import CHECKPOINT_SELECTOR
 from connect.server.receipts import wait_mined
 from connect.settings import MODE_RESTRICTED
 from connect.signer import SERVER_BUILT, Signer
@@ -52,14 +53,13 @@ STAKING_REMINDER = (
 LIVENESS_RATIO_SCALE = 10**18
 # the index of the Marketplace request count in the nonces both contracts keep
 REQUEST_COUNT_INDEX = 1
+# the server's one staking call: checkpoint(), no arguments
+CHECKPOINT_DATA = "0x" + CHECKPOINT_SELECTOR
 
 
 def _selector(signature: str) -> bytes:
     """Return a function's 4-byte selector, as bytes."""
     return bytes.fromhex(selector_of(signature)[2:])
-
-
-CHECKPOINT_DATA = "0x" + CHECKPOINT_SELECTOR
 
 
 def _call(w3: Web3, to: str, data: bytes, types: list[str]) -> tuple:

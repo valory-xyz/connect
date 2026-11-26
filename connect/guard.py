@@ -80,10 +80,10 @@ import threading
 import time
 from dataclasses import dataclass
 
-from connect.chain_read import selector_of
 from connect.chains import MECH_MARKETPLACES
 from connect.config import AppConfig
 from connect.safe import (
+    CHECKPOINT_SELECTOR,
     EXEC_TRANSACTION_SELECTOR,
     OPERATION_CALL,
     SafeExec,
@@ -94,9 +94,6 @@ from connect.safe import (
 from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targets
 
 logger = logging.getLogger("agent")
-
-# checkpoint(), the one call a checkpoint allowance admits, as calldata_hex reads it
-CHECKPOINT_SELECTOR = selector_of("checkpoint()")[2:]
 
 
 class GuardError(Exception):
