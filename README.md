@@ -715,6 +715,15 @@ deployment configuration. Other chains keep their existing indexers.
 
 ### One payer per safe: nonces
 
+Off-chain requests sign explicit nonces by default: mech-client picks a random
+nonce and a 15-minute settle deadline per request, and the mech settles it on
+its own, in any order, so no request waits on another's slot. A mech without
+explicit nonces answers with a 503 and mech-client resends the request
+sequentially. An explicit request takes no slot in the queue below, so a slot
+it still holds does not block it. Setting
+`CONNECTION_CONFIGS_CONFIG_MECH_NONCE_MODE=sequential` sends every off-chain
+request through the allocator instead, as below; mechs before v0.37 need it.
+
 Off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
 process, through its `send_with_nonce`, so concurrent requests from one safe
 never share one. It follows the deployed sequential marketplace: the mech
@@ -895,9 +904,12 @@ mech it pays and whose terms apply: `valory_operated` and `terms` or
 `identification_note` on both flows, plus `operator`, `benchmarks`,
 `delivery`, `payment_info` and `terms_url` on the off-chain flow, which is the
 one that reads the manifest. `payment_info` is the report's `payment` label
-under another name: in the answer, `payment` is the charge the request
-accepted, the mech's per-request rate for each request id it took, as an
-integer in base units of its payment asset. Each report is its own check, resolver, indexer and
+under another name: in the answer, `payment` is what the request was charged,
+as an integer in base units of its payment asset: the mech's reported charge
+for each request id it took (`reported_charges`), and the per-request rate the
+request accepted for an id with none reported yet. `signed_cap` is that rate
+for every id, the most the request can cost; `mech_result` reports a
+delivery's charge as `payment` too. Each report is its own check, resolver, indexer and
 proof fetch alike, so two reports in one flow can disagree after a DNS blip
 or an indexer hiccup; `mech_request`'s is the one that governs the request it
 sent. mech-client's warnings, including a check that could not complete, are

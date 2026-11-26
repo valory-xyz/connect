@@ -139,3 +139,22 @@ def charged(terms: dict, rate: int, result: dict) -> dict:
         fields["payment_info"] = fields.pop("payment")
     fields["payment"] = rate * len(result.get("request_ids") or [])
     return fields
+
+
+def settle_payment(payload: dict, rate: int) -> None:
+    """Report as `payment` what the mech said it charged, the signed cap as `signed_cap`.
+
+    A request id the mech reported no charge for (`reported_charges`) still
+    counts at `rate`, the most it can be charged.
+    """
+    ids = payload.get("request_ids") or []
+    charges = payload.get("reported_charges") or {}
+    payload["signed_cap"] = rate * len(ids)
+    payload["payment"] = sum(int(charges.get(key, rate)) for key in ids)
+
+
+def result_charge(report: dict, outcomes: dict, key: str) -> None:
+    """Add a delivery's outcomes to a `mech_result` report, its charge as `payment`."""
+    report.update(outcomes)
+    if key in outcomes.get("reported_charges", {}):
+        report["payment"] = int(outcomes["reported_charges"][key])

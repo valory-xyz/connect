@@ -26,17 +26,25 @@ import typing as t
 from mech_client import (
     DeliveryResult,
     NonceRefused,
+    OffchainRequestRejected,
+    OffchainTopUpFailed,
+    PreSignHook,
     RULE_ANSWER_UNKNOWN,
     RULE_NONCE_TAKEN,
     RULE_REQUEST_REJECTED,
     RequestIdMismatch,
     RequestIdRpcError,
+    outcome_of,
 )
 from mech_client.domain.delivery import (
     OffchainDeliveryWatcher,
     OnchainDeliveryWatcher,
 )
-from mech_client.services.marketplace_service import MarketplaceService
+from mech_client.nonces import REJECTION_RULES
+from mech_client.services.marketplace_service import (
+    MarketplaceService,
+    NONCE_MODE_EXPLICIT,
+)
 
 from connect.signer_errors import SendUnknown, SignerError, logged_cause
 
@@ -224,7 +232,7 @@ def over_max_payment(
     what = "would be signed a cap of" if signed_cap else "charges"
     return (
         f"mech {mech} {what} {price} per request (in its payment asset base "
-        f"units), above max_payment={max_payment}; pass a higher max_payment "
+        f"units), which exceeds max_payment={max_payment}; pass a higher max_payment "
         "to accept that"
     )
 
@@ -347,6 +355,40 @@ def not_bought(error: Exception, what: str, *, posted: bool, note: str) -> MechE
         "the mech asked for a top-up (HTTP 402), which failed: "
         f"{said(error, what)}; the nonce stays held until it settles{note}"
     )
+
+
+def lost_answer(  # pylint: disable=too-many-arguments
+    plan: "RequestPlan",
+    sent: list[tuple[int, PreSignHook]],
+    armed: dict[int, bytes],
+    error: Exception,
+    note: str,
+) -> MechAnswerUnknown:
+    """Describe a signed request whose answer was lost, its armed id pending."""
+    held = armed[sent[-1][0]].hex()
+    what = request_label(plan.chain, plan.priced.mech, plan.tool, held)
+    return answer_lost(error, held, what, note)
+
+
+def explicit_hook(
+    arm: t.Callable[[bytes, int], None], sent: list[tuple[int, PreSignHook]]
+) -> PreSignHook:
+    """Return the pre-sign hook of an explicit send: arm the id, record the send."""
+
+    def on_request_id(request_id: bytes, nonce: int) -> None:
+        arm(request_id, nonce)
+        sent.append((nonce, hook))
+
+    hook = PreSignHook(on_request_id)
+    return hook
+
+
+def explicit_send(send: t.Callable[..., dict], hook: PreSignHook) -> dict:
+    """Send with an explicit nonce, the mech's HTTP answer as the allocator's rule."""
+    try:
+        return send(nonce_mode=NONCE_MODE_EXPLICIT, on_request_id=hook)
+    except (OffchainRequestRejected, OffchainTopUpFailed) as e:
+        raise NonceRefused(REJECTION_RULES[outcome_of(e)], str(e)) from e
 
 
 def answer_lost(error: Exception, held: str, what: str, note: str) -> MechAnswerUnknown:

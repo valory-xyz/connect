@@ -218,8 +218,9 @@ composing a prompt:
   request signs a cap: derived from the expected cost the mech's manifest
   publishes for the tool in its payment asset, or the mech's on-chain price
   when it publishes none. `max_payment` bounds that cap, the mech charges at
-  most that per request, and `payment` in the answer is the cap times the
-  number of requests.
+  most that per request. `payment` in the answer is what was charged: each
+  request's reported charge, or the cap for one the mech has not reported
+  yet; `signed_cap` is the cap times the number of requests.
 - `delivery_results[request_id]` is normally the result file
   (`{schema_version, requestId, result, tool, …}`), but a mech that answers
   inline off-chain returns its envelope instead, with the answer under

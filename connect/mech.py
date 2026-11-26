@@ -56,7 +56,7 @@ from mech_client.services.marketplace_service import MarketplaceService
 from safe_eth.eth import EthereumClient
 
 from connect.activity import ActivityLog
-from connect.config import AppConfig
+from connect.config import AppConfig, MECH_NONCE_MODE_EXPLICIT
 from connect.guard import Guard
 from connect.idempotency import InFlightError, LedgerEntry, RequestLedger
 from connect.mech_allowances import MechAllowances, TopUpBudget, read_map_nonces
@@ -66,6 +66,8 @@ from connect.mech_budget import (
     offchain_priced,
     payment_report,
     price_mech,
+    result_charge,
+    settle_payment,
 )
 from connect.mech_queue import HardCancelRefused, MechQueue
 from connect.mech_signer import MechSigner
@@ -82,8 +84,10 @@ from connect.mech_types import (
     PricedMech,
     RequestPlan,
     SPEND_UNCERTAIN,
-    answer_lost,
     delivery_outcomes,
+    explicit_hook,
+    explicit_send,
+    lost_answer,
     merge_outcomes,
     not_bought,
     over_max_payment,
@@ -684,12 +688,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         )
         payload.update(charged(plan.terms, plan.priced.rate, result))
         if plan.offchain:
-            # nothing in the signed request expires it (mech-client sends no
-            # deadline): it can settle whenever the mech delivers it, or the
-            # operator's hard cancel consumes its nonce
+            # mech-client's result does not return an explicit request's deadline
             payload["expires"] = None
             payload.update(self.queue.report(plan.chain))
         self._resume_watch(payload, deadline)
+        settle_payment(payload, plan.priced.rate)
         if plan.offchain:
             by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
             got = result.get("deliveries") or {}
@@ -808,7 +811,15 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             with self._allowances.auto_deposit_armed(plan, hook):
                 return send(nonces=[nonce], on_request_id=hook)
 
+        def send_explicit() -> dict:
+            hook = explicit_hook(arm, sent)
+            # no queue slot: a slot the allocator still holds does not block it
+            with self._allowances.auto_deposit_armed(plan, hook):
+                return explicit_send(send, hook)
+
         try:
+            if self._config.mech_nonce_mode == MECH_NONCE_MODE_EXPLICIT:
+                return send_explicit()
             return send_with_nonce(
                 self._nonces,
                 chain=plan.chain,
@@ -826,7 +837,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         except NonceRefused as e:
             if e.rule != RULE_ANSWER_UNKNOWN:
                 raise
-            raise self._lost(plan, sent, armed, e) from e
+            raise lost_answer(plan, sent, armed, e, self.queue.note(plan.chain)) from e
         except Exception as e:
             # mech-client holds the nonce of a posted request whatever failed
             # (a SignerError after the POST is the 402 top-up's); a deposit
@@ -835,22 +846,12 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 raise
             posted = bool(sent) and sent[-1][1].posting
             if posted and not isinstance(e, SignerError):
-                raise self._lost(plan, sent, armed, e) from e
+                raise lost_answer(
+                    plan, sent, armed, e, self.queue.note(plan.chain)
+                ) from e
             what = request_label(plan.chain, plan.priced.mech, plan.tool, None)
             note = self.queue.note(plan.chain)
             raise not_bought(e, what, posted=posted, note=note) from e
-
-    def _lost(
-        self,
-        plan: RequestPlan,
-        sent: list[tuple[int, PreSignHook]],
-        armed: dict[int, bytes],
-        error: Exception,
-    ) -> MechAnswerUnknown:
-        """Describe a signed request whose answer was lost, its armed id pending."""
-        held = armed[sent[-1][0]].hex()
-        what = request_label(plan.chain, plan.priced.mech, plan.tool, held)
-        return answer_lost(error, held, what, self.queue.note(plan.chain))
 
     # too-many-arguments: keyword-only; what identifies a pending request
     def _with_pending(  # pylint: disable=too-many-locals,too-many-arguments
@@ -957,7 +958,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 salt=pending.salt,
             )
         self._activity.record("mech_result", chain=pending.chain, request_id=key)
-        report.update(delivery_outcomes({key: split[key]}))
+        result_charge(report, delivery_outcomes({key: split[key]}), key)
         url = split[key].url
         return {**report, "result": data[key], **({"url": url} if url else {})}
 

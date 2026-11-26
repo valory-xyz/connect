@@ -33,6 +33,9 @@ from connect.config import (
     MECH_GAP_RETRIES_ENV,
     MECH_HARD_CANCEL_AFTER_ENV,
     MECH_INDEXER_ENV_VARS,
+    MECH_NONCE_MODE_ENV,
+    MECH_NONCE_MODE_EXPLICIT,
+    MECH_NONCE_MODE_SEQUENTIAL,
     MECH_SETTLE_TIMEOUT_ENV,
     MINUTES_PER_RUN_ENV,
     SAFES_ENV,
@@ -242,6 +245,20 @@ def test_mech_settle_timeout_and_gap_retries_are_configurable(tmp_path: Path) ->
         for raw in ("-1", "1.5", "soon"):
             with pytest.raises(ValueError, match=name):
                 load_config(env | {name: raw})
+
+
+def test_mech_nonce_mode_defaults_to_explicit(tmp_path: Path) -> None:
+    """Unset is explicit, either mode is taken in any case, junk is refused."""
+    env = base_env(tmp_path)
+    assert load_config(env).mech_nonce_mode == MECH_NONCE_MODE_EXPLICIT
+    for raw, mode in (
+        (" Sequential ", MECH_NONCE_MODE_SEQUENTIAL),
+        ("explicit", MECH_NONCE_MODE_EXPLICIT),
+    ):
+        assert load_config(env | {MECH_NONCE_MODE_ENV: raw}).mech_nonce_mode == mode
+    for raw in ("random", "1", "explicit,sequential"):
+        with pytest.raises(ValueError, match=MECH_NONCE_MODE_ENV):
+            load_config(env | {MECH_NONCE_MODE_ENV: raw})
 
 
 def test_unknown_chain_lookup_raises(tmp_path: Path) -> None:

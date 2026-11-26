@@ -84,7 +84,12 @@ from connect import settings as settings_module
 from connect import workspace as workspace_module
 from connect.activity import ActivityLog
 from connect.chains import MECH_MARKETPLACES
-from connect.config import AppConfig, ChainConfig, NATIVE_ASSET
+from connect.config import (
+    AppConfig,
+    ChainConfig,
+    MECH_NONCE_MODE_EXPLICIT,
+    NATIVE_ASSET,
+)
 from connect.guard import ALLOWANCE_TTL, Guard, GuardError
 from connect.idempotency import RequestLedger
 from connect.intent import Capped
@@ -3015,6 +3020,30 @@ class TestMech:
             "ab": {"answer": "42"},
             "cd": failure_body,
         }
+        assert result["payment"] == 7 + RATE_CAP
+
+    @pytest.mark.parametrize("charges", [{}, {"ab": 7}, {"ab": 7, "cd": 0}, {"cd": 3}])
+    def test_payment_is_what_the_mech_charged_else_the_rate(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        charges: dict,
+    ) -> None:
+        """Each id counts its reported charge, an unreported one the full rate."""
+        rate = patched_mech.info[2]
+        patched_mech.result["request_ids"] = ["ab", "cd"]
+        patched_mech.result["deliveries"] = {
+            key: DeliveryResult(
+                key, {"answer": "42"}, None, actual_delivery_rate=charge
+            )
+            for key, charge in charges.items()
+        }
+        result = mech_service.request(
+            "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        unreported = sum(1 for key in ("ab", "cd") if key not in charges)
+        assert result["payment"] == sum(charges.values()) + unreported * rate
+        assert result["signed_cap"] == 2 * rate
 
     def test_a_run_that_fails_after_the_ack_is_reported_as_failed(
         self,
@@ -3102,6 +3131,7 @@ class TestMech:
             "ab": {"error": FAILED_RUN_ERROR, "fault": FAULT_MECH}
         }
         assert delivery["reported_charges"] == {"ab": str(RATE_CAP)}
+        assert delivery["payment"] == RATE_CAP
 
     def test_delivered_request_leaves_nothing_pending(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
@@ -3627,7 +3657,7 @@ class TestMech:
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
     ) -> None:
         """A refusal reached before any payment must not burn the id."""
-        with pytest.raises(MechNotSent, match="above max_payment"):
+        with pytest.raises(MechNotSent, match="exceeds max_payment"):
             mech_service.request(
                 "q",
                 "t",
@@ -6402,7 +6432,7 @@ class TestMech:
         """0.1 of the asset, pinned per type: a dropped key must fail here."""
         assert set(mech_budget.DEFAULT_MAX_PAYMENT) == set(PaymentType)
         patched_mech.info = (kind, 42, budget + 1)
-        with pytest.raises(MechError, match=f"above max_payment={budget}"):
+        with pytest.raises(MechError, match=f"exceeds max_payment={budget}"):
             mech_service.request(
                 "q",
                 "t",
@@ -6468,7 +6498,7 @@ class TestMech:
         """0.1 of a 6-decimal token is 10**5, not the native 10**17."""
         usdc = PaymentType.USDC_TOKEN
         patched_mech.info = (usdc, 42, 10**5 + 1)
-        with pytest.raises(MechError, match="above max_payment=100000"):
+        with pytest.raises(MechError, match="exceeds max_payment=100000"):
             mech_service.request(
                 "q",
                 "t",
@@ -6738,6 +6768,137 @@ class TestMech:
             top_up_budget=None,
         )
         assert "expires" not in report
+
+    def test_an_explicit_request_takes_no_queue_slot(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+    ) -> None:
+        """mech-client picks the nonce, the signed id is armed, nothing is held."""
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        for prompt in ("q", "q2"):
+            mech_service.request(
+                prompt,
+                "tool",
+                chain="testchain",
+                priority_mech=OTHER,
+                top_up_budget=None,
+            )
+            call = patched_mech.calls[-1]
+            assert call["nonce_mode"] == MECH_NONCE_MODE_EXPLICIT
+            assert "nonces" not in call
+            assert isinstance(call["on_request_id"], PreSignHook)
+        assert audit_kinds(store_path).count("mech_offchain_digest") == 2
+        assert mech_service.queue.in_flight("testchain", SAFE, 0) == 0
+
+    def test_a_held_slot_does_not_block_an_explicit_request(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """A posted request the mech refused holds its sequential slot; no stall."""
+        nonces = mech_service._nonces  # pylint: disable=protected-access
+        with nonces.reserve("testchain", SAFE, OTHER, lambda: 5, timeout=1) as slot:
+            slot.answered("not_accepted", mech=OTHER, salt="s", posted=True)
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        mech_service.request(
+            "q",
+            "tool",
+            chain="testchain",
+            priority_mech=OTHER,
+            timeout=1,
+            top_up_budget=None,
+        )
+        assert patched_mech.calls[-1]["nonce_mode"] == MECH_NONCE_MODE_EXPLICIT
+        assert mech_service.queue.in_flight("testchain", SAFE, 0) == 1  # still held
+
+    @pytest.mark.parametrize(
+        ("status", "reason", "error", "rule"),
+        [
+            (400, "Bad Request", MechRefused, "mech-request-rejected"),
+            (402, "Payment Required", MechRefused, "mech-request-rejected"),
+            (503, "Service Unavailable", MechNotSent, "mech-nonce-gap"),
+            (500, "Internal Server Error", MechAnswerUnknown, "mech-answer-unknown"),
+        ],
+    )
+    def test_an_explicit_request_s_answer_keeps_its_nonce_rule(  # pylint: disable=too-many-arguments
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        status: int,
+        reason: str,
+        error: type[Exception],
+        rule: str,
+    ) -> None:
+        """The mech's HTTP answer reads as the rule the sequential path names."""
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        patched_mech.raises = OffchainRequestRejected(
+            f"HTTP {status}",
+            request_id="0x01",
+            nonce=5,
+            status=status,
+            reason=reason,
+            unsent=[],
+        )
+        with pytest.raises(error, match=f"rule '{rule}'"):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+
+    def test_an_explicit_request_s_failed_top_up_is_a_refusal(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """A top-up the mech asked for and that failed bought nothing."""
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        patched_mech.raises = OffchainTopUpFailed(
+            "top-up failed", request_id="0x01", nonce=5, unsent=[]
+        )
+        with pytest.raises(MechRefused, match="rule 'mech-request-rejected'"):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+
+    def test_an_explicit_request_lost_after_posting_stays_pending(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+        store_path: Path,
+    ) -> None:
+        """A transport failure after the POST holds the signed id for mech_result."""
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        patched_mech.raises_after_signing = ConnectionError("reset")
+        with pytest.raises(MechAnswerUnknown) as e:
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
+        (signed,) = [
+            entry["request_id"]
+            for entry in audit_entries(store_path)
+            if entry["kind"] == "mech_offchain_digest"
+        ]
+        assert e.value.pending_request_ids == [signed.removeprefix("0x")]
+
+    def test_an_explicit_request_failing_before_signing_is_not_sent(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        app_config: AppConfig,
+    ) -> None:
+        """Nothing was signed or posted, so nothing was bought."""
+        app_config.mech_nonce_mode = MECH_NONCE_MODE_EXPLICIT
+        patched_mech.raises = ConnectionError("rpc down")
+        with pytest.raises(MechNotSent):
+            mech_service.request(
+                "q", "tool", chain="testchain", priority_mech=OTHER, top_up_budget=None
+            )
 
     def test_offchain_request_signs_the_nonce_connect_allocated(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService

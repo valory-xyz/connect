@@ -53,6 +53,7 @@ LOG_LEVEL_ENV = CUSTOM_ENV_VARS_PREFIX + "LOG_LEVEL"
 MINUTES_PER_RUN_ENV = CUSTOM_ENV_VARS_PREFIX + "MINUTES_PER_RUN"
 MECH_SETTLE_TIMEOUT_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_SETTLE_TIMEOUT"
 MECH_GAP_RETRIES_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_GAP_RETRIES"
+MECH_NONCE_MODE_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_NONCE_MODE"
 MECH_INDEXER_ENV_VARS = (
     "MECHX_MARKETPLACE_BASE_SQUID_URL",
     "MECHX_MARKETPLACE_POLYGON_SQUID_URL",
@@ -72,6 +73,12 @@ DEFAULT_MINUTES_PER_RUN = 15
 # before its safe's queue stalls; and how often a 503 gap resends a nonce
 DEFAULT_MECH_SETTLE_TIMEOUT = 1800
 DEFAULT_MECH_GAP_RETRIES = 3
+# how an off-chain mech request takes its nonce: `explicit` signs a random
+# nonce and a deadline, settled in any order; `sequential` takes the safe's
+# mapNonces counter through the allocator, which only mechs before v0.37 need
+MECH_NONCE_MODE_EXPLICIT = "explicit"
+MECH_NONCE_MODE_SEQUENTIAL = "sequential"
+MECH_NONCE_MODES = (MECH_NONCE_MODE_EXPLICIT, MECH_NONCE_MODE_SEQUENTIAL)
 # seconds a safe's queue must have been stalled before the operator may hard
 # cancel it (one paid on-chain request); longer than the settle timeout, so a
 # queue gets the time to clear itself first
@@ -109,6 +116,7 @@ class AppConfig:  # pylint: disable=too-many-instance-attributes
     minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
     mech_settle_timeout: int = DEFAULT_MECH_SETTLE_TIMEOUT
     mech_gap_retries: int = DEFAULT_MECH_GAP_RETRIES
+    mech_nonce_mode: str = MECH_NONCE_MODE_EXPLICIT
     mech_hard_cancel_after: int = DEFAULT_MECH_HARD_CANCEL_AFTER
 
     def __post_init__(self) -> None:
@@ -279,6 +287,19 @@ def _parse_count(env: dict[str, str], name: str, default: int) -> int:
     return value
 
 
+def _parse_nonce_mode(env: dict[str, str]) -> str:
+    """Parse the off-chain nonce mode; unset means explicit."""
+    raw = env.get(MECH_NONCE_MODE_ENV, "").strip().lower()
+    if not raw:
+        return MECH_NONCE_MODE_EXPLICIT
+    if raw not in MECH_NONCE_MODES:
+        raise ValueError(
+            f"{MECH_NONCE_MODE_ENV} is not one of {', '.join(MECH_NONCE_MODES)}: "
+            f"{raw!r}"
+        )
+    return raw
+
+
 def _indexer_url(value: str | None) -> str | None:
     """Normalize unset endpoint values from Pearl and standalone environments."""
     value = (value or "").strip()
@@ -378,6 +399,7 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         mech_gap_retries=_parse_count(
             env, MECH_GAP_RETRIES_ENV, DEFAULT_MECH_GAP_RETRIES
         ),
+        mech_nonce_mode=_parse_nonce_mode(env),
         mech_hard_cancel_after=_parse_count(
             env, MECH_HARD_CANCEL_AFTER_ENV, DEFAULT_MECH_HARD_CANCEL_AFTER
         ),
