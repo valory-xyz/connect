@@ -134,6 +134,14 @@ class _DepositAllowance:
     expires: float
 
 
+@dataclass(frozen=True)
+class _CheckpointAllowance:
+    """One pre-authorized EOA checkpoint() call, keyed by its chain."""
+
+    staking_contract: str  # lowercase
+    expires: float
+
+
 # the handle allow_safe_deposit_once returns, for revoke_safe_deposit
 DepositGrant = _DepositAllowance
 
@@ -153,8 +161,8 @@ class Guard:
         self._allowed_digests: dict[bytes, float] = {}
         # pre-authorized deposits; entries are consumed by check_transaction
         self._deposit_allowances: list[_DepositAllowance] = []
-        # chain -> (staking contract, monotonic expiry) of one armed checkpoint
-        self._checkpoint_allowances: dict[str, tuple[str, float]] = {}
+        # chain -> its one armed checkpoint
+        self._checkpoint_allowances: dict[str, _CheckpointAllowance] = {}
 
     def mode(self) -> str:
         """Return the currently enforced mode."""
@@ -228,9 +236,9 @@ class Guard:
         """
         with self._allowance_lock:
             self._purge_expired()
-            self._checkpoint_allowances[chain.lower()] = (
-                staking_contract.lower(),
-                time.monotonic() + ALLOWANCE_TTL,
+            self._checkpoint_allowances[chain.lower()] = _CheckpointAllowance(
+                staking_contract=staking_contract.lower(),
+                expires=time.monotonic() + ALLOWANCE_TTL,
             )
 
     def revoke_digest(self, digest: bytes) -> None:
@@ -276,11 +284,11 @@ class Guard:
         self._deposit_allowances = [
             a for a in self._deposit_allowances if a.expires > now
         ]
-        for chain, (contract, expiry) in list(self._checkpoint_allowances.items()):
-            if expiry <= now:
+        for chain, checkpoint in list(self._checkpoint_allowances.items()):
+            if checkpoint.expires <= now:
                 logger.warning(
                     "checkpoint allowance to %s on %s expired unconsumed",
-                    contract,
+                    checkpoint.staking_contract,
                     chain,
                 )
                 del self._checkpoint_allowances[chain]
@@ -465,7 +473,7 @@ class Guard:
         with self._allowance_lock:
             self._purge_expired()
             allowance = self._checkpoint_allowances.get(chain)
-            if allowance is None or allowance[0] != to.lower():
+            if allowance is None or allowance.staking_contract != to.lower():
                 return False
             if consume:
                 del self._checkpoint_allowances[chain]

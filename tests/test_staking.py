@@ -39,6 +39,7 @@ from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import (
     ACTIVITY_CHECKER_ENV,
     AppConfig,
+    ChainConfig,
     SAFES_ENV,
     SERVICE_ID_ENV,
     STAKING_CONTRACT_ENV,
@@ -633,6 +634,24 @@ class TestGuardAllowance:
         with pytest.raises(Exception, match="only allow transactions targeting"):
             restricted.check_transaction("testchain", to, value, data)
         # the allowance is still there for the exact call
+        restricted.check_transaction(
+            "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+        )
+
+    def test_applies_to_its_own_chain_only(
+        self, restricted: Guard, app_config: AppConfig
+    ) -> None:
+        """The exact call on another chain: refused, the armed chain's allowance kept."""
+        app_config.chains["otherchain"] = ChainConfig(
+            rpc_url="http://127.0.0.1:9", safe_address=SAFE
+        )
+        restricted.allow_checkpoint_once(
+            chain="testchain", staking_contract=STAKING_CONTRACT
+        )
+        with pytest.raises(Exception, match="only allow transactions targeting"):
+            restricted.check_transaction(
+                "otherchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
+            )
         restricted.check_transaction(
             "testchain", STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA
         )
