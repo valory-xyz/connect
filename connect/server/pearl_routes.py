@@ -106,6 +106,8 @@ def _staking_reminder(state: t.Any) -> str | None:
     try:
         return reading.result(timeout=REMINDER_READ_SECONDS)
     except FutureTimeout:
+        # queued behind a hung read, it would run before the binary could exit
+        reading.cancel()
         logger.warning(
             "staking reminder skipped: the staking state took over %ss to read",
             REMINDER_READ_SECONDS,

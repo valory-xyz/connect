@@ -215,11 +215,6 @@ def w3(test_signer: Signer) -> StakingW3:
     return fake
 
 
-def _now() -> float:
-    """Return the fixed clock's time."""
-    return float(NOW)
-
-
 def _audited(config: AppConfig, kind: str) -> list[dict]:
     """Return the audit entries of one kind."""
     return [e for e in audit_entries(config.store_path) if e["kind"] == kind]
@@ -368,7 +363,7 @@ class TestRequestMade:
         """The count since the checkpoint against what the checker will need."""
         fake = StakingW3(safe_requests=safe_requests, ts_checkpoint=ts_checkpoint)
         assert (
-            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
             is expected
         )
         to, data = next(
@@ -381,9 +376,26 @@ class TestRequestMade:
         )
         assert to == STAKING_CONTRACT
         assert abi_decode(["uint256"], data[4:]) == (SERVICE_ID,)
-        # all five reads at one block, one behind the head
+        # all five reads, and the chain time, at one block, one behind the head
         assert len(fake.blocks) == 5
         assert set(fake.blocks) == {fake.pinned_block}
+        assert fake.time_blocks == [fake.pinned_block]
+
+    @pytest.mark.parametrize(
+        ("chain_time", "expected"),
+        [(NOW - DAY, True), (NOW, False)],
+        ids=["chain-a-day-in", "chain-two-days-in"],
+    )
+    def test_an_overdue_epoch_is_measured_to_the_chain_s_time(
+        self, monkeypatch: pytest.MonkeyPatch, chain_time: int, expected: bool
+    ) -> None:
+        """One request since a checkpoint two days back: the chain's clock decides."""
+        monkeypatch.setattr(time, "time", lambda: float(NOW + 5 * DAY))
+        fake = StakingW3(safe_requests=10, ts_checkpoint=NOW - 2 * DAY)
+        fake.chain_time = chain_time
+        assert (
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM) is expected
+        )
 
     def test_a_service_staked_after_the_checkpoint_is_measured_from_its_stake(
         self,
@@ -393,14 +405,14 @@ class TestRequestMade:
         fake = StakingW3(
             safe_requests=10, ts_checkpoint=NOW - 2 * DAY, ts_start=NOW - DAY
         )
-        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
 
     def test_a_service_staked_with_another_multisig_is_an_error(self) -> None:
         """SERVICE_ID naming another safe's service never scores this safe."""
         fake = StakingW3()
         fake.multisig = "0x" + "33" * 20
         with pytest.raises(ValueError, match="not the configured safe"):
-            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
 
     def test_a_checker_without_a_request_count_is_an_error(self) -> None:
         """A checker answering one nonce says why, not as an IndexError."""
@@ -414,13 +426,13 @@ class TestRequestMade:
 
         fake._answer = one_nonce  # type: ignore[method-assign]  # pylint: disable=protected-access
         with pytest.raises(ValueError, match="returns no Marketplace request count"):
-            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
 
     def test_no_staking_record_is_an_error(self) -> None:
         """An empty record cannot be read as "made" or "not made"."""
         fake = StakingW3(record=False)
         with pytest.raises(ValueError, match="no staking record"):
-            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
 
 
 class TestReminder:
@@ -439,7 +451,7 @@ class TestReminder:
         """Staked and short of the request: the reminder."""
         w3.safe_requests = 9
         assert (
-            staking.staking_reminder(staked_config, test_signer, now=_now)
+            staking.staking_reminder(staked_config, test_signer)
             == staking.STAKING_REMINDER
         )
 
@@ -447,14 +459,14 @@ class TestReminder:
         self, staked_config: AppConfig, test_signer: Signer, w3: StakingW3
     ) -> None:
         """The request made: nothing to say."""
-        assert staking.staking_reminder(staked_config, test_signer, now=_now) is None
+        assert staking.staking_reminder(staked_config, test_signer) is None
         assert w3.calls
 
     def test_silent_while_unstaked(
         self, app_config: AppConfig, test_signer: Signer, w3: StakingW3
     ) -> None:
         """Unstaked: no read at all."""
-        assert staking.staking_reminder(app_config, test_signer, now=_now) is None
+        assert staking.staking_reminder(app_config, test_signer) is None
         assert not w3.calls
 
     def test_a_failed_read_never_reminds(
@@ -468,7 +480,7 @@ class TestReminder:
         w3.fail = ConnectionError("http://rpc.example/secret-key unreachable")
         with caplog.at_level(logging.WARNING, logger="agent"):
             assert (
-                staking.staking_reminder(staked_config, test_signer, now=_now) is None
+                staking.staking_reminder(staked_config, test_signer) is None
             )
         assert "could not read the staking state on testchain" in caplog.text
         assert "secret-key" not in caplog.text
@@ -717,7 +729,7 @@ class TestCheckpoint:
         """A host clock ahead of the chain pays for no no-op checkpoint()."""
         test_signer.set_guard(guard)
         w3.chain_time = chain_time  # next checkpoint time is NOW + 60
-        monkeypatch.setattr(staking.time, "time", lambda: float(host_time))
+        monkeypatch.setattr(time, "time", lambda: float(host_time))
         result = staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
         assert (result is not None) is sent
         assert len(w3.eth.sent) == (1 if sent else 0)
@@ -1130,12 +1142,15 @@ class TestSessionNotice:
         client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Every launch reads on the same worker, so shutdown joins at most one."""
+        """Every launch reads on one worker, and a timed-out read is dropped."""
         monkeypatch.setattr(pearl_routes, "REMINDER_READ_SECONDS", 0.01)
         released = threading.Event()
 
+        reads: list[int] = []
+
         def hung(config: AppConfig, signer: Signer) -> str:
             """Block like a black-holed RPC until released."""
+            reads.append(1)
             released.wait(timeout=5)
             return staking.STAKING_REMINDER
 
@@ -1151,6 +1166,11 @@ class TestSessionNotice:
             assert len(readers) == 1
         finally:
             released.set()
+        # the timed-out launches' reads were dropped, not run after the hung one
+        pearl_routes._REMINDER_READER.submit(  # pylint: disable=protected-access
+            lambda: None
+        ).result(timeout=5)
+        assert len(reads) == 1
 
     def test_the_brief_tells_the_session_to_say_it(self) -> None:
         """The shipped brief names the file and says to relay it first."""

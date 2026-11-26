@@ -23,8 +23,6 @@ The rules are the README's ("Staking").
 """
 
 import logging
-import time
-import typing as t
 
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
@@ -88,8 +86,8 @@ def _uint(w3: Web3, to: str, signature: str, block: BlockIdentifier) -> int:
     return int(value)
 
 
-def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
-    """Whether the program's safe made the epoch's Marketplace requests, as of `now`.
+def request_made_this_epoch(w3: Web3, staking: StakingConfig) -> bool:
+    """Whether the program's safe made the epoch's Marketplace requests.
 
     Scores the count as RequesterActivityCheckerV2 does (every Connect program's
     checker; README, "Staking"), over the window the contract will measure.
@@ -133,6 +131,8 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
     liveness_period = _uint(w3, staking.staking_contract, "livenessPeriod()", block)
     ts_checkpoint = _uint(w3, staking.staking_contract, "tsCheckpoint()", block)
     ratio = _uint(w3, staking.activity_checker, "livenessRatio()", block)
+    # the chain's time, not this host's, as the checkpoint gate reads it
+    now = w3.eth.get_block(block)["timestamp"]
     # the contract measures from max(tsCheckpoint, tsStart) to the checkpoint,
     # which lands no earlier than tsCheckpoint + livenessPeriod
     window = max(now, ts_checkpoint + liveness_period) - max(ts_checkpoint, ts_start)
@@ -140,9 +140,7 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
     return eligible >= required
 
 
-def staking_reminder(
-    config: AppConfig, signer: Signer, now: t.Callable[[], float] = time.time
-) -> str | None:
+def staking_reminder(config: AppConfig, signer: Signer) -> str | None:
     """Return the reminder for a session opening now, or None.
 
     None while unstaked, once the request is made, and whenever the staking
@@ -153,7 +151,7 @@ def staking_reminder(
         return None
     chain = staking.chain
     try:
-        made = request_made_this_epoch(signer.w3(chain), staking, int(now()))
+        made = request_made_this_epoch(signer.w3(chain), staking)
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.warning(
             "staking reminder skipped: could not read the staking state on %s: %s",
