@@ -325,11 +325,7 @@ def audit_kinds(store_path: Path) -> list[str]:
 
 @pytest.fixture
 def app_config(store_path: Path) -> AppConfig:
-    """Config with one fake chain, its off-chain mech requests sequential.
-
-    The suite's allocator tests read the sequential path; the explicit-nonce
-    default has its own tests, which switch the mode.
-    """
+    """Config with one fake chain, in sequential mode (README, "One payer per safe")."""
     return AppConfig(
         chains={
             "testchain": ChainConfig(

@@ -54,6 +54,7 @@ from connect.config import (
     AppConfig,
     ChainConfig,
     MECH_NONCE_MODES,
+    MechNonceMode,
 )
 from connect.guard import Guard
 from connect.mech import MechError, MechService
@@ -955,7 +956,7 @@ def _serving_mech_endpoint(endpoint: _LocalMechEndpoint) -> t.Iterator[str]:
 def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-many-locals,too-many-statements,too-many-arguments
     rpc_url: str,
     fork_config: AppConfig,
-    nonce_mode: str,
+    nonce_mode: MechNonceMode,
     fork_store: SettingsStore,
     store_path: Path,
     account: LocalAccount,
@@ -977,9 +978,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     before the request is sent and the mech never has to ask. The third
     rides that balance straight through, depositing nothing at all.
 
-    Both nonce modes fund it the same way: an explicit request holds no
-    queue slot, but Connect counts it in flight until the marketplace
-    records it (nothing settles on the fork).
+    Both nonce modes fund it the same way (README, "One payer per safe").
 
     The mech endpoint is local (no live mech serves a fork); everything else
     — marketplace reads, nonces, digests, signing, the deposit transaction —

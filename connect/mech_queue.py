@@ -41,9 +41,9 @@ from connect.config import AppConfig, MECH_NONCE_MODE_EXPLICIT
 from connect.guard import GuardError
 from connect.mech_allowances import read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT
-from connect.mech_types import MechError, published_tools
+from connect.mech_types import MechError, published_tools, request_key
 from connect.signer import SignerError
-from connect.signer_errors import logged_cause
+from connect.signer_errors import cause_of, logged_cause
 
 logger = logging.getLogger("agent")
 
@@ -254,10 +254,13 @@ class MechQueue:
         raise HardCancelFailed(chain) from failure
 
     def sent(self, chain: str, result: t.Mapping) -> None:
-        """Take in an off-chain send's result: stamp it, remember explicit ids.
+        """Stamp the slots of a sequential off-chain send's deliveries.
 
-        Each explicit request it sent counts in flight (`_explicit_in_flight`).
+        An explicit request holds no slot: it is counted from its signing
+        (`explicit_signed`) instead.
         """
+        if self._config.mech_nonce_mode == MECH_NONCE_MODE_EXPLICIT:
+            return
         ids = list(result.get("request_ids") or [])
         got = result.get("deliveries") or {}
         self.stamp(
@@ -268,12 +271,24 @@ class MechQueue:
                 if key in got and got[key].data is not None
             ],
         )
-        if self._config.mech_nonce_mode != MECH_NONCE_MODE_EXPLICIT:
-            return
+
+    def explicit_signed(self, chain: str, request_id: str) -> None:
+        """Count an explicit request in flight from its signing (`_explicit_in_flight`)."""
+        now = self._clock()
+        held = self._explicit_held(chain)
+        for key, expires in list(held.items()):
+            if expires <= now:
+                del held[key]
+        held[request_key(request_id)] = now + EXPLICIT_NONCE_DEADLINE_SECONDS
+
+    def explicit_dropped(self, chain: str, request_id: str) -> None:
+        """Stop counting an explicit request the mech refused unadmitted."""
+        self._explicit_held(chain).pop(request_key(request_id), None)
+
+    def _explicit_held(self, chain: str) -> dict[str, float]:
+        """Return the safe's explicit requests in flight: request id -> deadline."""
         safe = t.cast(str, self._config.chain(chain).safe_address)
-        expires = self._clock() + EXPLICIT_NONCE_DEADLINE_SECONDS
-        held = self._explicit.setdefault((chain, safe.lower()), {})
-        held.update({key: expires for key in ids})
+        return self._explicit.setdefault((chain, safe.lower()), {})
 
     def stamp(self, chain: str, slots: t.Sequence[DeliveredSlot]) -> None:
         """Start the settle clock of the deliveries mech-client has not answered.
@@ -368,12 +383,16 @@ class MechQueue:
 
 
 def _settled(contract: t.Any, request_id: str) -> bool:
-    """Whether the marketplace recorded the request (its priority mech is set)."""
+    """Whether the marketplace recorded the request (its priority mech is set).
+
+    A record that cannot be read counts as unsettled, and is logged.
+    """
     try:
-        info = contract.functions.mapRequestIdInfos(
-            bytes.fromhex(request_id.removeprefix("0x"))
-        ).call()
-    except Exception:  # pylint: disable=broad-exception-caught
+        info = contract.functions.mapRequestIdInfos(bytes.fromhex(request_id)).call()
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.warning(
+            "could not read whether request %s settled: %s", request_id, cause_of(e)
+        )
         return False
     return int(str(info[0]), 16) != 0
 

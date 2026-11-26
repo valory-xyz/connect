@@ -30,7 +30,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict, cast
 
 from web3 import Web3
 
@@ -73,12 +73,13 @@ DEFAULT_MINUTES_PER_RUN = 15
 # before its safe's queue stalls; and how often a 503 gap resends a nonce
 DEFAULT_MECH_SETTLE_TIMEOUT = 1800
 DEFAULT_MECH_GAP_RETRIES = 3
-# how an off-chain mech request takes its nonce: `explicit` signs a random
-# nonce and a deadline, settled in any order; `sequential` takes the safe's
-# mapNonces counter through the allocator, which only mechs before v0.37 need
-MECH_NONCE_MODE_EXPLICIT = "explicit"
-MECH_NONCE_MODE_SEQUENTIAL = "sequential"
-MECH_NONCE_MODES = (MECH_NONCE_MODE_EXPLICIT, MECH_NONCE_MODE_SEQUENTIAL)
+MechNonceMode = Literal["explicit", "sequential"]
+MECH_NONCE_MODE_EXPLICIT: MechNonceMode = "explicit"
+MECH_NONCE_MODE_SEQUENTIAL: MechNonceMode = "sequential"
+MECH_NONCE_MODES: tuple[MechNonceMode, ...] = (
+    MECH_NONCE_MODE_EXPLICIT,
+    MECH_NONCE_MODE_SEQUENTIAL,
+)
 # seconds a safe's queue must have been stalled before the operator may hard
 # cancel it (one paid on-chain request); longer than the settle timeout, so a
 # queue gets the time to clear itself first
@@ -116,7 +117,7 @@ class AppConfig:  # pylint: disable=too-many-instance-attributes
     minutes_per_run: int = DEFAULT_MINUTES_PER_RUN
     mech_settle_timeout: int = DEFAULT_MECH_SETTLE_TIMEOUT
     mech_gap_retries: int = DEFAULT_MECH_GAP_RETRIES
-    mech_nonce_mode: str = MECH_NONCE_MODE_EXPLICIT
+    mech_nonce_mode: MechNonceMode = MECH_NONCE_MODE_EXPLICIT
     mech_hard_cancel_after: int = DEFAULT_MECH_HARD_CANCEL_AFTER
 
     def __post_init__(self) -> None:
@@ -287,7 +288,7 @@ def _parse_count(env: dict[str, str], name: str, default: int) -> int:
     return value
 
 
-def _parse_nonce_mode(env: dict[str, str]) -> str:
+def _parse_nonce_mode(env: dict[str, str]) -> MechNonceMode:
     """Parse the off-chain nonce mode; unset means explicit."""
     raw = env.get(MECH_NONCE_MODE_ENV, "").strip().lower()
     if not raw:
@@ -297,7 +298,7 @@ def _parse_nonce_mode(env: dict[str, str]) -> str:
             f"{MECH_NONCE_MODE_ENV} is not one of {', '.join(MECH_NONCE_MODES)}: "
             f"{raw!r}"
         )
-    return raw
+    return cast(MechNonceMode, raw)
 
 
 def _indexer_url(value: str | None) -> str | None:

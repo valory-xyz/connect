@@ -88,9 +88,7 @@ def offchain_priced(
     """Return `priced` at the cap mech-client signs for an off-chain `tool`.
 
     :raises MechNotSent: for a derived cap mech-client signs only with an
-        explicit `max_cost`. Connect has no such override yet, so a mech
-        pricing a tool that far above its on-chain price cannot be used
-        through Connect; that is intended for now.
+        explicit `max_cost`.
     """
     kind = PaymentType(priced.payment_type)
 
@@ -150,14 +148,24 @@ def settle_payment(payload: dict, rate: int) -> None:
     ids = payload.get("request_ids") or []
     charges = payload.get("reported_charges") or {}
     payload["signed_cap"] = rate * len(ids)
-    payload["payment"] = sum(int(charges.get(key, rate)) for key in ids)
+    payload["payment"] = sum(charge_of(charges, key, rate) for key in ids)
 
 
-def result_charge(report: dict, outcomes: dict, key: str) -> None:
-    """Add a delivery's outcomes to a `mech_result` report, its charge as `payment`."""
+def charge_of(charges: t.Mapping[str, str], key: str, rate: int) -> int:
+    """Return what request `key` is charged: its reported charge, at most `rate`."""
+    return min(int(charges.get(key, rate)), rate)
+
+
+def result_charge(report: dict, outcomes: dict, key: str, rate: int | None) -> None:
+    """Add a delivery's outcomes to a `mech_result` report.
+
+    `payment` is set only once the mech reported the id's charge, and only
+    with the rate it was signed at, which bounds it.
+    """
     report.update(outcomes)
-    if key in outcomes.get("reported_charges", {}):
-        report["payment"] = int(outcomes["reported_charges"][key])
+    charges = outcomes.get("reported_charges") or {}
+    if key in charges and rate is not None:
+        report["payment"] = charge_of(charges, key, rate)
 
 
 def replay_payment(payload: dict, outcomes: dict) -> None:

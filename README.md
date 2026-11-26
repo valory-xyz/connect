@@ -715,24 +715,25 @@ deployment configuration. Other chains keep their existing indexers.
 
 ### One payer per safe: nonces
 
-Off-chain requests sign explicit nonces by default: mech-client picks a random
-nonce and a 15-minute settle deadline per request, and the mech settles it on
-its own, in any order, so no request waits on another's slot. An explicit
-request takes no slot in the queue below, so a slot it still holds does not
-block it; the prepaid deposit still counts it in flight, from its send until
-the marketplace records it settled or its deadline passes, so one deposit
-covers several calls as before.
+Off-chain requests sign explicit nonces by default
+(`CONNECTION_CONFIGS_CONFIG_MECH_NONCE_MODE`, `explicit` or `sequential`, read
+at start): mech-client picks a random nonce and a 15-minute settle deadline per
+request, and the mech settles it on its own, in any order, so no request waits
+on another's slot. An explicit request takes no slot in the queue below, so a
+slot it still holds does not block it; the prepaid deposit counts it in flight
+from its signing until the marketplace records it settled or its deadline
+passes, so one deposit covers several calls.
 
 Explicit nonces need the mech to run v0.37 or later with them enabled. A mech
 before v0.37 refuses every explicit request (HTTP 401, its request id does not
-match), and one with them turned off answers HTTP 503, after which mech-client
-resends sequentially inside the same call: that resend signs Connect's cap, not
-the mech's advertised maximum, and reads `mapNonces` outside the queue below,
-so two requests close together can sign the same nonce. For either kind of
-mech, set `CONNECTION_CONFIGS_CONFIG_MECH_NONCE_MODE=sequential`, which sends
-every off-chain request through the allocator below.
+match). One with them turned off answers HTTP 503 with the reason
+"explicit-nonce requests are not enabled on this mech", and mech-client then
+resends the request sequentially inside the same call, outside the queue below;
+Connect refuses that resend before it is signed (`mech-explicit-nonces-off`,
+nothing bought). Any other 503 is refused like any other answer. For either
+kind of mech, set the mode to `sequential`.
 
-Off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
+In sequential mode, off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
 process, through its `send_with_nonce`, so concurrent requests from one safe
 never share one. It follows the deployed sequential marketplace: the mech
 admits only `mapNonces + accepted + settling` for a sender, so one mech is in
@@ -916,10 +917,11 @@ mech it pays and whose terms apply: `valory_operated` and `terms` or
 one that reads the manifest. `payment_info` is the report's `payment` label
 under another name: in the answer, `payment` is what the request was charged,
 as an integer in base units of its payment asset: the mech's reported charge
-for each request id it took (`reported_charges`), and the per-request rate the
-request accepted for an id with none reported yet. `signed_cap` is that rate
-for every id, the most the request can cost; `mech_result` reports a
-delivery's charge as `payment` too. Each report is its own check, resolver, indexer and
+for each request id it took (`reported_charges`), never above the per-request
+rate the request accepted, and that rate for an id with none reported yet.
+`signed_cap` is that rate for every id, the most the request can cost;
+`mech_result` sets `payment` only once the mech has reported that id's charge,
+bounded the same way. Each report is its own check, resolver, indexer and
 proof fetch alike, so two reports in one flow can disagree after a DNS blip
 or an indexer hiccup; `mech_request`'s is the one that governs the request it
 sent. mech-client's warnings, including a check that could not complete, are
@@ -951,10 +953,11 @@ the mech could not answer is named in `failed_runs` with its error and fault,
 and `reported_charges` carries what the mech reported charging for each
 request; both come back from `mech_result` too, and each failed run is
 audited as `mech_run_failed` with its error, fault and charge. A chat prompt
-(a JSON list of messages) with a message whose `content` is not a string or a
-list of text parts is refused before anything is signed
-(`chat-content-not-text`): the chat tool would refuse it as the caller's fault
-and charge the whole signed cap. The
+for the `chat` tool (a JSON list of messages) with a message whose `content` is
+not a string, a list of text parts or `null` is refused, and audited as a
+`refusal`, before anything is deposited or signed (`chat-content-not-text`):
+the chat tool would refuse it as the caller's fault and charge the whole signed
+cap. Other tools' prompts go out as given. The
 request was paid for, so the report is never lost to a failed read:
 `mech_result` picks it up.
 

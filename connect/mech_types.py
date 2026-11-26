@@ -258,6 +258,8 @@ class PendingDelivery(t.NamedTuple):
     from_block: int | None
     nonce: int | None
     salt: str | None
+    # the rate the request was signed at (off-chain: its cap), bounding `payment`
+    rate: int | None = None
 
 
 def published_tools(document: t.Any) -> list[str]:
@@ -312,13 +314,24 @@ def record_failed_runs(activity: ActivityLog, chain: str, report: t.Mapping) -> 
         )
 
 
-def check_chat_prompt(prompt: str) -> None:
-    """Refuse, before anything is signed, a chat whose message content is not text.
+# the chat tool, which charges the signed cap for a message it cannot serve
+CHAT_TOOL = "chat"
+
+
+def check_chat_prompt(  # pylint: disable=too-many-arguments
+    prompt: str,
+    tool: str,
+    *,
+    activity: ActivityLog,
+    chain: str | None,
+    request_id: str | None,
+) -> None:
+    """Refuse, and audit, a chat for the chat tool whose message content is not text.
 
     The chat tool serves a message whose `content` is absent, a string or a
     list of text parts, and charges the request for any other.
     """
-    if not is_chat_prompt(prompt):
+    if tool != CHAT_TOOL or not is_chat_prompt(prompt):
         return
     for index, message in enumerate(json.loads(prompt)):
         content = message.get("content")
@@ -328,11 +341,19 @@ def check_chat_prompt(prompt: str) -> None:
             isinstance(part, dict) and part.get("type") == "text" for part in content
         ):
             continue
-        raise MechNotSent(
-            f"rule '{RULE_CHAT_CONTENT}': message {index} ({message.get('role')!r}) "
-            "has content that is not a string or a list of text parts; nothing "
-            "was sent"
+        reason = (
+            f"message {index} ({message.get('role')!r}) has content that is not "
+            "a string or a list of text parts"
         )
+        activity.record(
+            "refusal",
+            rule=RULE_CHAT_CONTENT,
+            chain=chain,
+            tool=tool,
+            request_id=request_id,
+            reason=reason,
+        )
+        raise MechNotSent(f"rule '{RULE_CHAT_CONTENT}': {reason}; nothing was sent")
 
 
 def merge_outcomes(payload: dict, report: t.Mapping) -> None:
@@ -412,25 +433,55 @@ def lost_answer(  # pylint: disable=too-many-arguments
     return answer_lost(error, held, what, note)
 
 
-def explicit_hook(
-    arm: t.Callable[[bytes, int], None], sent: list[tuple[int, PreSignHook]]
-) -> PreSignHook:
-    """Return the pre-sign hook of an explicit send: arm the id, record the send."""
-
-    def on_request_id(request_id: bytes, nonce: int) -> None:
-        arm(request_id, nonce)
-        sent.append((nonce, hook))
-
-    hook = PreSignHook(on_request_id)
-    return hook
+# A mech with explicit nonces off answers 503 and mech-client resends the
+# request sequentially in the same call, outside the allocator: refused here.
+RULE_EXPLICIT_RESEND = "mech-explicit-nonces-off"
 
 
-def explicit_send(send: t.Callable[..., dict], hook: PreSignHook) -> dict:
-    """Send with an explicit nonce, the mech's HTTP answer as the allocator's rule."""
-    try:
-        return send(nonce_mode=NONCE_MODE_EXPLICIT, on_request_id=hook)
-    except (OffchainRequestRejected, OffchainTopUpFailed) as e:
-        raise NonceRefused(REJECTION_RULES[outcome_of(e)], str(e)) from e
+class ExplicitSend:  # pylint: disable=too-few-public-methods
+    """One explicit-nonce send: arms and counts the id it signs, and only one.
+
+    `queue` is the MechQueue that counts the id in flight from its signing.
+    """
+
+    def __init__(
+        self,
+        arm: t.Callable[[bytes, int], None],
+        sent: list[tuple[int, PreSignHook]],
+        queue: t.Any,
+        chain: str,
+    ) -> None:
+        """Wrap `arm` and the shared `sent` list in this send's pre-sign hook."""
+        self._arm, self._sent, self._queue, self._chain = arm, sent, queue, chain
+        self._signed: list[str] = []
+        self.hook = PreSignHook(self._on_request_id)
+
+    def _on_request_id(self, request_id: bytes, nonce: int) -> None:
+        if self._signed:  # a second id is mech-client's sequential resend
+            self._drop()
+            raise MechNotSent(
+                f"rule '{RULE_EXPLICIT_RESEND}': the mech does not take explicit "
+                "nonces, so nothing was bought; send it sequential nonces "
+                '(README, "One payer per safe: nonces")'
+            )
+        self._arm(request_id, nonce)
+        self._sent.append((nonce, self.hook))
+        self._signed.append(bytes(request_id).hex())
+        self._queue.explicit_signed(self._chain, self._signed[-1])
+
+    def _drop(self) -> None:
+        for key in self._signed:
+            self._queue.explicit_dropped(self._chain, key)
+
+    def __call__(self, send: t.Callable[..., dict]) -> dict:
+        """Send, the mech's HTTP answer as the allocator's rule."""
+        try:
+            return send(nonce_mode=NONCE_MODE_EXPLICIT, on_request_id=self.hook)
+        except (OffchainRequestRejected, OffchainTopUpFailed) as e:
+            rule = REJECTION_RULES[outcome_of(e)]
+            if rule != RULE_ANSWER_UNKNOWN:  # the mech admitted nothing
+                self._drop()
+            raise NonceRefused(rule, str(e)) from e
 
 
 def answer_lost(error: Exception, held: str, what: str, note: str) -> MechAnswerUnknown:
