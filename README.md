@@ -765,7 +765,25 @@ deployment configuration. Other chains keep their existing indexers.
 
 ### One payer per safe: nonces
 
-Off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
+Off-chain requests sign explicit nonces by default
+(`CONNECTION_CONFIGS_CONFIG_MECH_NONCE_MODE`, `explicit` or `sequential`, read
+at start; Pearl sets it through the service's `MECH_NONCE_MODE`): mech-client picks a random nonce and a 15-minute settle deadline per
+request, and the mech settles it on its own, in any order, so no request waits
+on another's slot. An explicit request takes no slot in the queue below, so a
+slot it still holds does not block it; the prepaid deposit counts it in flight
+from its signing until the marketplace records it settled or its deadline
+passes, so one deposit covers several calls.
+
+Explicit nonces need the mech to run v0.37 or later with them enabled. A mech
+before v0.37 refuses every explicit request (HTTP 401, its request id does not
+match). One with them turned off answers HTTP 503 with the reason
+"explicit-nonce requests are not enabled on this mech", and mech-client then
+resends the request sequentially inside the same call, outside the queue below;
+Connect refuses that resend before it is signed (`mech-explicit-nonces-off`,
+nothing bought). Any other 503 is refused like any other answer. For either
+kind of mech, set the mode to `sequential`.
+
+In sequential mode, off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
 process, through its `send_with_nonce`, so concurrent requests from one safe
 never share one. It follows the deployed sequential marketplace: the mech
 admits only `mapNonces + accepted + settling` for a sender, so one mech is in
@@ -884,9 +902,11 @@ signs its own marketplace nonces for the safe, and two payers on one safe
 collide.
 
 Each request carries a spending budget, `max_payment`, which goes to
-mech-client as `send_request(max_price=...)`: a mech pricing above it is
-refused (`MechPriceExceeded`, reported as `over-max-payment`) before any
-deposit, signature or POST. It bounds the request's 402 top-up as well: a
+mech-client as `send_request(max_price=...)`. Connect refuses a request above
+it first, before any deposit, signature or POST (`over-max-payment`): off-chain
+against the cap the request would sign, on-chain against the mech's price.
+mech-client's own `MechPriceExceeded` is the backstop and is reported the same
+way. It bounds the request's 402 top-up as well: a
 shortfall above `max_payment` (or above 10× the mech's price) is refused
 before anything is deposited, by mech-client and, in every mode, by Connect,
 which reads each transaction the flow sends and audits the refused deposit
@@ -945,9 +965,13 @@ mech it pays and whose terms apply: `valory_operated` and `terms` or
 `identification_note` on both flows, plus `operator`, `benchmarks`,
 `delivery`, `payment_info` and `terms_url` on the off-chain flow, which is the
 one that reads the manifest. `payment_info` is the report's `payment` label
-under another name: in the answer, `payment` is the charge the request
-accepted, the mech's per-request rate for each request id it took, as an
-integer in base units of its payment asset. Each report is its own check, resolver, indexer and
+under another name: in the answer, `payment` is what the request was charged,
+as an integer in base units of its payment asset: the mech's reported charge
+for each request id it took (`reported_charges`), never above the per-request
+rate the request accepted, and that rate for an id with none reported yet.
+`signed_cap` is that rate for every id, the most the request can cost;
+`mech_result` sets `payment` only once the mech has reported that id's charge,
+bounded the same way. Each report is its own check, resolver, indexer and
 proof fetch alike, so two reports in one flow can disagree after a DNS blip
 or an indexer hiccup; `mech_request`'s is the one that governs the request it
 sent. mech-client's warnings, including a check that could not complete, are
@@ -974,7 +998,16 @@ comes back marked `replayed`.
 A request that returned before its delivery reports the ids still awaited in
 `pending_request_ids`; one whose delivery could not be read in that wait
 carries the cause in `watch_errors`, keyed by id; a chat delivery that cannot
-be read leaves the cause in `chat_error` instead of losing the report. The
+be read leaves the cause in `chat_error` instead of losing the report. A run
+the mech could not answer is named in `failed_runs` with its error and fault,
+and `reported_charges` carries what the mech reported charging for each
+request; both come back from `mech_result` too, and each failed run is
+audited as `mech_run_failed` with its error, fault and charge. A chat prompt
+for the `chat` tool (a JSON list of messages) with a message whose `content` is
+not a string, a list of text parts or `null` is refused, and audited as a
+`refusal`, before anything is deposited or signed (`chat-content-not-text`):
+the chat tool would refuse it as the caller's fault and charge the whole signed
+cap. Other tools' prompts go out as given. The
 request was paid for, so the report is never lost to a failed read:
 `mech_result` picks it up.
 
@@ -1045,7 +1078,7 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`,
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_NONCE_MODE,MECH_HARD_CANCEL_AFTER}`,
   `CONNECTION_CONFIGS_CONFIG_{STAKING_CONTRACT_ADDRESS,ACTIVITY_CHECKER_CONTRACT_ADDRESS,SERVICE_ID}`
   (see [Staking](#staking)), plus
   `CONNECTION_CONFIGS_CONFIG_MECHX_{MARKETPLACE,REGISTRY}_{BASE,POLYGON}_SQUID_URL`;

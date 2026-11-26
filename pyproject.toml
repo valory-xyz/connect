@@ -17,7 +17,7 @@ dependencies = [
     "web3>=7.16.0,<8",
     "eth-account>=0.13.7,<0.14",
     "mcp==1.28.1",
-    "mech-client==0.26.2",
+    "mech-client==0.27.0",
     "open-aea-ledger-ethereum==2.2.10",
     "tomli-w>=1.2.0,<2",
 ]

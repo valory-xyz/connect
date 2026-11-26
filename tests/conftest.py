@@ -40,7 +40,7 @@ from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound, Web3RPCError
 
 from connect.activity import ACTIVITY_LOG_FILE, ActivityLog
-from connect.config import AppConfig, ChainConfig
+from connect.config import AppConfig, ChainConfig, MECH_NONCE_MODE_SEQUENTIAL
 from connect.guard import Guard
 from connect.mech import MechService
 from connect.server import auth as auth_module
@@ -325,7 +325,7 @@ def audit_kinds(store_path: Path) -> list[str]:
 
 @pytest.fixture
 def app_config(store_path: Path) -> AppConfig:
-    """Config with one fake chain."""
+    """Config with one fake chain, in sequential mode (README, "One payer per safe")."""
     return AppConfig(
         chains={
             "testchain": ChainConfig(
@@ -334,6 +334,7 @@ def app_config(store_path: Path) -> AppConfig:
             )
         },
         store_path=store_path,
+        mech_nonce_mode=MECH_NONCE_MODE_SEQUENTIAL,
     )
 
 

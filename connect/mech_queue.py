@@ -30,17 +30,20 @@ import typing as t
 
 from mech_client import MechPriceExceeded, NonceAllocator
 from mech_client.nonces import DELIVERY_REJECTED
-from mech_client.services.marketplace_service import MarketplaceService
+from mech_client.services.marketplace_service import (
+    EXPLICIT_NONCE_DEADLINE_SECONDS,
+    MarketplaceService,
+)
 from web3 import Web3
 
 from connect.activity import ActivityLog
-from connect.config import AppConfig
+from connect.config import AppConfig, MECH_NONCE_MODE_EXPLICIT
 from connect.guard import GuardError
 from connect.mech_allowances import read_map_nonces
 from connect.mech_budget import DEFAULT_MAX_PAYMENT
-from connect.mech_types import MechError, published_tools
+from connect.mech_types import MechError, published_tools, request_key
 from connect.signer import SignerError
-from connect.signer_errors import logged_cause
+from connect.signer_errors import cause_of, logged_cause
 
 logger = logging.getLogger("agent")
 
@@ -101,6 +104,8 @@ class MechQueue:
             gap_retries=config.mech_gap_retries,
             clock=clock,
         )
+        # (chain, safe) -> explicit request id -> when its settle deadline passes
+        self._explicit: dict[tuple[str, str], dict[str, float]] = {}
 
     def close(self) -> None:
         """Release STORE_PATH's queue store, so another allocator may take it."""
@@ -248,6 +253,43 @@ class MechQueue:
         )
         raise HardCancelFailed(chain) from failure
 
+    def sent(self, chain: str, result: t.Mapping) -> None:
+        """Stamp the slots of a sequential off-chain send's deliveries.
+
+        An explicit request holds no slot: it is counted from its signing
+        (`explicit_signed`) instead.
+        """
+        if self._config.mech_nonce_mode == MECH_NONCE_MODE_EXPLICIT:
+            return
+        ids = list(result.get("request_ids") or [])
+        got = result.get("deliveries") or {}
+        self.stamp(
+            chain,
+            [
+                (nonce, got[key].data, got[key].url)
+                for key, nonce in zip(ids, result.get("nonces") or [])
+                if key in got and got[key].data is not None
+            ],
+        )
+
+    def explicit_signed(self, chain: str, request_id: str) -> None:
+        """Count an explicit request in flight from its signing (`_explicit_in_flight`)."""
+        now = self._clock()
+        held = self._explicit_held(chain)
+        for key, expires in list(held.items()):
+            if expires <= now:
+                del held[key]
+        held[request_key(request_id)] = now + EXPLICIT_NONCE_DEADLINE_SECONDS
+
+    def explicit_dropped(self, chain: str, request_id: str) -> None:
+        """Stop counting an explicit request the mech refused unadmitted."""
+        self._explicit_held(chain).pop(request_key(request_id), None)
+
+    def _explicit_held(self, chain: str) -> dict[str, float]:
+        """Return the safe's explicit requests in flight: request id -> deadline."""
+        safe = t.cast(str, self._config.chain(chain).safe_address)
+        return self._explicit.setdefault((chain, safe.lower()), {})
+
     def stamp(self, chain: str, slots: t.Sequence[DeliveredSlot]) -> None:
         """Start the settle clock of the deliveries mech-client has not answered.
 
@@ -276,8 +318,14 @@ class MechQueue:
             chain, safe, [(nonce, salt) for nonce in _rejected_nonces(slots)]
         )
 
-    def in_flight(self, chain: str, safe: str, settled: int) -> int:
-        """Count the safe's slots the allocator holds at or above `settled`.
+    def in_flight(
+        self, chain: str, safe: str, settled: int, contract: t.Any = None
+    ) -> int:
+        """Count the safe's requests in flight: allocator slots, explicit ones.
+
+        Slots are those the allocator holds at or above `settled`; with the
+        marketplace `contract`, the explicit requests not yet settled count too
+        (`_explicit_in_flight`).
 
         Those are the requests this safe has in flight: delivered but not yet
         settled on chain, and accepted and not yet delivered. Each will take
@@ -292,7 +340,26 @@ class MechQueue:
         queue = self.allocator._queue(  # pylint: disable=protected-access
             self.allocator.key(chain, safe)
         )
-        return sum(1 for nonce in dict(queue.slots) if nonce >= settled)
+        slots = sum(1 for nonce in dict(queue.slots) if nonce >= settled)
+        if contract is None:
+            return slots
+        return slots + self._explicit_in_flight(chain, safe, contract)
+
+    def _explicit_in_flight(self, chain: str, safe: str, contract: t.Any) -> int:
+        """Count the explicit requests this process sent that may still settle.
+
+        One leaves the count once the marketplace records it (its
+        `mapRequestIdInfos` names a priority mech: it settled, and the balance
+        no longer shows it) or its settle deadline has passed (it never
+        will). A record that cannot be read keeps it counted: prepaying one
+        call too many costs less than a 402 round trip.
+        """
+        held = self._explicit.get((chain, safe.lower()), {})
+        now = self._clock()
+        for key, expires in list(held.items()):
+            if expires <= now or _settled(contract, key):
+                del held[key]
+        return len(held)
 
     def _stuck_mech(self, chain: str, safe: str, nonce: int) -> str:
         """Return the mech of the safe's slot at `nonce`, else its lowest held one.
@@ -313,6 +380,21 @@ class MechQueue:
                 "stuck request's mech to send the hard cancel to",
             )
         return Web3.to_checksum_address(slot.mech)
+
+
+def _settled(contract: t.Any, request_id: str) -> bool:
+    """Whether the marketplace recorded the request (its priority mech is set).
+
+    A record that cannot be read counts as unsettled, and is logged.
+    """
+    try:
+        info = contract.functions.mapRequestIdInfos(bytes.fromhex(request_id)).call()
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.warning(
+            "could not read whether request %s settled: %s", request_id, cause_of(e)
+        )
+        return False
+    return int(str(info[0]), 16) != 0
 
 
 def _rejected_nonces(slots: t.Sequence[DeliveredSlot]) -> list[int]:
