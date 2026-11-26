@@ -717,14 +717,20 @@ deployment configuration. Other chains keep their existing indexers.
 
 Off-chain requests sign explicit nonces by default: mech-client picks a random
 nonce and a 15-minute settle deadline per request, and the mech settles it on
-its own, in any order, so no request waits on another's slot. A mech without
-explicit nonces answers with a 503 and mech-client resends the request
-sequentially. An explicit request takes no slot in the queue below, so a slot
-it still holds does not block it; the prepaid deposit still counts it in
-flight, from its send until the marketplace records it settled or its
-deadline passes, so one deposit covers several calls as before. Setting
-`CONNECTION_CONFIGS_CONFIG_MECH_NONCE_MODE=sequential` sends every off-chain
-request through the allocator instead, as below; mechs before v0.37 need it.
+its own, in any order, so no request waits on another's slot. An explicit
+request takes no slot in the queue below, so a slot it still holds does not
+block it; the prepaid deposit still counts it in flight, from its send until
+the marketplace records it settled or its deadline passes, so one deposit
+covers several calls as before.
+
+Explicit nonces need the mech to run v0.37 or later with them enabled. A mech
+before v0.37 refuses every explicit request (HTTP 401, its request id does not
+match), and one with them turned off answers HTTP 503, after which mech-client
+resends sequentially inside the same call: that resend signs Connect's cap, not
+the mech's advertised maximum, and reads `mapNonces` outside the queue below,
+so two requests close together can sign the same nonce. For either kind of
+mech, set `CONNECTION_CONFIGS_CONFIG_MECH_NONCE_MODE=sequential`, which sends
+every off-chain request through the allocator below.
 
 Off-chain marketplace nonces come from mech-client's `NonceAllocator`, one per
 process, through its `send_with_nonce`, so concurrent requests from one safe
@@ -845,9 +851,11 @@ signs its own marketplace nonces for the safe, and two payers on one safe
 collide.
 
 Each request carries a spending budget, `max_payment`, which goes to
-mech-client as `send_request(max_price=...)`: a mech pricing above it is
-refused (`MechPriceExceeded`, reported as `over-max-payment`) before any
-deposit, signature or POST. It bounds the request's 402 top-up as well: a
+mech-client as `send_request(max_price=...)`. Connect refuses a request above
+it first, before any deposit, signature or POST (`over-max-payment`): off-chain
+against the cap the request would sign, on-chain against the mech's price.
+mech-client's own `MechPriceExceeded` is the backstop and is reported the same
+way. It bounds the request's 402 top-up as well: a
 shortfall above `max_payment` (or above 10× the mech's price) is refused
 before anything is deposited, by mech-client and, in every mode, by Connect,
 which reads each transaction the flow sends and audits the refused deposit

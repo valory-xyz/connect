@@ -29,7 +29,7 @@ from mech_client.services.marketplace_service import (
     UINT256_MAX,
 )
 
-from connect.mech_types import MechError, MechNotSent, PricedMech, said
+from connect.mech_types import MechError, MechNotSent, PricedMech, merge_outcomes, said
 
 # The agent's per-request spending budget, not a guardrail: the caller picks
 # max_payment per call and the server does not clamp it — the guardrail only
@@ -158,3 +158,16 @@ def result_charge(report: dict, outcomes: dict, key: str) -> None:
     report.update(outcomes)
     if key in outcomes.get("reported_charges", {}):
         report["payment"] = int(outcomes["reported_charges"][key])
+
+
+def replay_payment(payload: dict, outcomes: dict) -> None:
+    """Merge a replay's collected outcomes and settle `payment` on them.
+
+    The signed rate per request is `signed_cap` over the request ids; a
+    report stored before `signed_cap` existed carries it as `payment`.
+    """
+    merge_outcomes(payload, outcomes)
+    ids = payload.get("request_ids") or []
+    if ids:
+        cap = int(payload.get("signed_cap", payload.get("payment", 0)))
+        settle_payment(payload, cap // len(ids))

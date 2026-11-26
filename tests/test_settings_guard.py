@@ -60,7 +60,7 @@ from mech_client.domain import identification
 from mech_client.domain import operator as operator_module
 from mech_client.domain.delivery.models import DeliveryResult
 from mech_client.domain.identification import VALORY_TERMS_NOTICE
-from mech_client.domain.request_id import request_digest
+from mech_client.domain.request_id import explicit_request_digest, request_digest
 from mech_client.domain.tools import manager as manager_module
 from mech_client.domain.tools.manager import ToolManager
 from mech_client.infrastructure.config import PaymentType
@@ -88,6 +88,7 @@ from connect.chains import MECH_MARKETPLACES
 from connect.config import (
     AppConfig,
     ChainConfig,
+    MECH_NONCE_MODES,
     MECH_NONCE_MODE_EXPLICIT,
     NATIVE_ASSET,
 )
@@ -1967,6 +1968,11 @@ class FakeMarketplaceContract:
         self.nonce = 5
         self.request_id_override: bytes | None = None
         self.recorded: set[bytes] = set()  # request ids the marketplace settled
+        self.chain_id = 31337
+        # the latest block, which an explicit request's deadline is counted from
+        self.w3 = SimpleNamespace(
+            eth=SimpleNamespace(get_block=lambda block: {"timestamp": 1_800_000_000})
+        )
         self.records_unreadable = False
         self.functions = SimpleNamespace(
             mapRequestIdInfos=lambda request_id: SimpleNamespace(
@@ -1977,6 +1983,9 @@ class FakeMarketplaceContract:
             getRequestId=lambda *args: SimpleNamespace(
                 call=lambda: self._request_id(*args)
             ),
+            getRequestIdWithNonce=lambda *args: SimpleNamespace(
+                call=lambda: self._explicit_request_id(*args)
+            ),
         )
 
     def _request_info(self, request_id: bytes) -> tuple:
@@ -1985,6 +1994,29 @@ class FakeMarketplaceContract:
             raise ConnectionError("rpc down")
         mech = OTHER if bytes(request_id) in self.recorded else "0x" + "00" * 20
         return (mech, mech, "0x" + "00" * 20, 0, 0, b"\x00" * 32)
+
+    def _explicit_request_id(  # pylint: disable=too-many-arguments
+        self,
+        mech: str,
+        requester: str,
+        data: bytes,
+        rate: int,
+        payment_type: bytes | str,
+        nonce: int,
+        deadline: int,
+    ) -> bytes:
+        """getRequestIdWithNonce: the explicit-nonce path's EIP-712 id."""
+        return explicit_request_digest(
+            chain_id=self.chain_id,
+            marketplace=self.address,
+            mech=mech,
+            requester=requester,
+            data=_view_bytes(data),
+            delivery_rate=rate,
+            payment_type=_view_bytes(payment_type),
+            nonce=nonce,
+            deadline=deadline,
+        )
 
     def _request_id(
         self,
@@ -2769,11 +2801,15 @@ class TestMech:
         assert call["max_cost"] == cap
         assert result["payment"] == cap
 
+    @pytest.mark.parametrize("nonce_mode", MECH_NONCE_MODES)
     @pytest.mark.parametrize(
         "expected_cost", [{"asset": "native", "amount": str(ON_CHAIN_RATE)}, None]
     )
     def test_mech_client_signs_the_cap_connect_reports_as_payment(
-        self, monkeypatch: pytest.MonkeyPatch, expected_cost: dict | None
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        expected_cost: dict | None,
+        nonce_mode: str,
     ) -> None:
         """The pinned mech-client's real `send_request` signs the rate Connect sizes by.
 
@@ -2803,7 +2839,10 @@ class TestMech:
         contract = FakeMarketplaceContract()
         info = MechInfo(OTHER, 42, PaymentType.NATIVE, ON_CHAIN_RATE)
         for name, value in {
-            "mech_config": SimpleNamespace(priority_mech_address=OTHER),
+            "mech_config": SimpleNamespace(
+                priority_mech_address=OTHER,
+                ledger_config=SimpleNamespace(chain_id=contract.chain_id),
+            ),
             "tool_manager": SimpleNamespace(
                 read_tools_metadata=lambda service_id: metadata_read(manifest),
                 offchain_url_from_metadata=lambda service_id, read: manifest["url"],
@@ -2819,6 +2858,12 @@ class TestMech:
             monkeypatch.setattr(service, name, value, raising=False)
         on_chain = PricedMech(OTHER, 42, ON_CHAIN_RATE, PaymentType.NATIVE.value)
         priced = mech_budget.offchain_priced(service, on_chain, PRICED_TOOL, manifest)
+        # the two ways Connect sends: an allocator nonce, or explicit
+        sent_as: dict[str, t.Any] = (
+            {"nonce_mode": MECH_NONCE_MODE_EXPLICIT}
+            if nonce_mode == MECH_NONCE_MODE_EXPLICIT
+            else {"nonces": [contract.nonce]}
+        )
         result = asyncio.run(
             service.send_request(
                 prompts=("q",),
@@ -2827,12 +2872,16 @@ class TestMech:
                 use_offchain=True,
                 max_cost=priced.rate,
                 max_price=10**18,
-                nonces=[contract.nonce],
+                **sent_as,
             )
         )
         (payload,) = posted
         assert payload["delivery_rate"] == priced.rate
-        assert "nonce_mode" not in payload  # Connect's nonces stay sequential
+        if nonce_mode == MECH_NONCE_MODE_EXPLICIT:
+            assert payload["nonce_mode"] == MECH_NONCE_MODE_EXPLICIT
+            assert payload["nonce"] != contract.nonce  # not the counter
+        else:
+            assert "nonce_mode" not in payload
         reported = mech_budget.charged({}, priced.rate, result)["payment"]
         assert reported == payload["delivery_rate"] * len(result["request_ids"])
 
@@ -3156,6 +3205,7 @@ class TestMech:
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
+        store_path: Path,
     ) -> None:
         """The usual off-chain order: accepted first, the failure read by the resumed watch."""
         patched_mech.result["deliveries"] = {}  # acknowledged, not yet run
@@ -3171,6 +3221,8 @@ class TestMech:
         assert result["delivery_results"] == {
             "ab": {"status": "failed", "error": FAILED_RUN_ERROR}
         }
+        # read by the resumed watch through result(), which audits it once
+        assert audit_kinds(store_path).count("mech_run_failed") == 1
 
     def test_a_replay_reports_a_run_that_failed_since(
         self,
@@ -3201,6 +3253,7 @@ class TestMech:
                 "ab": {"error": FAILED_RUN_ERROR, "fault": FAULT_MECH}
             }
             assert again["reported_charges"] == {"ab": str(RATE_CAP)}
+            assert again["payment"] == RATE_CAP  # the collected charge
             assert "pending_request_ids" not in again
         assert len(patched_mech.calls) == 1  # paid once
 

@@ -66,6 +66,7 @@ from connect.mech_budget import (
     offchain_priced,
     payment_report,
     price_mech,
+    replay_payment,
     result_charge,
     settle_payment,
 )
@@ -483,7 +484,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
                 else:
                     still_waiting.append(key)
         merged = {**payload, "delivery_results": delivered, "replayed": True}
-        merge_outcomes(merged, outcomes)
+        replay_payment(merged, outcomes)
         if urls:
             merged["delivery_urls"] = urls
         merged.pop("pending_request_ids", None)
@@ -693,9 +694,10 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         if plan.offchain:
             payload["expires"] = None
             payload.update(self.queue.report(plan.chain))
+        # failures read in the send; result() audits those the resumed watch reads
+        record_failed_runs(self._activity, plan.chain, payload)
         self._resume_watch(payload, deadline)
         settle_payment(payload, plan.priced.rate)
-        record_failed_runs(self._activity, plan.chain, payload)
         if plan.offchain:
             self.queue.sent(plan.chain, result)
         try:  # paid and delivered by now: a delivery it cannot read loses nothing
