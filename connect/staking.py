@@ -144,18 +144,21 @@ def staking_reminder(
 def _checkpoint_worth_sending(w3: Web3, contract: str, now: int) -> bool:
     """Whether checkpoint() is due and would change something, as trader decides.
 
-    Never before the next checkpoint time. With no rewards left a checkpoint
-    changes nothing, so it would be due, and paid for, on every tick; a pending
-    rebaseline (v0.4 then answers the next checkpoint time as the current
-    block's, so it is due at once) is worth sending even so.
+    A pending rebaseline is due by itself: v0.4 then answers the next
+    checkpoint time with the current block's, so a send is never early, and
+    comparing it with this host's clock would skip it whenever that clock runs
+    behind the chain. Otherwise it is due once the next checkpoint time has
+    passed, and worth sending only while rewards are left: with none, it
+    changes nothing and would be paid for on every tick.
     """
     next_at = _uint(w3, contract, "getNextRewardCheckpointTimestamp()")
+    ts_checkpoint = _uint(w3, contract, "tsCheckpoint()")
+    liveness_period = _uint(w3, contract, "livenessPeriod()")
+    if next_at != ts_checkpoint + liveness_period:
+        return True
     if now < next_at:
         return False
-    rebaseline = next_at != _uint(w3, contract, "tsCheckpoint()") + _uint(
-        w3, contract, "livenessPeriod()"
-    )
-    return rebaseline or _uint(w3, contract, "availableRewards()") > 0
+    return _uint(w3, contract, "availableRewards()") > 0
 
 
 def checkpoint_if_due(

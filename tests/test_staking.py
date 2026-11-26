@@ -558,7 +558,7 @@ class TestCheckpoint:
         )
         assert len(w3.eth.sent) == 1
 
-    def test_a_rebaseline_is_not_sent_before_the_next_checkpoint_time(  # pylint: disable=too-many-arguments
+    def test_a_rebaseline_is_sent_with_this_clock_behind_the_chain(  # pylint: disable=too-many-arguments
         self,
         staked_config: AppConfig,
         test_signer: Signer,
@@ -566,16 +566,13 @@ class TestCheckpoint:
         activity: ActivityLog,
         w3: StakingW3,
     ) -> None:
-        """A next checkpoint time still ahead: nothing sent, whatever it signals."""
+        """The block time v0.4 answers a few seconds ahead of this host: sent."""
         test_signer.set_guard(guard)
-        w3.next_checkpoint = NOW + DAY
-        assert (
-            staking.checkpoint_if_due(
-                staked_config, test_signer, guard, activity, now=_now
-            )
-            is None
+        w3.next_checkpoint = NOW + 6
+        assert staking.checkpoint_if_due(
+            staked_config, test_signer, guard, activity, now=_now
         )
-        assert not w3.eth.sent
+        assert len(w3.eth.sent) == 1
 
     def test_a_failed_read_sends_nothing(  # pylint: disable=too-many-arguments
         self,
