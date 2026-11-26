@@ -54,6 +54,7 @@ from connect.server import app as app_module
 from connect.server import pearl_routes
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import Signer, SignerError
+from connect import workspace as workspace_module
 from connect.workspace import SESSION_NOTICE_FILE
 
 from tests.conftest import FakeW3, audit_entries
@@ -940,25 +941,31 @@ class TestSessionNotice:
         # and with none to clear
         assert client.post("/session").json()["launched"] is True
 
+    @pytest.mark.parametrize("target_exists", [True, False], ids=["live", "dangling"])
     @pytest.mark.parametrize(
         "notice", [staking.STAKING_REMINDER, None], ids=["write", "clear"]
     )
-    def test_a_planted_link_is_replaced_not_followed(
+    def test_a_planted_link_is_replaced_not_followed(  # pylint: disable=too-many-arguments
         self,
         client: TestClient,
         app_config: AppConfig,
         tmp_path: Path,
         notice: str | None,
+        target_exists: bool,
     ) -> None:
         """A session's link at the name never redirects the server's write."""
         outside = tmp_path / "outside.json"
-        outside.write_text("settings", encoding="utf-8")
+        if target_exists:
+            outside.write_text("settings", encoding="utf-8")
         self._notice(app_config).symlink_to(outside)
 
         workspace = client.app.state.workspace  # type: ignore[attr-defined]
         workspace.write_session_notice(notice)
 
-        assert outside.read_text(encoding="utf-8") == "settings"
+        if target_exists:
+            assert outside.read_text(encoding="utf-8") == "settings"
+        else:
+            assert not outside.exists()
         assert not self._notice(app_config).is_symlink()
         if notice is None:
             assert not self._notice(app_config).exists()
@@ -966,6 +973,34 @@ class TestSessionNotice:
             assert self._notice(app_config).read_text(encoding="utf-8") == (
                 notice + "\n"
             )
+
+    def test_a_link_planted_after_the_remove_fails_the_write(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The exclusive create refuses a link the session plants in between."""
+        outside = tmp_path / "outside.json"
+        outside.write_text("settings", encoding="utf-8")
+        real_remove = workspace_module._remove  # pylint: disable=protected-access
+
+        def remove_then_plant(target: Path) -> None:
+            real_remove(target)
+            target.symlink_to(outside)
+
+        self._notice(app_config).write_text("stale", encoding="utf-8")
+        monkeypatch.setattr(workspace_module, "_remove", remove_then_plant)
+
+        workspace = client.app.state.workspace  # type: ignore[attr-defined]
+        with pytest.raises(FileExistsError):
+            workspace.write_session_notice(staking.STAKING_REMINDER)
+        assert outside.read_text(encoding="utf-8") == "settings"
+
+    def test_the_notice_is_never_committed(self) -> None:
+        """A `git init` in the workspace ignores the notice, like the token."""
+        assert SESSION_NOTICE_FILE in workspace_module.GITIGNORE_ENTRIES
 
     def test_an_unwritable_notice_never_fails_the_launch(
         self,

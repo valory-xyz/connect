@@ -101,8 +101,15 @@ TOKEN_DENY_RULES = (
     "Read(./ocb-agent/**)",
 )
 # a `git init` in the workspace must never be able to stage the token, nor
-# the virtualenv the connect-polymarket skill builds at the workspace root
-GITIGNORE_ENTRIES = (".mcp.json*", ".codex/config.toml*", "ocb-agent/", ".venv/")
+# the virtualenv the connect-polymarket skill builds at the workspace root,
+# nor the server's session notice
+GITIGNORE_ENTRIES = (
+    ".mcp.json*",
+    ".codex/config.toml*",
+    "ocb-agent/",
+    ".venv/",
+    SESSION_NOTICE_FILE,
+)
 # picked, not tuned: refusals seen exit in ms; still running by then means launching
 LAUNCH_SETTLE_SECONDS = 2.0
 LAUNCH_PROBE_SECONDS = 10.0

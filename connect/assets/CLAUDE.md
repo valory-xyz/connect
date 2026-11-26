@@ -29,7 +29,8 @@ connect server owns — don't hand-edit them:
   checks and survives such a reset
 - `.gitignore` / `.claude/settings.json` — the server re-adds its hygiene
   entries if they go missing: never commit or read `.mcp.json` or
-  `.codex/config.toml`, and never commit `.venv/`
+  `.codex/config.toml`, and never commit `.venv/` or
+  `pearl-session-notice.md`
 - this brief itself, `CLAUDE.md`, and its copy `AGENTS.md`
 - `agent_performance.json` — except as "Minutes per run" below describes
 - `pearl-session-notice.md` — what the server has to tell the operator when
