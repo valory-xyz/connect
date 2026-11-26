@@ -30,7 +30,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from web3 import Web3
 
@@ -92,8 +92,13 @@ class FundRequirement(TypedDict):
 
 @dataclass(frozen=True)
 class StakingConfig:
-    """The staking program this instance is staked in, on its instance chain."""
+    """The staking program this instance is staked in, on its instance chain.
 
+    Built only by `load_config`, once the one chain carrying the safe is known.
+    """
+
+    chain: str
+    safe: str
     staking_contract: str
     activity_checker: str
     service_id: int
@@ -360,11 +365,13 @@ def _staking_address(env: dict[str, str], name: str) -> str | None:
     return Web3.to_checksum_address(raw)
 
 
-def _parse_staking(env: dict[str, str]) -> StakingConfig | None:
+def _parse_staking(env: dict[str, str], config: AppConfig) -> StakingConfig | None:
     """Read the staking program Pearl configured; None while unstaked.
 
     Staking is optional and the wallet must keep working without it, so a
     value Connect cannot use is logged and read as unstaked, never refused.
+    Pearl sets all three for a staked instance and none for an unstaked one,
+    so a partial set is a deploy fault, logged as an error.
     """
     try:
         staking_contract = _staking_address(env, STAKING_CONTRACT_ENV)
@@ -377,14 +384,24 @@ def _parse_staking(env: dict[str, str]) -> StakingConfig | None:
         logger.error("staking read as unstaked: %s", e)
         return None
     if activity_checker is None or service_id == 0:
-        logger.warning(
+        logger.error(
             "staking read as unstaked: %s is set but %s or %s is not",
             STAKING_CONTRACT_ENV,
             ACTIVITY_CHECKER_ENV,
             SERVICE_ID_ENV,
         )
         return None
+    chain = config.instance_chain
+    if chain is None:
+        # the program is for the chain carrying the safe; with none it has no chain
+        logger.error(
+            "staking read as unstaked: no single instance chain (chains with a safe: %s)",
+            config.safe_chains or "none",
+        )
+        return None
     return StakingConfig(
+        chain=chain,
+        safe=cast(str, config.chain(chain).safe_address),
         staking_contract=staking_contract,
         activity_checker=activity_checker,
         service_id=service_id,
@@ -442,13 +459,6 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
             env, MECH_HARD_CANCEL_AFTER_ENV, DEFAULT_MECH_HARD_CANCEL_AFTER
         ),
         ocb_chat_mech_overrides=_parse_ocb_chat_mechs(env),
-        staking=_parse_staking(env),
     )
-    if config.staking is not None and config.instance_chain is None:
-        # the program is for the chain carrying the safe; with none it has no chain
-        logger.warning(
-            "staking read as unstaked: no single instance chain (chains with a safe: %s)",
-            config.safe_chains or "none",
-        )
-        config.staking = None
+    config.staking = _parse_staking(env, config)
     return config

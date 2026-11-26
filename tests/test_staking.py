@@ -20,6 +20,7 @@
 """Staking: the env vars, the session reminder, and the checkpoint."""
 
 import asyncio
+import dataclasses
 import json
 import logging
 import threading
@@ -66,7 +67,11 @@ DAY = 86_400
 # ~1 request a day, as the Connect checkers are configured
 RATIO = 11_337_868_480_725
 PROGRAM = StakingConfig(
-    staking_contract=STAKING_CONTRACT, activity_checker=CHECKER, service_id=SERVICE_ID
+    chain="testchain",
+    safe=SAFE,
+    staking_contract=STAKING_CONTRACT,
+    activity_checker=CHECKER,
+    service_id=SERVICE_ID,
 )
 
 
@@ -227,10 +232,12 @@ class TestConfig:
             config = load_config(env)
         assert config.staking is None
         assert not staking.is_staked(config)
-        assert (
+        (record,) = [r for r in caplog.records if "no single instance chain" in r.message]
+        assert record.levelname == "ERROR"
+        assert record.message == (
             "staking read as unstaked: no single instance chain "
             f"(chains with a safe: {named})"
-        ) in caplog.text
+        )
 
     def test_a_staked_instance(self, tmp_path: Path) -> None:
         """All three set: the program, checksummed."""
@@ -244,7 +251,7 @@ class TestConfig:
                 },
             )
         )
-        assert config.staking == PROGRAM
+        assert config.staking == dataclasses.replace(PROGRAM, chain="gnosis")
         assert staking.is_staked(config)
 
     @pytest.mark.parametrize(
@@ -284,10 +291,11 @@ class TestConfig:
     def test_unusable_values_read_as_unstaked(
         self, tmp_path: Path, staking_env: dict, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A value Connect cannot use never stops the wallet: unstaked, and logged."""
+        """A value Connect cannot use never stops the wallet: unstaked, an error."""
         with caplog.at_level(logging.WARNING, logger="agent"):
             config = load_config(self._env(tmp_path, **staking_env))
         assert config.staking is None
+        assert [r.levelname for r in caplog.records] == ["ERROR"]
         assert "staking read as unstaked" in caplog.text
 
 
@@ -357,14 +365,6 @@ class TestReminder:
     ) -> None:
         """Unstaked: no read at all."""
         assert staking.staking_reminder(app_config, test_signer, now=_now) is None
-        assert not w3.calls
-
-    def test_silent_without_an_instance_chain(
-        self, staked_config: AppConfig, test_signer: Signer, w3: StakingW3
-    ) -> None:
-        """No chain carrying the safe: nothing to read."""
-        staked_config.chains["testchain"].safe_address = None
-        assert staking.staking_reminder(staked_config, test_signer, now=_now) is None
         assert not w3.calls
 
     def test_a_failed_read_never_reminds(
@@ -502,19 +502,23 @@ class TestCheckpoint:
         activity: ActivityLog,
         w3: StakingW3,
         receipt: dict | None,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A revert or a receipt that never comes: audited as failed, retried later."""
         test_signer.set_guard(guard)
         w3.ts_checkpoint = NOW - DAY
         w3.eth.receipt = receipt
-        assert (
-            staking.checkpoint_if_due(
-                staked_config, test_signer, guard, activity, now=_now
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            assert (
+                staking.checkpoint_if_due(
+                    staked_config, test_signer, guard, activity, now=_now
+                )
+                is None
             )
-            is None
-        )
         (entry,) = _audited(staked_config, "staking_checkpoint_failed")
         assert entry["tx_hash"].startswith("0x")
+        # the log names the transaction, so the operator can look it up
+        assert f"(tx {entry['tx_hash']})" in caplog.text
         assert entry["staking_contract"] == STAKING_CONTRACT
         payload = (staked_config.store_path / PERFORMANCE_FILE).read_text()
         assert '"last_activity": null' in payload

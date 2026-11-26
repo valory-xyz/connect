@@ -125,12 +125,13 @@ def staking_reminder(
     state cannot be read: a failed read is logged and never reminds.
     """
     staking = config.staking
-    chain = config.instance_chain
-    if staking is None or chain is None:
+    if staking is None:
         return None
-    safe = t.cast(str, config.chain(chain).safe_address)
+    chain = staking.chain
     try:
-        made = request_made_this_epoch(signer.w3(chain), staking, safe, int(now()))
+        made = request_made_this_epoch(
+            signer.w3(chain), staking, staking.safe, int(now())
+        )
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.warning(
             "staking reminder skipped: could not read the staking state on %s: %s",
@@ -174,9 +175,9 @@ def checkpoint_if_due(
     is logged and audited; the caller's next tick retries it.
     """
     staking = config.staking
-    chain = config.instance_chain
-    if staking is None or chain is None:
+    if staking is None:
         return None
+    chain = staking.chain
     tx_hash: str | None = None
     try:
         w3 = signer.w3(chain)
@@ -201,7 +202,12 @@ def checkpoint_if_due(
         wait_mined(w3, tx_hash)
     except Exception as e:  # pylint: disable=broad-exception-caught
         # cause_of, not the text: an RPC library's words may carry the RPC key
-        logger.warning("staking checkpoint on %s failed: %s", chain, logged_cause(e))
+        logger.warning(
+            "staking checkpoint on %s failed (tx %s): %s",
+            chain,
+            tx_hash,
+            logged_cause(e),
+        )
         activity.record(
             "staking_checkpoint_failed",
             chain=chain,
