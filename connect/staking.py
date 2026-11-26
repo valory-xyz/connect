@@ -32,7 +32,11 @@ from hexbytes import HexBytes
 from web3 import Web3
 from web3.types import BlockIdentifier
 
-from connect.activity import ActivityLog
+from connect.activity import (
+    STAKING_CHECKPOINT_FAILED_KIND,
+    STAKING_CHECKPOINT_KIND,
+    ActivityLog,
+)
 from connect.chain_read import selector_of
 from connect.config import AppConfig, StakingConfig
 from connect.guard import Guard
@@ -86,10 +90,8 @@ def is_staked(config: AppConfig) -> bool:
     return config.staking is not None
 
 
-def request_made_this_epoch(
-    w3: Web3, staking: StakingConfig, safe: str, now: int
-) -> bool:
-    """Whether the safe made the Marketplace requests the epoch needs, as of `now`.
+def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
+    """Whether the program's safe made the epoch's Marketplace requests, as of `now`.
 
     :raises ValueError: when the contract holds no record of the service.
     """
@@ -97,7 +99,7 @@ def request_made_this_epoch(
         w3,
         staking.activity_checker,
         _selector("getMultisigNonces(address)")
-        + abi_encode(["address"], [Web3.to_checksum_address(safe)]),
+        + abi_encode(["address"], [Web3.to_checksum_address(staking.safe)]),
         ["uint256[]"],
     )
     ((_, _, staked_nonces, _, _, _),) = _call(
@@ -136,9 +138,7 @@ def staking_reminder(
         return None
     chain = staking.chain
     try:
-        made = request_made_this_epoch(
-            signer.w3(chain), staking, staking.safe, int(now())
-        )
+        made = request_made_this_epoch(signer.w3(chain), staking, int(now()))
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.warning(
             "staking reminder skipped: could not read the staking state on %s: %s",
@@ -211,7 +211,7 @@ def checkpoint_if_due(
             logged_cause(e),
         )
         activity.record(
-            "staking_checkpoint_failed",
+            STAKING_CHECKPOINT_FAILED_KIND,
             chain=chain,
             staking_contract=staking.staking_contract,
             tx_hash=tx_hash,
@@ -219,7 +219,7 @@ def checkpoint_if_due(
         )
         return None
     activity.record(
-        "staking_checkpoint",
+        STAKING_CHECKPOINT_KIND,
         chain=chain,
         staking_contract=staking.staking_contract,
         tx_hash=tx_hash,

@@ -339,7 +339,7 @@ class TestRequestMade:
         """The count since the checkpoint against what the checker will need."""
         fake = StakingW3(safe_requests=safe_requests, ts_checkpoint=ts_checkpoint)
         assert (
-            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, SAFE, NOW)
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
             is expected
         )
         to, data = next(
@@ -357,7 +357,7 @@ class TestRequestMade:
         """An empty record cannot be read as "made" or "not made"."""
         fake = StakingW3(record=False)
         with pytest.raises(ValueError, match="no staking record"):
-            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, SAFE, NOW)
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
 
 
 class TestReminder:
