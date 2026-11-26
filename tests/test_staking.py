@@ -22,6 +22,7 @@
 import asyncio
 import json
 import logging
+import threading
 import time
 import typing as t
 from pathlib import Path
@@ -77,11 +78,10 @@ def _sel(signature: str) -> bytes:
 class StakingW3(FakeW3):
     """Fake Web3 answering the staking and checker reads.
 
-    The shapes are the ABIs olas-operate-middleware vendors:
-    `staking_token/build/StakingToken.json` (`getServiceInfo` returns the
-    `ServiceInfo` struct, multisig, owner, nonces, tsStart, reward, inactivity)
-    and `requester_activity_checker` (`getMultisigNonces(multisig)` returns
-    `[safe nonce, Marketplace request count]`).
+    The shapes are the contracts': StakingToken's `getServiceInfo` returns its
+    `ServiceInfo` struct (multisig, owner, nonces, tsStart, reward,
+    inactivity), and the requester activity checker's `getMultisigNonces`
+    returns `[safe nonce, Marketplace request count]`.
     """
 
     def __init__(  # pylint: disable=too-many-arguments
@@ -903,19 +903,25 @@ class TestSessionNotice:
     ) -> None:
         """A read past the time limit: no reminder, an old one cleared, launched."""
         monkeypatch.setattr(pearl_routes, "REMINDER_READ_SECONDS", 0.01)
+        answered = threading.Event()
 
         def slow(config: AppConfig, signer: Signer) -> str:
-            """Answer only after the launch has given up."""
-            time.sleep(0.5)
+            """Answer only once the launch has answered.
+
+            A launch that waited on it would get the reminder after the bound,
+            and write it, failing the asserts below instead of hanging.
+            """
+            answered.wait(timeout=5)
             return staking.STAKING_REMINDER
 
         monkeypatch.setattr(staking, "staking_reminder", slow)
         assert client.get("/healthcheck").json() == {"is_healthy": True}
         self._notice(app_config).write_text("stale", encoding="utf-8")
-        started = time.monotonic()
-        with caplog.at_level(logging.WARNING, logger="agent"):
-            assert client.post("/session").json()["launched"] is True
-        assert time.monotonic() - started < 0.4
+        try:
+            with caplog.at_level(logging.WARNING, logger="agent"):
+                assert client.post("/session").json()["launched"] is True
+        finally:
+            answered.set()
         assert not self._notice(app_config).exists()
         assert "took over" in caplog.text
 
