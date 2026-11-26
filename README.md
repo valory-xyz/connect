@@ -528,6 +528,45 @@ it, and the safe is judged on what it keeps after sending the EOA's need:
 the safe holds less than the need, `remaining` is negative, so the shortfall
 is added to the safe's `topup`.
 
+## Staking
+
+Pearl may stake a Connect instance on Gnosis or Robinhood Chain; staking is
+optional, and an unstaked instance works exactly as before. Pearl passes the
+program in three env vars, set at deploy for the instance chain:
+`CONNECTION_CONFIGS_CONFIG_STAKING_CONTRACT_ADDRESS`,
+`CONNECTION_CONFIGS_CONFIG_ACTIVITY_CHECKER_CONTRACT_ADDRESS` and
+`CONNECTION_CONFIGS_CONFIG_SERVICE_ID`. The zero address means unstaked. A
+staking contract set without a usable checker and service id, or a value that
+is not an address, is logged and read as unstaked: staking never stops the
+wallet. Switching programs restarts the agent, so the values are always the
+current program's.
+
+The contract's activity checker counts the safe's Marketplace requests on
+chain, so Connect reports nothing. A request counts once the mech settles it
+on chain, off-chain requests included.
+
+- **Session reminder.** On `POST /session`, while staked, Connect reads
+  whether the epoch's request is made: the checker's
+  `getMultisigNonces(safe)[1]` less the staking contract's
+  `getServiceInfo(id).nonces[1]`, against
+  `ceil(max(livenessPeriod, now - tsCheckpoint) * livenessRatio / 1e18)`.
+  When it is not, it writes the reminder to `pearl-session-notice.md` in the
+  workspace, which the brief tells the session to say first; otherwise it
+  removes the file. A read that fails is logged and never reminds, and
+  neither it nor the write can fail the launch.
+- **Checkpoint.** Nothing else in Pearl calls the permissionless
+  `checkpoint()` that closes an epoch, so while staked the server checks
+  every `STAKING_CHECKPOINT_INTERVAL_SECONDS` (600) whether
+  `getNextRewardCheckpointTimestamp()` has passed, and if so the agent EOA
+  calls it, with its own gas. A mined call is audited as
+  `staking_checkpoint`, anything else as `staking_checkpoint_failed`, and the
+  next check retries. Like the agent top-up, those are the call's whole audit
+  and never count as the agent's activity. It is no MCP tool and draws on no
+  token's budget. In restricted mode it passes through a one-shot allowance
+  for exactly `checkpoint()`, no value, to the configured staking contract.
+- **Eviction.** Connect never stops itself, evicted or not: the session keeps
+  its wallet and earns no rewards until the eviction ends.
+
 ## Threat-model notes
 
 Binding to `127.0.0.1` does **not** make the server unreachable from the web:

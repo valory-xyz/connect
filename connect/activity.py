@@ -42,8 +42,15 @@ PERFORMANCE_FILE = "agent_performance.json"
 MAX_LOG_BYTES = 5 * 1024 * 1024  # rotate to .1 beyond this
 ACTIVITY_GOAL_KEY = "activity_goal"
 # Connect's own housekeeping: audited, but not the agent's activity on Pearl's
-# performance card (README, "Agent top-up")
-HOUSEKEEPING_KINDS = frozenset({"agent_topup", "agent_topup_failed"})
+# performance card (README, "Agent top-up", "Staking")
+HOUSEKEEPING_KINDS = frozenset(
+    {
+        "agent_topup",
+        "agent_topup_failed",
+        "staking_checkpoint",
+        "staking_checkpoint_failed",
+    }
+)
 
 
 class ActivityLog:

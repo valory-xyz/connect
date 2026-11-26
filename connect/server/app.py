@@ -33,7 +33,7 @@ from fastapi.exceptions import RequestValidationError
 from hexbytes import HexBytes
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from connect import wallet
+from connect import staking, wallet
 from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import AppConfig
 from connect.guard import Guard
@@ -63,6 +63,10 @@ PERFORMANCE_REFRESH_SECONDS = 15.0
 # how often the agent EOA's native balance is checked against its funding
 # requirement
 AGENT_TOPUP_INTERVAL_SECONDS = 3600.0
+
+# how often a staked instance checks whether its staking checkpoint is due: an
+# epoch is about a day, so this bounds how late Connect closes one
+STAKING_CHECKPOINT_INTERVAL_SECONDS = 600.0
 
 
 async def refresh_performance(activity: ActivityLog) -> None:
@@ -159,6 +163,22 @@ async def top_up_agent(  # pylint: disable=too-many-arguments,too-many-positiona
         await asyncio.sleep(AGENT_TOPUP_INTERVAL_SECONDS)
 
 
+async def checkpoint_staking(
+    config: AppConfig, signer: Signer, guard: Guard, activity: ActivityLog
+) -> None:
+    """Call the staking checkpoint whenever it is due, until cancelled.
+
+    Unstaked, it never starts: the program cannot change without a restart.
+    """
+    if not staking.is_staked(config):
+        return
+    while True:
+        await asyncio.to_thread(
+            staking.checkpoint_if_due, config, signer, guard, activity
+        )
+        await asyncio.sleep(STAKING_CHECKPOINT_INTERVAL_SECONDS)
+
+
 def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     signer: Signer,
     config: AppConfig,
@@ -191,6 +211,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
             asyncio.create_task(
                 top_up_agent(config, signer, guard, activity, running.state.topped_up)
             ),
+            asyncio.create_task(checkpoint_staking(config, signer, guard, activity)),
         )
         try:
             async with mcp.session_manager.run():

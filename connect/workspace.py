@@ -88,6 +88,10 @@ MCP_TOOL_TIMEOUT_MS = 2_100_000
 UI_SUBDIR = "ui"
 UI_INDEX = "index.html"
 BRIEF_FILES = ("CLAUDE.md", "AGENTS.md")
+# what the server has to tell the operator when a session opens; the brief
+# tells the session to say it first. Written at every POST /session, and
+# absent when there is nothing to say
+SESSION_NOTICE_FILE = "pearl-session-notice.md"
 AGENT_DIRS = (Path(".claude"), Path(".agents"))
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harnesses read these themselves; the model never needs to, and reading
@@ -447,6 +451,14 @@ class Workspace:
                 f"would open. Is Claude Code or Codex installed?"
             )
         raise LaunchError(f"{reason} The workspace is at {self.path}")
+
+    def write_session_notice(self, notice: str | None) -> None:
+        """Leave `notice` for the session about to open, or remove an old one."""
+        path = self.path / SESSION_NOTICE_FILE
+        if notice is None:
+            path.unlink(missing_ok=True)
+            return
+        path.write_text(notice + "\n", encoding="utf-8")
 
     def prepare(self, harness: str) -> None:
         """Start installing `harness` once it is chosen, if it needs installing."""

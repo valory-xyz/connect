@@ -25,11 +25,12 @@ must never expose the session token.
 
 import logging
 import time
+import typing as t
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from connect import wallet, workspace
+from connect import staking, wallet, workspace
 from connect.server.auth import require_local_origin
 from connect.settings import validate_harness
 
@@ -84,6 +85,19 @@ class SessionRequest(BaseModel):
     harness: str | None = None
 
 
+def _write_session_notice(state: t.Any) -> None:
+    """Leave the session its staking reminder, or clear an earlier one.
+
+    A failure here never stops the launch: the session opens without it.
+    """
+    try:
+        state.workspace.write_session_notice(
+            staking.staking_reminder(state.config, state.signer)
+        )
+    except OSError:
+        logger.exception("could not write the session notice")
+
+
 @router.post("/session", dependencies=[Depends(require_local_origin)])
 def start_session(request: Request, body: SessionRequest | None = None) -> dict:
     """Open an agent session in the configured harness, on demand.
@@ -121,6 +135,7 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
             else state.settings_store.load().harness
         )
         state.settings_store.require_available(requested)
+        _write_session_notice(state)
         # a harness the operator may choose but nobody can open is a bug, not a
         # server fault to 500 over: answer the caller the same way as any other
         # unusable harness (test_every_choosable_harness_can_be_opened pins
