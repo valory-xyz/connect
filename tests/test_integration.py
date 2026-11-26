@@ -795,8 +795,9 @@ class _LocalMechEndpoint:
     Implements the two endpoints mech-client talks to — POST
     /send_signed_requests and GET /fetch_offchain_info — with the validation
     a real mech performs before serving a request: the request id must equal
-    the marketplace's getRequestId over the payload's own fields (read from
-    the forked contract), the signature must validate via the sender Safe's
+    the marketplace's view over the payload's own fields (getRequestId, or
+    getRequestIdWithNonce for an explicit nonce; read from the forked
+    contract), the signature must validate via the sender Safe's
     ERC-1271 isValidSignature (agent mode, since mech-client 0.21.3), and the
     first request is answered HTTP 402 until the prepaid deposit actually
     lands on the balance tracker on-chain.
@@ -835,16 +836,21 @@ class _LocalMechEndpoint:
         the magic value — exactly what the marketplace does at settlement.
         """
         request_id = int(form["request_id"])
-        expected = self._contract.functions.getRequestId(
+        fields = (
             Web3.to_checksum_address(self._mech),
             Web3.to_checksum_address(form["sender"]),
             bytes.fromhex(form["ipfs_hash"].removeprefix("0x")),
             int(form["delivery_rate"]),
             bytes.fromhex(self._payment_type_hex.removeprefix("0x")),
             int(form["nonce"]),
-        ).call()
-        if int.from_bytes(bytes(expected), "big") != request_id:
-            self.validation_errors.append("request id != contract getRequestId")
+        )
+        functions = self._contract.functions
+        if form.get("nonce_mode") == "explicit":  # its own view, with the deadline
+            view = functions.getRequestIdWithNonce(*fields, int(form["deadline"]))
+        else:
+            view = functions.getRequestId(*fields)
+        if int.from_bytes(bytes(view.call()), "big") != request_id:
+            self.validation_errors.append("request id != contract request id view")
         signature = bytes.fromhex(form["signature"].removeprefix("0x"))
         erc1271 = self._w3.eth.contract(
             address=Web3.to_checksum_address(form["sender"]),
