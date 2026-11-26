@@ -548,15 +548,20 @@ chain, so Connect reports nothing. A request counts once the mech settles it
 on chain, off-chain requests included.
 
 - **Session reminder.** On `POST /session`, while staked, Connect reads
-  whether the epoch's request is made: the checker's
+  whether the epoch's request is made, scored as `RequesterActivityCheckerV2`
+  (every Connect program's checker) scores it: the checker's
   `getMultisigNonces(safe)[1]` less the staking contract's
-  `getServiceInfo(id).nonces[1]`, against
-  `ceil(max(livenessPeriod, now - tsCheckpoint) * livenessRatio / 1e18)`.
+  `getServiceInfo(id).nonces[1]`, against `ceil(window * livenessRatio / 1e18)`,
+  where `window` runs from `max(tsCheckpoint, tsStart)` to the checkpoint,
+  which lands no earlier than `tsCheckpoint + livenessPeriod`. A service
+  staked with a multisig other than the configured safe, or a checker that
+  returns no request count, is a failed read.
   When it is not, it writes the reminder to `pearl-session-notice.md` in the
   workspace, which the brief tells the session to say first; otherwise it
   removes the file. A read that fails, or takes over `REMINDER_READ_SECONDS`,
   is logged and never reminds, and neither it nor the write can fail the
-  launch.
+  launch. Every launch reads on one worker thread, so a hung RPC leaves one
+  thread behind, not one per launch.
 - **Checkpoint.** Nothing else in Pearl calls the permissionless
   `checkpoint()` that closes an epoch, so while staked the server checks
   every `STAKING_CHECKPOINT_INTERVAL_SECONDS` whether one is worth sending,
@@ -565,7 +570,8 @@ on chain, off-chain requests included.
   answers the next checkpoint time with the current block's, so the send is
   never early, and no comparison with this host's clock is made, which would
   skip it whenever that clock runs behind the chain. Otherwise it is sent once
-  that timestamp has passed and `availableRewards()` is above 0 (with none left
+  that timestamp has passed by the pinned block's own time (not this host's
+  clock, which, if ahead, would pay for checkpoints that change nothing) and `availableRewards()` is above 0 (with none left
   a checkpoint changes nothing, so it would be due, and paid for, on every
   check). When one is worth sending, the agent EOA calls it, with its own gas.
   The reads behind that decision, and the reminder's, are taken at one block,

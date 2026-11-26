@@ -91,7 +91,11 @@ def _uint(w3: Web3, to: str, signature: str, block: BlockIdentifier) -> int:
 def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
     """Whether the program's safe made the epoch's Marketplace requests, as of `now`.
 
-    :raises ValueError: when the contract holds no record of the service.
+    Scores the count as RequesterActivityCheckerV2 does (every Connect program's
+    checker; README, "Staking"), over the window the contract will measure.
+
+    :raises ValueError: when the contract holds no record of this service and
+        safe, or the checker answers in a shape it does not score.
     """
     block = _read_block(w3)
     (nonces,) = _call(
@@ -102,7 +106,7 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
         ["uint256[]"],
         block,
     )
-    ((_, _, staked_nonces, _, _, _),) = _call(
+    ((multisig, _, staked_nonces, ts_start, _, _),) = _call(
         w3,
         staking.staking_contract,
         _selector("getServiceInfo(uint256)")
@@ -115,16 +119,24 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig, now: int) -> bool:
             f"service {staking.service_id} has no staking record on "
             f"{staking.staking_contract}"
         )
+    if Web3.to_checksum_address(multisig) != Web3.to_checksum_address(staking.safe):
+        raise ValueError(
+            f"service {staking.service_id} is staked with multisig {multisig}, "
+            f"not the configured safe {staking.safe}"
+        )
+    if len(nonces) <= REQUEST_COUNT_INDEX:
+        raise ValueError(
+            f"activity checker {staking.activity_checker} returns no Marketplace "
+            "request count"
+        )
     eligible = nonces[REQUEST_COUNT_INDEX] - staked_nonces[REQUEST_COUNT_INDEX]
     liveness_period = _uint(w3, staking.staking_contract, "livenessPeriod()", block)
-    since_checkpoint = now - _uint(
-        w3, staking.staking_contract, "tsCheckpoint()", block
-    )
+    ts_checkpoint = _uint(w3, staking.staking_contract, "tsCheckpoint()", block)
     ratio = _uint(w3, staking.activity_checker, "livenessRatio()", block)
-    # ceil(max(livenessPeriod, since_checkpoint) * ratio / 1e18), in integers
-    required = -(
-        -max(liveness_period, since_checkpoint) * ratio // LIVENESS_RATIO_SCALE
-    )
+    # the contract measures from max(tsCheckpoint, tsStart) to the checkpoint,
+    # which lands no earlier than tsCheckpoint + livenessPeriod
+    window = max(now, ts_checkpoint + liveness_period) - max(ts_checkpoint, ts_start)
+    required = -(-window * ratio // LIVENESS_RATIO_SCALE)  # ceil, in integers
     return eligible >= required
 
 
@@ -152,7 +164,7 @@ def staking_reminder(
     return None if made else STAKING_REMINDER
 
 
-def _checkpoint_worth_sending(w3: Web3, contract: str, now: int) -> bool:
+def _checkpoint_worth_sending(w3: Web3, contract: str) -> bool:
     """Whether checkpoint() is due and worth sending (README, "Staking")."""
     block = _read_block(w3)
     next_at = _uint(w3, contract, "getNextRewardCheckpointTimestamp()", block)
@@ -160,7 +172,8 @@ def _checkpoint_worth_sending(w3: Web3, contract: str, now: int) -> bool:
     liveness_period = _uint(w3, contract, "livenessPeriod()", block)
     if next_at != ts_checkpoint + liveness_period:
         return True
-    if now < next_at:
+    # the chain's time, not this host's: a clock ahead would pay for no-op sends
+    if w3.eth.get_block(block)["timestamp"] < next_at:
         return False
     return _uint(w3, contract, "availableRewards()", block) > 0
 
@@ -170,7 +183,6 @@ def checkpoint_if_due(
     signer: Signer,
     guard: Guard,
     activity: ActivityLog,
-    now: t.Callable[[], float] = time.time,
 ) -> str | None:
     """Call checkpoint() from the agent EOA once it is due; return the tx hash.
 
@@ -184,7 +196,7 @@ def checkpoint_if_due(
     tx_hash: str | None = None
     try:
         w3 = signer.w3(chain)
-        if not _checkpoint_worth_sending(w3, staking.staking_contract, int(now())):
+        if not _checkpoint_worth_sending(w3, staking.staking_contract):
             return None
         # armed only while restricted, as for the agent top-up: one armed in
         # unrestricted mode would outlive a switch back for its TTL

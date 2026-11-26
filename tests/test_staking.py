@@ -99,6 +99,7 @@ class StakingW3(FakeW3):
         next_checkpoint: int | None = None,
         available_rewards: int = 10**18,
         record: bool = True,
+        ts_start: int = NOW - 10 * DAY,
     ) -> None:
         """Hold the on-chain state the reads answer from.
 
@@ -112,14 +113,20 @@ class StakingW3(FakeW3):
         self.next_checkpoint = next_checkpoint
         self.available_rewards = available_rewards
         self.record = record
+        self.ts_start = ts_start
+        self.multisig = SAFE
         self.fail: Exception | None = None
         self.calls: list[tuple[str, bytes]] = []
         # another service's checkpoint: a read at any block but the pinned one
         # (one behind the head) sees it, so an unpinned read fails the test
         self.other_checkpoint_landed = False
         self.blocks: list[object] = []
+        self.time_blocks: list[object] = []
         self.eth.call = self._call  # type: ignore[attr-defined]
         self.eth.block_number = 1_000  # type: ignore[attr-defined]
+        # the pinned block's time, which the checkpoint gate reads
+        self.chain_time = NOW
+        self.eth.get_block = self._get_block  # type: ignore[method-assign,assignment]
         self.eth.receipt = {"status": 1}
 
     def _call(self, tx: dict, block: object = "latest") -> bytes:
@@ -136,6 +143,11 @@ class StakingW3(FakeW3):
             finally:
                 self.ts_checkpoint -= DAY
         return self._answer(to, data)
+
+    def _get_block(self, block: object) -> dict:
+        """Answer get_block with the chain's time, recording the block asked."""
+        self.time_blocks.append(block)
+        return {"timestamp": self.chain_time}
 
     @property
     def pinned_block(self) -> int:
@@ -182,7 +194,7 @@ class StakingW3(FakeW3):
         nonces = [2, self.staked_requests] if self.record else []
         return abi_encode(
             ["(address,address,uint256[],uint256,uint256,uint256)"],
-            [(SAFE, SAFE, nonces, NOW - DAY, 0, 0)],
+            [(self.multisig, SAFE, nonces, self.ts_start, 0, 0)],
         )
 
 
@@ -373,6 +385,37 @@ class TestRequestMade:
         assert len(fake.blocks) == 5
         assert set(fake.blocks) == {fake.pinned_block}
 
+    def test_a_service_staked_after_the_checkpoint_is_measured_from_its_stake(
+        self,
+    ) -> None:
+        """The contract measures from max(tsCheckpoint, tsStart), so this does too."""
+        # two days since the checkpoint, but staked one day ago: one request
+        fake = StakingW3(
+            safe_requests=10, ts_checkpoint=NOW - 2 * DAY, ts_start=NOW - DAY
+        )
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
+
+    def test_a_service_staked_with_another_multisig_is_an_error(self) -> None:
+        """SERVICE_ID naming another safe's service never scores this safe."""
+        fake = StakingW3()
+        fake.multisig = "0x" + "33" * 20
+        with pytest.raises(ValueError, match="not the configured safe"):
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
+
+    def test_a_checker_without_a_request_count_is_an_error(self) -> None:
+        """A checker answering one nonce says why, not as an IndexError."""
+        fake = StakingW3()
+        answer = fake._answer  # pylint: disable=protected-access
+
+        def one_nonce(to: str, data: bytes) -> bytes:
+            if data[:4] == _sel("getMultisigNonces(address)"):
+                return HexBytes(abi_encode(["uint256[]"], [[3]]))
+            return answer(to, data)
+
+        fake._answer = one_nonce  # type: ignore[method-assign]  # pylint: disable=protected-access
+        with pytest.raises(ValueError, match="returns no Marketplace request count"):
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM, NOW)
+
     def test_no_staking_record_is_an_error(self) -> None:
         """An empty record cannot be read as "made" or "not made"."""
         fake = StakingW3(record=False)
@@ -445,9 +488,7 @@ class TestCheckpoint:
         """Before the next checkpoint time: nothing sent, nothing audited."""
         test_signer.set_guard(guard)
         assert (
-            staking.checkpoint_if_due(
-                staked_config, test_signer, guard, activity, now=_now
-            )
+            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
             is None
         )
         assert not w3.eth.sent
@@ -491,9 +532,7 @@ class TestCheckpoint:
         monkeypatch.setattr(test_signer, "send", spy)
         armed: list[dict] = []
         monkeypatch.setattr(guard, "allow_checkpoint_once", lambda **k: armed.append(k))
-        tx_hash = staking.checkpoint_if_due(
-            staked_config, test_signer, guard, activity, now=_now
-        )
+        tx_hash = staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
         assert tx_hash is not None
         assert tx_hash.startswith("0x")
         ((chain, to, kwargs),) = sends
@@ -513,10 +552,11 @@ class TestCheckpoint:
         assert entry["tx_hash"] == tx_hash
         payload = (staked_config.store_path / PERFORMANCE_FILE).read_text()
         assert '"last_activity": null' in payload
-        # all four reads of the decision, availableRewards() included, at the
-        # one pinned block
+        # all four reads of the decision, availableRewards() included, and the
+        # chain time it is gated on, at the one pinned block
         assert len(w3.blocks) == 4
         assert set(w3.blocks) == {w3.pinned_block}
+        assert w3.pinned_block in w3.time_blocks
 
     def test_restricted_arms_the_allowance_it_spends(  # pylint: disable=too-many-arguments
         self,
@@ -533,9 +573,7 @@ class TestCheckpoint:
         guard = Guard(settings_store, staked_config, agent_signer=test_signer.address)
         test_signer.set_guard(guard)
         w3.ts_checkpoint = NOW - DAY - 1
-        assert staking.checkpoint_if_due(
-            staked_config, test_signer, guard, activity, now=_now
-        )
+        assert staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
         assert len(w3.eth.sent) == 1
         with pytest.raises(SignerError, match="only allow transactions targeting"):
             test_signer.send(
@@ -561,9 +599,7 @@ class TestCheckpoint:
         w3.eth.receipt = receipt
         with caplog.at_level(logging.WARNING, logger="agent"):
             assert (
-                staking.checkpoint_if_due(
-                    staked_config, test_signer, guard, activity, now=_now
-                )
+                staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
                 is None
             )
         (entry,) = _audited(staked_config, "staking_checkpoint_failed")
@@ -587,9 +623,7 @@ class TestCheckpoint:
         w3.ts_checkpoint = NOW - 2 * DAY
         w3.available_rewards = 0
         assert (
-            staking.checkpoint_if_due(
-                staked_config, test_signer, guard, activity, now=_now
-            )
+            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
             is None
         )
         assert not w3.eth.sent
@@ -608,9 +642,7 @@ class TestCheckpoint:
         w3.available_rewards = 0
         # tsCheckpoint + livenessPeriod is still a minute away
         w3.next_checkpoint = NOW
-        assert staking.checkpoint_if_due(
-            staked_config, test_signer, guard, activity, now=_now
-        )
+        assert staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
         assert len(w3.eth.sent) == 1
 
     @pytest.mark.parametrize(
@@ -635,9 +667,7 @@ class TestCheckpoint:
         test_signer.set_guard(guard)
         w3.ts_checkpoint = ts_checkpoint
         w3.next_checkpoint = NOW + 6
-        assert staking.checkpoint_if_due(
-            staked_config, test_signer, guard, activity, now=_now
-        )
+        assert staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
         assert len(w3.eth.sent) == 1
 
     def test_another_checkpoint_between_the_reads_is_no_rebaseline(  # pylint: disable=too-many-arguments
@@ -656,15 +686,41 @@ class TestCheckpoint:
         test_signer.set_guard(guard)
         w3.other_checkpoint_landed = True
         assert (
-            staking.checkpoint_if_due(
-                staked_config, test_signer, guard, activity, now=_now
-            )
+            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
             is None
         )
         assert not w3.eth.sent
         # every read, not only the first, at the one pinned block
         assert w3.blocks
         assert set(w3.blocks) == {w3.pinned_block}
+
+    @pytest.mark.parametrize(
+        ("chain_time", "host_time", "sent"),
+        [
+            (NOW + 120, NOW - DAY, True),
+            (NOW, NOW + DAY, False),
+        ],
+        ids=["chain-past-host-behind", "chain-before-host-ahead"],
+    )
+    def test_the_due_time_is_the_chain_s_not_this_host_s(  # pylint: disable=too-many-arguments
+        self,
+        staked_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        w3: StakingW3,
+        monkeypatch: pytest.MonkeyPatch,
+        chain_time: int,
+        host_time: int,
+        sent: bool,
+    ) -> None:
+        """A host clock ahead of the chain pays for no no-op checkpoint()."""
+        test_signer.set_guard(guard)
+        w3.chain_time = chain_time  # next checkpoint time is NOW + 60
+        monkeypatch.setattr(staking.time, "time", lambda: float(host_time))
+        result = staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
+        assert (result is not None) is sent
+        assert len(w3.eth.sent) == (1 if sent else 0)
 
     def test_a_failed_read_sends_nothing(  # pylint: disable=too-many-arguments
         self,
@@ -1068,6 +1124,33 @@ class TestSessionNotice:
         assert held == [False]
         assert not self._notice(app_config).exists()
         assert "took over" in caplog.text
+
+    def test_hung_reads_leave_one_thread_behind_not_one_per_launch(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every launch reads on the same worker, so shutdown joins at most one."""
+        monkeypatch.setattr(pearl_routes, "REMINDER_READ_SECONDS", 0.01)
+        released = threading.Event()
+
+        def hung(config: AppConfig, signer: Signer) -> str:
+            """Block like a black-holed RPC until released."""
+            released.wait(timeout=5)
+            return staking.STAKING_REMINDER
+
+        monkeypatch.setattr(staking, "staking_reminder", hung)
+        try:
+            for _ in range(3):
+                assert client.post("/session").json()["launched"] is True
+            readers = [
+                th
+                for th in threading.enumerate()
+                if th.name.startswith("staking-reminder")
+            ]
+            assert len(readers) == 1
+        finally:
+            released.set()
 
     def test_the_brief_tells_the_session_to_say_it(self) -> None:
         """The shipped brief names the file and says to relay it first."""

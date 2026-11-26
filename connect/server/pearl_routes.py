@@ -43,6 +43,11 @@ router = APIRouter()
 FUNDS_STATUS_CACHE_SECONDS = 30
 # how long a session launch waits on the staking reads for its reminder
 REMINDER_READ_SECONDS = 5.0
+# one worker for every launch: a read the launch gave up on keeps it, so a hung
+# RPC leaves one thread behind, not one per launch, for shutdown to join
+_REMINDER_READER = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="staking-reminder"
+)
 
 
 @router.get("/healthcheck")
@@ -95,9 +100,10 @@ def _staking_reminder(state: t.Any) -> str | None:
     Its reads go to the chain's RPC, which can hang for its whole timeout per
     read, and the launch must not wait on them.
     """
-    pool = ThreadPoolExecutor(max_workers=1)
+    reading = _REMINDER_READER.submit(
+        staking.staking_reminder, state.config, state.signer
+    )
     try:
-        reading = pool.submit(staking.staking_reminder, state.config, state.signer)
         return reading.result(timeout=REMINDER_READ_SECONDS)
     except FutureTimeout:
         logger.warning(
@@ -105,8 +111,6 @@ def _staking_reminder(state: t.Any) -> str | None:
             REMINDER_READ_SECONDS,
         )
         return None
-    finally:
-        pool.shutdown(wait=False)
 
 
 def _write_session_notice(state: t.Any) -> None:
