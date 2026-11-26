@@ -847,8 +847,13 @@ class TestCheckpointTask:
 
         monkeypatch.setattr(staking, "checkpoint_if_due", recorded_check)
         end_at_sleep(monkeypatch, events)
-        # a workspace not yet usable, so each tick stops after the checkpoint
-        unready = SimpleNamespace(ensure=lambda: False)
+
+        def unusable() -> bool:
+            """Record reaching the notice refresh; the tick stops there."""
+            events.append("notice")
+            return False
+
+        unready = SimpleNamespace(ensure=unusable)
         args: tuple = (config, None, None, None, unready)
         # end_at_sleep cancels a staked task; an unstaked one returns at once
         with contextlib.suppress(asyncio.CancelledError):
@@ -864,11 +869,13 @@ class TestCheckpointTask:
     def test_staked_checks_at_start_then_every_interval(
         self, staked_config: AppConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Staked: a check, then one per interval, until cancelled."""
+        """Staked: a tick (checkpoint, then notice), then one per interval."""
         assert self._run(monkeypatch, staked_config, lambda *a: None) == [
             "check",
+            "notice",
             "sleep 600.0",
             "check",
+            "notice",
             "sleep 600.0",
         ]
 
