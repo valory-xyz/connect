@@ -563,10 +563,15 @@ on chain, off-chain requests included.
   is logged and never reminds, and neither it nor the write can fail the
   launch. Every launch reads on one worker thread, and a read that times out
   while still queued is dropped, so a hung RPC leaves one read behind, not one
-  per launch. The checkpoint's periodic tick (below) reads and writes the
-  notice the same way after each check, once the workspace is usable, so a
-  session opened from the coding tool, with no `POST /session`, finds it at
-  most one interval old. A tick and a launch writing at once cannot follow a
+  per launch. After the block number, the six reads (five `eth_call`s and the
+  pinned block's timestamp) are made at once, so the read costs two round
+  trips, not seven. The checkpoint's periodic tick (below) reads and writes
+  the notice the same way after each check, once the workspace is usable, so
+  a session opened from the coding tool, with no `POST /session`, finds it at
+  most one interval old. A tick whose read fails leaves the file as it was:
+  "could not tell" never removes a reminder a launch wrote. The brief and the
+  `pearl-connect` skill both tell the session to relay the file, so a harness
+  that reads only one of them still does. A tick and a launch writing at once cannot follow a
   link: the loser's exclusive create fails, and that is logged.
 - **Checkpoint.** Nothing else in Pearl calls the permissionless
   `checkpoint()` that closes an epoch, so while staked the server checks

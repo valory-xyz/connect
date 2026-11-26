@@ -389,6 +389,28 @@ class TestRequestMade:
         fake.chain_time = chain_time
         assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM) is expected
 
+    def test_the_reads_are_made_at_once(self) -> None:
+        """All six reads after the block number are in flight together.
+
+        Each read waits for the other five, so reads made one by one would
+        break the barrier instead of answering.
+        """
+        fake = StakingW3()
+        barrier = threading.Barrier(6, timeout=2)
+        call, get_block = fake.eth.call, fake.eth.get_block  # type: ignore[attr-defined]
+
+        def call_together(*args: t.Any) -> t.Any:
+            barrier.wait()
+            return call(*args)
+
+        def get_block_together(*args: t.Any) -> t.Any:
+            barrier.wait()
+            return get_block(*args)
+
+        fake.eth.call = call_together  # type: ignore[attr-defined]
+        fake.eth.get_block = get_block_together  # type: ignore[method-assign,assignment]
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
+
     def test_a_service_staked_after_the_checkpoint_is_measured_from_its_stake(
         self,
     ) -> None:
@@ -465,6 +487,14 @@ class TestReminder:
         """Unstaked: no read at all."""
         assert staking.staking_reminder(app_config, test_signer) is None
         assert not w3.calls
+
+    def test_read_staking_reminder_raises_what_the_read_raised(
+        self, staked_config: AppConfig, test_signer: Signer, w3: StakingW3
+    ) -> None:
+        """The raising form, for a caller that must tell "made" from "unknown"."""
+        w3.fail = ConnectionError("down")
+        with pytest.raises(ConnectionError):
+            staking.read_staking_reminder(staked_config, test_signer)
 
     def test_a_failed_read_never_reminds(
         self,
@@ -911,7 +941,9 @@ class TestCheckpointTask:
         monkeypatch.setattr(
             staking, "checkpoint_if_due", lambda *a, **k: checks.append(a)
         )
-        monkeypatch.setattr(staking, "staking_reminder", lambda config, signer: None)
+        monkeypatch.setattr(
+            staking, "read_staking_reminder", lambda config, signer: None
+        )
         app = make_app(test_signer, staked_config, activity)
         with TestClient(app, base_url="http://127.0.0.1:8716"):
             deadline = time.monotonic() + 5
@@ -1170,7 +1202,7 @@ class TestSessionNotice:
             events.append("reminder")
             return answers.pop(0)
 
-        monkeypatch.setattr(staking, "staking_reminder", reminder)
+        monkeypatch.setattr(staking, "read_staking_reminder", reminder)
         self._tick(client, app_config)
         assert self._notice(app_config).read_text(encoding="utf-8") == (
             staking.STAKING_REMINDER + "\n"
@@ -1179,6 +1211,34 @@ class TestSessionNotice:
         assert not self._notice(app_config).exists()
         # the checkpoint first, so the notice reflects the state after it
         assert events == ["checkpoint", "reminder"] * 2
+
+    def test_a_failed_read_on_a_tick_leaves_the_notice(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A read that fails says nothing: the launch's reminder stands."""
+        monkeypatch.setattr(staking, "checkpoint_if_due", lambda *a: None)
+
+        error = ConnectionError("http://rpc.example/secret-key unreachable")
+
+        def unreadable(config: AppConfig, signer: Signer) -> str | None:
+            raise error
+
+        monkeypatch.setattr(staking, "read_staking_reminder", unreadable)
+        assert client.get("/healthcheck").json() == {"is_healthy": True}
+        self._notice(app_config).write_text(
+            staking.STAKING_REMINDER + "\n", encoding="utf-8"
+        )
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            self._tick(client, app_config)
+        assert self._notice(app_config).read_text(encoding="utf-8") == (
+            staking.STAKING_REMINDER + "\n"
+        )
+        assert "session notice left as it was" in caplog.text
+        assert "secret-key" not in caplog.text
 
     def test_a_tick_writes_nothing_before_the_workspace_is_usable(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1189,7 +1249,7 @@ class TestSessionNotice:
             staking, "checkpoint_if_due", lambda *a: events.append("checkpoint")
         )
         monkeypatch.setattr(
-            staking, "staking_reminder", lambda *a: events.append("reminder")
+            staking, "read_staking_reminder", lambda *a: events.append("reminder")
         )
         unready = SimpleNamespace(ensure=lambda: False)
         app_module.staking_tick(None, None, None, None, unready)  # type: ignore[arg-type]
@@ -1205,7 +1265,9 @@ class TestSessionNotice:
         """A disk error refreshing the notice is logged, not raised."""
         monkeypatch.setattr(staking, "checkpoint_if_due", lambda *a: None)
         monkeypatch.setattr(
-            staking, "staking_reminder", lambda config, signer: staking.STAKING_REMINDER
+            staking,
+            "read_staking_reminder",
+            lambda config, signer: staking.STAKING_REMINDER,
         )
 
         def broken(self: t.Any, notice: str | None) -> None:
@@ -1222,3 +1284,14 @@ class TestSessionNotice:
             encoding="utf-8"
         )
         assert f"If `{SESSION_NOTICE_FILE}` is in this workspace" in brief
+
+    def test_the_skill_tells_the_session_to_say_it_too(self) -> None:
+        """The pearl-connect skill repeats it, for a harness that skips the brief."""
+        skill = (
+            Path(staking.__file__).parent
+            / "assets"
+            / "skills"
+            / "pearl-connect"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        assert f"If `{SESSION_NOTICE_FILE}` is in the workspace" in skill

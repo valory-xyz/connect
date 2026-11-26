@@ -23,6 +23,8 @@ The rules are the README's ("Staking").
 """
 
 import logging
+import typing as t
+from concurrent.futures import ThreadPoolExecutor
 
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
@@ -82,28 +84,53 @@ def _uint(w3: Web3, to: str, signature: str, block: BlockIdentifier) -> int:
     return value
 
 
-def request_made_this_epoch(w3: Web3, staking: StakingConfig) -> bool:
+def _concurrently(*reads: t.Callable[[], t.Any]) -> list[t.Any]:
+    """Run independent reads at once: one round trip's latency, not one per read."""
+    with ThreadPoolExecutor(
+        max_workers=len(reads), thread_name_prefix="staking-read"
+    ) as pool:
+        futures = [pool.submit(read) for read in reads]
+        return [future.result() for future in futures]
+
+
+def request_made_this_epoch(  # pylint: disable=too-many-locals
+    w3: Web3, staking: StakingConfig
+) -> bool:
     """Whether the program's safe made the epoch's Marketplace requests (README, "Staking").
 
     :raises ValueError: when the contract holds no record of this service and
         safe, or the checker answers in a shape it does not score.
     """
     block = _read_block(w3)
-    (nonces,) = _call(
-        w3,
-        staking.activity_checker,
-        _selector("getMultisigNonces(address)")
-        + abi_encode(["address"], [Web3.to_checksum_address(staking.safe)]),
-        ["uint256[]"],
-        block,
-    )
-    ((multisig, _, staked_nonces, ts_start, _, _),) = _call(
-        w3,
-        staking.staking_contract,
-        _selector("getServiceInfo(uint256)")
-        + abi_encode(["uint256"], [staking.service_id]),
-        ["(address,address,uint256[],uint256,uint256,uint256)"],
-        block,
+    checker, contract = staking.activity_checker, staking.staking_contract
+    (
+        (nonces,),
+        ((multisig, _, staked_nonces, ts_start, _, _),),
+        liveness_period,
+        ts_checkpoint,
+        ratio,
+        chain_block,
+    ) = _concurrently(
+        lambda: _call(
+            w3,
+            checker,
+            _selector("getMultisigNonces(address)")
+            + abi_encode(["address"], [Web3.to_checksum_address(staking.safe)]),
+            ["uint256[]"],
+            block,
+        ),
+        lambda: _call(
+            w3,
+            contract,
+            _selector("getServiceInfo(uint256)")
+            + abi_encode(["uint256"], [staking.service_id]),
+            ["(address,address,uint256[],uint256,uint256,uint256)"],
+            block,
+        ),
+        lambda: _uint(w3, contract, "livenessPeriod()", block),
+        lambda: _uint(w3, contract, "tsCheckpoint()", block),
+        lambda: _uint(w3, checker, "livenessRatio()", block),
+        lambda: w3.eth.get_block(block),
     )
     if len(staked_nonces) <= REQUEST_COUNT_INDEX:
         raise ValueError(
@@ -121,33 +148,38 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig) -> bool:
             "request count"
         )
     eligible = nonces[REQUEST_COUNT_INDEX] - staked_nonces[REQUEST_COUNT_INDEX]
-    liveness_period = _uint(w3, staking.staking_contract, "livenessPeriod()", block)
-    ts_checkpoint = _uint(w3, staking.staking_contract, "tsCheckpoint()", block)
-    ratio = _uint(w3, staking.activity_checker, "livenessRatio()", block)
     # the chain's time, not this host's, as the checkpoint gate reads it
-    now = w3.eth.get_block(block)["timestamp"]
+    now = chain_block["timestamp"]
     window = max(now, ts_checkpoint + liveness_period) - max(ts_checkpoint, ts_start)
     # ceil, in integers; the checker passes no epoch without a new request
     required = max(-(-window * ratio // LIVENESS_RATIO_SCALE), 1)
     return eligible >= required
 
 
-def staking_reminder(config: AppConfig, signer: Signer) -> str | None:
-    """Return the reminder while the epoch's request is not made, else None."""
+def read_staking_reminder(config: AppConfig, signer: Signer) -> str | None:
+    """Return the reminder while the epoch's request is not made, else None.
+
+    :raises Exception: whatever the read raised, so a caller can tell "nothing
+        to say" from "could not tell".
+    """
     staking = config.staking
     if staking is None:
         return None
-    chain = staking.chain
+    made = request_made_this_epoch(signer.w3(staking.chain), staking)
+    return None if made else STAKING_REMINDER
+
+
+def staking_reminder(config: AppConfig, signer: Signer) -> str | None:
+    """Like read_staking_reminder, but a failed read is logged and reminds nothing."""
     try:
-        made = request_made_this_epoch(signer.w3(chain), staking)
+        return read_staking_reminder(config, signer)
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.warning(
             "staking reminder skipped: could not read the staking state on %s: %s",
-            chain,
+            config.staking.chain if config.staking else None,
             logged_cause(e),
         )
         return None
-    return None if made else STAKING_REMINDER
 
 
 def _checkpoint_worth_sending(w3: Web3, contract: str) -> bool:

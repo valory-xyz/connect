@@ -55,6 +55,7 @@ from connect.server.mcp_tools import build_mcp
 from connect.server.receipts import wait_mined
 from connect.settings import MODE_RESTRICTED, SettingsStore
 from connect.signer import SERVER_BUILT, Signer
+from connect.signer_errors import logged_cause
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
@@ -195,7 +196,16 @@ def staking_tick(
     if not workspace.ensure():
         return
     try:
-        workspace.write_session_notice(staking.staking_reminder(config, signer))
+        notice = staking.read_staking_reminder(config, signer)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # "could not tell" is no answer: the launch's notice stands
+        logger.warning(
+            "session notice left as it was: could not read the staking state: %s",
+            logged_cause(e),
+        )
+        return
+    try:
+        workspace.write_session_notice(notice)
     except OSError:
         logger.exception("could not refresh the session notice")
 
