@@ -20,6 +20,7 @@
 """Staking: the env vars, the session reminder, and the checkpoint."""
 
 import asyncio
+import contextlib
 import dataclasses
 import functools
 import json
@@ -396,6 +397,11 @@ class TestRequestMade:
             safe_requests=10, ts_checkpoint=NOW - 2 * DAY, ts_start=NOW - DAY
         )
         assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
+
+    def test_a_service_staked_at_the_read_still_needs_a_request(self) -> None:
+        """A zero-length window needs one request, as the checker does."""
+        fake = StakingW3(safe_requests=9, ts_checkpoint=NOW - 5 * DAY, ts_start=NOW)
+        assert not staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
 
     def test_a_service_staked_with_another_multisig_is_an_error(self) -> None:
         """SERVICE_ID naming another safe's service never scores this safe."""
@@ -841,10 +847,9 @@ class TestCheckpointTask:
         monkeypatch.setattr(staking, "checkpoint_if_due", recorded_check)
         end_at_sleep(monkeypatch, events)
         args: tuple = (config, None, None, None)
-        try:
+        # end_at_sleep cancels a staked task; an unstaked one returns at once
+        with contextlib.suppress(asyncio.CancelledError):
             asyncio.run(app_module.checkpoint_staking(*args))
-        except asyncio.CancelledError:
-            pass
         return events
 
     def test_unstaked_never_starts(

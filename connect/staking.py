@@ -127,7 +127,8 @@ def request_made_this_epoch(w3: Web3, staking: StakingConfig) -> bool:
     # the chain's time, not this host's, as the checkpoint gate reads it
     now = w3.eth.get_block(block)["timestamp"]
     window = max(now, ts_checkpoint + liveness_period) - max(ts_checkpoint, ts_start)
-    required = -(-window * ratio // LIVENESS_RATIO_SCALE)  # ceil, in integers
+    # ceil, in integers; the checker passes no epoch without a new request
+    required = max(-(-window * ratio // LIVENESS_RATIO_SCALE), 1)
     return eligible >= required
 
 

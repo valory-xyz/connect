@@ -551,7 +551,7 @@ on chain, off-chain requests included.
   whether the epoch's request is made, scored as `RequesterActivityCheckerV2`
   (every Connect program's checker) scores it: the checker's
   `getMultisigNonces(safe)[1]` less the staking contract's
-  `getServiceInfo(id).nonces[1]`, against `ceil(window * livenessRatio / 1e18)`,
+  `getServiceInfo(id).nonces[1]`, against `ceil(window * livenessRatio / 1e18)`, and never fewer than one,
   where `window` runs from `max(tsCheckpoint, tsStart)` to the checkpoint,
   which lands no earlier than `tsCheckpoint + livenessPeriod` and no earlier
   than the pinned block's own time (not this host's clock). A service
