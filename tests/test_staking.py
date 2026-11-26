@@ -37,6 +37,7 @@ from hexbytes import HexBytes
 from web3 import Web3
 
 from connect import staking
+from connect import workspace as workspace_module
 from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import (
     ACTIVITY_CHECKER_ENV,
@@ -54,7 +55,6 @@ from connect.server import app as app_module
 from connect.server import pearl_routes
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import Signer, SignerError
-from connect import workspace as workspace_module
 from connect.workspace import SESSION_NOTICE_FILE
 
 from tests.conftest import FakeW3, audit_entries
@@ -211,6 +211,17 @@ def _now() -> float:
 def _audited(config: AppConfig, kind: str) -> list[dict]:
     """Return the audit entries of one kind."""
     return [e for e in audit_entries(config.store_path) if e["kind"] == kind]
+
+
+async def _run_until(job: t.Coroutine, done: t.Callable[[], bool]) -> None:
+    """Run `job` as a task until `done()` (or 5 s), then cancel it."""
+    task = asyncio.create_task(job)
+    deadline = time.monotonic() + 5
+    while not done() and time.monotonic() < deadline:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 class TestConfig:
@@ -641,7 +652,8 @@ class TestCheckpoint:
         )
         assert not w3.eth.sent
         # every read, not only the first, at the one pinned block
-        assert w3.blocks and set(w3.blocks) == {w3.pinned_block}
+        assert w3.blocks
+        assert set(w3.blocks) == {w3.pinned_block}
 
     def test_a_failed_read_sends_nothing(  # pylint: disable=too-many-arguments
         self,
@@ -795,20 +807,14 @@ class TestCheckpointTask:
         )
         monkeypatch.setattr(app_module, "STAKING_CHECKPOINT_INTERVAL_SECONDS", 0.0)
 
-        async def run() -> None:
-            task = asyncio.create_task(
+        asyncio.run(
+            _run_until(
                 app_module.checkpoint_staking(
                     staked_config, test_signer, guard, activity
-                )
+                ),
+                lambda: len(called) >= 3,
             )
-            deadline = time.monotonic() + 5
-            while len(called) < 3 and time.monotonic() < deadline:
-                await asyncio.sleep(0)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-        asyncio.run(run())
+        )
         assert len(called) >= 3
 
     def test_a_failed_check_does_not_end_the_task(  # pylint: disable=too-many-arguments
@@ -831,21 +837,15 @@ class TestCheckpointTask:
         monkeypatch.setattr(staking, "checkpoint_if_due", failing)
         monkeypatch.setattr(app_module, "STAKING_CHECKPOINT_INTERVAL_SECONDS", 0.0)
 
-        async def run() -> None:
-            task = asyncio.create_task(
-                app_module.checkpoint_staking(
-                    staked_config, test_signer, guard, activity
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            asyncio.run(
+                _run_until(
+                    app_module.checkpoint_staking(
+                        staked_config, test_signer, guard, activity
+                    ),
+                    lambda: len(called) >= 2,
                 )
             )
-            deadline = time.monotonic() + 5
-            while len(called) < 2 and time.monotonic() < deadline:
-                await asyncio.sleep(0)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-        with caplog.at_level(logging.ERROR, logger="agent"):
-            asyncio.run(run())
         assert len(called) >= 2
         assert "staking checkpoint check failed" in caplog.text
 

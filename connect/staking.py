@@ -68,7 +68,7 @@ def _selector(signature: str) -> bytes:
 
 
 def _read_block(w3: Web3) -> BlockIdentifier:
-    """The block every read of one decision is taken at: one behind the head.
+    """Return the block every read of one decision is taken at: one behind the head.
 
     Pinned, so another service's checkpoint mined between the reads cannot
     mix two blocks; one behind, so a load-balanced RPC node a block behind the

@@ -36,8 +36,8 @@ from connect import staking, wallet
 from connect.activity import (
     AGENT_TOPUP_FAILED_KIND,
     AGENT_TOPUP_KIND,
-    PERFORMANCE_FILE,
     ActivityLog,
+    PERFORMANCE_FILE,
 )
 from connect.config import AppConfig
 from connect.guard import Guard
@@ -116,9 +116,7 @@ def _send_agent_topup(  # pylint: disable=too-many-arguments,too-many-positional
             error=str(e),
         )
         return False
-    activity.record(
-        AGENT_TOPUP_KIND, chain=chain, value=str(amount), tx_hash=tx_hash
-    )
+    activity.record(AGENT_TOPUP_KIND, chain=chain, value=str(amount), tx_hash=tx_hash)
     return True
 
 
