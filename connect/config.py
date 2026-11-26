@@ -392,7 +392,7 @@ def _parse_staking(env: dict[str, str], config: AppConfig) -> StakingConfig | No
 
     Staking is optional and the wallet must keep working without it, so a
     value Connect cannot use is logged and read as unstaked, never refused.
-    A staking contract set without the other two is a deploy fault, logged
+    A staking contract set without either of the other two is a deploy fault, logged
     as an error; the others set without a contract read as unstaked quietly.
     """
     try:

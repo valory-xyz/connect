@@ -114,8 +114,8 @@ class StakingW3(FakeW3):
         self.record = record
         self.fail: Exception | None = None
         self.calls: list[tuple[str, bytes]] = []
-        # another service's checkpoint, mined after the block the reads are
-        # pinned to (one behind the head): any other block sees it landed
+        # another service's checkpoint: a read at any block but the pinned one
+        # (one behind the head) sees it, so an unpinned read fails the test
         self.other_checkpoint_landed = False
         self.blocks: list[object] = []
         self.eth.call = self._call  # type: ignore[attr-defined]
@@ -513,6 +513,10 @@ class TestCheckpoint:
         assert entry["tx_hash"] == tx_hash
         payload = (staked_config.store_path / PERFORMANCE_FILE).read_text()
         assert '"last_activity": null' in payload
+        # all four reads of the decision, availableRewards() included, at the
+        # one pinned block
+        assert len(w3.blocks) == 4
+        assert set(w3.blocks) == {w3.pinned_block}
 
     def test_restricted_arms_the_allowance_it_spends(  # pylint: disable=too-many-arguments
         self,
