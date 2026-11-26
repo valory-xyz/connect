@@ -939,7 +939,12 @@ carries the cause in `watch_errors`, keyed by id; a chat delivery that cannot
 be read leaves the cause in `chat_error` instead of losing the report. A run
 the mech could not answer is named in `failed_runs` with its error and fault,
 and `reported_charges` carries what the mech reported charging for each
-request; both come back from `mech_result` too. The
+request; both come back from `mech_result` too, and each failed run is
+audited as `mech_run_failed` with its error, fault and charge. A chat prompt
+(a JSON list of messages) with a message whose `content` is not a string or a
+list of text parts is refused before anything is signed
+(`chat-content-not-text`): the chat tool would refuse it as the caller's fault
+and charge the whole signed cap. The
 request was paid for, so the report is never lost to a failed read:
 `mech_result` picks it up.
 

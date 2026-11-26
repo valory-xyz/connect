@@ -20,6 +20,7 @@
 """Errors and shapes shared by connect/mech.py and mech_allowances.py."""
 
 import dataclasses
+import json
 import logging
 import typing as t
 
@@ -34,6 +35,7 @@ from mech_client import (
     RULE_REQUEST_REJECTED,
     RequestIdMismatch,
     RequestIdRpcError,
+    is_chat_prompt,
     outcome_of,
 )
 from mech_client.domain.delivery import (
@@ -46,6 +48,7 @@ from mech_client.services.marketplace_service import (
     NONCE_MODE_EXPLICIT,
 )
 
+from connect.activity import ActivityLog
 from connect.signer_errors import SendUnknown, SignerError, logged_cause
 
 logger = logging.getLogger("agent")
@@ -155,6 +158,8 @@ class MechUnknownRequest(MechError):
 # Marks a stored report whose request reached the paying call and then failed,
 # so the outcome — and the spend — is genuinely unknown to this server.
 SPEND_UNCERTAIN = "uncertain"
+# a chat message whose content the chat tool would refuse, and charge for
+RULE_CHAT_CONTENT = "chat-content-not-text"
 
 
 class PricedMech(t.NamedTuple):
@@ -291,6 +296,43 @@ def delivery_outcomes(deliveries: t.Mapping[str, DeliveryResult]) -> dict:
         **({"failed_runs": failed} if failed else {}),
         **({"reported_charges": charges} if charges else {}),
     }
+
+
+def record_failed_runs(activity: ActivityLog, chain: str, report: t.Mapping) -> None:
+    """Audit each run a report names in `failed_runs`, with what it was charged."""
+    charges = report.get("reported_charges") or {}
+    for key, run in (report.get("failed_runs") or {}).items():
+        activity.record(
+            "mech_run_failed",
+            chain=chain,
+            request_id=key,
+            error=run["error"],
+            fault=run["fault"],
+            charged=charges.get(key),
+        )
+
+
+def check_chat_prompt(prompt: str) -> None:
+    """Refuse, before anything is signed, a chat whose message content is not text.
+
+    The chat tool serves a message whose `content` is absent, a string or a
+    list of text parts, and charges the request for any other.
+    """
+    if not is_chat_prompt(prompt):
+        return
+    for index, message in enumerate(json.loads(prompt)):
+        content = message.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        if isinstance(content, list) and all(
+            isinstance(part, dict) and part.get("type") == "text" for part in content
+        ):
+            continue
+        raise MechNotSent(
+            f"rule '{RULE_CHAT_CONTENT}': message {index} ({message.get('role')!r}) "
+            "has content that is not a string or a list of text parts; nothing "
+            "was sent"
+        )
 
 
 def merge_outcomes(payload: dict, report: t.Mapping) -> None:

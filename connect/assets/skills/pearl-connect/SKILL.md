@@ -232,6 +232,10 @@ composing a prompt:
   charges for it: `reported_charges[request_id]` is what the mech reported
   charging for each request, in base units of its payment asset, at most the
   cap signed into the request.
+- A chat prompt is sent only when every message's `content` is a string, a
+  list of `{"type": "text", ...}` parts, or absent; any other content is
+  refused first (`chat-content-not-text`), so put a tool result or a non-text
+  answer back into the conversation as text.
 - `delivery_urls[request_id]` is the result file's URL, absent for an inline
   answer, where the envelope's `content_cid` names the document instead. An id
   whose file the mech delivered but nobody could read yet stays in

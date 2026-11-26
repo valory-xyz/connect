@@ -84,6 +84,7 @@ from connect.mech_types import (
     PricedMech,
     RequestPlan,
     SPEND_UNCERTAIN,
+    check_chat_prompt,
     delivery_outcomes,
     explicit_hook,
     explicit_send,
@@ -92,6 +93,7 @@ from connect.mech_types import (
     not_bought,
     over_max_payment,
     published_tools,
+    record_failed_runs,
     refusal,
     request_key,
     request_label,
@@ -342,6 +344,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         "Mech requests", for what that covers and what it deliberately does
         not.
         """
+        check_chat_prompt(prompt)  # before anything is reserved or signed
         timeout = _clamp_timeout(timeout)
         planned: RequestPlan | None = None
 
@@ -688,11 +691,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
         )
         payload.update(charged(plan.terms, plan.priced.rate, result))
         if plan.offchain:
-            # mech-client's result does not return an explicit request's deadline
             payload["expires"] = None
             payload.update(self.queue.report(plan.chain))
         self._resume_watch(payload, deadline)
         settle_payment(payload, plan.priced.rate)
+        record_failed_runs(self._activity, plan.chain, payload)
         if plan.offchain:
             by_key = zip(result.get("request_ids") or [], result.get("nonces") or [])
             got = result.get("deliveries") or {}
@@ -811,15 +814,11 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             with self._allowances.auto_deposit_armed(plan, hook):
                 return send(nonces=[nonce], on_request_id=hook)
 
-        def send_explicit() -> dict:
-            hook = explicit_hook(arm, sent)
-            # no queue slot: a slot the allocator still holds does not block it
-            with self._allowances.auto_deposit_armed(plan, hook):
-                return explicit_send(send, hook)
-
         try:
             if self._config.mech_nonce_mode == MECH_NONCE_MODE_EXPLICIT:
-                return send_explicit()
+                hook = explicit_hook(arm, sent)  # takes no slot of the allocator's
+                with self._allowances.auto_deposit_armed(plan, hook):
+                    return explicit_send(send, hook)
             return send_with_nonce(
                 self._nonces,
                 chain=plan.chain,
@@ -959,6 +958,7 @@ class MechService:  # pylint: disable=too-many-instance-attributes
             )
         self._activity.record("mech_result", chain=pending.chain, request_id=key)
         result_charge(report, delivery_outcomes({key: split[key]}), key)
+        record_failed_runs(self._activity, pending.chain, report)
         url = split[key].url
         return {**report, "result": data[key], **({"url": url} if url else {})}
 

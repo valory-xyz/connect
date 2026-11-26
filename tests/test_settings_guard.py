@@ -3045,6 +3045,99 @@ class TestMech:
         assert result["payment"] == sum(charges.values()) + unreported * rate
         assert result["signed_cap"] == 2 * rate
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            {"text": "hi"},
+            [{"type": "image_url", "image_url": {"url": "x"}}],
+            [{"type": "text", "text": "a"}, "b"],
+            7,
+        ],
+    )
+    def test_a_chat_message_that_is_not_text_is_refused_unsent(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        content: object,
+    ) -> None:
+        """The chat tool would refuse it and charge for it: nothing is signed."""
+        prompt = json.dumps(
+            [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": content},
+            ]
+        )
+        with pytest.raises(
+            MechNotSent, match="rule 'chat-content-not-text': message 1"
+        ):
+            mech_service.request(
+                prompt,
+                "chat",
+                chain="testchain",
+                priority_mech=OTHER,
+                request_id="r1",
+                top_up_budget=None,
+            )
+        assert not patched_mech.calls
+        mech_service.request(  # the id was never taken
+            "q",
+            "chat",
+            chain="testchain",
+            priority_mech=OTHER,
+            request_id="r1",
+            top_up_budget=None,
+        )
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "plain text",
+            json.dumps({"role": "user", "content": {"x": 1}}),  # not a list: text
+            json.dumps([{"role": "user", "content": "q"}]),
+            json.dumps([{"role": "assistant", "tool_calls": [], "content": None}]),
+            json.dumps([{"role": "user", "content": [{"type": "text", "text": "q"}]}]),
+        ],
+    )
+    def test_a_prompt_the_chat_tool_serves_is_sent(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        prompt: str,
+    ) -> None:
+        """Text, and chats whose every content is absent or text, go out."""
+        mech_service.request(
+            prompt, "chat", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        assert patched_mech.calls[-1]["prompts"] == (prompt,)
+
+    def test_a_failed_run_is_audited_with_its_charge(
+        self,
+        mech_service: MechService,
+        patched_mech: FakeMarketplaceService,
+        store_path: Path,
+    ) -> None:
+        """Each failed run gets its own record; an answered one gets none."""
+        patched_mech.result["request_ids"] = ["ab", "cd"]
+        patched_mech.result["deliveries"] = {
+            "ab": DeliveryResult("ab", {"answer": "42"}, None, actual_delivery_rate=7),
+            "cd": DeliveryResult(
+                "cd",
+                {"status": "failed", "error": FAILED_RUN_ERROR},
+                None,
+                actual_delivery_rate=RATE_CAP,
+                failure=RunFailure(error=FAILED_RUN_ERROR, fault=FAULT_CLIENT),
+            ),
+        }
+        mech_service.request(
+            "q", "t", chain="testchain", priority_mech=OTHER, top_up_budget=None
+        )
+        failed = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_run_failed"
+        ]
+        assert [
+            (e["request_id"], e["error"], e["fault"], e["charged"]) for e in failed
+        ] == [("cd", FAILED_RUN_ERROR, FAULT_CLIENT, str(RATE_CAP))]
+
     def test_a_run_that_fails_after_the_ack_is_reported_as_failed(
         self,
         mech_service: MechService,
@@ -3103,6 +3196,7 @@ class TestMech:
         mech_service: MechService,
         patched_mech: FakeMarketplaceService,
         monkeypatch: pytest.MonkeyPatch,
+        store_path: Path,
     ) -> None:
         """mech_result names a failed run too, not only the request's first answer."""
         patched_mech.result["deliveries"] = {}  # still pending after the send
@@ -3132,6 +3226,10 @@ class TestMech:
         }
         assert delivery["reported_charges"] == {"ab": str(RATE_CAP)}
         assert delivery["payment"] == RATE_CAP
+        (failed,) = [
+            e for e in audit_entries(store_path) if e["kind"] == "mech_run_failed"
+        ]
+        assert (failed["request_id"], failed["fault"]) == ("ab", FAULT_MECH)
 
     def test_delivered_request_leaves_nothing_pending(
         self, mech_service: MechService, patched_mech: FakeMarketplaceService
