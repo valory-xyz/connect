@@ -392,8 +392,8 @@ def _parse_staking(env: dict[str, str], config: AppConfig) -> StakingConfig | No
 
     Staking is optional and the wallet must keep working without it, so a
     value Connect cannot use is logged and read as unstaked, never refused.
-    Pearl sets all three for a staked instance and none for an unstaked one,
-    so a partial set is a deploy fault, logged as an error.
+    A staking contract set without the other two is a deploy fault, logged
+    as an error; the others set without a contract read as unstaked quietly.
     """
     try:
         staking_contract = _staking_address(env, STAKING_CONTRACT_ENV)
