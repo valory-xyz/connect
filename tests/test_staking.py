@@ -113,15 +113,28 @@ class StakingW3(FakeW3):
         self.record = record
         self.fail: Exception | None = None
         self.calls: list[tuple[str, bytes]] = []
+        # another service's checkpoint, mined right after the next read of
+        # "latest": a read pinned to a block still sees the state before it
+        self.checkpoint_lands_after_next_read = False
         self.eth.call = self._call  # type: ignore[attr-defined]
+        self.eth.block_number = 1_000  # type: ignore[attr-defined]
         self.eth.receipt = {"status": 1}
 
-    def _call(self, tx: dict) -> bytes:
+    def _call(self, tx: dict, block: object = "latest") -> bytes:
         """Answer one eth_call."""
         if self.fail is not None:
             raise self.fail
         to, data = tx["to"], bytes(tx["data"])
         self.calls.append((to, data))
+        if self.checkpoint_lands_after_next_read and block == "latest":
+            self.checkpoint_lands_after_next_read = False
+            answer = self._answer(to, data)
+            self.ts_checkpoint += DAY
+            return answer
+        return self._answer(to, data)
+
+    def _answer(self, to: str, data: bytes) -> bytes:
+        """Answer one read from the current state."""
         answers = {
             (CHECKER, _sel("getMultisigNonces(address)")): lambda: abi_encode(
                 ["uint256[]"], [[3, self.safe_requests]]
@@ -569,6 +582,11 @@ class TestCheckpoint:
         )
         assert len(w3.eth.sent) == 1
 
+    @pytest.mark.parametrize(
+        "ts_checkpoint",
+        [NOW - DAY + 60, NOW - DAY - 60],
+        ids=["epoch-not-over", "epoch-overdue"],
+    )
     def test_a_rebaseline_is_sent_with_this_clock_behind_the_chain(  # pylint: disable=too-many-arguments
         self,
         staked_config: AppConfig,
@@ -576,14 +594,40 @@ class TestCheckpoint:
         guard: Guard,
         activity: ActivityLog,
         w3: StakingW3,
+        ts_checkpoint: int,
     ) -> None:
-        """The block time v0.4 answers a few seconds ahead of this host: sent."""
+        """The block time v0.4 answers a few seconds ahead of this host: sent.
+
+        Both sides of `tsCheckpoint + livenessPeriod`: an overdue epoch's
+        block time is above it, a current one's below.
+        """
         test_signer.set_guard(guard)
+        w3.ts_checkpoint = ts_checkpoint
         w3.next_checkpoint = NOW + 6
         assert staking.checkpoint_if_due(
             staked_config, test_signer, guard, activity, now=_now
         )
         assert len(w3.eth.sent) == 1
+
+    def test_another_checkpoint_between_the_reads_is_no_rebaseline(  # pylint: disable=too-many-arguments
+        self,
+        staked_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        w3: StakingW3,
+    ) -> None:
+        """The reads are pinned to one block, so a checkpoint mined between them
+        cannot pair an old next-checkpoint time with a new tsCheckpoint."""
+        test_signer.set_guard(guard)
+        w3.checkpoint_lands_after_next_read = True
+        assert (
+            staking.checkpoint_if_due(
+                staked_config, test_signer, guard, activity, now=_now
+            )
+            is None
+        )
+        assert not w3.eth.sent
 
     def test_a_failed_read_sends_nothing(  # pylint: disable=too-many-arguments
         self,

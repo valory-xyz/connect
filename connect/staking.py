@@ -30,6 +30,7 @@ from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from hexbytes import HexBytes
 from web3 import Web3
+from web3.types import BlockIdentifier
 
 from connect.activity import ActivityLog
 from connect.chain_read import selector_of
@@ -62,15 +63,21 @@ def _selector(signature: str) -> bytes:
     return bytes.fromhex(selector_of(signature)[2:])
 
 
-def _call(w3: Web3, to: str, data: bytes, types: list[str]) -> tuple:
+def _call(
+    w3: Web3, to: str, data: bytes, types: list[str], block: BlockIdentifier = "latest"
+) -> tuple:
     """Run one eth_call and decode what it returns."""
-    raw = w3.eth.call({"to": Web3.to_checksum_address(to), "data": HexBytes(data)})
+    raw = w3.eth.call(
+        {"to": Web3.to_checksum_address(to), "data": HexBytes(data)}, block
+    )
     return abi_decode(types, bytes(raw))
 
 
-def _uint(w3: Web3, to: str, signature: str) -> int:
+def _uint(
+    w3: Web3, to: str, signature: str, block: BlockIdentifier = "latest"
+) -> int:
     """Read a no-argument uint256 view."""
-    (value,) = _call(w3, to, _selector(signature), ["uint256"])
+    (value,) = _call(w3, to, _selector(signature), ["uint256"], block)
     return int(value)
 
 
@@ -143,23 +150,18 @@ def staking_reminder(
 
 
 def _checkpoint_worth_sending(w3: Web3, contract: str, now: int) -> bool:
-    """Whether checkpoint() is due and would change something, as trader decides.
-
-    A pending rebaseline is due by itself: v0.4 then answers the next
-    checkpoint time with the current block's, so a send is never early, and
-    comparing it with this host's clock would skip it whenever that clock runs
-    behind the chain. Otherwise it is due once the next checkpoint time has
-    passed, and worth sending only while rewards are left: with none, it
-    changes nothing and would be paid for on every tick.
-    """
-    next_at = _uint(w3, contract, "getNextRewardCheckpointTimestamp()")
-    ts_checkpoint = _uint(w3, contract, "tsCheckpoint()")
-    liveness_period = _uint(w3, contract, "livenessPeriod()")
+    """Whether checkpoint() is due and worth sending (README, "Staking")."""
+    # one block for every read: another service's checkpoint landing between
+    # them would read as a pending rebaseline
+    block = w3.eth.block_number
+    next_at = _uint(w3, contract, "getNextRewardCheckpointTimestamp()", block)
+    ts_checkpoint = _uint(w3, contract, "tsCheckpoint()", block)
+    liveness_period = _uint(w3, contract, "livenessPeriod()", block)
     if next_at != ts_checkpoint + liveness_period:
         return True
     if now < next_at:
         return False
-    return _uint(w3, contract, "availableRewards()") > 0
+    return _uint(w3, contract, "availableRewards()", block) > 0
 
 
 def checkpoint_if_due(
