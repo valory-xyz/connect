@@ -214,11 +214,28 @@ composing a prompt:
   default, and the request then needs an explicit one) caps what one
   request may cost: a mech pricing above it is refused before any payment.
   Raising the cap is an explicit choice — check the price first with
-  `mech_tools(priority_mech=...)` (`max_delivery_rate`).
+  `mech_tools(priority_mech=...)` (`max_delivery_rate`). Off-chain, a
+  request signs a cap: derived from the expected cost the mech's manifest
+  publishes for the tool in its payment asset, or the mech's on-chain price
+  when it publishes none. `max_payment` bounds that cap, the mech charges at
+  most that per request. `payment` in the answer is what was charged: each
+  request's reported charge, or the cap for one the mech has not reported
+  yet; `signed_cap` is the cap times the number of requests.
 - `delivery_results[request_id]` is normally the result file
   (`{schema_version, requestId, result, tool, …}`), but a mech that answers
   inline off-chain returns its envelope instead, with the answer under
   `response` — check for that key before assuming.
+- `failed_runs[request_id]` names a run the mech could not answer, with its
+  `error` and `fault` (`client` when the request could not be run as sent,
+  `mech` when the mech failed, `null` when the mech did not say). Its
+  `delivery_results` entry is the failure, not an answer. The mech still
+  charges for it: `reported_charges[request_id]` is what the mech reported
+  charging for each request, in base units of its payment asset, at most the
+  cap signed into the request.
+- A chat prompt for the `chat` tool is sent only when every message's
+  `content` is a string, a list of `{"type": "text", ...}` parts, `null` or
+  absent; any other content is refused first (`chat-content-not-text`), so put
+  a tool result or a non-text answer back into the conversation as text.
 - `delivery_urls[request_id]` is the result file's URL, absent for an inline
   answer, where the envelope's `content_cid` names the document instead. An id
   whose file the mech delivered but nobody could read yet stays in

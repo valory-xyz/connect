@@ -20,19 +20,35 @@
 """Errors and shapes shared by connect/mech.py and mech_allowances.py."""
 
 import dataclasses
+import json
 import logging
 import typing as t
 
 from mech_client import (
+    DeliveryResult,
     NonceRefused,
+    OffchainRequestRejected,
+    OffchainTopUpFailed,
+    PreSignHook,
     RULE_ANSWER_UNKNOWN,
     RULE_NONCE_TAKEN,
     RULE_REQUEST_REJECTED,
     RequestIdMismatch,
     RequestIdRpcError,
+    is_chat_prompt,
+    outcome_of,
 )
-from mech_client.services.marketplace_service import MarketplaceService
+from mech_client.domain.delivery import (
+    OffchainDeliveryWatcher,
+    OnchainDeliveryWatcher,
+)
+from mech_client.nonces import REJECTION_RULES
+from mech_client.services.marketplace_service import (
+    MarketplaceService,
+    NONCE_MODE_EXPLICIT,
+)
 
+from connect.activity import ActivityLog
 from connect.signer_errors import SendUnknown, SignerError, logged_cause
 
 logger = logging.getLogger("agent")
@@ -142,15 +158,18 @@ class MechUnknownRequest(MechError):
 # Marks a stored report whose request reached the paying call and then failed,
 # so the outcome — and the spend — is genuinely unknown to this server.
 SPEND_UNCERTAIN = "uncertain"
+# a chat message whose content the chat tool would refuse, and charge for
+RULE_CHAT_CONTENT = "chat-content-not-text"
 
 
 class PricedMech(t.NamedTuple):
-    """The mech a request will pay, with the price the cap must bind."""
+    """The mech a request will pay, with the per-request rate its bounds bind."""
 
     mech: str
     service_id: int
-    # per-request price in the mech's payment asset base units (wei for
-    # native mechs, token base units for OLAS/USDC ones)
+    # per request, in the mech's payment asset base units (wei for native
+    # mechs, token base units for OLAS/USDC ones): the mech's on-chain price,
+    # or off-chain the cap the request signs (`mech_budget.offchain_priced`)
     rate: int
     payment_type: str
 
@@ -207,12 +226,19 @@ class RequestPlan(t.NamedTuple):
         return not self.offchain
 
 
-def over_max_payment(mech: str, price: int, max_payment: int) -> str:
-    """Word the refusal of a mech whose price is above the request's budget."""
+def over_max_payment(
+    mech: str, price: int, max_payment: int, signed_cap: bool = False
+) -> str:
+    """Word the refusal of a mech whose price is above the request's budget.
+
+    Off-chain the figure is the cap the request would sign (`signed_cap`),
+    not a charge.
+    """
+    what = "would be signed a cap of" if signed_cap else "charges"
     return (
-        f"mech {mech} charges {price} per request (in its payment asset base "
-        f"units), above max_payment={max_payment}; pass a higher max_payment "
-        "to accept that price"
+        f"mech {mech} {what} {price} per request (in its payment asset base "
+        f"units), which exceeds max_payment={max_payment}; pass a higher max_payment "
+        "to accept that"
     )
 
 
@@ -232,6 +258,8 @@ class PendingDelivery(t.NamedTuple):
     from_block: int | None
     nonce: int | None
     salt: str | None
+    # the rate the request was signed at (off-chain: its cap), bounding `payment`
+    rate: int | None = None
 
 
 def published_tools(document: t.Any) -> list[str]:
@@ -252,6 +280,87 @@ def published_tools(document: t.Any) -> list[str]:
 def request_key(request_id: object) -> str:
     """Normalize a caller's request id: mech-client's are bare lowercase hex."""
     return str(request_id).lower().removeprefix("0x")
+
+
+def delivery_outcomes(deliveries: t.Mapping[str, DeliveryResult]) -> dict:
+    """Return the `failed_runs` and `reported_charges` maps, each only when non-empty."""
+    failed = {
+        key: {"error": d.failure.error, "fault": d.failure.fault}
+        for key, d in deliveries.items()
+        if d.failure is not None
+    }
+    charges = {
+        key: str(d.actual_delivery_rate)
+        for key, d in deliveries.items()
+        if d.actual_delivery_rate is not None
+    }
+    return {
+        **({"failed_runs": failed} if failed else {}),
+        **({"reported_charges": charges} if charges else {}),
+    }
+
+
+def record_failed_runs(activity: ActivityLog, chain: str, report: t.Mapping) -> None:
+    """Audit each run a report names in `failed_runs`, with what it was charged."""
+    charges = report.get("reported_charges") or {}
+    for key, run in (report.get("failed_runs") or {}).items():
+        activity.record(
+            "mech_run_failed",
+            chain=chain,
+            request_id=key,
+            error=run["error"],
+            fault=run["fault"],
+            charged=charges.get(key),
+        )
+
+
+# the chat tool, which charges the signed cap for a message it cannot serve
+CHAT_TOOL = "chat"
+
+
+def check_chat_prompt(  # pylint: disable=too-many-arguments
+    prompt: str,
+    tool: str,
+    *,
+    activity: ActivityLog,
+    chain: str | None,
+    request_id: str | None,
+) -> None:
+    """Refuse, and audit, a chat for the chat tool whose message content is not text.
+
+    The chat tool serves a message whose `content` is absent, a string or a
+    list of text parts, and charges the request for any other.
+    """
+    if tool != CHAT_TOOL or not is_chat_prompt(prompt):
+        return
+    for index, message in enumerate(json.loads(prompt)):
+        content = message.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        if isinstance(content, list) and all(
+            isinstance(part, dict) and part.get("type") == "text" for part in content
+        ):
+            continue
+        reason = (
+            f"message {index} ({message.get('role')!r}) has content that is not "
+            "a string or a list of text parts"
+        )
+        activity.record(
+            "refusal",
+            rule=RULE_CHAT_CONTENT,
+            chain=chain,
+            tool=tool,
+            request_id=request_id,
+            reason=reason,
+        )
+        raise MechNotSent(f"rule '{RULE_CHAT_CONTENT}': {reason}; nothing was sent")
+
+
+def merge_outcomes(payload: dict, report: t.Mapping) -> None:
+    """Add a `result()` report's `failed_runs` and `reported_charges` to `payload`."""
+    for field in ("failed_runs", "reported_charges"):
+        if report.get(field):
+            payload[field] = {**(payload.get(field) or {}), **report[field]}
 
 
 # what a caller is told of a failure whose words are a library's, which may
@@ -311,6 +420,70 @@ def not_bought(error: Exception, what: str, *, posted: bool, note: str) -> MechE
     )
 
 
+def lost_answer(  # pylint: disable=too-many-arguments
+    plan: "RequestPlan",
+    sent: list[tuple[int, PreSignHook]],
+    armed: dict[int, bytes],
+    error: Exception,
+    note: str,
+) -> MechAnswerUnknown:
+    """Describe a signed request whose answer was lost, its armed id pending."""
+    held = armed[sent[-1][0]].hex()
+    what = request_label(plan.chain, plan.priced.mech, plan.tool, held)
+    return answer_lost(error, held, what, note)
+
+
+# A mech with explicit nonces off answers 503 and mech-client resends the
+# request sequentially in the same call, outside the allocator: refused here.
+RULE_EXPLICIT_RESEND = "mech-explicit-nonces-off"
+
+
+class ExplicitSend:  # pylint: disable=too-few-public-methods
+    """One explicit-nonce send: arms and counts the id it signs, and only one.
+
+    `queue` is the MechQueue that counts the id in flight from its signing.
+    """
+
+    def __init__(
+        self,
+        arm: t.Callable[[bytes, int], None],
+        sent: list[tuple[int, PreSignHook]],
+        queue: t.Any,
+        chain: str,
+    ) -> None:
+        """Wrap `arm` and the shared `sent` list in this send's pre-sign hook."""
+        self._arm, self._sent, self._queue, self._chain = arm, sent, queue, chain
+        self._signed: list[str] = []
+        self.hook = PreSignHook(self._on_request_id)
+
+    def _on_request_id(self, request_id: bytes, nonce: int) -> None:
+        if self._signed:  # a second id is mech-client's sequential resend
+            self._drop()
+            raise MechNotSent(
+                f"rule '{RULE_EXPLICIT_RESEND}': the mech does not take explicit "
+                "nonces, so nothing was bought; send it sequential nonces "
+                '(README, "One payer per safe: nonces")'
+            )
+        self._arm(request_id, nonce)
+        self._sent.append((nonce, self.hook))
+        self._signed.append(bytes(request_id).hex())
+        self._queue.explicit_signed(self._chain, self._signed[-1])
+
+    def _drop(self) -> None:
+        for key in self._signed:
+            self._queue.explicit_dropped(self._chain, key)
+
+    def __call__(self, send: t.Callable[..., dict]) -> dict:
+        """Send, the mech's HTTP answer as the allocator's rule."""
+        try:
+            return send(nonce_mode=NONCE_MODE_EXPLICIT, on_request_id=self.hook)
+        except (OffchainRequestRejected, OffchainTopUpFailed) as e:
+            rule = REJECTION_RULES[outcome_of(e)]
+            if rule != RULE_ANSWER_UNKNOWN:  # the mech admitted nothing
+                self._drop()
+            raise NonceRefused(rule, str(e)) from e
+
+
 def answer_lost(error: Exception, held: str, what: str, note: str) -> MechAnswerUnknown:
     """Describe a signed request whose answer was lost, its id `held` pending."""
     return MechAnswerUnknown(
@@ -320,3 +493,15 @@ def answer_lost(error: Exception, held: str, what: str, note: str) -> MechAnswer
         [held],
         getattr(error.__cause__, "deposited", 0),
     )
+
+
+async def watch_delivery(
+    service: MarketplaceService, pending: PendingDelivery, key: str, timeout: float
+) -> dict:
+    """Run the watcher for the flow this request was sent through."""
+    if pending.offchain:
+        url = service.tool_manager.get_offchain_url(pending.service_id)
+        return await OffchainDeliveryWatcher(url, timeout).watch([key])
+    contract = service.marketplace_contract()
+    watcher = OnchainDeliveryWatcher(contract, service.ledger_api, timeout)
+    return await watcher.watch([key], from_block=pending.from_block)

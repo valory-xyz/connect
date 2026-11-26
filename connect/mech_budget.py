@@ -23,9 +23,13 @@ import typing as t
 
 from mech_client import payment_token
 from mech_client.infrastructure.config.payment_config import PaymentType
-from mech_client.services.marketplace_service import MarketplaceService
+from mech_client.services.marketplace_service import (
+    MAX_DERIVED_CAP_FACTOR,
+    MarketplaceService,
+    UINT256_MAX,
+)
 
-from connect.mech_types import MechError, PricedMech, said
+from connect.mech_types import MechError, MechNotSent, PricedMech, merge_outcomes, said
 
 # The agent's per-request spending budget, not a guardrail: the caller picks
 # max_payment per call and the server does not clamp it — the guardrail only
@@ -78,6 +82,38 @@ def price_mech(service: MarketplaceService, chain: str, mech: str) -> PricedMech
     )
 
 
+def offchain_priced(
+    service: MarketplaceService, priced: PricedMech, tool: str, document: t.Any
+) -> PricedMech:
+    """Return `priced` at the cap mech-client signs for an off-chain `tool`.
+
+    :raises MechNotSent: for a derived cap mech-client signs only with an
+        explicit `max_cost`.
+    """
+    kind = PaymentType(priced.payment_type)
+
+    def cap(advertised_max: int) -> int:
+        return service._resolve_signed_rate(  # pylint: disable=protected-access
+            tools=(tool,),
+            metadata=document,
+            payment_type=kind,
+            advertised_max=advertised_max,
+            max_cost=None,
+            use_offchain=True,
+        )
+
+    try:
+        return priced._replace(rate=cap(priced.rate))
+    except ValueError as e:
+        derived = cap(UINT256_MAX)  # the same cap, with no limit to refuse it
+        raise MechNotSent(
+            f"mech {priced.mech} prices {tool} at a cap of {derived}, more than "
+            f"{MAX_DERIVED_CAP_FACTOR}x its on-chain price of {priced.rate}; "
+            "this server does not sign a cap that far above it, so the tool "
+            "cannot be requested here"
+        ) from e
+
+
 def payment_report(payment_type: PaymentType, chain: str) -> dict[str, t.Any]:
     """Report the token a mech is paid in and the budget a request defaults to."""
     default = DEFAULT_MAX_PAYMENT.get(payment_type)
@@ -101,3 +137,45 @@ def charged(terms: dict, rate: int, result: dict) -> dict:
         fields["payment_info"] = fields.pop("payment")
     fields["payment"] = rate * len(result.get("request_ids") or [])
     return fields
+
+
+def settle_payment(payload: dict, rate: int) -> None:
+    """Report as `payment` what the mech said it charged, the signed cap as `signed_cap`.
+
+    A request id the mech reported no charge for (`reported_charges`) still
+    counts at `rate`, the most it can be charged.
+    """
+    ids = payload.get("request_ids") or []
+    charges = payload.get("reported_charges") or {}
+    payload["signed_cap"] = rate * len(ids)
+    payload["payment"] = sum(charge_of(charges, key, rate) for key in ids)
+
+
+def charge_of(charges: t.Mapping[str, str], key: str, rate: int) -> int:
+    """Return what request `key` is charged: its reported charge, at most `rate`."""
+    return min(int(charges.get(key, rate)), rate)
+
+
+def result_charge(report: dict, outcomes: dict, key: str, rate: int | None) -> None:
+    """Add a delivery's outcomes to a `mech_result` report.
+
+    `payment` is set only once the mech reported the id's charge, and only
+    with the rate it was signed at, which bounds it.
+    """
+    report.update(outcomes)
+    charges = outcomes.get("reported_charges") or {}
+    if key in charges and rate is not None:
+        report["payment"] = charge_of(charges, key, rate)
+
+
+def replay_payment(payload: dict, outcomes: dict) -> None:
+    """Merge a replay's collected outcomes and settle `payment` on them.
+
+    The signed rate per request is `signed_cap` over the request ids; a
+    report stored before `signed_cap` existed carries it as `payment`.
+    """
+    merge_outcomes(payload, outcomes)
+    ids = payload.get("request_ids") or []
+    if ids:
+        cap = int(payload.get("signed_cap", payload.get("payment", 0)))
+        settle_payment(payload, cap // len(ids))

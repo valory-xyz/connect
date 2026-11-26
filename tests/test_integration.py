@@ -49,7 +49,13 @@ from safe_eth.safe.safe_deployments import safe_deployments
 from web3 import Web3
 
 from connect.activity import ActivityLog
-from connect.config import AGENT_HTTP_PORT, AppConfig, ChainConfig
+from connect.config import (
+    AGENT_HTTP_PORT,
+    AppConfig,
+    ChainConfig,
+    MECH_NONCE_MODES,
+    MechNonceMode,
+)
 from connect.guard import Guard
 from connect.mech import MechError, MechService
 from connect.mech_allowances import _MAX_AUTO_DEPOSIT_RATIO, deposit_tracker
@@ -795,8 +801,9 @@ class _LocalMechEndpoint:
     Implements the two endpoints mech-client talks to — POST
     /send_signed_requests and GET /fetch_offchain_info — with the validation
     a real mech performs before serving a request: the request id must equal
-    the marketplace's getRequestId over the payload's own fields (read from
-    the forked contract), the signature must validate via the sender Safe's
+    the marketplace's view over the payload's own fields (getRequestId, or
+    getRequestIdWithNonce for an explicit nonce; read from the forked
+    contract), the signature must validate via the sender Safe's
     ERC-1271 isValidSignature (agent mode, since mech-client 0.21.3), and the
     first request is answered HTTP 402 until the prepaid deposit actually
     lands on the balance tracker on-chain.
@@ -835,16 +842,21 @@ class _LocalMechEndpoint:
         the magic value — exactly what the marketplace does at settlement.
         """
         request_id = int(form["request_id"])
-        expected = self._contract.functions.getRequestId(
+        fields = (
             Web3.to_checksum_address(self._mech),
             Web3.to_checksum_address(form["sender"]),
             bytes.fromhex(form["ipfs_hash"].removeprefix("0x")),
             int(form["delivery_rate"]),
             bytes.fromhex(self._payment_type_hex.removeprefix("0x")),
             int(form["nonce"]),
-        ).call()
-        if int.from_bytes(bytes(expected), "big") != request_id:
-            self.validation_errors.append("request id != contract getRequestId")
+        )
+        functions = self._contract.functions
+        if form.get("nonce_mode") == "explicit":  # its own view, with the deadline
+            view = functions.getRequestIdWithNonce(*fields, int(form["deadline"]))
+        else:
+            view = functions.getRequestId(*fields)
+        if int.from_bytes(bytes(view.call()), "big") != request_id:
+            self.validation_errors.append("request id != contract request id view")
         signature = bytes.fromhex(form["signature"].removeprefix("0x"))
         erc1271 = self._w3.eth.contract(
             address=Web3.to_checksum_address(form["sender"]),
@@ -940,9 +952,11 @@ def _serving_mech_endpoint(endpoint: _LocalMechEndpoint) -> t.Iterator[str]:
         thread.join(timeout=10)
 
 
-def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-many-locals,too-many-statements
+@pytest.mark.parametrize("nonce_mode", MECH_NONCE_MODES)
+def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-many-locals,too-many-statements,too-many-arguments
     rpc_url: str,
     fork_config: AppConfig,
+    nonce_mode: MechNonceMode,
     fork_store: SettingsStore,
     store_path: Path,
     account: LocalAccount,
@@ -964,6 +978,8 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     before the request is sent and the mech never has to ask. The third
     rides that balance straight through, depositing nothing at all.
 
+    Both nonce modes fund it the same way (README, "One payer per safe").
+
     The mech endpoint is local (no live mech serves a fork); everything else
     — marketplace reads, nonces, digests, signing, the deposit transaction —
     is real chain state. Only the metadata document is stubbed to point the
@@ -981,6 +997,7 @@ def test_offchain_request_end_to_end_restricted_on_fork(  # pylint: disable=too-
     _set_balance(rpc_url, safe_address, 10**18)
     fork_config.chains["gnosis"].safe_address = safe_address
     assert guard.mode() == "restricted"
+    fork_config.mech_nonce_mode = nonce_mode
     mech_service = MechService(signer, fork_config, activity, guard)
 
     picked = _pick_live_mech(mech_service)
