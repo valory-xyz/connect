@@ -927,6 +927,33 @@ class TestSessionNotice:
         # and with none to clear
         assert client.post("/session").json()["launched"] is True
 
+    @pytest.mark.parametrize(
+        "notice", [staking.STAKING_REMINDER, None], ids=["write", "clear"]
+    )
+    def test_a_planted_link_is_replaced_not_followed(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        tmp_path: Path,
+        notice: str | None,
+    ) -> None:
+        """A session's link at the name never redirects the server's write."""
+        outside = tmp_path / "outside.json"
+        outside.write_text("settings", encoding="utf-8")
+        self._notice(app_config).symlink_to(outside)
+
+        workspace = client.app.state.workspace  # type: ignore[attr-defined]
+        workspace.write_session_notice(notice)
+
+        assert outside.read_text(encoding="utf-8") == "settings"
+        assert not self._notice(app_config).is_symlink()
+        if notice is None:
+            assert not self._notice(app_config).exists()
+        else:
+            assert self._notice(app_config).read_text(encoding="utf-8") == (
+                notice + "\n"
+            )
+
     def test_an_unwritable_notice_never_fails_the_launch(
         self,
         client: TestClient,
