@@ -30,7 +30,6 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from hexbytes import HexBytes
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from connect import staking, wallet
@@ -48,7 +47,7 @@ from connect.server.auth import (
     require_local_origin,
 )
 from connect.server.mcp_tools import build_mcp
-from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
+from connect.server.receipts import wait_mined
 from connect.settings import MODE_RESTRICTED, SettingsStore
 from connect.signer import SERVER_BUILT, Signer
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
@@ -101,13 +100,7 @@ def _send_agent_topup(  # pylint: disable=too-many-arguments,too-many-positional
             # restricted, by its single-use allowance: no session intent applies
             intent=SERVER_BUILT,
         )
-        receipt = signer.w3(chain).eth.wait_for_transaction_receipt(
-            HexBytes(tx_hash),
-            timeout=MAX_RECEIPT_TIMEOUT,
-            poll_latency=RECEIPT_POLL_SECONDS,
-        )
-        if receipt["status"] != 1:
-            raise RuntimeError("the transaction reverted")
+        wait_mined(signer.w3(chain), tx_hash)
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.exception("agent top-up of %d wei on %s failed", amount, chain)
         activity.record(

@@ -35,7 +35,7 @@ from connect.activity import ActivityLog
 from connect.chain_read import selector_of
 from connect.config import AppConfig, StakingConfig
 from connect.guard import CHECKPOINT_SELECTOR, Guard
-from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
+from connect.server.receipts import wait_mined
 from connect.settings import MODE_RESTRICTED
 from connect.signer import SERVER_BUILT, Signer
 from connect.signer_errors import cause_of, logged_cause
@@ -195,13 +195,7 @@ def checkpoint_if_due(
             # contract with no value: no session intent applies
             intent=SERVER_BUILT,
         )
-        receipt = w3.eth.wait_for_transaction_receipt(
-            HexBytes(tx_hash),
-            timeout=MAX_RECEIPT_TIMEOUT,
-            poll_latency=RECEIPT_POLL_SECONDS,
-        )
-        if receipt["status"] != 1:
-            raise RuntimeError("the transaction reverted")
+        wait_mined(w3, tx_hash)
     except Exception as e:  # pylint: disable=broad-exception-caught
         # cause_of, not the text: an RPC library's words may carry the RPC key
         logger.warning("staking checkpoint on %s failed: %s", chain, logged_cause(e))

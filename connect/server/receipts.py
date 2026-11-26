@@ -27,6 +27,7 @@ import logging
 import typing as t
 
 from hexbytes import HexBytes
+from web3 import Web3
 from web3.exceptions import TimeExhausted
 
 from connect.signer import Signer
@@ -75,6 +76,17 @@ def settled(
         # it goes to the log, and the caller gets Connect's own words.
         logger.warning("could not read the receipt of %s", tx_hash, exc_info=True)
         return {"tx_hash": tx_hash, "status": "pending", "receipt_error": RECEIPT_ERROR}
+
+
+def wait_mined(w3: Web3, tx_hash: str) -> None:
+    """Wait for the server's own transaction to be mined; raise unless it succeeded."""
+    receipt = w3.eth.wait_for_transaction_receipt(
+        HexBytes(tx_hash),
+        timeout=MAX_RECEIPT_TIMEOUT,
+        poll_latency=RECEIPT_POLL_SECONDS,
+    )
+    if receipt["status"] != 1:
+        raise RuntimeError("the transaction reverted")
 
 
 def mined_result(tx_hash: str, receipt: t.Mapping[str, t.Any]) -> dict:
