@@ -302,10 +302,11 @@ an ERC-20 approval, and always declared: the allowance exemption above reads
 the token's own `allowance()`, which says nothing about a Permit2 grant. An RPC that cannot simulate refuses the send
 as `simulation-unavailable`, so Pearl must give Connect, on every chain, an RPC
 that serves `eth_simulateV1` (Celo's `forno.celo.org` does not). The
-transactions the server builds itself — the mech flow (`MechSigner`) and the
-agent top-up — pass the private `SERVER_BUILT` marker and skip the gate; they
-are bounded by `max_payment` and the top-up plan, and while restricted by their
-single-use allowances. The diff names each token's `symbol()` for the reader
+transactions the server builds itself — the mech flow (`MechSigner`), the
+agent top-up and the staking checkpoint — pass the private `SERVER_BUILT`
+marker and skip the gate; they are bounded by `max_payment`, the top-up plan
+and the fixed `checkpoint()` call (no value, to the configured staking
+contract), and while restricted by their single-use allowances. The diff names each token's `symbol()` for the reader
 (display only: nothing is checked against it, and a token without one reads
 as `""`). `preflight_transaction` and `simulate_transaction` take
 the same `intent` and report the gate's `problems` without signing.
@@ -1042,7 +1043,9 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`, plus
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_HARD_CANCEL_AFTER}`,
+  `CONNECTION_CONFIGS_CONFIG_{STAKING_CONTRACT_ADDRESS,ACTIVITY_CHECKER_CONTRACT_ADDRESS,SERVICE_ID}`
+  (see [Staking](#staking)), plus
   `CONNECTION_CONFIGS_CONFIG_MECHX_{MARKETPLACE,REGISTRY}_{BASE,POLYGON}_SQUID_URL`;
   see [Base and Polygon indexers](#base-and-polygon-indexers))
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =
