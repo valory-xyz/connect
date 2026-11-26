@@ -383,6 +383,13 @@ class TestRequestMade:
 class TestReminder:
     """staking_reminder, for POST /session."""
 
+    def test_the_copy_is_the_adopted_one(self) -> None:
+        """The words D25/Q20 adopted, which the brief relays verbatim."""
+        assert staking.STAKING_REMINDER == (
+            "This agent is staked. Make one Marketplace request today to become "
+            "eligible for OLAS activity rewards."
+        )
+
     def test_reminds_while_the_request_is_not_made(
         self, staked_config: AppConfig, test_signer: Signer, w3: StakingW3
     ) -> None:
