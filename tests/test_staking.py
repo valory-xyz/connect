@@ -21,6 +21,7 @@
 
 import asyncio
 import logging
+import time
 import typing as t
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from connect.config import (
 )
 from connect.guard import Guard
 from connect.server import app as app_module
+from connect.server import pearl_routes
 from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import Signer, SignerError
 from connect.workspace import SESSION_NOTICE_FILE
@@ -70,23 +72,36 @@ def _sel(signature: str) -> bytes:
 
 
 class StakingW3(FakeW3):
-    """Fake Web3 answering the staking and checker reads."""
+    """Fake Web3 answering the staking and checker reads.
+
+    The shapes are the ABIs olas-operate-middleware vendors:
+    `staking_token/build/StakingToken.json` (`getServiceInfo` returns the
+    `ServiceInfo` struct, multisig, owner, nonces, tsStart, reward, inactivity)
+    and `requester_activity_checker` (`getMultisigNonces(multisig)` returns
+    `[safe nonce, Marketplace request count]`).
+    """
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
         *,
         safe_requests: int = 10,
         staked_requests: int = 9,
-        ts_checkpoint: int = NOW - DAY,
-        next_checkpoint: int = NOW + 60,
+        ts_checkpoint: int = NOW - DAY + 60,
+        next_checkpoint: int | None = None,
+        available_rewards: int = 10**18,
         record: bool = True,
     ) -> None:
-        """Hold the on-chain state the reads answer from."""
+        """Hold the on-chain state the reads answer from.
+
+        `next_checkpoint` defaults to `ts_checkpoint + livenessPeriod`, the
+        answer of a contract with no rebaseline pending.
+        """
         super().__init__()
         self.safe_requests = safe_requests
         self.staked_requests = staked_requests
         self.ts_checkpoint = ts_checkpoint
         self.next_checkpoint = next_checkpoint
+        self.available_rewards = available_rewards
         self.record = record
         self.fail: Exception | None = None
         self.calls: list[tuple[str, bytes]] = []
@@ -116,7 +131,19 @@ class StakingW3(FakeW3):
             (
                 STAKING_CONTRACT,
                 _sel("getNextRewardCheckpointTimestamp()"),
-            ): lambda: abi_encode(["uint256"], [self.next_checkpoint]),
+            ): lambda: abi_encode(
+                ["uint256"],
+                [
+                    (
+                        self.ts_checkpoint + DAY
+                        if self.next_checkpoint is None
+                        else self.next_checkpoint
+                    )
+                ],
+            ),
+            (STAKING_CONTRACT, _sel("availableRewards()")): lambda: abi_encode(
+                ["uint256"], [self.available_rewards]
+            ),
         }
         return HexBytes(answers[(to, data[:4])]())
 
@@ -235,7 +262,9 @@ class TestRequestMade:
             # a day since the checkpoint needs ceil(86400 * ratio / 1e18) = 1
             (10, NOW - DAY, True),
             (9, NOW - DAY, False),
-            # within the liveness period, the period itself is what counts
+            # within the liveness period, the period itself is what counts:
+            # right after a checkpoint, none would be needed without the floor
+            (9, NOW, False),
             (9, NOW - 60, False),
             (10, NOW - 60, True),
             # two days without a checkpoint need two
@@ -271,7 +300,7 @@ class TestReminder:
     def test_reminds_while_the_request_is_not_made(
         self, staked_config: AppConfig, test_signer: Signer, w3: StakingW3
     ) -> None:
-        """Staked and short of the request: the D15 copy."""
+        """Staked and short of the request: the reminder."""
         w3.safe_requests = 9
         assert (
             staking.staking_reminder(staked_config, test_signer, now=_now)
@@ -365,7 +394,7 @@ class TestCheckpoint:
     ) -> None:
         """Due: one checkpoint() call, audited only as itself, no allowance armed."""
         test_signer.set_guard(guard)
-        w3.next_checkpoint = NOW
+        w3.ts_checkpoint = NOW - DAY
         sends: list[tuple[str, str, dict]] = []
         send = test_signer.send
 
@@ -414,7 +443,7 @@ class TestCheckpoint:
         )
         guard = Guard(settings_store, staked_config, agent_signer=test_signer.address)
         test_signer.set_guard(guard)
-        w3.next_checkpoint = NOW - 1
+        w3.ts_checkpoint = NOW - DAY - 1
         assert staking.checkpoint_if_due(
             staked_config, test_signer, guard, activity, now=_now
         )
@@ -438,7 +467,7 @@ class TestCheckpoint:
     ) -> None:
         """A revert or a receipt that never comes: audited as failed, retried later."""
         test_signer.set_guard(guard)
-        w3.next_checkpoint = NOW
+        w3.ts_checkpoint = NOW - DAY
         w3.eth.receipt = receipt
         assert (
             staking.checkpoint_if_due(
@@ -449,6 +478,46 @@ class TestCheckpoint:
         (entry,) = _audited(staked_config, "staking_checkpoint_failed")
         assert entry["tx_hash"].startswith("0x")
         assert entry["staking_contract"] == STAKING_CONTRACT
+        payload = (staked_config.store_path / PERFORMANCE_FILE).read_text()
+        assert '"last_activity": null' in payload
+
+    def test_no_rewards_left_sends_nothing(  # pylint: disable=too-many-arguments
+        self,
+        staked_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        w3: StakingW3,
+    ) -> None:
+        """Due, but with no rewards a checkpoint changes nothing: not sent."""
+        test_signer.set_guard(guard)
+        w3.ts_checkpoint = NOW - 2 * DAY
+        w3.available_rewards = 0
+        assert (
+            staking.checkpoint_if_due(
+                staked_config, test_signer, guard, activity, now=_now
+            )
+            is None
+        )
+        assert not w3.eth.sent
+        assert not audit_entries(staked_config.store_path)
+
+    def test_a_pending_rebaseline_is_sent_without_rewards(  # pylint: disable=too-many-arguments
+        self,
+        staked_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        w3: StakingW3,
+    ) -> None:
+        """v0.4 signals a rebaseline by its next checkpoint time: sent even so."""
+        test_signer.set_guard(guard)
+        w3.available_rewards = 0
+        w3.next_checkpoint = NOW + DAY
+        assert staking.checkpoint_if_due(
+            staked_config, test_signer, guard, activity, now=_now
+        )
+        assert len(w3.eth.sent) == 1
 
     def test_a_failed_read_sends_nothing(  # pylint: disable=too-many-arguments
         self,
@@ -457,16 +526,21 @@ class TestCheckpoint:
         guard: Guard,
         activity: ActivityLog,
         w3: StakingW3,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The due-time read failing: audited, nothing sent, no tx hash."""
-        w3.fail = ConnectionError("down")
-        assert (
-            staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
-            is None
-        )
+        """The due-time read failing: audited without the RPC's words, nothing sent."""
+        w3.fail = ConnectionError("http://rpc.example/secret-key unreachable")
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            assert (
+                staking.checkpoint_if_due(staked_config, test_signer, guard, activity)
+                is None
+            )
         assert not w3.eth.sent
         (entry,) = _audited(staked_config, "staking_checkpoint_failed")
         assert entry["tx_hash"] is None
+        assert "secret-key" not in entry["error"]
+        assert "staking checkpoint on testchain failed" in caplog.text
+        assert "secret-key" not in caplog.text
 
 
 class TestGuardAllowance:
@@ -585,7 +659,8 @@ class TestCheckpointTask:
                     staked_config, test_signer, guard, activity
                 )
             )
-            while len(called) < 3:
+            deadline = time.monotonic() + 5
+            while len(called) < 3 and time.monotonic() < deadline:
                 await asyncio.sleep(0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -593,6 +668,70 @@ class TestCheckpointTask:
 
         asyncio.run(run())
         assert len(called) >= 3
+
+    def test_a_failed_check_does_not_end_the_task(  # pylint: disable=too-many-arguments
+        self,
+        staked_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Whatever a check raises is logged, and the next one still runs."""
+        called: list[int] = []
+
+        def failing(*_: t.Any, **__: t.Any) -> None:
+            """Fail every check."""
+            called.append(1)
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(staking, "checkpoint_if_due", failing)
+        monkeypatch.setattr(app_module, "STAKING_CHECKPOINT_INTERVAL_SECONDS", 0.0)
+
+        async def run() -> None:
+            task = asyncio.create_task(
+                app_module.checkpoint_staking(
+                    staked_config, test_signer, guard, activity
+                )
+            )
+            deadline = time.monotonic() + 5
+            while len(called) < 2 and time.monotonic() < deadline:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            asyncio.run(run())
+        assert len(called) >= 2
+        assert "staking checkpoint check failed" in caplog.text
+
+    def test_runs_with_the_app_and_stops_after(  # pylint: disable=too-many-arguments
+        self,
+        test_signer: Signer,
+        staked_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The lifespan starts the task with the app and cancels it on shutdown."""
+        monkeypatch.setattr(app_module, "STAKING_CHECKPOINT_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(app_module, "AGENT_TOPUP_INTERVAL_SECONDS", 3600.0)
+        checks: list[tuple] = []
+        monkeypatch.setattr(
+            staking, "checkpoint_if_due", lambda *a, **k: checks.append(a)
+        )
+        app = make_app(test_signer, staked_config, activity)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            deadline = time.monotonic() + 5
+            while len(checks) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(checks) >= 2
+        assert checks[0][:3] == (staked_config, test_signer, app.state.guard)
+        at_shutdown = len(checks)
+        time.sleep(0.1)
+        assert len(checks) == at_shutdown
 
 
 class TestSessionNotice:
@@ -607,10 +746,19 @@ class TestSessionNotice:
         make_app: t.Callable,
         monkeypatch: pytest.MonkeyPatch,
     ) -> t.Iterator[TestClient]:
-        """Yield a client whose launches open nothing."""
+        """Yield a client whose launches open nothing, noting the notice they see."""
+
+        def opened(self: t.Any, harness: str, *, fallback: bool = False) -> str:
+            """Record what the session would find, then open nothing."""
+            notice = app_config.store_path / SESSION_NOTICE_FILE
+            self.seen_notices.append(
+                notice.read_text(encoding="utf-8") if notice.exists() else None
+            )
+            return harness
+
+        monkeypatch.setattr("connect.workspace.Workspace.open_session", opened)
         monkeypatch.setattr(
-            "connect.workspace.Workspace.open_session",
-            lambda self, harness, *, fallback=False: harness,
+            "connect.workspace.Workspace.seen_notices", [], raising=False
         )
         app = make_app(test_signer, app_config, activity)
         with TestClient(app, base_url="http://127.0.0.1:8716") as client:
@@ -631,9 +779,10 @@ class TestSessionNotice:
             staking, "staking_reminder", lambda config, signer: staking.STAKING_REMINDER
         )
         assert client.post("/session").json()["launched"] is True
-        assert self._notice(app_config).read_text(encoding="utf-8") == (
+        # there before the session opened, not only after
+        assert client.app.state.workspace.seen_notices == [  # type: ignore[attr-defined]
             staking.STAKING_REMINDER + "\n"
-        )
+        ]
 
     def test_clears_an_old_reminder(
         self,
@@ -668,6 +817,31 @@ class TestSessionNotice:
         with caplog.at_level(logging.ERROR, logger="agent"):
             assert client.post("/session").json()["launched"] is True
         assert "could not write the session notice" in caplog.text
+
+    def test_a_slow_read_never_holds_the_launch(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A read past the time limit: no reminder, an old one cleared, launched."""
+        monkeypatch.setattr(pearl_routes, "REMINDER_READ_SECONDS", 0.01)
+
+        def slow(config: AppConfig, signer: Signer) -> str:
+            """Answer only after the launch has given up."""
+            time.sleep(0.5)
+            return staking.STAKING_REMINDER
+
+        monkeypatch.setattr(staking, "staking_reminder", slow)
+        assert client.get("/healthcheck").json() == {"is_healthy": True}
+        self._notice(app_config).write_text("stale", encoding="utf-8")
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            assert client.post("/session").json()["launched"] is True
+        assert time.monotonic() - started < 0.4
+        assert not self._notice(app_config).exists()
+        assert "took over" in caplog.text
 
     def test_the_brief_tells_the_session_to_say_it(self) -> None:
         """The shipped brief names the file and says to relay it first."""

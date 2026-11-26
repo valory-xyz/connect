@@ -173,9 +173,12 @@ async def checkpoint_staking(
     if not staking.is_staked(config):
         return
     while True:
-        await asyncio.to_thread(
-            staking.checkpoint_if_due, config, signer, guard, activity
-        )
+        try:
+            await asyncio.to_thread(
+                staking.checkpoint_if_due, config, signer, guard, activity
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("staking checkpoint check failed")
         await asyncio.sleep(STAKING_CHECKPOINT_INTERVAL_SECONDS)
 
 

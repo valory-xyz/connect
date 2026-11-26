@@ -80,6 +80,7 @@ import threading
 import time
 from dataclasses import dataclass
 
+from connect.chain_read import selector_of
 from connect.chains import MECH_MARKETPLACES
 from connect.config import AppConfig
 from connect.safe import (
@@ -95,7 +96,7 @@ from connect.settings import MODE_RESTRICTED, SettingsStore, token_approve_targe
 logger = logging.getLogger("agent")
 
 # checkpoint(), the one call a checkpoint allowance admits, as calldata_hex reads it
-CHECKPOINT_SELECTOR = "c2c4c5c1"
+CHECKPOINT_SELECTOR = selector_of("checkpoint()")[2:]
 
 
 class GuardError(Exception):
@@ -395,7 +396,10 @@ class Guard:
         exec_call: "SafeExec | None",
         consume: bool,
     ) -> None:
-        """Restricted mode: the safe CALLs a whitelisted address, or nothing."""
+        """Restricted mode: the safe CALLs a whitelisted address, or nothing.
+
+        The exceptions are the server's own allowances, each its exact call.
+        """
         if exec_call is None and self._consume_checkpoint_allowance(
             chain, to=to, value=value, calldata=calldata, consume=consume
         ):

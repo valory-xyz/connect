@@ -26,6 +26,8 @@ must never expose the session token.
 import logging
 import time
 import typing as t
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
@@ -39,6 +41,8 @@ logger = logging.getLogger("agent")
 router = APIRouter()
 
 FUNDS_STATUS_CACHE_SECONDS = 30
+# how long a session launch waits on the staking reads for its reminder
+REMINDER_READ_SECONDS = 5.0
 
 
 @router.get("/healthcheck")
@@ -85,15 +89,33 @@ class SessionRequest(BaseModel):
     harness: str | None = None
 
 
+def _staking_reminder(state: t.Any) -> str | None:
+    """Read the reminder within REMINDER_READ_SECONDS; past that, there is none.
+
+    Its reads go to the chain's RPC, which can hang for its whole timeout per
+    read, and the launch must not wait on them.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        reading = pool.submit(staking.staking_reminder, state.config, state.signer)
+        return reading.result(timeout=REMINDER_READ_SECONDS)
+    except FutureTimeout:
+        logger.warning(
+            "staking reminder skipped: the staking state took over %ss to read",
+            REMINDER_READ_SECONDS,
+        )
+        return None
+    finally:
+        pool.shutdown(wait=False)
+
+
 def _write_session_notice(state: t.Any) -> None:
     """Leave the session its staking reminder, or clear an earlier one.
 
     A failure here never stops the launch: the session opens without it.
     """
     try:
-        state.workspace.write_session_notice(
-            staking.staking_reminder(state.config, state.signer)
-        )
+        state.workspace.write_session_notice(_staking_reminder(state))
     except OSError:
         logger.exception("could not write the session notice")
 

@@ -19,12 +19,7 @@
 
 """Connect's own staking: the epoch's Marketplace request, and the checkpoint.
 
-Pearl stakes the service and passes the program in through `AppConfig.staking`
-(README, "Staking"). The staking contract counts the Agent Safe's Marketplace
-requests on chain through its activity checker, so Connect reports nothing: it
-only reads whether the request is made, for the session's reminder, and calls
-the permissionless `checkpoint()` that closes an epoch, which nothing else in
-Pearl calls on these contracts.
+The rules are the README's ("Staking").
 """
 
 import logging
@@ -33,11 +28,11 @@ import typing as t
 
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
-from eth_utils import function_signature_to_4byte_selector
 from hexbytes import HexBytes
 from web3 import Web3
 
 from connect.activity import ActivityLog
+from connect.chain_read import selector_of
 from connect.config import AppConfig, StakingConfig
 from connect.guard import CHECKPOINT_SELECTOR, Guard
 from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
@@ -60,8 +55,8 @@ REQUEST_COUNT_INDEX = 1
 
 
 def _selector(signature: str) -> bytes:
-    """Return a function's 4-byte selector."""
-    return function_signature_to_4byte_selector(signature)
+    """Return a function's 4-byte selector, as bytes."""
+    return bytes.fromhex(selector_of(signature)[2:])
 
 
 CHECKPOINT_DATA = "0x" + CHECKPOINT_SELECTOR
@@ -80,7 +75,7 @@ def _uint(w3: Web3, to: str, signature: str) -> int:
 
 
 def is_staked(config: AppConfig) -> bool:
-    """Whether Pearl staked this instance (a non-zero staking contract)."""
+    """Whether Pearl staked this instance with a program Connect can use."""
     return config.staking is not None
 
 
@@ -88,10 +83,6 @@ def request_made_this_epoch(
     w3: Web3, staking: StakingConfig, safe: str, now: int
 ) -> bool:
     """Whether the safe made the Marketplace requests the epoch needs, as of `now`.
-
-    The count is since the last checkpoint, and the requirement is the one the
-    activity checker applies when the next checkpoint runs, so a request counts
-    once the mech settles it on chain.
 
     :raises ValueError: when the contract holds no record of the service.
     """
@@ -150,6 +141,22 @@ def staking_reminder(
     return None if made else STAKING_REMINDER
 
 
+def _checkpoint_worth_sending(w3: Web3, contract: str, now: int) -> bool:
+    """Whether checkpoint() is due and would change something, as trader decides.
+
+    With no rewards left a checkpoint changes nothing, so it would be due, and
+    paid for, on every tick; a pending rebaseline (v0.4 then answers the next
+    checkpoint time as the current block's) is worth sending even so.
+    """
+    next_at = _uint(w3, contract, "getNextRewardCheckpointTimestamp()")
+    rebaseline = next_at != _uint(w3, contract, "tsCheckpoint()") + _uint(
+        w3, contract, "livenessPeriod()"
+    )
+    if not rebaseline and now < next_at:
+        return False
+    return rebaseline or _uint(w3, contract, "availableRewards()") > 0
+
+
 def checkpoint_if_due(
     config: AppConfig,
     signer: Signer,
@@ -159,8 +166,8 @@ def checkpoint_if_due(
 ) -> str | None:
     """Call checkpoint() from the agent EOA once it is due; return the tx hash.
 
-    None while unstaked, before the next checkpoint time, and on a failure,
-    which is logged and audited; the caller's next tick retries it.
+    None while unstaked, while it is not worth sending, and on a failure, which
+    is logged and audited; the caller's next tick retries it.
     """
     staking = config.staking
     chain = config.instance_chain
@@ -169,10 +176,7 @@ def checkpoint_if_due(
     tx_hash: str | None = None
     try:
         w3 = signer.w3(chain)
-        due_at = _uint(
-            w3, staking.staking_contract, "getNextRewardCheckpointTimestamp()"
-        )
-        if int(now()) < due_at:
+        if not _checkpoint_worth_sending(w3, staking.staking_contract, int(now())):
             return None
         # armed only while restricted, as for the agent top-up: one armed in
         # unrestricted mode would outlive a switch back for its TTL

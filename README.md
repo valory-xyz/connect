@@ -441,7 +441,8 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   shortfall (the request's `max_payment`, within 10× the mech's per-request
   rate). The
   [agent top-up](#agent-top-up) arms the same bare native shape for the agent
-  EOA. The MechMarketplace contract per chain
+  EOA, and the [staking checkpoint](#staking) arms one `checkpoint()` call, no
+  value, from the agent EOA to the configured staking contract. The MechMarketplace contract per chain
   (imported from the pinned mech-client) is whitelisted by default — the only
   contract the safe calls in the on-chain mech flow — so mech requests work out
   of the box; the entry admits only the mech flow's own calls (above). Balance trackers and payment tokens are deliberately not
@@ -552,13 +553,17 @@ on chain, off-chain requests included.
   `ceil(max(livenessPeriod, now - tsCheckpoint) * livenessRatio / 1e18)`.
   When it is not, it writes the reminder to `pearl-session-notice.md` in the
   workspace, which the brief tells the session to say first; otherwise it
-  removes the file. A read that fails is logged and never reminds, and
-  neither it nor the write can fail the launch.
+  removes the file. A read that fails, or takes over `REMINDER_READ_SECONDS`,
+  is logged and never reminds, and neither it nor the write can fail the
+  launch.
 - **Checkpoint.** Nothing else in Pearl calls the permissionless
   `checkpoint()` that closes an epoch, so while staked the server checks
-  every `STAKING_CHECKPOINT_INTERVAL_SECONDS` (600) whether
-  `getNextRewardCheckpointTimestamp()` has passed, and if so the agent EOA
-  calls it, with its own gas. A mined call is audited as
+  every `STAKING_CHECKPOINT_INTERVAL_SECONDS` whether one is worth sending,
+  as trader decides: `getNextRewardCheckpointTimestamp()` has passed and
+  `availableRewards()` is above 0 (with none left a checkpoint changes
+  nothing, so it would be due, and paid for, on every check), or a rebaseline
+  is pending (that timestamp differs from `tsCheckpoint + livenessPeriod`).
+  If so the agent EOA calls it, with its own gas. A mined call is audited as
   `staking_checkpoint`, anything else as `staking_checkpoint_failed`, and the
   next check retries. Like the agent top-up, those are the call's whole audit
   and never count as the agent's activity. It is no MCP tool and draws on no

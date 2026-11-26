@@ -88,9 +88,7 @@ MCP_TOOL_TIMEOUT_MS = 2_100_000
 UI_SUBDIR = "ui"
 UI_INDEX = "index.html"
 BRIEF_FILES = ("CLAUDE.md", "AGENTS.md")
-# what the server has to tell the operator when a session opens; the brief
-# tells the session to say it first. Written at every POST /session, and
-# absent when there is nothing to say
+# the server's message for the opening session; the brief tells it to relay it
 SESSION_NOTICE_FILE = "pearl-session-notice.md"
 AGENT_DIRS = (Path(".claude"), Path(".agents"))
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"

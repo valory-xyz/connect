@@ -35,6 +35,7 @@ from typing import TypedDict
 from web3 import Web3
 
 from connect.run_goal import check_target
+from connect.safe import ZERO_ADDRESS
 
 logger = logging.getLogger("agent")
 
@@ -352,7 +353,7 @@ def _staking_address(env: dict[str, str], name: str) -> str | None:
     :raises ValueError: on a value that is not an address.
     """
     raw = env.get(name, "").strip()
-    if not raw or raw.lower() == NATIVE_ASSET:
+    if not raw or raw.lower() == ZERO_ADDRESS:
         return None
     if not Web3.is_address(raw):
         raise ValueError(f"{name} is not an address: {raw!r}")
@@ -372,7 +373,8 @@ def _parse_staking(env: dict[str, str]) -> StakingConfig | None:
         activity_checker = _staking_address(env, ACTIVITY_CHECKER_ENV)
         service_id = _parse_count(env, SERVICE_ID_ENV, 0)
     except ValueError as e:
-        logger.warning("staking read as unstaked: %s", e)
+        # Pearl never sends these, and staking is now off for the whole run
+        logger.error("staking read as unstaked: %s", e)
         return None
     if activity_checker is None or service_id == 0:
         logger.warning(
