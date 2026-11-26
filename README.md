@@ -537,9 +537,9 @@ program in three env vars, set at deploy for the instance chain:
 `CONNECTION_CONFIGS_CONFIG_STAKING_CONTRACT_ADDRESS`,
 `CONNECTION_CONFIGS_CONFIG_ACTIVITY_CHECKER_CONTRACT_ADDRESS` and
 `CONNECTION_CONFIGS_CONFIG_SERVICE_ID`. The zero address means unstaked. A
-staking contract set without a usable checker and service id, or a value that
-is not an address, is logged and read as unstaked: staking never stops the
-wallet. Switching programs restarts the agent, so the values are always the
+staking contract set without a usable checker and service id, a value that
+is not an address, or a configuration with no single chain carrying a safe,
+is logged and read as unstaked: staking never stops the wallet. Switching programs restarts the agent, so the values are always the
 current program's.
 
 The contract's activity checker counts the safe's Marketplace requests on

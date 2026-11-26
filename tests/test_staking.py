@@ -20,6 +20,7 @@
 """Staking: the env vars, the session reminder, and the checkpoint."""
 
 import asyncio
+import json
 import logging
 import time
 import typing as t
@@ -38,6 +39,7 @@ from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import (
     ACTIVITY_CHECKER_ENV,
     AppConfig,
+    SAFES_ENV,
     SERVICE_ID_ENV,
     STAKING_CONTRACT_ENV,
     STORE_PATH_ENV,
@@ -187,12 +189,47 @@ class TestConfig:
     """The three env vars Pearl sets at deploy."""
 
     def _env(self, tmp_path: Path, **staking_env: str) -> dict:
-        """Return a minimal environment plus the given staking values."""
+        """Return a minimal environment, a safe on gnosis, and the staking values."""
         return {
             "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS": "http://rpc",
+            SAFES_ENV: json.dumps({"gnosis": SAFE}),
             STORE_PATH_ENV: str(tmp_path),
             **staking_env,
         }
+
+    @pytest.mark.parametrize(
+        ("safes", "named"),
+        [({}, "none"), ({"gnosis": SAFE, "base": SAFE}, "['gnosis', 'base']")],
+        ids=["no-safe", "two-safes"],
+    )
+    def test_no_single_instance_chain_reads_as_unstaked(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        safes: dict,
+        named: str,
+    ) -> None:
+        """A program with no one chain to run on: unstaked, and the log names why."""
+        env = {
+            **self._env(
+                tmp_path,
+                **{
+                    STAKING_CONTRACT_ENV: STAKING_CONTRACT,
+                    ACTIVITY_CHECKER_ENV: CHECKER,
+                    SERVICE_ID_ENV: str(SERVICE_ID),
+                },
+            ),
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_BASE_ADDRESS": "http://rpc",
+            SAFES_ENV: json.dumps(safes),
+        }
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            config = load_config(env)
+        assert config.staking is None
+        assert not staking.is_staked(config)
+        assert (
+            "staking read as unstaked: no single instance chain "
+            f"(chains with a safe: {named})"
+        ) in caplog.text
 
     def test_a_staked_instance(self, tmp_path: Path) -> None:
         """All three set: the program, checksummed."""

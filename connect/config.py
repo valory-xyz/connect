@@ -426,7 +426,7 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
     if log_level not in LOG_LEVELS:
         log_level = DEFAULT_LOG_LEVEL
 
-    return AppConfig(
+    config = AppConfig(
         chains=chains,
         store_path=store_path,
         fund_requirements=fund_requirements,
@@ -444,3 +444,11 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         ocb_chat_mech_overrides=_parse_ocb_chat_mechs(env),
         staking=_parse_staking(env),
     )
+    if config.staking is not None and config.instance_chain is None:
+        # the program is for the chain carrying the safe; with none it has no chain
+        logger.warning(
+            "staking read as unstaked: no single instance chain (chains with a safe: %s)",
+            config.safe_chains or "none",
+        )
+        config.staking = None
+    return config
