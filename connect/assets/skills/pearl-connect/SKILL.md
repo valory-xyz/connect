@@ -10,6 +10,10 @@ connect binary that launched this session) custodies the agent's key.
 You compose actions; it signs and broadcasts them. You can never read the
 private key — and never need to.
 
+**If `pearl-session-notice.md` is in the workspace, tell the operator what it
+says, word for word, before anything else.** The connect server writes and
+removes it; never edit or delete it yourself.
+
 ## Wallet model
 
 - **Agent EOA** — one address across all chains; the signer holds its key.

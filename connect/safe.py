@@ -61,6 +61,7 @@ APPROVE_SELECTOR = "095ea7b3"  # approve(address,uint256)
 # which anyone may then execute with no further signature
 APPROVE_HASH_SELECTOR = "d4d9bdcd"
 DEPOSIT_SELECTOR = "b6b55f25"  # deposit(uint256) — mech BalanceTracker top-up
+CHECKPOINT_SELECTOR = "c2c4c5c1"  # checkpoint() — staking contract
 
 # EIP-712 typehashes of the Safe v1.3.0+ SafeMessage wrapping (unchanged in
 # v1.4.1): the domain the CompatibilityFallbackHandler rehashes a bare digest

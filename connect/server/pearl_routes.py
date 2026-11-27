@@ -25,11 +25,14 @@ must never expose the session token.
 
 import logging
 import time
+import typing as t
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from connect import wallet, workspace
+from connect import staking, wallet, workspace
 from connect.server.auth import require_local_origin
 from connect.settings import validate_harness
 
@@ -38,6 +41,13 @@ logger = logging.getLogger("agent")
 router = APIRouter()
 
 FUNDS_STATUS_CACHE_SECONDS = 30
+# how long a session launch waits on the staking reads for its reminder
+REMINDER_READ_SECONDS = 5.0
+# one worker for every launch: a read the launch gave up on keeps it, so a hung
+# RPC leaves one thread behind, not one per launch, for shutdown to join
+_REMINDER_READER = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="staking-reminder"
+)
 
 
 @router.get("/healthcheck")
@@ -84,6 +94,31 @@ class SessionRequest(BaseModel):
     harness: str | None = None
 
 
+def _staking_reminder(state: t.Any) -> str | None:
+    """Read the reminder within REMINDER_READ_SECONDS; past that, there is none."""
+    reading = _REMINDER_READER.submit(
+        staking.staking_reminder, state.config, state.signer
+    )
+    try:
+        return reading.result(timeout=REMINDER_READ_SECONDS)
+    except FutureTimeout:
+        # queued behind a hung read, it would run before the binary could exit
+        reading.cancel()
+        logger.warning(
+            "staking reminder skipped: the staking state took over %ss to read",
+            REMINDER_READ_SECONDS,
+        )
+        return None
+
+
+def _write_session_notice(state: t.Any) -> None:
+    """Leave the session its staking reminder, or clear an earlier one."""
+    try:
+        state.workspace.write_session_notice(_staking_reminder(state))
+    except OSError:
+        logger.exception("could not write the session notice")
+
+
 @router.post("/session", dependencies=[Depends(require_local_origin)])
 def start_session(request: Request, body: SessionRequest | None = None) -> dict:
     """Open an agent session in the configured harness, on demand.
@@ -121,6 +156,7 @@ def start_session(request: Request, body: SessionRequest | None = None) -> dict:
             else state.settings_store.load().harness
         )
         state.settings_store.require_available(requested)
+        _write_session_notice(state)
         # a harness the operator may choose but nobody can open is a bug, not a
         # server fault to 500 over: answer the caller the same way as any other
         # unusable harness (test_every_choosable_harness_can_be_opened pins

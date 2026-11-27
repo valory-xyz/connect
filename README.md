@@ -138,8 +138,8 @@ address, its ABI, its signature convention — is the session's problem.
 
 ## Run window
 
-Connect has no staking epoch, so its activity goal is **one run window per
-process** of N minutes, opened when the process starts and never rolled over.
+Connect's activity goal is not a staking epoch, staked or not (see
+[Staking](#staking)): it is **one run window per process** of N minutes, opened when the process starts and never rolled over.
 Every write of `agent_performance.json` carries it as the `activity_goal`
 block Pearl reads through the middleware's `agent_performance` endpoint:
 
@@ -302,10 +302,11 @@ an ERC-20 approval, and always declared: the allowance exemption above reads
 the token's own `allowance()`, which says nothing about a Permit2 grant. An RPC that cannot simulate refuses the send
 as `simulation-unavailable`, so Pearl must give Connect, on every chain, an RPC
 that serves `eth_simulateV1` (Celo's `forno.celo.org` does not). The
-transactions the server builds itself — the mech flow (`MechSigner`) and the
-agent top-up — pass the private `SERVER_BUILT` marker and skip the gate; they
-are bounded by `max_payment` and the top-up plan, and while restricted by their
-single-use allowances. The diff names each token's `symbol()` for the reader
+transactions the server builds itself — the mech flow (`MechSigner`), the
+agent top-up and the staking checkpoint — pass the private `SERVER_BUILT`
+marker and skip the gate; they are bounded by `max_payment`, the top-up plan
+and the fixed `checkpoint()` call (no value, to the configured staking
+contract), and while restricted by their single-use allowances. The diff names each token's `symbol()` for the reader
 (display only: nothing is checked against it, and a token without one reads
 as `""`). `preflight_transaction` and `simulate_transaction` take
 the same `intent` and report the gate's `problems` without signing.
@@ -441,7 +442,8 @@ the agent-visible mode readouts (`mode` in `wallet_info`/`GET /wallet` and the
   shortfall (the request's `max_payment`, within 10× the mech's per-request
   rate). The
   [agent top-up](#agent-top-up) arms the same bare native shape for the agent
-  EOA. The MechMarketplace contract per chain
+  EOA, and the [staking checkpoint](#staking) arms one `checkpoint()` call, no
+  value, from the agent EOA to the configured staking contract. The MechMarketplace contract per chain
   (imported from the pinned mech-client) is whitelisted by default — the only
   contract the safe calls in the on-chain mech flow — so mech requests work out
   of the box; the entry admits only the mech flow's own calls (above). Balance trackers and payment tokens are deliberately not
@@ -527,6 +529,74 @@ it, and the safe is judged on what it keeps after sending the EOA's need:
 `topup - remaining` when `remaining` is below its `threshold`, else 0. When
 the safe holds less than the need, `remaining` is negative, so the shortfall
 is added to the safe's `topup`.
+
+## Staking
+
+Pearl may stake a Connect instance on Gnosis or Robinhood Chain; staking is
+optional, and an unstaked instance works exactly as before. Pearl passes the
+program in three env vars, set at deploy for the instance chain:
+`CONNECTION_CONFIGS_CONFIG_STAKING_CONTRACT_ADDRESS`,
+`CONNECTION_CONFIGS_CONFIG_ACTIVITY_CHECKER_CONTRACT_ADDRESS` and
+`CONNECTION_CONFIGS_CONFIG_SERVICE_ID`. The zero address means unstaked. A
+staking contract set without a usable checker and service id, a value that
+is not an address, or a configuration with no single chain carrying a safe,
+is logged and read as unstaked: staking never stops the wallet. Switching programs restarts the agent, so the values are always the
+current program's.
+
+The contract's activity checker counts the safe's Marketplace requests on
+chain, so Connect reports nothing. A request counts once the mech settles it
+on chain, off-chain requests included.
+
+- **Session reminder.** On `POST /session`, while staked, Connect reads
+  whether the epoch's request is made, scored as `RequesterActivityCheckerV2`
+  (every Connect program's checker) scores it: the checker's
+  `getMultisigNonces(safe)[1]` less the staking contract's
+  `getServiceInfo(id).nonces[1]`, against `ceil(window * livenessRatio / 1e18)`, and never fewer than one,
+  where `window` runs from `max(tsCheckpoint, tsStart)` to the checkpoint,
+  which lands no earlier than `tsCheckpoint + livenessPeriod` and no earlier
+  than the pinned block's own time (not this host's clock). A service
+  staked with a multisig other than the configured safe, or a checker that
+  returns no request count, is a failed read.
+  When it is not, it writes the reminder to `pearl-session-notice.md` in the
+  workspace, which the brief tells the session to say first; otherwise it
+  removes the file. A read that fails, or takes over `REMINDER_READ_SECONDS`,
+  is logged and never reminds, and neither it nor the write can fail the
+  launch. Every launch reads on one worker thread, and a read that times out
+  while still queued is dropped, so a hung RPC leaves one read behind, not one
+  per launch. After the block number, the six reads (five `eth_call`s and the
+  pinned block's timestamp) are made at once, so the read costs two round
+  trips, not seven. The checkpoint's periodic tick (below) reads and writes
+  the notice the same way after each check, once the workspace is usable, so
+  a session opened from the coding tool, with no `POST /session`, finds it at
+  most one interval old. A tick whose read fails leaves the file as it was:
+  "could not tell" never removes a reminder a launch wrote. The brief and the
+  `pearl-connect` skill both tell the session to relay the file, so a harness
+  that reads only one of them still does. A tick and a launch writing at once cannot follow a
+  link: the loser's exclusive create fails, and that is logged.
+- **Checkpoint.** Nothing else in Pearl calls the permissionless
+  `checkpoint()` that closes an epoch, so while staked the server checks
+  every `STAKING_CHECKPOINT_INTERVAL_SECONDS` whether one is worth sending.
+  A pending rebaseline (`getNextRewardCheckpointTimestamp()` differs from
+  `tsCheckpoint + livenessPeriod`) is sent at once: the staking contract then
+  answers the next checkpoint time with the current block's, so the send is
+  never early, and no comparison with this host's clock is made, which would
+  skip it whenever that clock runs behind the chain. Otherwise it is sent once
+  that timestamp has passed by the pinned block's own time (not this host's
+  clock, which, if ahead, would pay for checkpoints that change nothing) and `availableRewards()` is above 0 (with none left
+  a checkpoint changes nothing, so it would be due, and paid for, on every
+  check). When one is worth sending, the agent EOA calls it, with its own gas.
+  The reads behind that decision, and the reminder's, are taken at one block,
+  one behind the head: another service's checkpoint mined between them cannot
+  read as a rebaseline, and an RPC node a block behind still has it. A mined call is audited as
+  `staking_checkpoint`, anything else as `staking_checkpoint_failed`, and the
+  next check retries. Like the agent top-up, those are the call's whole audit
+  and never count as the agent's activity. It is no MCP tool and draws on no
+  token's budget. In restricted mode it passes through a one-shot allowance
+  for exactly `checkpoint()`, no value, to the configured staking contract,
+  which only the server's own (`SERVER_BUILT`) send can spend and a failed
+  send withdraws.
+- **Eviction.** Connect never stops itself, evicted or not: the session keeps
+  its wallet and earns no rewards until the eviction ends.
 
 ## Threat-model notes
 
@@ -1028,7 +1098,9 @@ tree (mirroring `valory-xyz/olas-sdk-starter`):
 - `packages/valory/services/connect` — the service package whose
   connection overrides define the env vars the binary consumes
   (`CONNECTION_LEDGER_CONFIG_LEDGER_APIS_<CHAIN>_ADDRESS`,
-  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_NONCE_MODE,MECH_HARD_CANCEL_AFTER}`, plus
+  `CONNECTION_CONFIGS_CONFIG_{SAFE_CONTRACT_ADDRESSES,STORE_PATH,FUND_REQUIREMENTS,LOG_LEVEL,MINUTES_PER_RUN,MECH_SETTLE_TIMEOUT,MECH_GAP_RETRIES,MECH_NONCE_MODE,MECH_HARD_CANCEL_AFTER}`,
+  `CONNECTION_CONFIGS_CONFIG_{STAKING_CONTRACT_ADDRESS,ACTIVITY_CHECKER_CONTRACT_ADDRESS,SERVICE_ID}`
+  (see [Staking](#staking)), plus
   `CONNECTION_CONFIGS_CONFIG_MECHX_{MARKETPLACE,REGISTRY}_{BASE,POLYGON}_SQUID_URL`;
   see [Base and Polygon indexers](#base-and-polygon-indexers))
 - `packages/packages.json` — pinned hashes (`dev` = ours, `third_party` =

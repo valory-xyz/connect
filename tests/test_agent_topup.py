@@ -35,12 +35,11 @@ from connect.activity import ActivityLog, PERFORMANCE_FILE
 from connect.config import AppConfig, ChainConfig, FundRequirement, NATIVE_ASSET
 from connect.guard import Guard
 from connect.server import app as app_module
-from connect.settings import MODE_RESTRICTED, Protected, Settings, SettingsStore
 from connect.signer import Signer, SignerError, _ChainState
 from connect.signer_errors import SEND_FAILED
 from connect.wallet import AgentTopUp, plan_agent_topup
 
-from tests.conftest import FakeW3, audit_entries
+from tests.conftest import FakeW3, audit_entries, end_at_sleep
 
 SAFE = "0x" + "22" * 20
 TOKEN = "0x" + "77" * 20
@@ -321,17 +320,6 @@ class TestTopUpAgentSigner:
         monkeypatch.setattr(test_signer, "send_via_safe", spy)
         return calls
 
-    def _restricted_guard(
-        self, settings_store: SettingsStore, app_config: AppConfig, signer: Signer
-    ) -> Guard:
-        """Return a restricted guard with an empty whitelist, wired to the signer."""
-        settings_store.save(
-            Settings(protected=Protected(mode=MODE_RESTRICTED, whitelist={}))
-        )
-        guard = Guard(settings_store, app_config, agent_signer=signer.address)
-        signer.set_guard(guard)
-        return guard
-
     def _two_chains(self, app_config: AppConfig, signer: Signer) -> BalancesW3:
         """Add a "broken" chain before testchain, both due 401; return its fake."""
         app_config.chains = {
@@ -402,7 +390,7 @@ class TestTopUpAgentSigner:
         self,
         app_config: AppConfig,
         test_signer: Signer,
-        settings_store: SettingsStore,
+        restricted_guard: Guard,
         activity: ActivityLog,
         sends: list,
     ) -> None:
@@ -410,7 +398,7 @@ class TestTopUpAgentSigner:
         signer = _signer_on(
             test_signer, BalancesW3({test_signer.address: 99, SAFE: 400})
         )
-        guard = self._restricted_guard(settings_store, app_config, signer)
+        guard = restricted_guard
         app_config.fund_requirements = {"testchain": REQUIREMENTS}
         topped_up: set[str] = set()
         app_module.top_up_agent_signer(app_config, signer, guard, activity, topped_up)
@@ -419,15 +407,12 @@ class TestTopUpAgentSigner:
         with pytest.raises(SignerError, match="do not allow the safe to call"):
             signer.send_via_safe("testchain", signer.address, value=400, data="0x")
 
+    @pytest.mark.usefixtures("restricted_guard")
     def test_restricted_refuses_without_the_allowance(
-        self,
-        app_config: AppConfig,
-        test_signer: Signer,
-        settings_store: SettingsStore,
+        self, test_signer: Signer
     ) -> None:
         """The same send, unarmed, is what restricted mode refuses."""
         signer = _signer_on(test_signer, BalancesW3({}))
-        self._restricted_guard(settings_store, app_config, signer)
         with pytest.raises(SignerError, match="do not allow the safe to call"):
             signer.send_via_safe("testchain", signer.address, value=1, data="0x")
 
@@ -521,14 +506,14 @@ class TestTopUpAgentSigner:
         self,
         app_config: AppConfig,
         test_signer: Signer,
-        settings_store: SettingsStore,
+        restricted_guard: Guard,
         activity: ActivityLog,
         sends: list,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Restricted: an allowance that never arms on one chain is refused there only."""
         self._two_chains(app_config, test_signer)
-        guard = self._restricted_guard(settings_store, app_config, test_signer)
+        guard = restricted_guard
         allow = guard.allow_agent_topup_once
 
         def allow_but_broken(*, chain: str, amount_cap: int) -> None:
@@ -584,14 +569,8 @@ class TestTopUpTask:
             events.append("check")
             check(*args)
 
-        async def sleep(seconds: float) -> None:
-            """Record the sleep; end the job at the second one."""
-            events.append(f"sleep {seconds}")
-            if events.count(f"sleep {seconds}") == 2:
-                raise asyncio.CancelledError
-
         monkeypatch.setattr(app_module, "top_up_agent_signer", recorded_check)
-        monkeypatch.setattr(app_module.asyncio, "sleep", sleep)
+        end_at_sleep(monkeypatch, events)
         args: tuple = (None, None, None, None, set())
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(app_module.top_up_agent(*args))  # type: ignore[arg-type]

@@ -30,11 +30,15 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from hexbytes import HexBytes
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from connect import wallet
-from connect.activity import ActivityLog, PERFORMANCE_FILE
+from connect import staking, wallet
+from connect.activity import (
+    AGENT_TOPUP_FAILED_KIND,
+    AGENT_TOPUP_KIND,
+    ActivityLog,
+    PERFORMANCE_FILE,
+)
 from connect.config import AppConfig
 from connect.guard import Guard
 from connect.mech import MechService
@@ -48,9 +52,10 @@ from connect.server.auth import (
     require_local_origin,
 )
 from connect.server.mcp_tools import build_mcp
-from connect.server.receipts import MAX_RECEIPT_TIMEOUT, RECEIPT_POLL_SECONDS
+from connect.server.receipts import wait_mined
 from connect.settings import MODE_RESTRICTED, SettingsStore
 from connect.signer import SERVER_BUILT, Signer
+from connect.signer_errors import logged_cause
 from connect.workspace import UI_INDEX, Workspace, load_ui_bundle
 
 logger = logging.getLogger("agent")
@@ -63,6 +68,9 @@ PERFORMANCE_REFRESH_SECONDS = 15.0
 # how often the agent EOA's native balance is checked against its funding
 # requirement
 AGENT_TOPUP_INTERVAL_SECONDS = 3600.0
+
+# bounds how late a due checkpoint is sent
+STAKING_CHECKPOINT_INTERVAL_SECONDS = 600.0
 
 
 async def refresh_performance(activity: ActivityLog) -> None:
@@ -97,24 +105,18 @@ def _send_agent_topup(  # pylint: disable=too-many-arguments,too-many-positional
             # restricted, by its single-use allowance: no session intent applies
             intent=SERVER_BUILT,
         )
-        receipt = signer.w3(chain).eth.wait_for_transaction_receipt(
-            HexBytes(tx_hash),
-            timeout=MAX_RECEIPT_TIMEOUT,
-            poll_latency=RECEIPT_POLL_SECONDS,
-        )
-        if receipt["status"] != 1:
-            raise RuntimeError("the transaction reverted")
+        wait_mined(signer.w3(chain), tx_hash)
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.exception("agent top-up of %d wei on %s failed", amount, chain)
         activity.record(
-            "agent_topup_failed",
+            AGENT_TOPUP_FAILED_KIND,
             chain=chain,
             value=str(amount),
             tx_hash=tx_hash,
             error=str(e),
         )
         return False
-    activity.record("agent_topup", chain=chain, value=str(amount), tx_hash=tx_hash)
+    activity.record(AGENT_TOPUP_KIND, chain=chain, value=str(amount), tx_hash=tx_hash)
     return True
 
 
@@ -141,6 +143,24 @@ def top_up_agent_signer(  # pylint: disable=too-many-arguments,too-many-position
             topped_up.discard(chain)
 
 
+async def _every(
+    interval: t.Callable[[], float],
+    failure: str,
+    job: t.Callable[..., object],
+    *args: t.Any,
+) -> None:
+    """Run `job(*args)` off the loop now, then every `interval()` s, until cancelled.
+
+    A failed run is logged as `failure` and never ends the loop.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(job, *args)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception(failure)
+        await asyncio.sleep(interval())
+
+
 async def top_up_agent(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     config: AppConfig,
     signer: Signer,
@@ -149,14 +169,67 @@ async def top_up_agent(  # pylint: disable=too-many-arguments,too-many-positiona
     topped_up: set[str],
 ) -> None:
     """Top up the agent EOA at start, then every interval, until cancelled."""
-    while True:
-        try:
-            await asyncio.to_thread(
-                top_up_agent_signer, config, signer, guard, activity, topped_up
-            )
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.exception("agent top-up check failed")
-        await asyncio.sleep(AGENT_TOPUP_INTERVAL_SECONDS)
+    await _every(
+        lambda: AGENT_TOPUP_INTERVAL_SECONDS,
+        "agent top-up check failed",
+        top_up_agent_signer,
+        config,
+        signer,
+        guard,
+        activity,
+        topped_up,
+    )
+
+
+def staking_tick(
+    config: AppConfig,
+    signer: Signer,
+    guard: Guard,
+    activity: ActivityLog,
+    workspace: Workspace,
+) -> None:
+    """Send the checkpoint if due, then refresh the session notice from the chain.
+
+    The refresh is what keeps a session opened outside Pearl current.
+    """
+    staking.checkpoint_if_due(config, signer, guard, activity)
+    if not workspace.ensure():
+        return
+    try:
+        notice = staking.read_staking_reminder(config, signer)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # "could not tell" is no answer: the launch's notice stands
+        logger.warning(
+            "session notice left as it was: could not read the staking state: %s",
+            logged_cause(e),
+        )
+        return
+    try:
+        workspace.write_session_notice(notice)
+    except OSError:
+        logger.exception("could not refresh the session notice")
+
+
+async def checkpoint_staking(
+    config: AppConfig,
+    signer: Signer,
+    guard: Guard,
+    activity: ActivityLog,
+    workspace: Workspace,
+) -> None:
+    """Run the staking tick every interval, until cancelled; unstaked, never."""
+    if config.staking is None:
+        return
+    await _every(
+        lambda: STAKING_CHECKPOINT_INTERVAL_SECONDS,
+        "staking checkpoint check failed",
+        staking_tick,
+        config,
+        signer,
+        guard,
+        activity,
+        workspace,
+    )
 
 
 def create_app(  # pylint: disable=too-many-arguments,too-many-locals
@@ -190,6 +263,9 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
             asyncio.create_task(refresh_performance(activity)),
             asyncio.create_task(
                 top_up_agent(config, signer, guard, activity, running.state.topped_up)
+            ),
+            asyncio.create_task(
+                checkpoint_staking(config, signer, guard, activity, workspace)
             ),
         )
         try:

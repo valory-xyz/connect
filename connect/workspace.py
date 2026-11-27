@@ -88,6 +88,8 @@ MCP_TOOL_TIMEOUT_MS = 2_100_000
 UI_SUBDIR = "ui"
 UI_INDEX = "index.html"
 BRIEF_FILES = ("CLAUDE.md", "AGENTS.md")
+# the server's message for the opening session; the brief tells it to relay it
+SESSION_NOTICE_FILE = "pearl-session-notice.md"
 AGENT_DIRS = (Path(".claude"), Path(".agents"))
 CLAUDE_SETTINGS_FILE = Path(".claude") / "settings.json"
 # the harnesses read these themselves; the model never needs to, and reading
@@ -99,8 +101,15 @@ TOKEN_DENY_RULES = (
     "Read(./ocb-agent/**)",
 )
 # a `git init` in the workspace must never be able to stage the token, nor
-# the virtualenv the connect-polymarket skill builds at the workspace root
-GITIGNORE_ENTRIES = (".mcp.json*", ".codex/config.toml*", "ocb-agent/", ".venv/")
+# the virtualenv the connect-polymarket skill builds at the workspace root,
+# nor the server's session notice
+GITIGNORE_ENTRIES = (
+    ".mcp.json*",
+    ".codex/config.toml*",
+    "ocb-agent/",
+    ".venv/",
+    SESSION_NOTICE_FILE,
+)
 # picked, not tuned: refusals seen exit in ms; still running by then means launching
 LAUNCH_SETTLE_SECONDS = 2.0
 LAUNCH_PROBE_SECONDS = 10.0
@@ -447,6 +456,16 @@ class Workspace:
                 f"would open. Is Claude Code or Codex installed?"
             )
         raise LaunchError(f"{reason} The workspace is at {self.path}")
+
+    def write_session_notice(self, notice: str | None) -> None:
+        """Leave `notice` for the session, or remove an old one; never write through a link."""
+        path = self.path / SESSION_NOTICE_FILE
+        _remove(path)
+        if notice is None:
+            return
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as notice_file:
+            notice_file.write(notice + "\n")
 
     def prepare(self, harness: str) -> None:
         """Start installing `harness` once it is chosen, if it needs installing."""

@@ -35,6 +35,7 @@ from typing import Literal, TypedDict, cast
 from web3 import Web3
 
 from connect.run_goal import check_target
+from connect.safe import ZERO_ADDRESS
 
 logger = logging.getLogger("agent")
 
@@ -61,6 +62,10 @@ MECH_INDEXER_ENV_VARS = (
     "MECHX_REGISTRY_POLYGON_SQUID_URL",
 )
 MECH_HARD_CANCEL_AFTER_ENV = CUSTOM_ENV_VARS_PREFIX + "MECH_HARD_CANCEL_AFTER"
+# set by Pearl at deploy for the instance chain; the zero address means unstaked
+STAKING_CONTRACT_ENV = CUSTOM_ENV_VARS_PREFIX + "STAKING_CONTRACT_ADDRESS"
+ACTIVITY_CHECKER_ENV = CUSTOM_ENV_VARS_PREFIX + "ACTIVITY_CHECKER_CONTRACT_ADDRESS"
+SERVICE_ID_ENV = CUSTOM_ENV_VARS_PREFIX + "SERVICE_ID"
 
 # A QA override, never set by Pearl: OCB_CHAT_MECH_GNOSIS=0x... gives OCB that
 # chat mech on that chain in place of the shipped one
@@ -91,6 +96,27 @@ class FundRequirement(TypedDict):
 
     threshold: int
     topup: int
+
+
+@dataclass(frozen=True)
+class StakingConfig:
+    """The staking program this instance is staked in, on its instance chain.
+
+    Built only by `load_config`, once the one chain carrying the safe is known.
+    """
+
+    chain: str
+    safe: str
+    staking_contract: str
+    activity_checker: str
+    service_id: int
+
+    def __post_init__(self) -> None:
+        """Refuse service id 0, which names no service."""
+        if self.service_id <= 0:
+            raise ValueError(
+                f"staking service id must be positive, not {self.service_id}"
+            )
 
 
 @dataclass
@@ -132,6 +158,8 @@ class AppConfig:  # pylint: disable=too-many-instance-attributes
 
     # chain -> OCB chat mech, from OCB_CHAT_MECH_<CHAIN>
     ocb_chat_mech_overrides: dict[str, str] = field(default_factory=dict)
+    # None while unstaked, or when Pearl's staking values cannot be used
+    staking: StakingConfig | None = None
 
     @property
     def safe_chains(self) -> list[str]:
@@ -353,6 +381,61 @@ def _parse_ocb_chat_mechs(env: dict[str, str]) -> dict[str, str]:
     return overrides
 
 
+def _staking_address(env: dict[str, str], name: str) -> str | None:
+    """Read one staking address; unset or the zero address is None.
+
+    :raises ValueError: on a value that is not an address.
+    """
+    raw = env.get(name, "").strip()
+    if not raw or raw.lower() == ZERO_ADDRESS:
+        return None
+    if not Web3.is_address(raw):
+        raise ValueError(f"{name} is not an address: {raw!r}")
+    return Web3.to_checksum_address(raw)
+
+
+def _parse_staking(env: dict[str, str], config: AppConfig) -> StakingConfig | None:
+    """Read the staking program Pearl configured; None while unstaked.
+
+    Staking is optional and the wallet must keep working without it, so a
+    value Connect cannot use is logged and read as unstaked, never refused.
+    A staking contract set without either of the other two is a deploy fault, logged
+    as an error; the others set without a contract read as unstaked quietly.
+    """
+    try:
+        staking_contract = _staking_address(env, STAKING_CONTRACT_ENV)
+        if staking_contract is None:
+            return None
+        activity_checker = _staking_address(env, ACTIVITY_CHECKER_ENV)
+        service_id = _parse_count(env, SERVICE_ID_ENV, 0)
+    except ValueError as e:
+        # Pearl never sends these, and staking is now off for the whole run
+        logger.error("staking read as unstaked: %s", e)
+        return None
+    if activity_checker is None or service_id == 0:
+        logger.error(
+            "staking read as unstaked: %s is set but %s or %s is not",
+            STAKING_CONTRACT_ENV,
+            ACTIVITY_CHECKER_ENV,
+            SERVICE_ID_ENV,
+        )
+        return None
+    chain = config.instance_chain
+    if chain is None:
+        logger.error(
+            "staking read as unstaked: no single instance chain (chains with a safe: %s)",
+            config.safe_chains or "none",
+        )
+        return None
+    return StakingConfig(
+        chain=chain,
+        safe=cast(str, config.chain(chain).safe_address),
+        staking_contract=staking_contract,
+        activity_checker=activity_checker,
+        service_id=service_id,
+    )
+
+
 def load_config(env: dict[str, str] | None = None) -> AppConfig:
     """Load config."""
     env = dict(os.environ) if env is None else env
@@ -388,7 +471,7 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
     if log_level not in LOG_LEVELS:
         log_level = DEFAULT_LOG_LEVEL
 
-    return AppConfig(
+    config = AppConfig(
         chains=chains,
         store_path=store_path,
         fund_requirements=fund_requirements,
@@ -406,3 +489,5 @@ def load_config(env: dict[str, str] | None = None) -> AppConfig:
         ),
         ocb_chat_mech_overrides=_parse_ocb_chat_mechs(env),
     )
+    config.staking = _parse_staking(env, config)
+    return config

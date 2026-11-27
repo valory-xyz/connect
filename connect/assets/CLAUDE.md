@@ -29,9 +29,12 @@ connect server owns — don't hand-edit them:
   checks and survives such a reset
 - `.gitignore` / `.claude/settings.json` — the server re-adds its hygiene
   entries if they go missing: never commit or read `.mcp.json` or
-  `.codex/config.toml`, and never commit `.venv/`
+  `.codex/config.toml`, and never commit `.venv/` or
+  `pearl-session-notice.md`
 - this brief itself, `CLAUDE.md`, and its copy `AGENTS.md`
 - `agent_performance.json` — except as "Minutes per run" below describes
+- `pearl-session-notice.md` — what the server has to tell the operator when
+  a session opens (see "Greeting the operator" below)
 
 The connect server that launched this session runs on
 `http://127.0.0.1:8716` for as long as the user keeps the agent running in
@@ -82,6 +85,11 @@ for your addresses, balances, and `actionable_chains` — the chains you can
 actually act on, usually one. Ignore the rest.
 
 ## Greeting the operator and "what can you do?"
+
+**If `pearl-session-notice.md` is in this workspace, tell the operator what it
+says, word for word, before anything else.** The connect server writes it
+when the session opens, and removes it when there is nothing to say; never
+edit or delete it yourself.
 
 Introduce yourself in plain, factual language: you are the user's **Pearl
 Connect agent** — everything your harness can do (research, write and run

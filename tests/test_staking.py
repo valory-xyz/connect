@@ -1,0 +1,1297 @@
+# -*- coding: utf-8 -*-
+# ------------------------------------------------------------------------------
+#
+#   Copyright 2026 Valory AG
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# ------------------------------------------------------------------------------
+
+"""Staking: the env vars, the session reminder, and the checkpoint."""
+
+import asyncio
+import contextlib
+import dataclasses
+import functools
+import json
+import logging
+import threading
+import time
+import typing as t
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from eth_abi import decode as abi_decode
+from eth_abi import encode as abi_encode
+from eth_utils import function_signature_to_4byte_selector
+from fastapi.testclient import TestClient
+from hexbytes import HexBytes
+from web3 import Web3
+
+from connect import staking
+from connect import workspace as workspace_module
+from connect.activity import ActivityLog, PERFORMANCE_FILE
+from connect.config import (
+    ACTIVITY_CHECKER_ENV,
+    AppConfig,
+    ChainConfig,
+    SAFES_ENV,
+    SERVICE_ID_ENV,
+    STAKING_CONTRACT_ENV,
+    STORE_PATH_ENV,
+    StakingConfig,
+    load_config,
+)
+from connect.guard import Guard
+from connect.server import app as app_module
+from connect.server import pearl_routes
+from connect.signer import SERVER_BUILT, Signer, SignerError
+from connect.workspace import SESSION_NOTICE_FILE
+
+from tests.conftest import FakeW3, audit_entries, end_at_sleep
+
+STAKING_CONTRACT = Web3.to_checksum_address("0x" + "5a" * 20)
+CHECKER = Web3.to_checksum_address("0x" + "c4" * 20)
+SAFE = "0x" + "22" * 20
+SERVICE_ID = 42
+NOW = 1_800_000_000
+DAY = 86_400
+# ~1 request a day
+RATIO = 11_337_868_480_725
+PROGRAM = StakingConfig(
+    chain="testchain",
+    safe=SAFE,
+    staking_contract=STAKING_CONTRACT,
+    activity_checker=CHECKER,
+    service_id=SERVICE_ID,
+)
+
+
+def _sel(signature: str) -> bytes:
+    """Return a selector."""
+    return function_signature_to_4byte_selector(signature)
+
+
+class StakingW3(FakeW3):
+    """Fake Web3 answering the staking and checker reads.
+
+    The shapes are the contracts': StakingToken's `getServiceInfo` returns its
+    `ServiceInfo` struct (multisig, owner, nonces, tsStart, reward,
+    inactivity), and the requester activity checker's `getMultisigNonces`
+    returns `[safe nonce, Marketplace request count]`.
+    """
+
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        *,
+        safe_requests: int = 10,
+        staked_requests: int = 9,
+        ts_checkpoint: int = NOW - DAY + 60,
+        next_checkpoint: int | None = None,
+        available_rewards: int = 10**18,
+        record: bool = True,
+        ts_start: int = NOW - 10 * DAY,
+    ) -> None:
+        """Hold the on-chain state the reads answer from.
+
+        `next_checkpoint` defaults to `ts_checkpoint + livenessPeriod`, the
+        answer of a contract with no rebaseline pending.
+        """
+        super().__init__()
+        self.safe_requests = safe_requests
+        self.staked_requests = staked_requests
+        self.ts_checkpoint = ts_checkpoint
+        self.next_checkpoint = next_checkpoint
+        self.available_rewards = available_rewards
+        self.record = record
+        self.ts_start = ts_start
+        self.multisig = SAFE
+        self.fail: Exception | None = None
+        self.calls: list[tuple[str, bytes]] = []
+        # another service's checkpoint: a read at any block but the pinned one
+        # (one behind the head) sees it, so an unpinned read fails the test
+        self.other_checkpoint_landed = False
+        self.blocks: list[object] = []
+        self.time_blocks: list[object] = []
+        self.eth.call = self._call  # type: ignore[attr-defined]
+        self.eth.block_number = 1_000  # type: ignore[attr-defined]
+        # the pinned block's time, which the checkpoint gate reads
+        self.chain_time = NOW
+        self.eth.get_block = self._get_block  # type: ignore[method-assign,assignment]
+        self.eth.receipt = {"status": 1}
+
+    def _call(self, tx: dict, block: object = "latest") -> bytes:
+        """Answer one eth_call."""
+        if self.fail is not None:
+            raise self.fail
+        to, data = tx["to"], bytes(tx["data"])
+        self.calls.append((to, data))
+        self.blocks.append(block)
+        if self.other_checkpoint_landed and block != self.pinned_block:
+            self.ts_checkpoint += DAY
+            try:
+                return self._answer(to, data)
+            finally:
+                self.ts_checkpoint -= DAY
+        return self._answer(to, data)
+
+    def _get_block(self, block: object) -> dict:
+        """Answer get_block with the chain's time, recording the block asked."""
+        self.time_blocks.append(block)
+        return {"timestamp": self.chain_time}
+
+    @property
+    def pinned_block(self) -> int:
+        """The block the staking reads must all be taken at."""
+        return self.eth.block_number - 1  # type: ignore[attr-defined]
+
+    def _answer(self, to: str, data: bytes) -> bytes:
+        """Answer one read from the current state."""
+        answers = {
+            (CHECKER, _sel("getMultisigNonces(address)")): lambda: abi_encode(
+                ["uint256[]"], [[3, self.safe_requests]]
+            ),
+            (CHECKER, _sel("livenessRatio()")): lambda: abi_encode(
+                ["uint256"], [RATIO]
+            ),
+            (STAKING_CONTRACT, _sel("getServiceInfo(uint256)")): self._service_info,
+            (STAKING_CONTRACT, _sel("livenessPeriod()")): lambda: abi_encode(
+                ["uint256"], [DAY]
+            ),
+            (STAKING_CONTRACT, _sel("tsCheckpoint()")): lambda: abi_encode(
+                ["uint256"], [self.ts_checkpoint]
+            ),
+            (
+                STAKING_CONTRACT,
+                _sel("getNextRewardCheckpointTimestamp()"),
+            ): lambda: abi_encode(
+                ["uint256"],
+                [
+                    (
+                        self.ts_checkpoint + DAY
+                        if self.next_checkpoint is None
+                        else self.next_checkpoint
+                    )
+                ],
+            ),
+            (STAKING_CONTRACT, _sel("availableRewards()")): lambda: abi_encode(
+                ["uint256"], [self.available_rewards]
+            ),
+        }
+        return HexBytes(answers[(to, data[:4])]())
+
+    def _service_info(self) -> bytes:
+        """Encode getServiceInfo for the service, or an empty record."""
+        nonces = [2, self.staked_requests] if self.record else []
+        return abi_encode(
+            ["(address,address,uint256[],uint256,uint256,uint256)"],
+            [(self.multisig, SAFE, nonces, self.ts_start, 0, 0)],
+        )
+
+
+@pytest.fixture
+def staked_config(app_config: AppConfig) -> AppConfig:
+    """Return the test config, staked on its one chain."""
+    app_config.staking = PROGRAM
+    return app_config
+
+
+@pytest.fixture
+def w3(test_signer: Signer) -> StakingW3:
+    """Point the signer's test chain at a staking fake."""
+    fake = StakingW3()
+    test_signer._chains._states["testchain"].w3 = (  # pylint: disable=protected-access
+        t.cast(Web3, fake)
+    )
+    return fake
+
+
+def _audited(config: AppConfig, kind: str) -> list[dict]:
+    """Return the audit entries of one kind."""
+    return [e for e in audit_entries(config.store_path) if e["kind"] == kind]
+
+
+class TestConfig:
+    """The three env vars Pearl sets at deploy."""
+
+    def _env(self, tmp_path: Path, **staking_env: str) -> dict:
+        """Return a minimal environment, a safe on gnosis, and the staking values."""
+        return {
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_GNOSIS_ADDRESS": "http://rpc",
+            SAFES_ENV: json.dumps({"gnosis": SAFE}),
+            STORE_PATH_ENV: str(tmp_path),
+            **staking_env,
+        }
+
+    @pytest.mark.parametrize(
+        ("safes", "named"),
+        [({}, "none"), ({"gnosis": SAFE, "base": SAFE}, "['gnosis', 'base']")],
+        ids=["no-safe", "two-safes"],
+    )
+    def test_no_single_instance_chain_reads_as_unstaked(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        safes: dict,
+        named: str,
+    ) -> None:
+        """A program with no one chain to run on: unstaked, and the log names why."""
+        env = {
+            **self._env(
+                tmp_path,
+                **{
+                    STAKING_CONTRACT_ENV: STAKING_CONTRACT,
+                    ACTIVITY_CHECKER_ENV: CHECKER,
+                    SERVICE_ID_ENV: str(SERVICE_ID),
+                },
+            ),
+            "CONNECTION_LEDGER_CONFIG_LEDGER_APIS_BASE_ADDRESS": "http://rpc",
+            SAFES_ENV: json.dumps(safes),
+        }
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            config = load_config(env)
+        assert config.staking is None
+        (record,) = [
+            r for r in caplog.records if "no single instance chain" in r.message
+        ]
+        assert record.levelname == "ERROR"
+        assert record.message == (
+            "staking read as unstaked: no single instance chain "
+            f"(chains with a safe: {named})"
+        )
+
+    def test_a_staked_instance(self, tmp_path: Path) -> None:
+        """All three set: the program, checksummed."""
+        config = load_config(
+            self._env(
+                tmp_path,
+                **{
+                    STAKING_CONTRACT_ENV: STAKING_CONTRACT.lower(),
+                    ACTIVITY_CHECKER_ENV: CHECKER,
+                    SERVICE_ID_ENV: str(SERVICE_ID),
+                },
+            )
+        )
+        assert config.staking == dataclasses.replace(PROGRAM, chain="gnosis")
+
+    @pytest.mark.parametrize(
+        "staking_env",
+        [
+            {},
+            {STAKING_CONTRACT_ENV: ""},
+            {
+                STAKING_CONTRACT_ENV: "0x" + "00" * 20,
+                ACTIVITY_CHECKER_ENV: "0x" + "00" * 20,
+                SERVICE_ID_ENV: "7",
+            },
+        ],
+        ids=["unset", "empty", "zero-address"],
+    )
+    def test_unstaked(self, tmp_path: Path, staking_env: dict) -> None:
+        """Unset or the zero address is unstaked, quietly."""
+        config = load_config(self._env(tmp_path, **staking_env))
+        assert config.staking is None
+
+    @pytest.mark.parametrize(
+        "staking_env",
+        [
+            {STAKING_CONTRACT_ENV: "not-an-address"},
+            {STAKING_CONTRACT_ENV: STAKING_CONTRACT, ACTIVITY_CHECKER_ENV: "0x12"},
+            {
+                STAKING_CONTRACT_ENV: STAKING_CONTRACT,
+                ACTIVITY_CHECKER_ENV: CHECKER,
+                SERVICE_ID_ENV: "-1",
+            },
+            {STAKING_CONTRACT_ENV: STAKING_CONTRACT, SERVICE_ID_ENV: "7"},
+            {STAKING_CONTRACT_ENV: STAKING_CONTRACT, ACTIVITY_CHECKER_ENV: CHECKER},
+        ],
+        ids=["bad-contract", "bad-checker", "bad-id", "no-checker", "no-id"],
+    )
+    def test_unusable_values_read_as_unstaked(
+        self, tmp_path: Path, staking_env: dict, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A value Connect cannot use never stops the wallet: unstaked, an error."""
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            config = load_config(self._env(tmp_path, **staking_env))
+        assert config.staking is None
+        assert [r.levelname for r in caplog.records] == ["ERROR"]
+        assert "staking read as unstaked" in caplog.text
+
+    @pytest.mark.parametrize("service_id", [0, -1])
+    def test_a_program_names_a_service(self, service_id: int) -> None:
+        """A program refuses a service id that names no service."""
+        with pytest.raises(ValueError, match="must be positive"):
+            dataclasses.replace(PROGRAM, service_id=service_id)
+
+
+class TestRequestMade:
+    """request_made_this_epoch against the checker's requirement."""
+
+    @pytest.mark.parametrize(
+        ("safe_requests", "ts_checkpoint", "expected"),
+        [
+            # a day since the checkpoint needs ceil(86400 * ratio / 1e18) = 1
+            (10, NOW - DAY, True),
+            (9, NOW - DAY, False),
+            # within the liveness period, the period itself is what counts:
+            # right after a checkpoint, none would be needed without the floor
+            (9, NOW, False),
+            (9, NOW - 60, False),
+            (10, NOW - 60, True),
+            # two days without a checkpoint need two
+            (10, NOW - 2 * DAY, False),
+            (11, NOW - 2 * DAY, True),
+        ],
+    )
+    def test_requirement(
+        self, safe_requests: int, ts_checkpoint: int, expected: bool
+    ) -> None:
+        """The count since the checkpoint against what the checker will need."""
+        fake = StakingW3(safe_requests=safe_requests, ts_checkpoint=ts_checkpoint)
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM) is expected
+        to, data = next(
+            c for c in fake.calls if c[1][:4] == _sel("getMultisigNonces(address)")
+        )
+        assert to == CHECKER
+        assert abi_decode(["address"], data[4:]) == (Web3.to_checksum_address(SAFE),)
+        to, data = next(
+            c for c in fake.calls if c[1][:4] == _sel("getServiceInfo(uint256)")
+        )
+        assert to == STAKING_CONTRACT
+        assert abi_decode(["uint256"], data[4:]) == (SERVICE_ID,)
+        # all five reads, and the chain time, at one block, one behind the head
+        assert len(fake.blocks) == 5
+        assert set(fake.blocks) == {fake.pinned_block}
+        assert fake.time_blocks == [fake.pinned_block]
+
+    @pytest.mark.parametrize(
+        ("chain_time", "expected"),
+        [(NOW - DAY, True), (NOW, False)],
+        ids=["chain-a-day-in", "chain-two-days-in"],
+    )
+    def test_an_overdue_epoch_is_measured_to_the_chain_s_time(
+        self, monkeypatch: pytest.MonkeyPatch, chain_time: int, expected: bool
+    ) -> None:
+        """One request since a checkpoint two days back: the chain's clock decides."""
+        monkeypatch.setattr(time, "time", lambda: float(NOW + 5 * DAY))
+        fake = StakingW3(safe_requests=10, ts_checkpoint=NOW - 2 * DAY)
+        fake.chain_time = chain_time
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM) is expected
+
+    def test_the_reads_are_made_at_once(self) -> None:
+        """All six reads after the block number are in flight together.
+
+        Each read waits for the other five, so reads made one by one would
+        break the barrier instead of answering.
+        """
+        fake = StakingW3()
+        barrier = threading.Barrier(6, timeout=2)
+        call, get_block = fake.eth.call, fake.eth.get_block  # type: ignore[attr-defined]
+
+        def call_together(*args: t.Any) -> t.Any:
+            barrier.wait()
+            return call(*args)
+
+        def get_block_together(*args: t.Any) -> t.Any:
+            barrier.wait()
+            return get_block(*args)
+
+        fake.eth.call = call_together  # type: ignore[attr-defined]
+        fake.eth.get_block = get_block_together  # type: ignore[method-assign,assignment]
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
+
+    def test_a_service_staked_after_the_checkpoint_is_measured_from_its_stake(
+        self,
+    ) -> None:
+        """The contract measures from max(tsCheckpoint, tsStart), so this does too."""
+        # two days since the checkpoint, but staked one day ago: one request
+        fake = StakingW3(
+            safe_requests=10, ts_checkpoint=NOW - 2 * DAY, ts_start=NOW - DAY
+        )
+        assert staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
+
+    def test_a_service_staked_at_the_read_still_needs_a_request(self) -> None:
+        """A zero-length window needs one request, as the checker does."""
+        fake = StakingW3(safe_requests=9, ts_checkpoint=NOW - 5 * DAY, ts_start=NOW)
+        assert not staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
+
+    def test_a_service_staked_with_another_multisig_is_an_error(self) -> None:
+        """SERVICE_ID naming another safe's service never scores this safe."""
+        fake = StakingW3()
+        fake.multisig = "0x" + "33" * 20
+        with pytest.raises(ValueError, match="not the configured safe"):
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
+
+    def test_a_checker_without_a_request_count_is_an_error(self) -> None:
+        """A checker answering one nonce says why, not as an IndexError."""
+        fake = StakingW3()
+        answer = fake._answer  # pylint: disable=protected-access
+
+        def one_nonce(to: str, data: bytes) -> bytes:
+            if data[:4] == _sel("getMultisigNonces(address)"):
+                return HexBytes(abi_encode(["uint256[]"], [[3]]))
+            return answer(to, data)
+
+        fake._answer = one_nonce  # type: ignore[method-assign]  # pylint: disable=protected-access
+        with pytest.raises(ValueError, match="returns no Marketplace request count"):
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
+
+    def test_no_staking_record_is_an_error(self) -> None:
+        """An empty record cannot be read as "made" or "not made"."""
+        fake = StakingW3(record=False)
+        with pytest.raises(ValueError, match="no staking record"):
+            staking.request_made_this_epoch(t.cast(Web3, fake), PROGRAM)
+
+
+class TestReminder:
+    """staking_reminder, for POST /session."""
+
+    def test_the_copy_is_the_adopted_one(self) -> None:
+        """Pins the reminder text the brief relays."""
+        assert staking.STAKING_REMINDER == (
+            "This agent is staked. Make one Marketplace request today to become "
+            "eligible for OLAS activity rewards."
+        )
+
+    def test_reminds_while_the_request_is_not_made(
+        self, staked_config: AppConfig, test_signer: Signer, w3: StakingW3
+    ) -> None:
+        """Staked and short of the request: the reminder."""
+        w3.safe_requests = 9
+        assert (
+            staking.staking_reminder(staked_config, test_signer)
+            == staking.STAKING_REMINDER
+        )
+
+    def test_silent_once_the_request_is_made(
+        self, staked_config: AppConfig, test_signer: Signer, w3: StakingW3
+    ) -> None:
+        """The request made: nothing to say."""
+        assert staking.staking_reminder(staked_config, test_signer) is None
+        assert w3.calls
+
+    def test_silent_while_unstaked(
+        self, app_config: AppConfig, test_signer: Signer, w3: StakingW3
+    ) -> None:
+        """Unstaked: no read at all."""
+        assert staking.staking_reminder(app_config, test_signer) is None
+        assert not w3.calls
+
+    def test_read_staking_reminder_raises_what_the_read_raised(
+        self, staked_config: AppConfig, test_signer: Signer, w3: StakingW3
+    ) -> None:
+        """The raising form, for a caller that must tell "made" from "unknown"."""
+        w3.fail = ConnectionError("down")
+        with pytest.raises(ConnectionError):
+            staking.read_staking_reminder(staked_config, test_signer)
+
+    def test_a_failed_read_never_reminds(
+        self,
+        staked_config: AppConfig,
+        test_signer: Signer,
+        w3: StakingW3,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An RPC failure is logged, without the RPC's words, and reminds nothing."""
+        w3.fail = ConnectionError("http://rpc.example/secret-key unreachable")
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            assert staking.staking_reminder(staked_config, test_signer) is None
+        assert "could not read the staking state on testchain" in caplog.text
+        assert "secret-key" not in caplog.text
+
+
+@pytest.fixture
+def checkpoint(
+    staked_config: AppConfig, test_signer: Signer, guard: Guard, activity: ActivityLog
+) -> t.Callable[[], str | None]:
+    """Return checkpoint_if_due on the staked config, the signer wired to the guard."""
+    test_signer.set_guard(guard)
+    return functools.partial(
+        staking.checkpoint_if_due, staked_config, test_signer, guard, activity
+    )
+
+
+@pytest.fixture
+def restricted_checkpoint(
+    staked_config: AppConfig,
+    test_signer: Signer,
+    restricted_guard: Guard,
+    activity: ActivityLog,
+) -> t.Callable[[], str | None]:
+    """Return checkpoint_if_due under a restricted guard with nothing whitelisted."""
+    return functools.partial(
+        staking.checkpoint_if_due,
+        staked_config,
+        test_signer,
+        restricted_guard,
+        activity,
+    )
+
+
+class TestCheckpoint:
+    """checkpoint_if_due, the lifespan's checkpoint call."""
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {},
+            {"ts_checkpoint": NOW - 2 * DAY, "available_rewards": 0},
+            {"other_checkpoint_landed": True},
+        ],
+        ids=["not-due", "no-rewards-left", "another-checkpoint-between-the-reads"],
+    )
+    def test_not_worth_sending_sends_nothing(
+        self,
+        checkpoint: t.Callable[[], str | None],
+        staked_config: AppConfig,
+        w3: StakingW3,
+        state: dict,
+    ) -> None:
+        """Not due, nothing left to pay, or no rebaseline after all: not sent.
+
+        The reads are pinned to one block, so another service's checkpoint
+        mined between them cannot pair an old next-checkpoint time with a new
+        tsCheckpoint and read as a rebaseline.
+        """
+        for name, value in state.items():
+            setattr(w3, name, value)
+        assert checkpoint() is None
+        assert not w3.eth.sent
+        assert not audit_entries(staked_config.store_path)
+        assert w3.blocks
+        assert set(w3.blocks) == {w3.pinned_block}
+
+    def test_unstaked_reads_nothing(
+        self,
+        app_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        activity: ActivityLog,
+        w3: StakingW3,
+    ) -> None:
+        """Unstaked: no read, no send."""
+        assert (
+            staking.checkpoint_if_due(app_config, test_signer, guard, activity) is None
+        )
+        assert not w3.calls
+        assert not w3.eth.sent
+
+    def test_due_sends_checkpoint_from_the_eoa(  # pylint: disable=too-many-arguments
+        self,
+        checkpoint: t.Callable[[], str | None],
+        staked_config: AppConfig,
+        test_signer: Signer,
+        guard: Guard,
+        w3: StakingW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Due: one checkpoint() call, audited only as itself, no allowance armed."""
+        w3.ts_checkpoint = NOW - DAY
+        sends: list[tuple[str, str, dict]] = []
+        send = test_signer.send
+
+        def spy(chain: str, to: str, **kwargs: t.Any) -> str:
+            """Record the send, then make it."""
+            sends.append((chain, to, kwargs))
+            return send(chain, to, **kwargs)
+
+        monkeypatch.setattr(test_signer, "send", spy)
+        armed: list[dict] = []
+        monkeypatch.setattr(guard, "allow_checkpoint_once", lambda **k: armed.append(k))
+        tx_hash = checkpoint()
+        assert tx_hash is not None
+        assert tx_hash.startswith("0x")
+        ((chain, to, kwargs),) = sends
+        assert (chain, to, kwargs["data"]) == (
+            "testchain",
+            STAKING_CONTRACT,
+            "0xc2c4c5c1",
+        )
+        assert kwargs.get("value", 0) == 0
+        assert kwargs["audit"] is False
+        assert len(w3.eth.sent) == 1
+        assert not armed
+        assert [e["kind"] for e in audit_entries(staked_config.store_path)] == [
+            "staking_checkpoint"
+        ]
+        (entry,) = _audited(staked_config, "staking_checkpoint")
+        assert entry["tx_hash"] == tx_hash
+        payload = (staked_config.store_path / PERFORMANCE_FILE).read_text()
+        assert '"last_activity": null' in payload
+        # all four reads of the decision, availableRewards() included, and the
+        # chain time it is gated on, at the one pinned block
+        assert len(w3.blocks) == 4
+        assert set(w3.blocks) == {w3.pinned_block}
+        assert w3.pinned_block in w3.time_blocks
+
+    def test_restricted_arms_the_allowance_it_spends(
+        self,
+        restricted_checkpoint: t.Callable[[], str | None],
+        test_signer: Signer,
+        w3: StakingW3,
+    ) -> None:
+        """Restricted, nothing whitelisted: the allowance lets exactly one call pass."""
+        w3.ts_checkpoint = NOW - DAY - 1
+        assert restricted_checkpoint()
+        assert len(w3.eth.sent) == 1
+        with pytest.raises(SignerError, match="only allow transactions targeting"):
+            test_signer.send(
+                "testchain", STAKING_CONTRACT, data=staking.CHECKPOINT_DATA
+            )
+
+    @pytest.mark.parametrize(
+        "receipt", [{"status": 0}, None], ids=["reverted", "unmined"]
+    )
+    def test_a_failed_call_is_audited_and_returns_none(
+        self,
+        checkpoint: t.Callable[[], str | None],
+        staked_config: AppConfig,
+        w3: StakingW3,
+        receipt: dict | None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A revert or a receipt that never comes: audited as failed, retried later."""
+        w3.ts_checkpoint = NOW - DAY
+        w3.eth.receipt = receipt
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            assert checkpoint() is None
+        (entry,) = _audited(staked_config, "staking_checkpoint_failed")
+        assert entry["tx_hash"].startswith("0x")
+        # the log names the transaction, so the operator can look it up
+        assert f"(tx {entry['tx_hash']})" in caplog.text
+        assert entry["staking_contract"] == STAKING_CONTRACT
+        payload = (staked_config.store_path / PERFORMANCE_FILE).read_text()
+        assert '"last_activity": null' in payload
+
+    def test_a_send_that_fails_before_the_guard_leaves_no_allowance(
+        self,
+        restricted_checkpoint: t.Callable[[], str | None],
+        test_signer: Signer,
+        w3: StakingW3,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A send that never reached the guard: its allowance is withdrawn."""
+        w3.ts_checkpoint = NOW - DAY
+        send = test_signer.send
+
+        def failing(*_: t.Any, **__: t.Any) -> str:
+            raise ConnectionError("rpc down")
+
+        monkeypatch.setattr(test_signer, "send", failing)
+        assert restricted_checkpoint() is None
+        with pytest.raises(SignerError, match="only allow transactions targeting"):
+            send(
+                "testchain",
+                STAKING_CONTRACT,
+                data=staking.CHECKPOINT_DATA,
+                intent=SERVER_BUILT,
+            )
+
+    @pytest.mark.parametrize(
+        ("ts_checkpoint", "next_checkpoint", "available_rewards"),
+        [
+            # tsCheckpoint + livenessPeriod is still a minute away
+            (NOW - DAY + 60, NOW, 0),
+            # the block time the contract answers, a few seconds ahead of the
+            # pinned block, on both sides of tsCheckpoint + livenessPeriod
+            (NOW - DAY + 60, NOW + 6, 10**18),
+            (NOW - DAY - 60, NOW + 6, 10**18),
+        ],
+        ids=["no-rewards-left", "epoch-not-over", "epoch-overdue"],
+    )
+    def test_a_pending_rebaseline_is_sent(
+        self,
+        checkpoint: t.Callable[[], str | None],
+        w3: StakingW3,
+        ts_checkpoint: int,
+        next_checkpoint: int,
+        available_rewards: int,
+    ) -> None:
+        """A rebaseline is sent at once, rewards or not, whatever the times say."""
+        w3.ts_checkpoint = ts_checkpoint
+        w3.next_checkpoint = next_checkpoint
+        w3.available_rewards = available_rewards
+        assert checkpoint()
+        assert len(w3.eth.sent) == 1
+
+    @pytest.mark.parametrize(
+        ("chain_time", "host_time", "sent"),
+        [
+            (NOW + 120, NOW - DAY, True),
+            (NOW, NOW + DAY, False),
+        ],
+        ids=["chain-past-host-behind", "chain-before-host-ahead"],
+    )
+    def test_the_due_time_is_the_chain_s_not_this_host_s(  # pylint: disable=too-many-arguments
+        self,
+        checkpoint: t.Callable[[], str | None],
+        w3: StakingW3,
+        monkeypatch: pytest.MonkeyPatch,
+        chain_time: int,
+        host_time: int,
+        sent: bool,
+    ) -> None:
+        """A host clock ahead of the chain pays for no no-op checkpoint()."""
+        w3.chain_time = chain_time  # next checkpoint time is NOW + 60
+        monkeypatch.setattr(time, "time", lambda: float(host_time))
+        assert (checkpoint() is not None) is sent
+        assert len(w3.eth.sent) == (1 if sent else 0)
+
+    def test_a_failed_read_sends_nothing(
+        self,
+        checkpoint: t.Callable[[], str | None],
+        staked_config: AppConfig,
+        w3: StakingW3,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The due-time read failing: audited without the RPC's words, nothing sent."""
+        w3.fail = ConnectionError("http://rpc.example/secret-key unreachable")
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            assert checkpoint() is None
+        assert not w3.eth.sent
+        (entry,) = _audited(staked_config, "staking_checkpoint_failed")
+        assert entry["tx_hash"] is None
+        assert "secret-key" not in entry["error"]
+        assert "staking checkpoint on testchain failed" in caplog.text
+        assert "secret-key" not in caplog.text
+
+
+class TestGuardAllowance:
+    """allow_checkpoint_once admits exactly checkpoint() to the armed contract."""
+
+    @pytest.fixture
+    def armed(self, restricted_guard: Guard) -> Guard:
+        """Return a restricted guard, nothing whitelisted, its checkpoint armed."""
+        restricted_guard.allow_checkpoint_once(
+            chain="testchain", staking_contract=STAKING_CONTRACT
+        )
+        return restricted_guard
+
+    def _check(self, guard: Guard, chain: str = "testchain", **kwargs: t.Any) -> None:
+        """Check the exact checkpoint() call, sent as the server's own."""
+        guard.check_transaction(
+            chain,
+            STAKING_CONTRACT,
+            0,
+            staking.CHECKPOINT_DATA,
+            server_built=True,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize(
+        ("to", "value", "data", "server_built"),
+        [
+            (STAKING_CONTRACT, 1, staking.CHECKPOINT_DATA, True),
+            (STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA + "00", True),
+            (STAKING_CONTRACT, 0, "0x", True),
+            (CHECKER, 0, staking.CHECKPOINT_DATA, True),
+            (STAKING_CONTRACT, 0, staking.CHECKPOINT_DATA, False),
+        ],
+        ids=["value", "extra-data", "no-data", "other-contract", "agent-send"],
+    )
+    def test_refuses_anything_else(  # pylint: disable=too-many-arguments
+        self, armed: Guard, to: str, value: int, data: str, server_built: bool
+    ) -> None:
+        """Value, other calldata, another contract or an agent's copy: refused, kept."""
+        with pytest.raises(Exception, match="only allow transactions targeting"):
+            armed.check_transaction(
+                "testchain", to, value, data, server_built=server_built
+            )
+        # the allowance is still there for the exact call
+        self._check(armed)
+
+    def test_a_revoked_allowance_admits_nothing(self, armed: Guard) -> None:
+        """revoke_checkpoint withdraws it, whatever the address's case."""
+        armed.revoke_checkpoint(
+            chain="TESTCHAIN", staking_contract=STAKING_CONTRACT.lower()
+        )
+        with pytest.raises(Exception, match="only allow transactions targeting"):
+            self._check(armed)
+        # and revoking none is a no-op
+        armed.revoke_checkpoint(chain="testchain", staking_contract=STAKING_CONTRACT)
+
+    def test_applies_to_its_own_chain_only(
+        self, armed: Guard, app_config: AppConfig
+    ) -> None:
+        """The exact call on another chain: refused, the armed chain's allowance kept."""
+        app_config.chains["otherchain"] = ChainConfig(
+            rpc_url="http://127.0.0.1:9", safe_address=SAFE
+        )
+        with pytest.raises(Exception, match="only allow transactions targeting"):
+            self._check(armed, "otherchain")
+        self._check(armed)
+
+    def test_a_dry_run_consumes_nothing(self, armed: Guard) -> None:
+        """consume=False answers without spending the allowance."""
+        self._check(armed, consume=False)
+        self._check(armed)
+        with pytest.raises(Exception, match="only allow transactions targeting"):
+            self._check(armed)
+
+    def test_an_allowance_expires(
+        self,
+        restricted_guard: Guard,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Unused past its TTL: gone, and the log says so."""
+        clock = [1000.0]
+        monkeypatch.setattr("connect.guard.time.monotonic", lambda: clock[0])
+        restricted_guard.allow_checkpoint_once(
+            chain="testchain", staking_contract=STAKING_CONTRACT
+        )
+        clock[0] += 3600
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            with pytest.raises(Exception, match="only allow transactions targeting"):
+                self._check(restricted_guard)
+        assert "checkpoint allowance" in caplog.text
+
+
+class TestCheckpointTask:
+    """checkpoint_staking, the lifespan task."""
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        config: AppConfig,
+        check: t.Callable[..., None],
+    ) -> list[str]:
+        """Run the task until its second sleep; return what happened, in order."""
+        events: list[str] = []
+
+        def recorded_check(*args: t.Any) -> None:
+            """Record a check, then run the given one."""
+            events.append("check")
+            check(*args)
+
+        monkeypatch.setattr(staking, "checkpoint_if_due", recorded_check)
+        end_at_sleep(monkeypatch, events)
+
+        def unusable() -> bool:
+            """Record reaching the notice refresh; the tick stops there."""
+            events.append("notice")
+            return False
+
+        unready = SimpleNamespace(ensure=unusable)
+        args: tuple = (config, None, None, None, unready)
+        # end_at_sleep cancels a staked task; an unstaked one returns at once
+        with contextlib.suppress(asyncio.CancelledError):
+            asyncio.run(app_module.checkpoint_staking(*args))
+        return events
+
+    def test_unstaked_never_starts(
+        self, app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unstaked: the task returns at once, having called nothing."""
+        assert not self._run(monkeypatch, app_config, lambda *a: None)
+
+    def test_staked_checks_at_start_then_every_interval(
+        self, staked_config: AppConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Staked: a tick (checkpoint, then notice), then one per interval."""
+        assert self._run(monkeypatch, staked_config, lambda *a: None) == [
+            "check",
+            "notice",
+            "sleep 600.0",
+            "check",
+            "notice",
+            "sleep 600.0",
+        ]
+
+    def test_a_failed_check_does_not_end_the_task(
+        self,
+        staked_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Whatever a check raises is logged, and the next one still runs."""
+
+        def failing(*_: t.Any) -> None:
+            """Fail every check."""
+            raise RuntimeError("boom")
+
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            events = self._run(monkeypatch, staked_config, failing)
+        assert events.count("check") == 2
+        assert "staking checkpoint check failed" in caplog.text
+
+    def test_runs_with_the_app_and_stops_after(  # pylint: disable=too-many-arguments
+        self,
+        test_signer: Signer,
+        staked_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The lifespan starts the task with the app and cancels it on shutdown."""
+        monkeypatch.setattr(app_module, "STAKING_CHECKPOINT_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(app_module, "AGENT_TOPUP_INTERVAL_SECONDS", 3600.0)
+        checks: list[tuple] = []
+        monkeypatch.setattr(
+            staking, "checkpoint_if_due", lambda *a, **k: checks.append(a)
+        )
+        monkeypatch.setattr(
+            staking, "read_staking_reminder", lambda config, signer: None
+        )
+        app = make_app(test_signer, staked_config, activity)
+        with TestClient(app, base_url="http://127.0.0.1:8716"):
+            deadline = time.monotonic() + 5
+            while len(checks) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(checks) >= 2
+        assert checks[0][:3] == (staked_config, test_signer, app.state.guard)
+        at_shutdown = len(checks)
+        time.sleep(0.1)
+        assert len(checks) == at_shutdown
+
+
+class TestSessionNotice:
+    """POST /session leaves the reminder for the session, or clears it."""
+
+    @pytest.fixture
+    def client(
+        self,
+        test_signer: Signer,
+        app_config: AppConfig,
+        activity: ActivityLog,
+        make_app: t.Callable,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> t.Iterator[TestClient]:
+        """Yield a client whose launches open nothing, noting the notice they see."""
+
+        def opened(self: t.Any, harness: str, *, fallback: bool = False) -> str:
+            """Record what the session would find, then open nothing."""
+            notice = app_config.store_path / SESSION_NOTICE_FILE
+            self.seen_notices.append(
+                notice.read_text(encoding="utf-8") if notice.exists() else None
+            )
+            return harness
+
+        monkeypatch.setattr("connect.workspace.Workspace.open_session", opened)
+        monkeypatch.setattr(
+            "connect.workspace.Workspace.seen_notices", [], raising=False
+        )
+        app = make_app(test_signer, app_config, activity)
+        with TestClient(app, base_url="http://127.0.0.1:8716") as client:
+            yield client
+
+    def _notice(self, app_config: AppConfig) -> Path:
+        """Where the session finds its notice."""
+        return app_config.store_path / SESSION_NOTICE_FILE
+
+    def test_writes_the_reminder(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A reminder due: written before the session opens."""
+        monkeypatch.setattr(
+            staking, "staking_reminder", lambda config, signer: staking.STAKING_REMINDER
+        )
+        assert client.post("/session").json()["launched"] is True
+        # there before the session opened, not only after
+        assert client.app.state.workspace.seen_notices == [  # type: ignore[attr-defined]
+            staking.STAKING_REMINDER + "\n"
+        ]
+
+    def test_clears_an_old_reminder(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Nothing to say: an earlier session's notice is removed."""
+        monkeypatch.setattr(staking, "staking_reminder", lambda config, signer: None)
+        assert client.get("/healthcheck").json() == {"is_healthy": True}
+        self._notice(app_config).write_text("stale", encoding="utf-8")
+        assert client.post("/session").json()["launched"] is True
+        assert not self._notice(app_config).exists()
+        # and with none to clear
+        assert client.post("/session").json()["launched"] is True
+
+    @pytest.mark.parametrize("target_exists", [True, False], ids=["live", "dangling"])
+    @pytest.mark.parametrize(
+        "notice", [staking.STAKING_REMINDER, None], ids=["write", "clear"]
+    )
+    def test_a_planted_link_is_replaced_not_followed(  # pylint: disable=too-many-arguments
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        tmp_path: Path,
+        notice: str | None,
+        target_exists: bool,
+    ) -> None:
+        """A session's link at the name never redirects the server's write."""
+        outside = tmp_path / "outside.json"
+        if target_exists:
+            outside.write_text("settings", encoding="utf-8")
+        self._notice(app_config).symlink_to(outside)
+
+        workspace = client.app.state.workspace  # type: ignore[attr-defined]
+        workspace.write_session_notice(notice)
+
+        if target_exists:
+            assert outside.read_text(encoding="utf-8") == "settings"
+        else:
+            assert not outside.exists()
+        assert not self._notice(app_config).is_symlink()
+        if notice is None:
+            assert not self._notice(app_config).exists()
+        else:
+            assert self._notice(app_config).read_text(encoding="utf-8") == (
+                notice + "\n"
+            )
+
+    def test_a_link_planted_after_the_remove_fails_the_write(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The exclusive create refuses a link the session plants in between."""
+        outside = tmp_path / "outside.json"
+        outside.write_text("settings", encoding="utf-8")
+        real_remove = workspace_module._remove  # pylint: disable=protected-access
+
+        def remove_then_plant(target: Path) -> None:
+            real_remove(target)
+            target.symlink_to(outside)
+
+        self._notice(app_config).write_text("stale", encoding="utf-8")
+        monkeypatch.setattr(workspace_module, "_remove", remove_then_plant)
+
+        workspace = client.app.state.workspace  # type: ignore[attr-defined]
+        with pytest.raises(FileExistsError):
+            workspace.write_session_notice(staking.STAKING_REMINDER)
+        assert outside.read_text(encoding="utf-8") == "settings"
+
+    def test_the_notice_is_never_committed(self) -> None:
+        """A `git init` in the workspace ignores the notice, like the token."""
+        assert SESSION_NOTICE_FILE in workspace_module.GITIGNORE_ENTRIES
+
+    def test_an_unwritable_notice_never_fails_the_launch(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A disk error writing the notice: logged, and the session still opens."""
+        monkeypatch.setattr(
+            staking, "staking_reminder", lambda config, signer: staking.STAKING_REMINDER
+        )
+
+        def broken(self: t.Any, notice: str | None) -> None:
+            raise OSError("read-only store")
+
+        monkeypatch.setattr("connect.workspace.Workspace.write_session_notice", broken)
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            assert client.post("/session").json()["launched"] is True
+        assert "could not write the session notice" in caplog.text
+
+    def test_a_slow_read_never_holds_the_launch(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A read past the time limit: no reminder, an old one cleared, launched."""
+        monkeypatch.setattr(pearl_routes, "REMINDER_READ_SECONDS", 0.01)
+        answered = threading.Event()
+        read_done = threading.Event()
+        held: list[bool] = []
+
+        def slow(config: AppConfig, signer: Signer) -> str:
+            """Answer only once the launch has answered.
+
+            `held` records whether the launch made it wait out the bound: a
+            launch that blocked on the read, by any route, never sets
+            `answered` before the read gives up.
+            """
+            held.append(not answered.wait(timeout=5))
+            read_done.set()
+            return staking.STAKING_REMINDER
+
+        monkeypatch.setattr(staking, "staking_reminder", slow)
+        assert client.get("/healthcheck").json() == {"is_healthy": True}
+        self._notice(app_config).write_text("stale", encoding="utf-8")
+        try:
+            with caplog.at_level(logging.WARNING, logger="agent"):
+                assert client.post("/session").json()["launched"] is True
+        finally:
+            answered.set()
+        assert read_done.wait(timeout=5)
+        assert held == [False]
+        assert not self._notice(app_config).exists()
+        assert "took over" in caplog.text
+
+    def test_hung_reads_leave_one_thread_behind_not_one_per_launch(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every launch reads on one worker, and a timed-out read is dropped."""
+        monkeypatch.setattr(pearl_routes, "REMINDER_READ_SECONDS", 0.01)
+        released = threading.Event()
+
+        reads: list[int] = []
+
+        def hung(config: AppConfig, signer: Signer) -> str:
+            """Block like a black-holed RPC until released."""
+            reads.append(1)
+            released.wait(timeout=5)
+            return staking.STAKING_REMINDER
+
+        monkeypatch.setattr(staking, "staking_reminder", hung)
+        try:
+            for _ in range(3):
+                assert client.post("/session").json()["launched"] is True
+            readers = [
+                th
+                for th in threading.enumerate()
+                if th.name.startswith("staking-reminder")
+            ]
+            assert len(readers) == 1
+        finally:
+            released.set()
+        # the timed-out launches' reads were dropped, not run after the hung one
+        pearl_routes._REMINDER_READER.submit(  # pylint: disable=protected-access
+            lambda: None
+        ).result(timeout=5)
+        assert len(reads) == 1
+
+    def _tick(self, client: TestClient, app_config: AppConfig) -> None:
+        """Run one staking tick against the client's app."""
+        state = client.app.state  # type: ignore[attr-defined]
+        app_module.staking_tick(
+            app_config, state.signer, state.guard, None, state.workspace  # type: ignore[arg-type]
+        )
+
+    def test_each_tick_refreshes_the_notice(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A request made between two ticks: the second removes the notice.
+
+        So a session opened from the coding tool, with no POST /session,
+        still finds the current reminder.
+        """
+        events: list[str] = []
+        answers = [staking.STAKING_REMINDER, None]
+        monkeypatch.setattr(
+            staking, "checkpoint_if_due", lambda *a: events.append("checkpoint")
+        )
+
+        def reminder(config: AppConfig, signer: Signer) -> str | None:
+            """Answer the reminder, then nothing once the request is made."""
+            events.append("reminder")
+            return answers.pop(0)
+
+        monkeypatch.setattr(staking, "read_staking_reminder", reminder)
+        self._tick(client, app_config)
+        assert self._notice(app_config).read_text(encoding="utf-8") == (
+            staking.STAKING_REMINDER + "\n"
+        )
+        self._tick(client, app_config)
+        assert not self._notice(app_config).exists()
+        # the checkpoint first, so the notice reflects the state after it
+        assert events == ["checkpoint", "reminder"] * 2
+
+    def test_a_failed_read_on_a_tick_leaves_the_notice(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A read that fails says nothing: the launch's reminder stands."""
+        monkeypatch.setattr(staking, "checkpoint_if_due", lambda *a: None)
+
+        error = ConnectionError("http://rpc.example/secret-key unreachable")
+
+        def unreadable(config: AppConfig, signer: Signer) -> str | None:
+            raise error
+
+        monkeypatch.setattr(staking, "read_staking_reminder", unreadable)
+        assert client.get("/healthcheck").json() == {"is_healthy": True}
+        self._notice(app_config).write_text(
+            staking.STAKING_REMINDER + "\n", encoding="utf-8"
+        )
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            self._tick(client, app_config)
+        assert self._notice(app_config).read_text(encoding="utf-8") == (
+            staking.STAKING_REMINDER + "\n"
+        )
+        assert "session notice left as it was" in caplog.text
+        assert "secret-key" not in caplog.text
+
+    def test_a_tick_writes_nothing_before_the_workspace_is_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unusable workspace: the checkpoint still runs, no notice is read."""
+        events: list[str] = []
+        monkeypatch.setattr(
+            staking, "checkpoint_if_due", lambda *a: events.append("checkpoint")
+        )
+        monkeypatch.setattr(
+            staking, "read_staking_reminder", lambda *a: events.append("reminder")
+        )
+        unready = SimpleNamespace(ensure=lambda: False)
+        app_module.staking_tick(None, None, None, None, unready)  # type: ignore[arg-type]
+        assert events == ["checkpoint"]
+
+    def test_an_unwritable_notice_never_ends_the_tick(
+        self,
+        client: TestClient,
+        app_config: AppConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A disk error refreshing the notice is logged, not raised."""
+        monkeypatch.setattr(staking, "checkpoint_if_due", lambda *a: None)
+        monkeypatch.setattr(
+            staking,
+            "read_staking_reminder",
+            lambda config, signer: staking.STAKING_REMINDER,
+        )
+
+        def broken(self: t.Any, notice: str | None) -> None:
+            raise FileExistsError("a launch's write won the race")
+
+        monkeypatch.setattr("connect.workspace.Workspace.write_session_notice", broken)
+        with caplog.at_level(logging.ERROR, logger="agent"):
+            self._tick(client, app_config)
+        assert "could not refresh the session notice" in caplog.text
+
+    def test_the_brief_tells_the_session_to_say_it(self) -> None:
+        """The shipped brief names the file and says to relay it first."""
+        brief = (Path(staking.__file__).parent / "assets" / "CLAUDE.md").read_text(
+            encoding="utf-8"
+        )
+        assert f"If `{SESSION_NOTICE_FILE}` is in this workspace" in brief
+
+    def test_the_skill_tells_the_session_to_say_it_too(self) -> None:
+        """The pearl-connect skill repeats it, for a harness that skips the brief."""
+        skill = (
+            Path(staking.__file__).parent
+            / "assets"
+            / "skills"
+            / "pearl-connect"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        assert f"If `{SESSION_NOTICE_FILE}` is in the workspace" in skill
